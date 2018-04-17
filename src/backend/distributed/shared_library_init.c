@@ -109,6 +109,7 @@ static const struct config_enum_entry replication_model_options[] = {
 };
 
 static const struct config_enum_entry task_executor_type_options[] = {
+	{ "adaptive", MULTI_ADAPTIVE_EXECUTOR, false },
 	{ "real-time", MULTI_EXECUTOR_REAL_TIME, false },
 	{ "task-tracker", MULTI_EXECUTOR_TASK_TRACKER, false },
 	{ NULL, 0, false }
@@ -613,6 +614,37 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.force_max_query_parallelization",
+		gettext_noop("Open as many connections as possible to maximize query "
+					 "parallelization"),
+		gettext_noop("When enabled, Citus will force the executor to use "
+					 "as many connections as possible while executing a "
+					 "parallel distributed query. If not enabled, the executor"
+					 "might choose to use less connections to optimize overall "
+					 "query execution throughput. Internally, setting this true "
+					 "will end up with using one connection per task."),
+		&ForceMaxQueryParallelization,
+		false,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.executor_slow_start_interval",
+		gettext_noop("Time to wait between opening connections to the same worker node"),
+		gettext_noop("When the individual tasks of a multi-shard query take very "
+					 "little time, they can often be finished over a single (often "
+					 "already cached) connection. To avoid redundantly opening "
+					 "additional connections, the executor waits between connection "
+					 "attempts for the configured number of milliseconds. At the end "
+					 "of the interval, it doubles the number of connections it is allowed "
+					 "to open next time."),
+		&ExecutorSlowStartInterval,
+		10, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_deadlock_prevention",
@@ -725,6 +757,18 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
+		"citus.max_adaptive_executor_pool_size",
+		gettext_noop("Sets the maximum number of connections used per distributed query "
+					 "for each worker node. If set to zero, adaptive executor is "
+					 "disabled"),
+		gettext_noop("See src/backend/executor/README for the details"),
+		&MaxAdaptiveExecutorPoolSize,
+		4, 0, INT_MAX,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
 		"citus.max_worker_nodes_tracked",
 		gettext_noop("Sets the maximum number of worker nodes that are tracked."),
 		gettext_noop("Worker nodes' network locations, their membership and "
@@ -776,7 +820,7 @@ RegisterCitusConfigVariables(void)
 		&MaxCachedConnectionsPerWorker,
 		1, 0, INT_MAX,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		0,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -928,7 +972,7 @@ RegisterCitusConfigVariables(void)
 					 "queries that touch thousands of shards and/or that involve table "
 					 "repartitioning."),
 		&TaskExecutorType,
-		MULTI_EXECUTOR_REAL_TIME,
+		MULTI_ADAPTIVE_EXECUTOR,
 		task_executor_type_options,
 		PGC_USERSET,
 		0,

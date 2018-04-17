@@ -126,6 +126,8 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 
 		HandleRemoteTransactionConnectionError(connection, raiseErrors);
 	}
+
+	transaction->beginSent = true;
 }
 
 
@@ -1255,6 +1257,9 @@ FinishRemoteTransactionSavepointRollback(MultiConnection *connection, SubTransac
 
 	PQclear(result);
 	ForgetResults(connection);
+
+	/* reset transaction state so the executor can accept next commands in transaction */
+	transaction->transactionState = REMOTE_TRANS_STARTED;
 }
 
 
