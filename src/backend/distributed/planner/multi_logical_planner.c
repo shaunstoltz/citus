@@ -789,7 +789,7 @@ IsReadIntermediateResultFunction(Node *node)
 	{
 		FuncExpr *funcExpr = (FuncExpr *) node;
 
-		if (funcExpr->funcid == CitusReadIntermediateResultFuncId())
+		if (IsReadIntermediateResultFunctionId(funcExpr->funcid))
 		{
 			return true;
 		}
