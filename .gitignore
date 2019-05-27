@@ -40,3 +40,6 @@ lib*.pc
 
 # temporary files vim creates
 *.swp
+
+# uncrustify temp files
+*.uncrustify
