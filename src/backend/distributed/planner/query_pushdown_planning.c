@@ -102,6 +102,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 {
 	List *qualifierList = NIL;
 	StringInfo errorMessage = NULL;
+	bool subqueryPulledUp = false;
 
 	/*
 	 * We check the existence of subqueries in FROM clause on the modified query
@@ -133,11 +134,21 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 		return true;
 	}
 
+	if (JoinTreeContainsSubquery(originalQuery))
+	{
+		/*
+		 * The orignal query contains subquery but not the  rewrittenQuery. This
+		 * can happen when pull_up_subqueries() returns true.
+		 */
+		subqueryPulledUp = true;
+	}
+
 	/*
 	 * We handle outer joins as subqueries, since the join order planner
 	 * does not know how to handle them.
 	 */
-	if (FindNodeCheck((Node *) originalQuery->jointree, IsOuterJoinExpr))
+	if (FindNodeCheck((Node *) originalQuery->jointree, IsOuterJoinExpr) ||
+		(subqueryPulledUp && FindNodeCheck((Node *) rewrittenQuery, IsOuterJoinExpr)))
 	{
 		return true;
 	}
