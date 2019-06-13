@@ -5,7 +5,7 @@
 --
 -- It'd be nice to script generation of this file, but alas, that's
 -- not done yet.
-
+SELECT version();
 
 SET citus.next_shard_id TO 580000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 580000;
