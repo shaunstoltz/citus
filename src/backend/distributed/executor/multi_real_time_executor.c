@@ -1047,7 +1047,7 @@ RealTimeExecScan(CustomScanState *node)
 		ExecuteSubPlans(distributedPlan);
 		MultiRealTimeExecute(workerJob);
 
-		LoadTuplesIntoTupleStore(scanState, workerJob);
+		LoadTaskFilesIntoScanStateTupleStore(scanState, workerJob);
 
 		scanState->finishedRemoteScan = true;
 	}

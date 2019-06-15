@@ -15,6 +15,7 @@
 #include "fmgr.h"
 
 #include "distributed/commands/multi_copy.h"
+#include "distributed/sharding.h"
 #include "nodes/execnodes.h"
 #include "nodes/pg_list.h"
 #include "tcop/dest.h"

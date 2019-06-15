@@ -122,8 +122,6 @@ static MapMergeJob * BuildMapMergeJob(Query *jobQuery, List *dependedJobList,
 									  Oid baseRelationId,
 									  BoundaryNodeJobType boundaryNodeJobType);
 static uint32 HashPartitionCount(void);
-static ArrayType * SplitPointObject(ShardInterval **shardIntervalArray,
-									uint32 shardIntervalCount);
 
 /* Local functions forward declarations for task list creation and helper functions */
 static bool DistributedPlanRouterExecutable(DistributedPlan *distributedPlan);
@@ -186,8 +184,6 @@ static void AssignDataFetchDependencies(List *taskList);
 static uint32 TaskListHighestTaskId(List *taskList);
 static List * MapTaskList(MapMergeJob *mapMergeJob, List *filterTaskList);
 static char * ColumnName(Var *column, List *rangeTableList);
-static StringInfo SplitPointArrayString(ArrayType *splitPointObject,
-										Oid columnType, int32 columnTypeMod);
 static List * MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList,
 							uint32 taskIdIndex);
 static StringInfo ColumnNameArrayString(uint32 columnCount, uint64 generatingJobId);
@@ -1918,7 +1914,7 @@ HashPartitionCount(void)
  * shard interval's minimum value, sorts and inserts these minimum values into a
  * new array. This sorted array is then used by the MapMerge job.
  */
-static ArrayType *
+ArrayType *
 SplitPointObject(ShardInterval **shardIntervalArray, uint32 shardIntervalCount)
 {
 	ArrayType *splitPointObject = NULL;
@@ -4354,7 +4350,7 @@ ColumnName(Var *column, List *rangeTableList)
  * object, and converts this array (and array's typed elements) to their string
  * representations.
  */
-static StringInfo
+StringInfo
 SplitPointArrayString(ArrayType *splitPointObject, Oid columnType, int32 columnTypeMod)
 {
 	StringInfo splitPointArrayString = NULL;

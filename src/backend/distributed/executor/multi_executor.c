@@ -204,20 +204,35 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
  * filled the tuplestores, but that's a fair bit of work.
  */
 void
-LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
+LoadTaskFilesIntoScanStateTupleStore(CitusScanState *citusScanState, Job *workerJob)
 {
 	CustomScanState customScanState = citusScanState->customScanState;
-	List *workerTaskList = workerJob->taskList;
 	TupleDesc tupleDescriptor = NULL;
+
+	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
+
+	Assert(citusScanState->tuplestorestate == NULL);
+
+	citusScanState->tuplestorestate = LoadTaskFilesIntoTupleStore(workerJob,
+																  tupleDescriptor);
+}
+
+
+/*
+ * LoadTaskFilesIntoTupleStore reads all the task files written by the real-time
+ * or task-tracker executor into a tuple store and returns it.
+ */
+Tuplestorestate *
+LoadTaskFilesIntoTupleStore(Job *workerJob, TupleDesc tupleDescriptor)
+{
+	Tuplestorestate *tupleStore = NULL;
+	List *workerTaskList = workerJob->taskList;
 	ListCell *workerTaskCell = NULL;
 	bool randomAccess = true;
 	bool interTransactions = false;
 	char *copyFormat = "text";
 
-	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
-
-	Assert(citusScanState->tuplestorestate == NULL);
-	citusScanState->tuplestorestate =
+	tupleStore =
 		tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
 
 	if (BinaryMasterCopyFormat)
@@ -235,10 +250,12 @@ LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
 		taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
 
 		ReadFileIntoTupleStore(taskFilename->data, copyFormat, tupleDescriptor,
-							   citusScanState->tuplestorestate);
+							   tupleStore);
 	}
 
-	tuplestore_donestoring(citusScanState->tuplestorestate);
+	tuplestore_donestoring(tupleStore);
+
+	return tupleStore;
 }
 
 

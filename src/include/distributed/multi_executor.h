@@ -33,7 +33,10 @@ extern bool WritableStandbyCoordinator;
 
 extern void CitusExecutorStart(QueryDesc *queryDesc, int eflags);
 extern TupleTableSlot * ReturnTupleFromTuplestore(CitusScanState *scanState);
-extern void LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob);
+extern void LoadTaskFilesIntoScanStateTupleStore(CitusScanState *citusScanState,
+												 Job *workerJob);
+extern Tuplestorestate * LoadTaskFilesIntoTupleStore(Job *workerJob,
+													 TupleDesc tupleDescriptor);
 extern void ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc
 								   tupleDescriptor, Tuplestorestate *tupstore);
 extern Query * ParseQueryString(const char *queryString);

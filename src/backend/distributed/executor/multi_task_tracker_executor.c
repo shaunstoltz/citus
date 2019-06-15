@@ -3017,7 +3017,7 @@ TaskTrackerExecScan(CustomScanState *node)
 		PrepareMasterJobDirectory(workerJob);
 		MultiTaskTrackerExecute(workerJob);
 
-		LoadTuplesIntoTupleStore(scanState, workerJob);
+		LoadTaskFilesIntoScanStateTupleStore(scanState, workerJob);
 
 		scanState->finishedRemoteScan = true;
 	}
