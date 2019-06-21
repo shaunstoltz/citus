@@ -1207,7 +1207,6 @@ SELECT DISTINCT ON (o_custkey) o_custkey, l_orderkey
 EXPLAIN (COSTS FALSE)
 	SELECT DISTINCT ON (o_custkey) o_custkey, l_orderkey
 		FROM lineitem_hash_part JOIN orders_hash_part ON (l_orderkey = o_orderkey) 
-		WHERE o_custkey < 15
 		ORDER BY 1,2;
                                                    QUERY PLAN                                                   
 ----------------------------------------------------------------------------------------------------------------
@@ -1223,19 +1222,17 @@ EXPLAIN (COSTS FALSE)
                            ->  Sort
                                  Sort Key: orders_hash_part.o_custkey, lineitem_hash_part.l_orderkey
                                  ->  Hash Join
-                                       Hash Cond: (lineitem_hash_part.l_orderkey = orders_hash_part.o_orderkey)
-                                       ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+                                       Hash Cond: (orders_hash_part.o_orderkey = lineitem_hash_part.l_orderkey)
+                                       ->  Seq Scan on orders_hash_part_360045 orders_hash_part
                                        ->  Hash
-                                             ->  Seq Scan on orders_hash_part_360045 orders_hash_part
-                                                   Filter: (o_custkey < 15)
-(17 rows)
+                                             ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+(16 rows)
 
 -- explain without order by
 -- notice master plan has order by on distinct on column
 EXPLAIN (COSTS FALSE)
 	SELECT DISTINCT ON (o_custkey) o_custkey, l_orderkey
-		FROM lineitem_hash_part JOIN orders_hash_part ON (l_orderkey = o_orderkey) 
-		WHERE o_custkey < 15;
+		FROM lineitem_hash_part JOIN orders_hash_part ON (l_orderkey = o_orderkey);
                                                    QUERY PLAN                                                   
 ----------------------------------------------------------------------------------------------------------------
  Unique
@@ -1250,12 +1247,11 @@ EXPLAIN (COSTS FALSE)
                            ->  Sort
                                  Sort Key: orders_hash_part.o_custkey
                                  ->  Hash Join
-                                       Hash Cond: (lineitem_hash_part.l_orderkey = orders_hash_part.o_orderkey)
-                                       ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+                                       Hash Cond: (orders_hash_part.o_orderkey = lineitem_hash_part.l_orderkey)
+                                       ->  Seq Scan on orders_hash_part_360045 orders_hash_part
                                        ->  Hash
-                                             ->  Seq Scan on orders_hash_part_360045 orders_hash_part
-                                                   Filter: (o_custkey < 15)
-(17 rows)
+                                             ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+(16 rows)
 
 -- each customer's each order's first l_partkey
 SELECT DISTINCT ON (o_custkey, l_orderkey) o_custkey, l_orderkey, l_linenumber, l_partkey
@@ -1305,8 +1301,7 @@ SELECT DISTINCT ON (o_custkey, l_orderkey) o_custkey, l_orderkey, l_linenumber, 
 -- explain without order by
 EXPLAIN (COSTS FALSE)
 	SELECT DISTINCT ON (o_custkey, l_orderkey) o_custkey, l_orderkey, l_linenumber, l_partkey
-		FROM lineitem_hash_part JOIN orders_hash_part ON (l_orderkey = o_orderkey) 
-		WHERE o_custkey < 20;
+		FROM lineitem_hash_part JOIN orders_hash_part ON (l_orderkey = o_orderkey);
                                                    QUERY PLAN                                                   
 ----------------------------------------------------------------------------------------------------------------
  Unique
@@ -1321,12 +1316,11 @@ EXPLAIN (COSTS FALSE)
                            ->  Sort
                                  Sort Key: orders_hash_part.o_custkey, lineitem_hash_part.l_orderkey
                                  ->  Hash Join
-                                       Hash Cond: (lineitem_hash_part.l_orderkey = orders_hash_part.o_orderkey)
-                                       ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+                                       Hash Cond: (orders_hash_part.o_orderkey = lineitem_hash_part.l_orderkey)
+                                       ->  Seq Scan on orders_hash_part_360045 orders_hash_part
                                        ->  Hash
-                                             ->  Seq Scan on orders_hash_part_360045 orders_hash_part
-                                                   Filter: (o_custkey < 20)
-(17 rows)
+                                             ->  Seq Scan on lineitem_hash_part_360041 lineitem_hash_part
+(16 rows)
 
 -- each customer's each order's last l_partkey
 SELECT DISTINCT ON (o_custkey, l_orderkey) o_custkey, l_orderkey, l_linenumber, l_partkey
