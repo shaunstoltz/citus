@@ -565,7 +565,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			Assert(placementConnection != NULL);
 
-			ereport(ERROR,
+			ereport(INFO,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot perform DDL on placement " UINT64_FORMAT
 							", which has been read over multiple connections",
@@ -583,7 +583,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			Assert(placementConnection != NULL);
 
-			ereport(ERROR,
+			ereport(INFO,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot perform DDL on placement " UINT64_FORMAT
 							" since a co-located placement has been read over multiple connections",
@@ -604,7 +604,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 				 * connection. Neither connection is guaranteed to see all uncomitted
 				 * writes and therefore we cannot proceed.
 				 */
-				ereport(ERROR,
+				ereport(INFO,
 						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 						 errmsg("cannot perform query with placements that were "
 								"modified over multiple connections")));
@@ -637,7 +637,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 			Assert(placementConnection != NULL);
 			Assert(!CanUseExistingConnection(flags, userName, placementConnection));
 
-			ereport(ERROR,
+			ereport(INFO,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot establish a new connection for "
 							"placement " UINT64_FORMAT
@@ -660,7 +660,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 			Assert(!CanUseExistingConnection(flags, userName, placementConnection));
 			Assert(!placementConnection->hadDDL);
 
-			ereport(ERROR,
+			ereport(INFO,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot establish a new connection for "
 							"placement " UINT64_FORMAT
@@ -680,7 +680,7 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 			Assert(!placementConnection->hadDDL);
 			Assert(!placementConnection->hadDML);
 
-			ereport(ERROR,
+			ereport(INFO,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("cannot perform a parallel DDL command because multiple "
 							"placements have been accessed over the same connection")));
