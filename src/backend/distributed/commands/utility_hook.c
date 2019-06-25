@@ -77,7 +77,6 @@ CitusProcessUtility(Node *node, const char *queryString, ProcessUtilityContext c
 					ParamListInfo params, DestReceiver *dest, char *completionTag)
 {
 	PlannedStmt *plannedStmt = makeNode(PlannedStmt);
-	plannedStmt->commandType = CMD_UTILITY;
 	plannedStmt->utilityStmt = node;
 
 	ProcessUtility(plannedStmt, queryString, context, params, NULL, dest,
@@ -583,7 +582,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 		if (MultiShardConnectionType == SEQUENTIAL_CONNECTION ||
 			ddlJob->executeSequentially)
 		{
-			ExecuteModifyTasksSequentiallyWithoutResults(ddlJob->taskList, CMD_UTILITY);
+			ExecuteModifyTasksSequentiallyWithoutResults(ddlJob->taskList, MODLEVEL_NONE);
 		}
 		else
 		{

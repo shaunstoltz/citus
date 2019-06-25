@@ -70,7 +70,7 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 
 			query = copyObject(originalQuery);
 
-			copiedInsertRte = ExtractInsertRangeTableEntry(query);
+			copiedInsertRte = ExtractResultRelationRTE(query);
 			copiedSubqueryRte = ExtractSelectRangeTableEntry(query);
 			copiedSubquery = copiedSubqueryRte->subquery;
 

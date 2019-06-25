@@ -139,7 +139,6 @@ static List * BuildRoutesForInsert(Query *query, DeferredErrorMessage **planning
 static List * GroupInsertValuesByShardId(List *insertValuesList);
 static List * ExtractInsertValuesList(Query *query, Var *partitionColumn);
 static DeferredErrorMessage * MultiRouterPlannableQuery(Query *query);
-static DeferredErrorMessage * ErrorIfQueryHasModifyingCTE(Query *queryTree);
 static RangeTblEntry * GetUpdateOrDeleteRTE(Query *query);
 static bool SelectsFromDistributedTable(List *rangeTableList, Query *query);
 static List * get_all_actual_clauses(List *restrictinfo_list);
@@ -164,7 +163,7 @@ static void ReorderTaskPlacementsByTaskAssignmentPolicy(Job *job,
 
 /*
  * CreateRouterPlan attempts to create a router executor plan for the given
- * SELECT statement.  ->planningError is set if planning fails.
+ * SELECT statement. ->planningError is set if planning fails.
  */
 DistributedPlan *
 CreateRouterPlan(Query *originalQuery, Query *query,
@@ -185,8 +184,8 @@ CreateRouterPlan(Query *originalQuery, Query *query,
 
 
 /*
- * CreateModifyPlan attempts to create a plan the given modification
- * statement.  If planning fails ->planningError is set to a description of
+ * CreateModifyPlan attempts to create a plan for the given modification
+ * statement. If planning fails ->planningError is set to a description of
  * the failure.
  */
 DistributedPlan *
@@ -197,7 +196,7 @@ CreateModifyPlan(Query *originalQuery, Query *query,
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
 	bool multiShardQuery = false;
 
-	distributedPlan->operation = query->commandType;
+	distributedPlan->modLevel = ModifyLevelForQuery(query);
 
 	distributedPlan->planningError = ModifyQuerySupported(query, originalQuery,
 														  multiShardQuery,
@@ -242,8 +241,8 @@ CreateModifyPlan(Query *originalQuery, Query *query,
  * CreateSingleTaskRouterPlan creates a physical plan for given query. The created plan is
  * either a modify task that changes a single shard, or a router task that returns
  * query results from a single worker. Supported modify queries (insert/update/delete)
- * are router plannable by default. If query is not router plannable then either NULL is
- * returned, or the returned plan has planningError set to a description of the problem.
+ * are router plannable by default. If query is not router plannable the returned plan
+ * has planningError set to a description of the problem.
  */
 static void
 CreateSingleTaskRouterPlan(DistributedPlan *distributedPlan, Query *originalQuery,
@@ -252,7 +251,7 @@ CreateSingleTaskRouterPlan(DistributedPlan *distributedPlan, Query *originalQuer
 {
 	Job *job = NULL;
 
-	distributedPlan->operation = query->commandType;
+	distributedPlan->modLevel = ModifyLevelForQuery(query);
 
 	/* we cannot have multi shard update/delete query via this code path */
 	job = RouterJob(originalQuery, plannerRestrictionContext,
@@ -489,7 +488,7 @@ ModifyQueryResultRelationId(Query *query)
 						errmsg("input query is not a modification query")));
 	}
 
-	resultRte = ExtractInsertRangeTableEntry(query);
+	resultRte = ExtractResultRelationRTE(query);
 	Assert(OidIsValid(resultRte->relid));
 
 	return resultRte->relid;
@@ -497,20 +496,12 @@ ModifyQueryResultRelationId(Query *query)
 
 
 /*
- * ExtractInsertRangeTableEntry returns the INSERT'ed table's range table entry.
- * Note that the function expects and asserts that the input query be
- * an INSERT...SELECT query.
+ * ExtractResultRelationRTE returns the table's resultRelation range table entry.
  */
 RangeTblEntry *
-ExtractInsertRangeTableEntry(Query *query)
+ExtractResultRelationRTE(Query *query)
 {
-	int resultRelation = query->resultRelation;
-	List *rangeTableList = query->rtable;
-	RangeTblEntry *insertRTE = NULL;
-
-	insertRTE = rt_fetch(resultRelation, rangeTableList);
-
-	return insertRTE;
+	return rt_fetch(query->resultRelation, query->rtable);
 }
 
 
@@ -604,21 +595,6 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 			CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
 			Query *cteQuery = (Query *) cte->ctequery;
 			DeferredErrorMessage *cteError = NULL;
-
-			if (cteQuery->commandType != CMD_SELECT)
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "Router planner doesn't support non-select common table expressions.",
-									 NULL, NULL);
-			}
-
-			if (cteQuery->hasForUpdate)
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "Router planner doesn't support SELECT FOR UPDATE"
-									 " in common table expressions.",
-									 NULL, NULL);
-			}
 
 			if (FindNodeCheck((Node *) cteQuery, CitusIsVolatileFunction))
 			{
@@ -1071,7 +1047,7 @@ HasDangerousJoinUsing(List *rtableList, Node *joinTreeNode)
 		{
 			/*
 			 * Yes, so check each join alias var to see if any of them are not
-			 * simple references to underlying columns.  If so, we have a
+			 * simple references to underlying columns. If so, we have a
 			 * dangerous situation and must pick unique aliases.
 			 */
 			RangeTblEntry *joinRTE = rt_fetch(joinExpr->rtindex, rtableList);
@@ -1114,14 +1090,9 @@ HasDangerousJoinUsing(List *rtableList, Node *joinTreeNode)
 bool
 UpdateOrDeleteQuery(Query *query)
 {
-	CmdType commandType = query->commandType;
+	ModifyLevel modLevel = ModifyLevelForQuery(query);
 
-	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
-	{
-		return true;
-	}
-
-	return false;
+	return modLevel >= MODLEVEL_NONCOMMUTATIVE;
 }
 
 
@@ -1572,26 +1543,35 @@ CreateTask(TaskType taskType)
  * ExtractFirstDistributedTableId takes a given query, and finds the relationId
  * for the first distributed table in that query. If the function cannot find a
  * distributed table, it returns InvalidOid.
- *
- * We only use this function for modifications and fast path queries, which
- * should have the first distributed table in the top-level rtable.
  */
 Oid
 ExtractFirstDistributedTableId(Query *query)
 {
-	List *rangeTableList = query->rtable;
 	ListCell *rangeTableCell = NULL;
+	ListCell *cteCell = NULL;
 	Oid distributedTableId = InvalidOid;
 
 	Assert(IsModifyCommand(query) || FastPathRouterQuery(query));
 
-	foreach(rangeTableCell, rangeTableList)
+	foreach(rangeTableCell, query->rtable)
 	{
 		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
 
 		if (IsDistributedTable(rangeTableEntry->relid))
 		{
 			distributedTableId = rangeTableEntry->relid;
+			break;
+		}
+	}
+
+	foreach(cteCell, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
+		Query *cteQuery = (Query *) cte->ctequery;
+
+		distributedTableId = ExtractFirstDistributedTableId(cteQuery);
+		if (OidIsValid(distributedTableId))
+		{
 			break;
 		}
 	}
@@ -1843,8 +1823,8 @@ SingleShardModifyTaskList(Query *query, uint64 jobId, List *relationShardList,
 
 
 /*
- * GetUpdateOrDeleteRTE checks query if it has an UPDATE or DELETE RTE. If it finds
- * it returns it.
+ * GetUpdateOrDeleteRTE checks query if it has an UPDATE or DELETE RTE.
+ * Returns that RTE if found.
  */
 static RangeTblEntry *
 GetUpdateOrDeleteRTE(Query *query)
@@ -3039,7 +3019,7 @@ MultiRouterPlannableQuery(Query *query)
 		}
 	}
 
-	return ErrorIfQueryHasModifyingCTE(query);
+	return NULL;
 }
 
 
@@ -3097,42 +3077,6 @@ CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 	}
 
 	return newContext;
-}
-
-
-/*
- * ErrorIfQueryHasModifyingCTE checks if the query contains modifying common table
- * expressions and errors out if it does.
- */
-static DeferredErrorMessage *
-ErrorIfQueryHasModifyingCTE(Query *queryTree)
-{
-	ListCell *cteCell = NULL;
-
-	Assert(queryTree->commandType == CMD_SELECT);
-
-	foreach(cteCell, queryTree->cteList)
-	{
-		CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
-		Query *cteQuery = (Query *) cte->ctequery;
-
-		/*
-		 * Here we only check for command type of top level query. Normally there can be
-		 * nested CTE, however PostgreSQL dictates that data-modifying statements must
-		 * be at top level of CTE. Therefore it is OK to just check for top level.
-		 * Similarly, we do not need to check for subqueries.
-		 */
-		if (cteQuery->commandType != CMD_SELECT)
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "data-modifying statements are not supported in "
-								 "the WITH clauses of distributed queries",
-								 NULL, NULL);
-		}
-	}
-
-	/* everything OK */
-	return NULL;
 }
 
 

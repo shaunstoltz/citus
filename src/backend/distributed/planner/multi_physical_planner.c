@@ -228,7 +228,7 @@ CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
 	distributedPlan->workerJob = workerJob;
 	distributedPlan->masterQuery = masterQuery;
 	distributedPlan->routerExecutable = DistributedPlanRouterExecutable(distributedPlan);
-	distributedPlan->operation = CMD_SELECT;
+	distributedPlan->modLevel = MODLEVEL_READONLY;
 
 	return distributedPlan;
 }
@@ -4307,6 +4307,54 @@ GenerateSyntheticShardIntervalArray(int partitionCount)
 	}
 
 	return shardIntervalArray;
+}
+
+
+/*
+ * Determine ModifyLevel required for given query
+ */
+ModifyLevel
+ModifyLevelForQuery(Query *query)
+{
+	CmdType commandType = query->commandType;
+	ModifyLevel modLevel = MODLEVEL_READONLY;
+
+	if (commandType != CMD_SELECT || commandType != CMD_INSERT ||
+		commandType != CMD_UPDATE || commandType != CMD_DELETE)
+	{
+		return MODLEVEL_NONE;
+	}
+
+	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
+	{
+		return MODLEVEL_NONCOMMUTATIVE;
+	}
+
+	if (commandType == CMD_INSERT)
+	{
+		modLevel = MODLEVEL_COMMUTATIVE;
+	}
+
+	if (query->hasModifyingCTE)
+	{
+		ListCell *cteCell = NULL;
+
+		modLevel = MODLEVEL_COMMUTATIVE;
+
+		foreach(cteCell, query->cteList)
+		{
+			CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
+			Query *cteQuery = (Query *) cte->ctequery;
+
+			if (cteQuery->commandType == CMD_UPDATE ||
+				cteQuery->commandType == CMD_DELETE)
+			{
+				return MODLEVEL_NONCOMMUTATIVE;
+			}
+		}
+	}
+
+	return modLevel;
 }
 
 
