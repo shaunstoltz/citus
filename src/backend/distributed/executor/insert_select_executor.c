@@ -131,7 +131,7 @@ CoordinatorInsertSelectExecScan(CustomScanState *node)
 				if (MultiShardConnectionType == SEQUENTIAL_CONNECTION)
 				{
 					ExecuteModifyTasksSequentially(scanState, prunedTaskList,
-												   CMD_INSERT, hasReturning);
+												   MODLEVEL_COMMUTATIVE, hasReturning);
 				}
 				else
 				{

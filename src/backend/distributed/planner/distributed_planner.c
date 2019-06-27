@@ -457,19 +457,12 @@ IsMultiTaskPlan(DistributedPlan *distributedPlan)
 
 
 /*
- * IsUpdateOrDelete returns true if the query performs update or delete.
+ * IsUpdateOrDelete returns true if the query performs an update or delete.
  */
 bool
 IsUpdateOrDelete(DistributedPlan *distributedPlan)
 {
-	CmdType commandType = distributedPlan->operation;
-
-	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
-	{
-		return true;
-	}
-
-	return false;
+	return distributedPlan->modLevel >= MODLEVEL_NONCOMMUTATIVE;
 }
 
 
@@ -480,15 +473,7 @@ IsUpdateOrDelete(DistributedPlan *distributedPlan)
 bool
 IsModifyDistributedPlan(DistributedPlan *distributedPlan)
 {
-	bool isModifyDistributedPlan = false;
-	CmdType operation = distributedPlan->operation;
-
-	if (operation == CMD_INSERT || operation == CMD_UPDATE || operation == CMD_DELETE)
-	{
-		isModifyDistributedPlan = true;
-	}
-
-	return isModifyDistributedPlan;
+	return distributedPlan->modLevel > MODLEVEL_READONLY;
 }
 
 

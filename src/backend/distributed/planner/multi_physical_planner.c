@@ -228,7 +228,7 @@ CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
 	distributedPlan->workerJob = workerJob;
 	distributedPlan->masterQuery = masterQuery;
 	distributedPlan->routerExecutable = DistributedPlanRouterExecutable(distributedPlan);
-	distributedPlan->operation = CMD_SELECT;
+	distributedPlan->modLevel = MODLEVEL_READONLY;
 
 	return distributedPlan;
 }
@@ -4307,6 +4307,33 @@ GenerateSyntheticShardIntervalArray(int partitionCount)
 	}
 
 	return shardIntervalArray;
+}
+
+
+/*
+ * Determine ModifyLevel required for given query
+ */
+ModifyLevel
+ModifyLevelForQuery(Query *query)
+{
+	CmdType commandType = query->commandType;
+
+	if (commandType == CMD_SELECT)
+	{
+		return MODLEVEL_READONLY;
+	}
+
+	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
+	{
+		return MODLEVEL_NONCOMMUTATIVE;
+	}
+
+	if (commandType == CMD_INSERT)
+	{
+		return MODLEVEL_COMMUTATIVE;
+	}
+
+	return MODLEVEL_NONE;
 }
 
 

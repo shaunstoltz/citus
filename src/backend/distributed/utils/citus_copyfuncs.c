@@ -103,12 +103,12 @@ CopyNodeDistributedPlan(COPYFUNC_ARGS)
 	DECLARE_FROM_AND_NEW_NODE(DistributedPlan);
 
 	COPY_SCALAR_FIELD(planId);
-	COPY_SCALAR_FIELD(operation);
+	COPY_SCALAR_FIELD(modLevel);
 	COPY_SCALAR_FIELD(hasReturning);
+	COPY_SCALAR_FIELD(routerExecutable);
 
 	COPY_NODE_FIELD(workerJob);
 	COPY_NODE_FIELD(masterQuery);
-	COPY_SCALAR_FIELD(routerExecutable);
 	COPY_SCALAR_FIELD(queryId);
 	COPY_NODE_FIELD(relationIdList);
 

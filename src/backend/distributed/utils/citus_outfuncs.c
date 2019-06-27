@@ -176,12 +176,12 @@ OutDistributedPlan(OUTFUNC_ARGS)
 	WRITE_NODE_TYPE("DISTRIBUTEDPLAN");
 
 	WRITE_UINT64_FIELD(planId);
-	WRITE_INT_FIELD(operation);
+	WRITE_ENUM_FIELD(modLevel, ModifyLevel);
 	WRITE_BOOL_FIELD(hasReturning);
+	WRITE_BOOL_FIELD(routerExecutable);
 
 	WRITE_NODE_FIELD(workerJob);
 	WRITE_NODE_FIELD(masterQuery);
-	WRITE_BOOL_FIELD(routerExecutable);
 	WRITE_UINT64_FIELD(queryId);
 	WRITE_NODE_FIELD(relationIdList);
 

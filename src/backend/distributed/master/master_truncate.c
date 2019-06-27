@@ -79,7 +79,7 @@ citus_truncate_trigger(PG_FUNCTION_ARGS)
 
 		if (MultiShardConnectionType == SEQUENTIAL_CONNECTION)
 		{
-			ExecuteModifyTasksSequentiallyWithoutResults(taskList, CMD_UTILITY);
+			ExecuteModifyTasksSequentiallyWithoutResults(taskList, MODLEVEL_NONE);
 		}
 		else
 		{
