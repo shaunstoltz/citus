@@ -197,7 +197,7 @@ CreateModifyPlan(Query *originalQuery, Query *query,
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
 	bool multiShardQuery = false;
 
-	distributedPlan->modLevel = ModifyLevelForQuery(query);
+	distributedPlan->modLevel = RowModifyForQuery(query);
 
 	distributedPlan->planningError = ModifyQuerySupported(query, originalQuery,
 														  multiShardQuery,
@@ -252,7 +252,7 @@ CreateSingleTaskRouterPlan(DistributedPlan *distributedPlan, Query *originalQuer
 {
 	Job *job = NULL;
 
-	distributedPlan->modLevel = ModifyLevelForQuery(query);
+	distributedPlan->modLevel = RowModifyForQuery(query);
 
 	/* we cannot have multi shard update/delete query via this code path */
 	job = RouterJob(originalQuery, plannerRestrictionContext,
@@ -1106,9 +1106,14 @@ HasDangerousJoinUsing(List *rtableList, Node *joinTreeNode)
 bool
 UpdateOrDeleteQuery(Query *query)
 {
-	ModifyLevel modLevel = ModifyLevelForQuery(query);
+	CmdType commandType = query->commandType;
 
-	return modLevel >= MODLEVEL_NONCOMMUTATIVE;
+	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
+	{
+		return true;
+	}
+
+	return false;
 }
 
 
@@ -1510,11 +1515,6 @@ RouterInsertTaskList(Query *query, DeferredErrorMessage **planningError)
 		modifyTask->replicationModel = cacheEntry->replicationModel;
 		modifyTask->rowValuesLists = modifyRoute->rowValuesLists;
 
-		if (query->onConflict != NULL)
-		{
-			modifyTask->upsertQuery = true;
-		}
-
 		insertTaskList = lappend(insertTaskList, modifyTask);
 	}
 
@@ -1544,7 +1544,6 @@ CreateTask(TaskType taskType)
 	task->shardInterval = NULL;
 	task->assignmentConstrained = false;
 	task->taskExecution = NULL;
-	task->upsertQuery = false;
 	task->replicationModel = REPLICATION_MODEL_INVALID;
 	task->relationRowLockList = NIL;
 

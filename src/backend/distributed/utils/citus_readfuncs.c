@@ -202,7 +202,7 @@ ReadDistributedPlan(READFUNC_ARGS)
 	READ_LOCALS(DistributedPlan);
 
 	READ_UINT64_FIELD(planId);
-	READ_ENUM_FIELD(modLevel, ModifyLevel);
+	READ_ENUM_FIELD(modLevel, RowModify);
 	READ_BOOL_FIELD(hasReturning);
 	READ_BOOL_FIELD(routerExecutable);
 
@@ -381,7 +381,6 @@ ReadTask(READFUNC_ARGS)
 	READ_NODE_FIELD(shardInterval);
 	READ_BOOL_FIELD(assignmentConstrained);
 	READ_NODE_FIELD(taskExecution);
-	READ_BOOL_FIELD(upsertQuery);
 	READ_CHAR_FIELD(replicationModel);
 	READ_BOOL_FIELD(modifyWithSubquery);
 	READ_NODE_FIELD(relationShardList);

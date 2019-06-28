@@ -111,13 +111,13 @@ typedef enum
 
 
 /* Enumeration that specifies extent of DML modifications */
-typedef enum ModifyLevel
+typedef enum RowModify
 {
-	MODLEVEL_NONE = 0,
-	MODLEVEL_READONLY = 1,
-	MODLEVEL_COMMUTATIVE = 2,
-	MODLEVEL_NONCOMMUTATIVE = 3
-} ModifyLevel;
+	ROW_MODIFY_NONE = 0,
+	ROW_MODIFY_READONLY = 1,
+	ROW_MODIFY_COMMUTATIVE = 2,
+	ROW_MODIFY_NONCOMMUTATIVE = 3
+} RowModify;
 
 /*
  * Job represents a logical unit of work that contains one set of data transfers
@@ -192,7 +192,6 @@ typedef struct Task
 	ShardInterval *shardInterval;  /* only applies to merge tasks */
 	bool assignmentConstrained;    /* only applies to merge tasks */
 	TaskExecution *taskExecution;  /* used by task tracker executor */
-	bool upsertQuery;              /* only applies to modify tasks */
 	char replicationModel;         /* only applies to modify tasks */
 
 	List *relationRowLockList;
@@ -239,7 +238,7 @@ typedef struct DistributedPlan
 	uint64 planId;
 
 	/* specifies nature of modifications in query */
-	ModifyLevel modLevel;
+	RowModify modLevel;
 
 	/* specifies whether a DML command has a RETURNING */
 	bool hasReturning;
@@ -349,7 +348,7 @@ extern bool ShardIntervalsOverlap(ShardInterval *firstInterval,
 								  ShardInterval *secondInterval);
 extern bool CoPartitionedTables(Oid firstRelationId, Oid secondRelationId);
 extern ShardInterval ** GenerateSyntheticShardIntervalArray(int partitionCount);
-extern ModifyLevel ModifyLevelForQuery(Query *query);
+extern RowModify RowModifyForQuery(Query *query);
 
 
 /* function declarations for Task and Task list operations */

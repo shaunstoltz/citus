@@ -230,7 +230,7 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 	bool allReferenceTables = relationRestrictionContext->allReferenceTables;
 	bool allDistributionKeysInQueryAreEqual = false;
 
-	distributedPlan->modLevel = ModifyLevelForQuery(originalQuery);
+	distributedPlan->modLevel = RowModifyForQuery(originalQuery);
 
 	/*
 	 * Error semantics for INSERT ... SELECT queries are different than regular
@@ -442,7 +442,6 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	uint64 jobId = INVALID_JOB_ID;
 	List *insertShardPlacementList = NULL;
 	List *intersectedPlacementList = NULL;
-	bool upsertQuery = false;
 	bool replacePrunedQueryWithDummy = false;
 	bool allReferenceTables =
 		plannerRestrictionContext->relationRestrictionContext->allReferenceTables;
@@ -565,12 +564,6 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	/* this is required for correct deparsing of the query */
 	ReorderInsertSelectTargetLists(copiedQuery, copiedInsertRte, copiedSubqueryRte);
 
-	/* set the upsert flag */
-	if (originalQuery->onConflict != NULL)
-	{
-		upsertQuery = true;
-	}
-
 	/* setting an alias simplifies deparsing of RETURNING */
 	if (copiedInsertRte->alias == NULL)
 	{
@@ -588,7 +581,6 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	modifyTask->dependedTaskList = NULL;
 	modifyTask->anchorShardId = shardId;
 	modifyTask->taskPlacementList = insertShardPlacementList;
-	modifyTask->upsertQuery = upsertQuery;
 	modifyTask->relationShardList = relationShardList;
 	modifyTask->replicationModel = cacheEntry->replicationModel;
 
@@ -1141,7 +1133,7 @@ CreateCoordinatorInsertSelectPlan(uint64 planId, Query *parse)
 	Oid targetRelationId = insertRte->relid;
 
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
-	distributedPlan->modLevel = MODLEVEL_COMMUTATIVE;
+	distributedPlan->modLevel = RowModifyForQuery(insertSelectQuery);
 
 	distributedPlan->planningError =
 		CoordinatorInsertSelectSupported(insertSelectQuery);
@@ -1440,7 +1432,6 @@ TwoPhaseInsertSelectTaskList(Oid targetRelationId, Query *insertSelectQuery,
 		modifyTask->dependedTaskList = NULL;
 		modifyTask->anchorShardId = shardId;
 		modifyTask->taskPlacementList = insertShardPlacementList;
-		modifyTask->upsertQuery = insertResultQuery->onConflict != NULL;
 		modifyTask->relationShardList = list_make1(relationShard);
 		modifyTask->replicationModel = targetCacheEntry->replicationModel;
 

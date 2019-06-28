@@ -176,7 +176,7 @@ OutDistributedPlan(OUTFUNC_ARGS)
 	WRITE_NODE_TYPE("DISTRIBUTEDPLAN");
 
 	WRITE_UINT64_FIELD(planId);
-	WRITE_ENUM_FIELD(modLevel, ModifyLevel);
+	WRITE_ENUM_FIELD(modLevel, RowModify);
 	WRITE_BOOL_FIELD(hasReturning);
 	WRITE_BOOL_FIELD(routerExecutable);
 
@@ -467,7 +467,6 @@ OutTask(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(shardInterval);
 	WRITE_BOOL_FIELD(assignmentConstrained);
 	WRITE_NODE_FIELD(taskExecution);
-	WRITE_BOOL_FIELD(upsertQuery);
 	WRITE_CHAR_FIELD(replicationModel);
 	WRITE_BOOL_FIELD(modifyWithSubquery);
 	WRITE_NODE_FIELD(relationShardList);

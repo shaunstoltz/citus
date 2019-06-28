@@ -228,7 +228,7 @@ CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
 	distributedPlan->workerJob = workerJob;
 	distributedPlan->masterQuery = masterQuery;
 	distributedPlan->routerExecutable = DistributedPlanRouterExecutable(distributedPlan);
-	distributedPlan->modLevel = MODLEVEL_READONLY;
+	distributedPlan->modLevel = ROW_MODIFY_READONLY;
 
 	return distributedPlan;
 }
@@ -2430,7 +2430,6 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 	subqueryTask->dependedTaskList = NULL;
 	subqueryTask->anchorShardId = anchorShardId;
 	subqueryTask->taskPlacementList = selectPlacementList;
-	subqueryTask->upsertQuery = false;
 	subqueryTask->relationShardList = relationShardList;
 
 	return subqueryTask;
@@ -4311,29 +4310,37 @@ GenerateSyntheticShardIntervalArray(int partitionCount)
 
 
 /*
- * Determine ModifyLevel required for given query
+ * Determine RowModify required for given query
  */
-ModifyLevel
-ModifyLevelForQuery(Query *query)
+RowModify
+RowModifyForQuery(Query *query)
 {
 	CmdType commandType = query->commandType;
 
 	if (commandType == CMD_SELECT)
 	{
-		return MODLEVEL_READONLY;
-	}
-
-	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
-	{
-		return MODLEVEL_NONCOMMUTATIVE;
+		return ROW_MODIFY_READONLY;
 	}
 
 	if (commandType == CMD_INSERT)
 	{
-		return MODLEVEL_COMMUTATIVE;
+		if (query->onConflict == NULL)
+		{
+			return ROW_MODIFY_COMMUTATIVE;
+		}
+		else
+		{
+			return ROW_MODIFY_NONCOMMUTATIVE;
+		}
 	}
 
-	return MODLEVEL_NONE;
+	if (commandType == CMD_UPDATE &&
+		commandType == CMD_DELETE)
+	{
+		return ROW_MODIFY_NONCOMMUTATIVE;
+	}
+
+	return ROW_MODIFY_NONE;
 }
 
 

@@ -462,7 +462,7 @@ IsMultiTaskPlan(DistributedPlan *distributedPlan)
 bool
 IsUpdateOrDelete(DistributedPlan *distributedPlan)
 {
-	return distributedPlan->modLevel >= MODLEVEL_NONCOMMUTATIVE;
+	return distributedPlan->modLevel >= ROW_MODIFY_NONCOMMUTATIVE;
 }
 
 
@@ -473,7 +473,7 @@ IsUpdateOrDelete(DistributedPlan *distributedPlan)
 bool
 IsModifyDistributedPlan(DistributedPlan *distributedPlan)
 {
-	return distributedPlan->modLevel > MODLEVEL_READONLY;
+	return distributedPlan->modLevel > ROW_MODIFY_READONLY;
 }
 
 
