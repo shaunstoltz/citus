@@ -1550,3 +1550,25 @@ ExhaustivePruneOne(ShardInterval *curInterval,
 
 	return false;
 }
+
+
+/*
+ * ShardsForPartitionColumnValue gets the shards for a single partition column value.
+ */
+List *
+ShardsForPartitionColumnValue(Oid relationId, Node *partitionColumnValue)
+{
+	Const *partitionValueConst = (Const *) strip_implicit_coercions(partitionColumnValue);
+	Index tableId = 1;
+	Var *partitionColumn = PartitionColumn(relationId, tableId);
+	OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
+	Const *rightConst = (Const *) get_rightop((Expr *) equalityExpr);
+	List *restrictClauseList = NIL;
+
+	rightConst->constvalue = partitionValueConst->constvalue;
+	rightConst->constisnull = partitionValueConst->constisnull;
+	rightConst->constbyval = partitionValueConst->constbyval;
+	restrictClauseList = list_make1(equalityExpr);
+
+	return PruneShards(relationId, tableId, restrictClauseList, NULL);
+}
