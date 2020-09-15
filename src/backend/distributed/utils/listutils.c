@@ -15,6 +15,7 @@
 
 #include "utils/lsyscache.h"
 #include "lib/stringinfo.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/listutils.h"
 #include "nodes/pg_list.h"
 #include "utils/memutils.h"
@@ -39,17 +40,16 @@ SortList(List *pointerList, int (*comparisonFunction)(const void *, const void *
 	uint32 arraySize = (uint32) list_length(pointerList);
 	void **array = (void **) palloc0(arraySize * sizeof(void *));
 
-	ListCell *pointerCell = NULL;
-	foreach(pointerCell, pointerList)
+	void *pointer = NULL;
+	foreach_ptr(pointer, pointerList)
 	{
-		void *pointer = lfirst(pointerCell);
 		array[arrayIndex] = pointer;
 
 		arrayIndex++;
 	}
 
 	/* sort the array of pointers using the comparison function */
-	qsort(array, arraySize, sizeof(void *), comparisonFunction);
+	SafeQsort(array, arraySize, sizeof(void *), comparisonFunction);
 
 	/* convert the sorted array of pointers back to a sorted list */
 	for (arrayIndex = 0; arrayIndex < arraySize; arrayIndex++)
@@ -77,12 +77,12 @@ PointerArrayFromList(List *pointerList)
 {
 	int pointerCount = list_length(pointerList);
 	void **pointerArray = (void **) palloc0(pointerCount * sizeof(void *));
-	ListCell *pointerCell = NULL;
 	int pointerIndex = 0;
 
-	foreach(pointerCell, pointerList)
+	void *pointer = NULL;
+	foreach_ptr(pointer, pointerList)
 	{
-		pointerArray[pointerIndex] = (void *) lfirst(pointerCell);
+		pointerArray[pointerIndex] = pointer;
 		pointerIndex += 1;
 	}
 
@@ -124,7 +124,6 @@ HTAB *
 ListToHashSet(List *itemList, Size keySize, bool isStringList)
 {
 	HASHCTL info;
-	ListCell *itemCell = NULL;
 	int flags = HASH_ELEM | HASH_CONTEXT;
 
 	/* allocate sufficient capacity for O(1) expected look-up time */
@@ -143,9 +142,9 @@ ListToHashSet(List *itemList, Size keySize, bool isStringList)
 
 	HTAB *itemSet = hash_create("ListToHashSet", capacity, &info, flags);
 
-	foreach(itemCell, itemList)
+	void *item = NULL;
+	foreach_ptr(item, itemList)
 	{
-		void *item = lfirst(itemCell);
 		bool foundInSet = false;
 
 		hash_search(itemSet, item, HASH_ENTER, &foundInSet);
@@ -163,15 +162,18 @@ ListToHashSet(List *itemList, Size keySize, bool isStringList)
 char *
 StringJoin(List *stringList, char delimiter)
 {
-	ListCell *stringCell = NULL;
 	StringInfo joinedString = makeStringInfo();
 
-	foreach(stringCell, stringList)
+	const char *command = NULL;
+	int curIndex = 0;
+	foreach_ptr(command, stringList)
 	{
-		const char *command = lfirst(stringCell);
-
+		if (curIndex > 0)
+		{
+			appendStringInfoChar(joinedString, delimiter);
+		}
 		appendStringInfoString(joinedString, command);
-		appendStringInfoChar(joinedString, delimiter);
+		curIndex++;
 	}
 
 	return joinedString->data;
@@ -188,11 +190,11 @@ ListTake(List *pointerList, int size)
 {
 	List *result = NIL;
 	int listIndex = 0;
-	ListCell *pointerCell = NULL;
 
-	foreach(pointerCell, pointerList)
+	void *pointer = NULL;
+	foreach_ptr(pointer, pointerList)
 	{
-		result = lappend(result, lfirst(pointerCell));
+		result = lappend(result, pointer);
 		listIndex++;
 		if (listIndex >= size)
 		{
@@ -201,4 +203,41 @@ ListTake(List *pointerList, int size)
 	}
 
 	return result;
+}
+
+
+/*
+ * safe_list_nth first checks if given index is valid and errors out if it is
+ * not. Otherwise, it directly calls list_nth.
+ */
+void *
+safe_list_nth(const List *list, int index)
+{
+	int listLength = list_length(list);
+	if (index < 0 || index >= listLength)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("invalid list access: list length was %d but "
+							   "element at index %d was requested ",
+							   listLength, index)));
+	}
+
+	return list_nth(list, index);
+}
+
+
+/*
+ * GenerateListFromElement returns a new list with length of listLength
+ * such that all the elements are identical with input listElement pointer.
+ */
+List *
+GenerateListFromElement(void *listElement, int listLength)
+{
+	List *list = NIL;
+	for (int i = 0; i < listLength; i++)
+	{
+		list = lappend(list, listElement);
+	}
+
+	return list;
 }

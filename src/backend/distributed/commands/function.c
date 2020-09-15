@@ -19,7 +19,9 @@
 #include "miscadmin.h"
 #include "funcapi.h"
 
-#if PG_VERSION_NUM >= 120000
+#include "distributed/pg_version_constants.h"
+
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
 #endif
 #include "access/htup_details.h"
@@ -30,18 +32,23 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"
+#include "distributed/listutils.h"
 #include "distributed/maintenanced.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata/pg_dist_object.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
+#include "distributed/namespace_utils.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_create_or_replace.h"
 #include "distributed/worker_transaction.h"
 #include "nodes/makefuncs.h"
@@ -83,6 +90,18 @@ static ObjectAddress FunctionToObjectAddress(ObjectType objectType,
 static void ErrorIfUnsupportedAlterFunctionStmt(AlterFunctionStmt *stmt);
 static void ErrorIfFunctionDependsOnExtension(const ObjectAddress *functionAddress);
 static char * quote_qualified_func_name(Oid funcOid);
+static void DistributeFunctionWithDistributionArgument(RegProcedure funcOid,
+													   char *distributionArgumentName,
+													   Oid distributionArgumentOid,
+													   char *colocateWithTableName,
+													   const ObjectAddress *
+													   functionAddress);
+static void DistributeFunctionColocatedWithDistributedTable(RegProcedure funcOid,
+															char *colocateWithTableName,
+															const ObjectAddress *
+															functionAddress);
+static void DistributeFunctionColocatedWithReferenceTable(const
+														  ObjectAddress *functionAddress);
 
 
 PG_FUNCTION_INFO_V1(create_distributed_function);
@@ -103,9 +122,8 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	StringInfoData ddlCommand = { 0 };
 	ObjectAddress functionAddress = { 0 };
 
-	int distributionArgumentIndex = -1;
 	Oid distributionArgumentOid = InvalidOid;
-	int colocationId = -1;
+	bool colocatedWithReferenceTable = false;
 
 	char *distributionArgumentName = NULL;
 	char *colocateWithTableName = NULL;
@@ -123,8 +141,8 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(1))
 	{
 		/*
-		 * Using the  default value, so distribute the function but do not set
-		 * the  distribution argument.
+		 * Using the default value, so distribute the function but do not set
+		 * the distribution argument.
 		 */
 		distributionArgumentName = NULL;
 	}
@@ -144,8 +162,17 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	{
 		colocateWithText = PG_GETARG_TEXT_P(2);
 		colocateWithTableName = text_to_cstring(colocateWithText);
+
+		/* check if the colocation belongs to a reference table */
+		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
+		{
+			Oid colocationRelationId = ResolveRelationId(colocateWithText, false);
+			colocatedWithReferenceTable = IsCitusTableType(colocationRelationId,
+														   REFERENCE_TABLE);
+		}
 	}
 
+	EnsureCoordinator();
 	EnsureFunctionOwner(funcOid);
 
 	ObjectAddressSet(functionAddress, ProcedureRelationId, funcOid);
@@ -163,54 +190,118 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	const char *alterFunctionOwnerSQL = GetFunctionAlterOwnerCommand(funcOid);
 	initStringInfo(&ddlCommand);
 	appendStringInfo(&ddlCommand, "%s;%s", createFunctionSQL, alterFunctionOwnerSQL);
-	SendCommandToWorkersAsUser(ALL_WORKERS, CurrentUserName(), ddlCommand.data);
+	SendCommandToWorkersAsUser(NON_COORDINATOR_NODES, CurrentUserName(), ddlCommand.data);
 
 	MarkObjectDistributed(&functionAddress);
 
-	if (distributionArgumentName == NULL)
+	if (distributionArgumentName != NULL)
 	{
-		/* cannot provide colocate_with without distribution_arg_name */
-		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
-		{
-			char *functionName = get_func_name(funcOid);
-
-
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("cannot distribute the function \"%s\" since the "
-								   "distribution argument is not valid ", functionName),
-							errhint("To provide \"colocate_with\" option, the"
-									" distribution argument parameter should also "
-									"be provided")));
-		}
-
-		/* set distribution argument and colocationId to NULL */
-		UpdateFunctionDistributionInfo(&functionAddress, NULL, NULL);
+		DistributeFunctionWithDistributionArgument(funcOid, distributionArgumentName,
+												   distributionArgumentOid,
+												   colocateWithTableName,
+												   &functionAddress);
 	}
-	else if (distributionArgumentName != NULL)
+	else if (!colocatedWithReferenceTable)
 	{
-		/* get the argument index, or error out if we cannot find a valid index */
-		distributionArgumentIndex =
-			GetDistributionArgIndex(funcOid, distributionArgumentName,
-									&distributionArgumentOid);
-
-		/* get the colocation id, or error out if we cannot find an appropriate one */
-		colocationId =
-			GetFunctionColocationId(funcOid, colocateWithTableName,
-									distributionArgumentOid);
-
-		/* if provided, make sure to record the distribution argument and colocationId */
-		UpdateFunctionDistributionInfo(&functionAddress, &distributionArgumentIndex,
-									   &colocationId);
-
-		/*
-		 * Once we have at least one distributed function/procedure with distribution
-		 * argument, we sync the metadata to nodes so that the function/procedure
-		 * delegation can be handled locally on the nodes.
-		 */
-		TriggerSyncMetadataToPrimaryNodes();
+		DistributeFunctionColocatedWithDistributedTable(funcOid, colocateWithTableName,
+														&functionAddress);
+	}
+	else if (colocatedWithReferenceTable)
+	{
+		DistributeFunctionColocatedWithReferenceTable(&functionAddress);
 	}
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * DistributeFunctionWithDistributionArgument updates pg_dist_object records for
+ * a function/procedure that has a distribution argument, and triggers metadata
+ * sync so that the functions can be delegated on workers.
+ */
+static void
+DistributeFunctionWithDistributionArgument(RegProcedure funcOid,
+										   char *distributionArgumentName,
+										   Oid distributionArgumentOid,
+										   char *colocateWithTableName,
+										   const ObjectAddress *functionAddress)
+{
+	/* get the argument index, or error out if we cannot find a valid index */
+	int distributionArgumentIndex =
+		GetDistributionArgIndex(funcOid, distributionArgumentName,
+								&distributionArgumentOid);
+
+	/* get the colocation id, or error out if we cannot find an appropriate one */
+	int colocationId =
+		GetFunctionColocationId(funcOid, colocateWithTableName,
+								distributionArgumentOid);
+
+	/* record the distribution argument and colocationId */
+	UpdateFunctionDistributionInfo(functionAddress, &distributionArgumentIndex,
+								   &colocationId);
+
+	/*
+	 * Once we have at least one distributed function/procedure with distribution
+	 * argument, we sync the metadata to nodes so that the function/procedure
+	 * delegation can be handled locally on the nodes.
+	 */
+	TriggerSyncMetadataToPrimaryNodes();
+}
+
+
+/*
+ * DistributeFunctionColocatedWithDistributedTable updates pg_dist_object records for
+ * a function/procedure that is colocated with a distributed table.
+ */
+static void
+DistributeFunctionColocatedWithDistributedTable(RegProcedure funcOid,
+												char *colocateWithTableName,
+												const ObjectAddress *functionAddress)
+{
+	/*
+	 * cannot provide colocate_with without distribution_arg_name when the function
+	 * is not collocated with a reference table
+	 */
+	if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
+	{
+		char *functionName = get_func_name(funcOid);
+
+
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cannot distribute the function \"%s\" since the "
+							   "distribution argument is not valid ", functionName),
+						errhint("To provide \"colocate_with\" option with a"
+								" distributed table, the distribution argument"
+								" parameter should also be provided")));
+	}
+
+	/* set distribution argument and colocationId to NULL */
+	UpdateFunctionDistributionInfo(functionAddress, NULL, NULL);
+}
+
+
+/*
+ * DistributeFunctionColocatedWithReferenceTable updates pg_dist_object records for
+ * a function/procedure that is colocated with a reference table.
+ */
+static void
+DistributeFunctionColocatedWithReferenceTable(const ObjectAddress *functionAddress)
+{
+	/* get the reference table colocation id */
+	int colocationId = CreateReferenceTableColocationId();
+
+	/* set distribution argument to NULL and colocationId to the reference table colocation id */
+	int *distributionArgumentIndex = NULL;
+	UpdateFunctionDistributionInfo(functionAddress, distributionArgumentIndex,
+								   &colocationId);
+
+	/*
+	 * Once we have at least one distributed function/procedure that reads
+	 * from a reference table, we sync the metadata to nodes so that the
+	 * function/procedure delegation can be handled locally on the nodes.
+	 */
+	TriggerSyncMetadataToPrimaryNodes();
 }
 
 
@@ -295,7 +386,7 @@ GetDistributionArgIndex(Oid functionOid, char *distributionArgumentName,
 	}
 
 	/*
-	 * The user didn't provid "$paramIndex" but potentially the name of the paramater.
+	 * The user didn't provid "$paramIndex" but potentially the name of the parameter.
 	 * So, loop over the arguments and try to find the argument name that matches
 	 * the parameter that user provided.
 	 */
@@ -346,7 +437,7 @@ GetFunctionColocationId(Oid functionOid, char *colocateWithTableName,
 						Oid distributionArgumentOid)
 {
 	int colocationId = INVALID_COLOCATION_ID;
-	Relation pgDistColocation = heap_open(DistColocationRelationId(), ShareLock);
+	Relation pgDistColocation = table_open(DistColocationRelationId(), ShareLock);
 
 	if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) == 0)
 	{
@@ -394,7 +485,7 @@ GetFunctionColocationId(Oid functionOid, char *colocateWithTableName,
 	}
 
 	/* keep the lock */
-	heap_close(pgDistColocation, NoLock);
+	table_close(pgDistColocation, NoLock);
 
 	return colocationId;
 }
@@ -408,12 +499,11 @@ static void
 EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid distributionColumnType,
 									  Oid sourceRelationId)
 {
-	DistTableCacheEntry *sourceTableEntry = DistributedTableCacheEntry(sourceRelationId);
-	char sourceDistributionMethod = sourceTableEntry->partitionMethod;
+	CitusTableCacheEntry *sourceTableEntry = GetCitusTableCacheEntry(sourceRelationId);
 	char sourceReplicationModel = sourceTableEntry->replicationModel;
-	Var *sourceDistributionColumn = DistPartitionKey(sourceRelationId);
 
-	if (sourceDistributionMethod != DISTRIBUTE_BY_HASH)
+	if (!IsCitusTableTypeCacheEntry(sourceTableEntry, HASH_DISTRIBUTED) &&
+		!IsCitusTableTypeCacheEntry(sourceTableEntry, REFERENCE_TABLE))
 	{
 		char *functionName = get_func_name(functionOid);
 		char *sourceRelationName = get_rel_name(sourceRelationId);
@@ -421,8 +511,21 @@ EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid distributionColumnTyp
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot colocate function \"%s\" and table \"%s\" because "
 							   "colocate_with option is only supported for hash "
-							   "distributed tables.", functionName,
-							   sourceRelationName)));
+							   "distributed tables and reference tables.",
+							   functionName, sourceRelationName)));
+	}
+
+	if (IsCitusTableTypeCacheEntry(sourceTableEntry, REFERENCE_TABLE) &&
+		distributionColumnType != InvalidOid)
+	{
+		char *functionName = get_func_name(functionOid);
+		char *sourceRelationName = get_rel_name(sourceRelationId);
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot colocate function \"%s\" and table \"%s\" because "
+							   "distribution arguments are not supported when "
+							   "colocating with reference tables.",
+							   functionName, sourceRelationName)));
 	}
 
 	if (sourceReplicationModel != REPLICATION_MODEL_STREAMING)
@@ -443,6 +546,7 @@ EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid distributionColumnTyp
 	 * If the types are the same, we're good. If not, we still check if there
 	 * is any coercion path between the types.
 	 */
+	Var *sourceDistributionColumn = DistPartitionKeyOrError(sourceRelationId);
 	Oid sourceDistributionColumnType = sourceDistributionColumn->vartype;
 	if (sourceDistributionColumnType != distributionColumnType)
 	{
@@ -483,7 +587,7 @@ UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 	bool isnull[Natts_pg_dist_object];
 	bool replace[Natts_pg_dist_object];
 
-	Relation pgDistObjectRel = heap_open(DistObjectRelationId(), RowExclusiveLock);
+	Relation pgDistObjectRel = table_open(DistObjectRelationId(), RowExclusiveLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistObjectRel);
 
 	/* scan pg_dist_object for classid = $1 AND objid = $2 AND objsubid = $3 via index */
@@ -543,7 +647,7 @@ UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 
 	systable_endscan(scanDescriptor);
 
-	heap_close(pgDistObjectRel, NoLock);
+	table_close(pgDistObjectRel, NoLock);
 }
 
 
@@ -556,7 +660,6 @@ UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 char *
 GetFunctionDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace)
 {
-	OverrideSearchPath *overridePath = NULL;
 	char *createFunctionSQL = NULL;
 
 	if (get_func_prokind(funcOid) == PROKIND_AGGREGATE)
@@ -567,16 +670,8 @@ GetFunctionDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace)
 	{
 		Datum sqlTextDatum = (Datum) 0;
 
-		/*
-		 * Set search_path to NIL so that all objects outside of pg_catalog will be
-		 * schema-prefixed. pg_catalog will be added automatically when we call
-		 * PushOverrideSearchPath(), since we set addCatalog to true;
-		 */
-		overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-		overridePath->schemas = NIL;
-		overridePath->addCatalog = true;
+		PushOverrideEmptySearchPath(CurrentMemoryContext);
 
-		PushOverrideSearchPath(overridePath);
 		sqlTextDatum = DirectFunctionCall1(pg_get_functiondef,
 										   ObjectIdGetDatum(funcOid));
 		createFunctionSQL = TextDatumGetCString(sqlTextDatum);
@@ -667,7 +762,7 @@ GetAggregateDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace)
 	const char *name = NameStr(proc->proname);
 	const char *nsp = get_namespace_name(proc->pronamespace);
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	if (useCreateOrReplace)
 	{
 		appendStringInfo(&buf, "CREATE OR REPLACE AGGREGATE %s(",
@@ -971,7 +1066,7 @@ GetAggregateDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace)
 	ReleaseSysCache(aggtup);
 	ReleaseSysCache(proctup);
 
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 	if (useCreateOrReplace)
 	{
 		return WrapCreateOrReplace(buf.data);
@@ -1025,14 +1120,12 @@ EnsureSequentialModeForFunctionDDL(void)
 static void
 TriggerSyncMetadataToPrimaryNodes(void)
 {
-	List *workerList = ActivePrimaryWorkerNodeList(ShareLock);
-	ListCell *workerCell = NULL;
+	List *workerList = ActivePrimaryNonCoordinatorNodeList(ShareLock);
 	bool triggerMetadataSync = false;
 
-	foreach(workerCell, workerList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerCell);
-
 		/* if already has metadata, no need to do it again */
 		if (!workerNode->hasMetadata)
 		{
@@ -1197,7 +1290,7 @@ PostprocessCreateFunctionStmt(Node *node, const char *queryString)
 								GetFunctionAlterOwnerCommand(address.objectId),
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1211,7 +1304,6 @@ CreateFunctionStmtObjectAddress(Node *node, bool missing_ok)
 {
 	CreateFunctionStmt *stmt = castNode(CreateFunctionStmt, node);
 	ObjectType objectType = OBJECT_FUNCTION;
-	ListCell *parameterCell = NULL;
 
 	if (stmt->is_procedure)
 	{
@@ -1221,9 +1313,9 @@ CreateFunctionStmtObjectAddress(Node *node, bool missing_ok)
 	ObjectWithArgs *objectWithArgs = makeNode(ObjectWithArgs);
 	objectWithArgs->objname = stmt->funcname;
 
-	foreach(parameterCell, stmt->parameters)
+	FunctionParameter *funcParam = NULL;
+	foreach_ptr(funcParam, stmt->parameters)
 	{
-		FunctionParameter *funcParam = castNode(FunctionParameter, lfirst(parameterCell));
 		objectWithArgs->objargs = lappend(objectWithArgs->objargs, funcParam->argType);
 	}
 
@@ -1242,16 +1334,15 @@ ObjectAddress
 DefineAggregateStmtObjectAddress(Node *node, bool missing_ok)
 {
 	DefineStmt *stmt = castNode(DefineStmt, node);
-	ListCell *parameterCell = NULL;
 
 	Assert(stmt->kind == OBJECT_AGGREGATE);
 
 	ObjectWithArgs *objectWithArgs = makeNode(ObjectWithArgs);
 	objectWithArgs->objname = stmt->defnames;
 
-	foreach(parameterCell, linitial(stmt->args))
+	FunctionParameter *funcParam = NULL;
+	foreach_ptr(funcParam, linitial(stmt->args))
 	{
-		FunctionParameter *funcParam = castNode(FunctionParameter, lfirst(parameterCell));
 		objectWithArgs->objargs = lappend(objectWithArgs->objargs, funcParam->argType);
 	}
 
@@ -1286,7 +1377,7 @@ PreprocessAlterFunctionStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1319,7 +1410,7 @@ PreprocessRenameFunctionStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1350,7 +1441,7 @@ PreprocessAlterFunctionSchemaStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1382,7 +1473,7 @@ PreprocessAlterFunctionOwnerStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1402,8 +1493,6 @@ PreprocessDropFunctionStmt(Node *node, const char *queryString)
 	List *deletingObjectWithArgsList = stmt->objects;
 	List *distributedObjectWithArgsList = NIL;
 	List *distributedFunctionAddresses = NIL;
-	ListCell *addressCell = NULL;
-	ListCell *objectWithArgsListCell = NULL;
 
 	AssertObjectTypeIsFunctional(stmt->removeType);
 
@@ -1435,9 +1524,9 @@ PreprocessDropFunctionStmt(Node *node, const char *queryString)
 	 * iterate over all functions to be dropped and filter to keep only distributed
 	 * functions.
 	 */
-	foreach(objectWithArgsListCell, deletingObjectWithArgsList)
+	ObjectWithArgs *func = NULL;
+	foreach_ptr(func, deletingObjectWithArgsList)
 	{
-		ObjectWithArgs *func = castNode(ObjectWithArgs, lfirst(objectWithArgsListCell));
 		ObjectAddress address = FunctionToObjectAddress(stmt->removeType, func,
 														stmt->missing_ok);
 
@@ -1468,9 +1557,9 @@ PreprocessDropFunctionStmt(Node *node, const char *queryString)
 	EnsureSequentialModeForFunctionDDL();
 
 	/* remove the entries for the distributed objects on dropping */
-	foreach(addressCell, distributedFunctionAddresses)
+	ObjectAddress *address = NULL;
+	foreach_ptr(address, distributedFunctionAddresses)
 	{
-		ObjectAddress *address = (ObjectAddress *) lfirst(addressCell);
 		UnmarkObjectDistributed(address);
 	}
 
@@ -1486,7 +1575,7 @@ PreprocessDropFunctionStmt(Node *node, const char *queryString)
 								(void *) dropStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -1715,16 +1804,17 @@ GenerateBackupNameForProcCollision(const ObjectAddress *address)
 
 	while (true)
 	{
-		int suffixLength = snprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
-									count);
+		int suffixLength = SafeSnprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
+										count);
 
 		/* trim the base name at the end to leave space for the suffix and trailing \0 */
 		baseLength = Min(baseLength, NAMEDATALEN - suffixLength - 1);
 
 		/* clear newName before copying the potentially trimmed baseName and suffix */
 		memset(newName, 0, NAMEDATALEN);
-		strncpy(newName, baseName, baseLength);
-		strncpy(newName + baseLength, suffix, suffixLength);
+		strncpy_s(newName, NAMEDATALEN, baseName, baseLength);
+		strncpy_s(newName + baseLength, NAMEDATALEN - baseLength, suffix,
+				  suffixLength);
 
 		List *newProcName = list_make2(namespace, makeString(newName));
 
@@ -1822,11 +1912,9 @@ FunctionToObjectAddress(ObjectType objectType, ObjectWithArgs *objectWithArgs,
 static void
 ErrorIfUnsupportedAlterFunctionStmt(AlterFunctionStmt *stmt)
 {
-	ListCell *actionCell = NULL;
-
-	foreach(actionCell, stmt->actions)
+	DefElem *action = NULL;
+	foreach_ptr(action, stmt->actions)
 	{
-		DefElem *action = castNode(DefElem, lfirst(actionCell));
 		if (strcmp(action->defname, "set") == 0)
 		{
 			VariableSetStmt *setStmt = castNode(VariableSetStmt, action->arg);

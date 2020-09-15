@@ -15,6 +15,7 @@ SELECT run_command_on_workers('CREATE USER reprefuser WITH LOGIN');
 (2 rows)
 
 SET citus.enable_alter_role_propagation TO ON;
+-- alter role for other than the extension owner works in enterprise, output differs accordingly
 ALTER ROLE reprefuser WITH CREATEDB;
 SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
  ?column?
@@ -23,7 +24,7 @@ SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
 (1 row)
 
 -- test that coordinator pg_dist_node entry is synced to the workers
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -36,7 +37,7 @@ SELECT verify_metadata('localhost', :worker_1_port),
  t               | t
 (1 row)
 
-CREATE TABLE ref(a int);
+CREATE TABLE ref(groupid int);
 SELECT create_reference_table('ref');
  create_reference_table
 ---------------------------------------------------------------------
@@ -50,14 +51,14 @@ ALTER ROLE reprefuser WITH CREATEROLE;
 select rolcreatedb, rolcreaterole from pg_roles where rolname = 'reprefuser';
  rolcreatedb | rolcreaterole
 ---------------------------------------------------------------------
- t           | t
+ f           | t
 (1 row)
 
 \c - - - :worker_2_port
 select rolcreatedb, rolcreaterole from pg_roles where rolname = 'reprefuser';
  rolcreatedb | rolcreaterole
 ---------------------------------------------------------------------
- t           | f
+ f           | f
 (1 row)
 
 \c - - - :master_port
@@ -76,7 +77,6 @@ SET client_min_messages TO DEBUG;
 SELECT count(*) FROM ref;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  executing the command locally: SELECT count(*) AS count FROM mx_add_coordinator.ref_7000000 ref
  count
 ---------------------------------------------------------------------
@@ -86,19 +86,65 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM mx_add_coo
 SELECT count(*) FROM ref;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  executing the command locally: SELECT count(*) AS count FROM mx_add_coordinator.ref_7000000 ref
  count
 ---------------------------------------------------------------------
      0
 (1 row)
 
+-- test that distributed functions also use local execution
+CREATE OR REPLACE FUNCTION my_group_id()
+RETURNS void
+LANGUAGE plpgsql
+SET search_path FROM CURRENT
+AS $$
+DECLARE
+    gid int;
+BEGIN
+    SELECT groupid INTO gid
+    FROM pg_dist_local_group;
+
+    INSERT INTO mx_add_coordinator.ref(groupid) VALUES (gid);
+END;
+$$;
+SELECT create_distributed_function('my_group_id()', colocate_with := 'ref');
+DEBUG:  switching to sequential query execution mode
+DETAIL:  A distributed function is created. To make sure subsequent commands see the type correctly we need to make sure to use only one connection for all future commands
+ create_distributed_function
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT my_group_id();
+DEBUG:  pushing down the function call
+ my_group_id
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT my_group_id();
+DEBUG:  pushing down the function call
+ my_group_id
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT DISTINCT(groupid) FROM ref ORDER BY 1;
+DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Creating router plan
+NOTICE:  executing the command locally: SELECT DISTINCT groupid FROM mx_add_coordinator.ref_7000000 ref ORDER BY groupid
+ groupid
+---------------------------------------------------------------------
+      14
+(1 row)
+
+TRUNCATE TABLE ref;
+NOTICE:  executing the command locally: TRUNCATE TABLE mx_add_coordinator.ref_xxxxx CASCADE
 -- for round-robin policy, always go to workers
 SET citus.task_assignment_policy TO "round-robin";
 SELECT count(*) FROM ref;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  count
 ---------------------------------------------------------------------
      0
@@ -107,7 +153,6 @@ DEBUG:  Plan is router executable
 SELECT count(*) FROM ref;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  count
 ---------------------------------------------------------------------
      0
@@ -116,30 +161,67 @@ DEBUG:  Plan is router executable
 SELECT count(*) FROM ref;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  count
 ---------------------------------------------------------------------
      0
 (1 row)
 
+SELECT my_group_id();
+DEBUG:  pushing down the function call
+ my_group_id
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT my_group_id();
+DEBUG:  pushing down the function call
+ my_group_id
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT my_group_id();
+DEBUG:  pushing down the function call
+ my_group_id
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT DISTINCT(groupid) FROM ref ORDER BY 1;
+DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Creating router plan
+ groupid
+---------------------------------------------------------------------
+      14
+      18
+(2 rows)
+
+TRUNCATE TABLE ref;
+NOTICE:  executing the command locally: TRUNCATE TABLE mx_add_coordinator.ref_xxxxx CASCADE
 -- modifications always go through local shard as well as remote ones
 INSERT INTO ref VALUES (1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-NOTICE:  executing the command locally: INSERT INTO mx_add_coordinator.ref_7000000 (a) VALUES (1)
+NOTICE:  executing the command locally: INSERT INTO mx_add_coordinator.ref_7000000 (groupid) VALUES (1)
 -- get it ready for the next executions
 TRUNCATE ref;
+NOTICE:  executing the command locally: TRUNCATE TABLE mx_add_coordinator.ref_xxxxx CASCADE
+ALTER TABLE ref RENAME COLUMN groupid TO a;
+NOTICE:  executing the command locally: SELECT worker_apply_shard_ddl_command (7000000, 'mx_add_coordinator', 'ALTER TABLE ref RENAME COLUMN groupid TO a;')
 -- test that changes from a metadata node is reflected in the coordinator placement
 \c - - - :worker_1_port
 SET search_path TO mx_add_coordinator,public;
 INSERT INTO ref VALUES (1), (2), (3);
 UPDATE ref SET a = a + 1;
 DELETE FROM ref WHERE a > 3;
--- Test we don't allow reference/local joins on mx workers
+-- Test we allow reference/local joins on mx workers
 CREATE TABLE local_table (a int);
 INSERT INTO local_table VALUES (2), (4);
 SELECT r.a FROM ref r JOIN local_table lt on r.a = lt.a;
-ERROR:  relation local_table is not distributed
+ a
+---------------------------------------------------------------------
+ 2
+(1 row)
+
 \c - - - :master_port
 SET search_path TO mx_add_coordinator,public;
 SELECT * FROM ref ORDER BY a;
@@ -170,7 +252,7 @@ SELECT master_remove_node('localhost', :master_port);
 (1 row)
 
 -- test that coordinator pg_dist_node entry was removed from the workers
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -183,9 +265,7 @@ SELECT verify_metadata('localhost', :worker_1_port),
  t               | t
 (1 row)
 
+SET client_min_messages TO error;
 DROP SCHEMA mx_add_coordinator CASCADE;
-NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table ref
-drop cascades to table ref_7000000
 SET search_path TO DEFAULT;
 RESET client_min_messages;

@@ -17,10 +17,12 @@
 #include "distributed/citus_ruleutils.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/insert_select_planner.h"
+#include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_planner.h"
+#include "distributed/shard_utils.h"
 #include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
@@ -46,18 +48,20 @@ static char * DeparseTaskQuery(Task *task, Query *query);
  * include execution-time changes such as function evaluation.
  */
 void
-RebuildQueryStrings(Query *originalQuery, List *taskList)
+RebuildQueryStrings(Job *workerJob)
 {
-	ListCell *taskCell = NULL;
+	Query *originalQuery = workerJob->jobQuery;
+	List *taskList = workerJob->taskList;
 	Oid relationId = ((RangeTblEntry *) linitial(originalQuery->rtable))->relid;
 	RangeTblEntry *valuesRTE = ExtractDistributedInsertValuesRTE(originalQuery);
 
-	foreach(taskCell, taskList)
+	Task *task = NULL;
+
+	foreach_ptr(task, taskList)
 	{
-		Task *task = (Task *) lfirst(taskCell);
 		Query *query = originalQuery;
 
-		if (UpdateOrDeleteQuery(query) && list_length(taskList))
+		if (UpdateOrDeleteQuery(query) && list_length(taskList) > 1)
 		{
 			query = copyObject(originalQuery);
 		}
@@ -69,13 +73,12 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 
 			query = copyObject(originalQuery);
 
-			RangeTblEntry *copiedInsertRte = ExtractResultRelationRTE(query);
+			RangeTblEntry *copiedInsertRte = ExtractResultRelationRTEOrError(query);
 			RangeTblEntry *copiedSubqueryRte = ExtractSelectRangeTableEntry(query);
 			Query *copiedSubquery = copiedSubqueryRte->subquery;
 
-			/* there are no restrictions to add for reference tables */
-			char partitionMethod = PartitionMethod(shardInterval->relationId);
-			if (partitionMethod != DISTRIBUTE_BY_NONE)
+			/* there are no restrictions to add for reference and citus local tables */
+			if (IsCitusTableType(shardInterval->relationId, DISTRIBUTED_TABLE))
 			{
 				AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
 			}
@@ -107,13 +110,20 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 			}
 		}
 
+		bool isQueryObjectOrText = GetTaskQueryType(task) == TASK_QUERY_TEXT ||
+								   GetTaskQueryType(task) == TASK_QUERY_OBJECT;
 		ereport(DEBUG4, (errmsg("query before rebuilding: %s",
-								task->queryForLocalExecution == NULL &&
-								task->queryStringLazy == NULL
+								!isQueryObjectOrText
 								? "(null)"
 								: ApplyLogRedaction(TaskQueryString(task)))));
 
 		UpdateTaskQueryString(query, relationId, valuesRTE, task);
+
+		/*
+		 * If parameters were resolved in the job query, then they are now also
+		 * resolved in the query string.
+		 */
+		task->parametersInQueryStringResolved = workerJob->parametersInJobQueryResolved;
 
 		ereport(DEBUG4, (errmsg("query after rebuilding:  %s",
 								ApplyLogRedaction(TaskQueryString(task)))));
@@ -171,7 +181,7 @@ UpdateTaskQueryString(Query *query, Oid distributedTableId, RangeTblEntry *value
 		task->anchorDistributedTableId = distributedTableId;
 	}
 
-	SetTaskQuery(task, query);
+	SetTaskQueryIfShouldLazyDeparse(task, query);
 
 	if (valuesRTE != NULL)
 	{
@@ -222,9 +232,15 @@ UpdateRelationToShardNames(Node *node, List *relationShardList)
 		return false;
 	}
 
+	if (!IsCitusTable(newRte->relid))
+	{
+		/* leave local tables as is */
+		return false;
+	}
+
 	/*
 	 * Search for the restrictions associated with the RTE. There better be
-	 * some, otherwise this query wouldn't be elegible as a router query.
+	 * some, otherwise this query wouldn't be eligible as a router query.
 	 *
 	 * FIXME: We should probably use a hashtable here, to do efficient
 	 * lookup.
@@ -299,7 +315,7 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 
 	/*
 	 * Search for the restrictions associated with the RTE. There better be
-	 * some, otherwise this query wouldn't be elegible as a router query.
+	 * some, otherwise this query wouldn't be eligible as a router query.
 	 *
 	 * FIXME: We should probably use a hashtable here, to do efficient
 	 * lookup.
@@ -325,15 +341,10 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 		return true;
 	}
 
-	uint64 shardId = relationShard->shardId;
-	Oid relationId = relationShard->relationId;
+	Oid shardOid = GetTableLocalShardOid(relationShard->relationId,
+										 relationShard->shardId);
 
-	char *relationName = get_rel_name(relationId);
-	AppendShardIdToName(&relationName, shardId);
-
-	Oid schemaId = get_rel_namespace(relationId);
-
-	newRte->relid = get_relname_relid(relationName, schemaId);
+	newRte->relid = shardOid;
 
 	return false;
 }
@@ -346,7 +357,7 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 static void
 ConvertRteToSubqueryWithEmptyResult(RangeTblEntry *rte)
 {
-	Relation relation = heap_open(rte->relid, NoLock);
+	Relation relation = table_open(rte->relid, NoLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(relation);
 	int columnCount = tupleDescriptor->natts;
 	List *targetList = NIL;
@@ -376,7 +387,7 @@ ConvertRteToSubqueryWithEmptyResult(RangeTblEntry *rte)
 		targetList = lappend(targetList, targetEntry);
 	}
 
-	heap_close(relation, NoLock);
+	table_close(relation, NoLock);
 
 	FromExpr *joinTree = makeNode(FromExpr);
 	joinTree->quals = makeBoolConst(false, false);
@@ -407,36 +418,58 @@ ShouldLazyDeparseQuery(Task *task)
 
 
 /*
- * SetTaskQuery attaches the query to the task so that it can be used during
- * execution. If local execution can possibly take place it sets task->queryForLocalExecution.
+ * SetTaskQueryIfShouldLazyDeparse attaches the query to the task so that it can be used during
+ * execution. If local execution can possibly take place it sets task->jobQueryReferenceForLazyDeparsing.
  * If not it deparses the query and sets queryStringLazy, to avoid blowing the
  * size of the task unnecesarily.
  */
 void
-SetTaskQuery(Task *task, Query *query)
+SetTaskQueryIfShouldLazyDeparse(Task *task, Query *query)
 {
 	if (ShouldLazyDeparseQuery(task))
 	{
-		task->queryForLocalExecution = query;
-		task->queryStringLazy = NULL;
+		task->taskQuery.queryType = TASK_QUERY_OBJECT;
+		task->taskQuery.data.jobQueryReferenceForLazyDeparsing = query;
+		task->queryCount = 1;
 		return;
 	}
 
-	task->queryForLocalExecution = NULL;
-	task->queryStringLazy = DeparseTaskQuery(task, query);
+	SetTaskQueryString(task, DeparseTaskQuery(task, query));
 }
 
 
 /*
  * SetTaskQueryString attaches the query string to the task so that it can be
- * used during execution. It also unsets queryForLocalExecution to be sure
+ * used during execution. It also unsets jobQueryReferenceForLazyDeparsing to be sure
  * these are kept in sync.
  */
 void
 SetTaskQueryString(Task *task, char *queryString)
 {
-	task->queryForLocalExecution = NULL;
-	task->queryStringLazy = queryString;
+	if (queryString == NULL)
+	{
+		task->taskQuery.queryType = TASK_QUERY_NULL;
+		task->queryCount = 0;
+	}
+	else
+	{
+		task->taskQuery.queryType = TASK_QUERY_TEXT;
+		task->taskQuery.data.queryStringLazy = queryString;
+		task->queryCount = 1;
+	}
+}
+
+
+/*
+ * SetTaskQueryStringList sets the queryStringList of the given task.
+ */
+void
+SetTaskQueryStringList(Task *task, List *queryStringList)
+{
+	Assert(queryStringList != NIL);
+	task->taskQuery.queryType = TASK_QUERY_TEXT_LIST;
+	task->taskQuery.data.queryStringList = queryStringList;
+	task->queryCount = list_length(queryStringList);
 }
 
 
@@ -470,7 +503,36 @@ DeparseTaskQuery(Task *task, Query *query)
 
 
 /*
- * TaskQueryString generates task->queryStringLazy if missing.
+ * GetTaskQueryType returns the type of the task query.
+ */
+int
+GetTaskQueryType(Task *task)
+{
+	return task->taskQuery.queryType;
+}
+
+
+/*
+ * TaskQueryStringAtIndex returns query at given index among the possibly
+ * multiple queries that a task can have.
+ */
+char *
+TaskQueryStringAtIndex(Task *task, int index)
+{
+	Assert(index < task->queryCount);
+
+	int taskQueryType = GetTaskQueryType(task);
+	if (taskQueryType == TASK_QUERY_TEXT_LIST)
+	{
+		return list_nth(task->taskQuery.data.queryStringList, index);
+	}
+
+	return TaskQueryString(task);
+}
+
+
+/*
+ * TaskQueryString generates task query string text if missing.
  *
  * For performance reasons, the queryString is generated lazily. For example
  * for local queries it is usually not needed to generate it, so this way we
@@ -479,24 +541,46 @@ DeparseTaskQuery(Task *task, Query *query)
 char *
 TaskQueryString(Task *task)
 {
-	if (task->queryStringLazy != NULL)
+	int taskQueryType = GetTaskQueryType(task);
+	if (taskQueryType == TASK_QUERY_NULL)
 	{
-		return task->queryStringLazy;
+		/* if task query type is TASK_QUERY_NULL then the data will be NULL,
+		 * this is unexpected state */
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("unexpected task query state: task query type is null"),
+						errdetail("Please report this to the Citus core team.")));
 	}
-	Assert(task->queryForLocalExecution != NULL);
+	else if (taskQueryType == TASK_QUERY_TEXT_LIST)
+	{
+		return StringJoin(task->taskQuery.data.queryStringList, ';');
+	}
+	else if (taskQueryType == TASK_QUERY_TEXT)
+	{
+		return task->taskQuery.data.queryStringLazy;
+	}
+
+	Query *jobQueryReferenceForLazyDeparsing =
+		task->taskQuery.data.jobQueryReferenceForLazyDeparsing;
+
+	/*
+	 *	At this point task query type should be TASK_QUERY_OBJECT.
+	 */
+	Assert(task->taskQuery.queryType == TASK_QUERY_OBJECT &&
+		   jobQueryReferenceForLazyDeparsing != NULL);
 
 
 	/*
-	 * Switch to the memory context of task->queryForLocalExecution before generating the query
+	 * Switch to the memory context of task->jobQueryReferenceForLazyDeparsing before generating the query
 	 * string. This way the query string is not freed in between multiple
 	 * executions of a prepared statement. Except when UpdateTaskQueryString is
-	 * used to set task->queryForLocalExecution, in that case it is freed but it will be set to
+	 * used to set task->jobQueryReferenceForLazyDeparsing, in that case it is freed but it will be set to
 	 * NULL on the next execution of the query because UpdateTaskQueryString
 	 * does that.
 	 */
 	MemoryContext previousContext = MemoryContextSwitchTo(GetMemoryChunkContext(
-															  task->queryForLocalExecution));
-	task->queryStringLazy = DeparseTaskQuery(task, task->queryForLocalExecution);
+															  jobQueryReferenceForLazyDeparsing));
+	char *queryString = DeparseTaskQuery(task, jobQueryReferenceForLazyDeparsing);
 	MemoryContextSwitchTo(previousContext);
-	return task->queryStringLazy;
+	SetTaskQueryString(task, queryString);
+	return task->taskQuery.data.queryStringLazy;
 }

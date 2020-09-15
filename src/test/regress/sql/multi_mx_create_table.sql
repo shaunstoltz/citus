@@ -59,6 +59,10 @@ CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
 -- now create required stuff in the worker 1
 \c - - - :worker_1_port
 
+-- show that we do not support creating citus local tables from mx workers for now
+CREATE TABLE citus_local_table(a int);
+SELECT create_citus_local_table('citus_local_table');
+
 -- create schema to test schema support
 CREATE SCHEMA citus_mx_test_schema_join_1;
 CREATE SCHEMA citus_mx_test_schema_join_2;
@@ -261,7 +265,6 @@ CREATE TABLE lineitem_mx (
     l_shipmode char(10) not null,
     l_comment varchar(44) not null,
     PRIMARY KEY(l_orderkey, l_linenumber) );
-
 SET citus.shard_count TO 16;
 SELECT create_distributed_table('lineitem_mx', 'l_orderkey');
 

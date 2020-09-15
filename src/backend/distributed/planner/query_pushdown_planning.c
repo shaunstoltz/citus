@@ -21,6 +21,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "distributed/citus_clauses.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/deparse_shard_query.h"
@@ -35,7 +37,7 @@
 #include "distributed/relation_restriction_equivalence.h"
 #include "distributed/version_compat.h"
 #include "nodes/nodeFuncs.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/makefuncs.h"
 #include "optimizer/optimizer.h"
 #else
@@ -81,17 +83,14 @@ static bool ShouldRecurseForRecurringTuplesJoinChecks(RelOptInfo *relOptInfo);
 static bool RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo,
 												RelOptInfo *relationInfo,
 												RecurringTuplesType *recurType);
-static bool IsRecurringRTE(RangeTblEntry *rangeTableEntry,
-						   RecurringTuplesType *recurType);
-static bool IsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType);
+static bool ContainsRecurringRTE(RangeTblEntry *rangeTableEntry,
+								 RecurringTuplesType *recurType);
+static bool ContainsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType);
 static bool HasRecurringTuples(Node *node, RecurringTuplesType *recurType);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
-static List * FlattenJoinVars(List *columnList, Query *queryTree);
-static Node * FlattenJoinVarsMutator(Node *node, Query *queryTree);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
-											   List *flattenedColumnList,
 											   List *subqueryTargetEntryList);
-static void UpdateColumnToMatchingTargetEntry(Var *column, Node *flattenedExpr,
+static void UpdateColumnToMatchingTargetEntry(Var *column,
 											  List *targetEntryList);
 static MultiTable * MultiSubqueryPushdownTable(Query *subquery);
 static List * CreateSubqueryTargetEntryList(List *columnList);
@@ -107,8 +106,6 @@ bool
 ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery,
 						  PlannerRestrictionContext *plannerRestrictionContext)
 {
-	StringInfo errorMessage = NULL;
-
 	/*
 	 * We check the existence of subqueries in FROM clause on the modified query
 	 * given that if postgres already flattened the subqueries, MultiNodeTree()
@@ -153,7 +150,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery,
 	 * We process function RTEs as subqueries, since the join order planner
 	 * does not know how to handle them.
 	 */
-	if (FindNodeCheck((Node *) originalQuery, IsFunctionRTE))
+	if (FindNodeMatchingCheckFunction((Node *) originalQuery, IsFunctionRTE))
 	{
 		return true;
 	}
@@ -162,7 +159,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery,
 	 * We handle outer joins as subqueries, since the join order planner
 	 * does not know how to handle them.
 	 */
-	if (FindNodeCheck((Node *) originalQuery->jointree, IsOuterJoinExpr))
+	if (FindNodeMatchingCheckFunction((Node *) originalQuery->jointree, IsOuterJoinExpr))
 	{
 		return true;
 	}
@@ -173,7 +170,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery,
 	 * An example of this is https://github.com/citusdata/citus/issues/2739
 	 * where postgres pulls-up the outer-join in the subquery.
 	 */
-	if (FindNodeCheck((Node *) rewrittenQuery->jointree, IsOuterJoinExpr))
+	if (FindNodeMatchingCheckFunction((Node *) rewrittenQuery->jointree, IsOuterJoinExpr))
 	{
 		return true;
 	}
@@ -190,7 +187,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery,
 
 	/* check if the query has a window function and it is safe to pushdown */
 	if (originalQuery->hasWindowFuncs &&
-		SafeToPushdownWindowFunction(originalQuery, &errorMessage))
+		SafeToPushdownWindowFunction(originalQuery, NULL))
 	{
 		return true;
 	}
@@ -228,7 +225,7 @@ HasEmptyJoinTree(Query *query)
 		return true;
 	}
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	else if (list_length(query->rtable) == 1)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) linitial(query->rtable);
@@ -281,7 +278,7 @@ JoinTreeContainsSubqueryWalker(Node *joinTreeNode, void *context)
 bool
 WhereOrHavingClauseContainsSubquery(Query *query)
 {
-	if (FindNodeCheck(query->havingQual, IsNodeSubquery))
+	if (FindNodeMatchingCheckFunction(query->havingQual, IsNodeSubquery))
 	{
 		return true;
 	}
@@ -297,7 +294,7 @@ WhereOrHavingClauseContainsSubquery(Query *query)
 	 * JoinExpr nodes that also have quals. If that's the case we need to check
 	 * those as well if they contain andy subqueries.
 	 */
-	return FindNodeCheck((Node *) query->jointree, IsNodeSubquery);
+	return FindNodeMatchingCheckFunction((Node *) query->jointree, IsNodeSubquery);
 }
 
 
@@ -308,7 +305,7 @@ WhereOrHavingClauseContainsSubquery(Query *query)
 bool
 TargetListContainsSubquery(Query *query)
 {
-	return FindNodeCheck((Node *) query->targetList, IsNodeSubquery);
+	return FindNodeMatchingCheckFunction((Node *) query->targetList, IsNodeSubquery);
 }
 
 
@@ -336,7 +333,7 @@ IsFunctionRTE(Node *node)
  * IsNodeSubquery returns true if the given node is a Query or SubPlan or a
  * Param node with paramkind PARAM_EXEC.
  *
- * The check for SubPlan is needed whev this is used on a already rewritten
+ * The check for SubPlan is needed when this is used on a already rewritten
  * query. Such a query has SubPlan nodes instead of SubLink nodes (which
  * contain a Query node).
  * The check for PARAM_EXEC is needed because some very simple subqueries like
@@ -393,7 +390,7 @@ IsOuterJoinExpr(Node *node)
 
 /*
  * SafeToPushdownWindowFunction checks if the query with window function is supported.
- * It returns the result accordingly and modifies the error detail.
+ * Returns the result accordingly and modifies errorDetail if non null.
  */
 bool
 SafeToPushdownWindowFunction(Query *query, StringInfo *errorDetail)
@@ -411,20 +408,26 @@ SafeToPushdownWindowFunction(Query *query, StringInfo *errorDetail)
 
 		if (!windowClause->partitionClause)
 		{
-			*errorDetail = makeStringInfo();
-			appendStringInfoString(*errorDetail,
-								   "Window functions without PARTITION BY on distribution "
-								   "column is currently unsupported");
+			if (errorDetail)
+			{
+				*errorDetail = makeStringInfo();
+				appendStringInfoString(*errorDetail,
+									   "Window functions without PARTITION BY on distribution "
+									   "column is currently unsupported");
+			}
 			return false;
 		}
 	}
 
 	if (!WindowPartitionOnDistributionColumn(query))
 	{
-		*errorDetail = makeStringInfo();
-		appendStringInfoString(*errorDetail,
-							   "Window functions with PARTITION BY list missing distribution "
-							   "column is currently unsupported");
+		if (errorDetail)
+		{
+			*errorDetail = makeStringInfo();
+			appendStringInfoString(*errorDetail,
+								   "Window functions with PARTITION BY list missing distribution "
+								   "column is currently unsupported");
+		}
 		return false;
 	}
 
@@ -519,16 +522,7 @@ SubqueryMultiNodeTree(Query *originalQuery, Query *queryTree,
 	}
 	else if (subqueryPushdownError)
 	{
-		/*
-		 * If not eligible for single relation repartition query, we should raise
-		 * subquery pushdown error.
-		 */
-		bool singleRelationRepartitionSubquery =
-			SingleRelationRepartitionSubquery(originalQuery);
-		if (!singleRelationRepartitionSubquery)
-		{
-			RaiseDeferredErrorInternal(subqueryPushdownError, ERROR);
-		}
+		RaiseDeferredErrorInternal(subqueryPushdownError, ERROR);
 
 		List *subqueryEntryList = SubqueryEntryList(queryTree);
 		RangeTblEntry *subqueryRangeTableEntry = (RangeTblEntry *) linitial(
@@ -544,7 +538,7 @@ SubqueryMultiNodeTree(Query *originalQuery, Query *queryTree,
 			RaiseDeferredErrorInternal(repartitionQueryError, ERROR);
 		}
 
-		/* all checks has passed, safe to create the multi plan */
+		/* all checks have passed, safe to create the multi plan */
 		multiQueryNode = MultiNodeTree(queryTree);
 	}
 
@@ -730,7 +724,8 @@ FromClauseRecurringTupleType(Query *queryTree)
 		return RECURRING_TUPLES_EMPTY_JOIN_TREE;
 	}
 
-	if (FindNodeCheckInRangeTableList(queryTree->rtable, IsDistributedTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(queryTree->rtable,
+													  IsDistributedTableRTE))
 	{
 		/*
 		 * There is a distributed table somewhere in the FROM clause.
@@ -751,7 +746,7 @@ FromClauseRecurringTupleType(Query *queryTree)
 	 * Try to figure out which type of recurring tuples we have to produce a
 	 * relevant error message. If there are several we'll pick the first one.
 	 */
-	IsRecurringRangeTable(queryTree->rtable, &recurType);
+	ContainsRecurringRangeTable(queryTree->rtable, &recurType);
 
 	return recurType;
 }
@@ -852,6 +847,18 @@ DeferredErrorIfUnsupportedRecurringTuplesJoin(
 							 "part of the outer join", NULL);
 	}
 	return NULL;
+}
+
+
+/*
+ * CanPushdownSubquery checks if we can push down the given
+ * subquery to worker nodes.
+ */
+bool
+CanPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLimit)
+{
+	return DeferErrorIfCannotPushdownSubquery(subqueryTree, outerMostQueryHasLimit) ==
+		   NULL;
 }
 
 
@@ -1083,7 +1090,7 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 		 */
 		if (rangeTableEntry->rtekind == RTE_RELATION ||
 			rangeTableEntry->rtekind == RTE_SUBQUERY
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			|| rangeTableEntry->rtekind == RTE_RESULT
 #endif
 			)
@@ -1336,7 +1343,6 @@ static bool
 RelationInfoContainsOnlyRecurringTuples(PlannerInfo *plannerInfo,
 										RelOptInfo *relationInfo)
 {
-	RecurringTuplesType recurType;
 	Relids relids = bms_copy(relationInfo->relids);
 	int relationId = -1;
 
@@ -1344,11 +1350,19 @@ RelationInfoContainsOnlyRecurringTuples(PlannerInfo *plannerInfo,
 	{
 		RangeTblEntry *rangeTableEntry = plannerInfo->simple_rte_array[relationId];
 
-		/* relationInfo has this range table entry */
-		if (!IsRecurringRTE(rangeTableEntry, &recurType))
+		if (FindNodeMatchingCheckFunctionInRangeTableList(list_make1(rangeTableEntry),
+														  IsDistributedTableRTE))
 		{
+			/* we already found a distributed table, no need to check further */
 			return false;
 		}
+
+		/*
+		 * If there are no distributed tables, there should be at least
+		 * one recurring rte.
+		 */
+		RecurringTuplesType recurType PG_USED_FOR_ASSERTS_ONLY;
+		Assert(ContainsRecurringRTE(rangeTableEntry, &recurType));
 	}
 
 	return true;
@@ -1376,7 +1390,7 @@ RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo, RelOptInfo *relati
 		RangeTblEntry *rangeTableEntry = plannerInfo->simple_rte_array[relationId];
 
 		/* relationInfo has this range table entry */
-		if (IsRecurringRTE(rangeTableEntry, recurType))
+		if (ContainsRecurringRTE(rangeTableEntry, recurType))
 		{
 			return true;
 		}
@@ -1387,24 +1401,24 @@ RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo, RelOptInfo *relati
 
 
 /*
- * IsRecurringRTE returns whether the range table entry will generate
- * the same set of tuples when repeating it in a query on different
- * shards.
+ * ContainsRecurringRTE returns whether the range table entry contains
+ * any entry that generates the same set of tuples when repeating it in
+ * a query on different shards.
  */
 static bool
-IsRecurringRTE(RangeTblEntry *rangeTableEntry, RecurringTuplesType *recurType)
+ContainsRecurringRTE(RangeTblEntry *rangeTableEntry, RecurringTuplesType *recurType)
 {
-	return IsRecurringRangeTable(list_make1(rangeTableEntry), recurType);
+	return ContainsRecurringRangeTable(list_make1(rangeTableEntry), recurType);
 }
 
 
 /*
- * IsRecurringRangeTable returns whether the range table will generate
- * the same set of tuples when repeating it in a query on different
- * shards.
+ * ContainsRecurringRangeTable returns whether the range table list contains
+ * any entry that generates the same set of tuples when repeating it in
+ * a query on different shards.
  */
 static bool
-IsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType)
+ContainsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType)
 {
 	return range_table_walker(rangeTable, HasRecurringTuples, recurType,
 							  QTW_EXAMINE_RTES_BEFORE);
@@ -1431,8 +1445,7 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 		if (rangeTableEntry->rtekind == RTE_RELATION)
 		{
 			Oid relationId = rangeTableEntry->relid;
-			if (IsDistributedTable(relationId) &&
-				PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+			if (IsCitusTableType(relationId, REFERENCE_TABLE))
 			{
 				*recurType = RECURRING_TUPLES_REFERENCE_TABLE;
 
@@ -1463,7 +1476,7 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 			 */
 			return true;
 		}
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		else if (rangeTableEntry->rtekind == RTE_RESULT)
 		{
 			*recurType = RECURRING_TUPLES_EMPTY_JOIN_TREE;
@@ -1502,14 +1515,15 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
  * from other parts of code although it causes some code duplication.
  *
  * Current subquery pushdown support in MultiTree logic requires a single range
- * table entry in the top most from clause. Therefore we inject an synthetic
+ * table entry in the top most from clause. Therefore we inject a synthetic
  * query derived from the top level query and make it the only range table
  * entry for the top level query. This way we can push down any subquery joins
  * down to workers without invoking join order planner.
  */
 static MultiNode *
-SubqueryPushdownMultiNodeTree(Query *queryTree)
+SubqueryPushdownMultiNodeTree(Query *originalQuery)
 {
+	Query *queryTree = copyObject(originalQuery);
 	List *targetEntryList = queryTree->targetList;
 	MultiCollect *subqueryCollectNode = CitusMakeNode(MultiCollect);
 
@@ -1544,7 +1558,7 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	 *              SELECT
 	 *                  s1.a AS worker_column_0,
 	 *                  s2.c AS worker_column_1,
-	 *                  s2.b AS as worker_column_2
+	 *                  s2.b AS worker_column_2
 	 *              FROM (some subquery) s1, (some subquery) s2
 	 *              WHERE s1.a = s2.a) worker_subquery
 	 *      GROUP BY worker_column_0
@@ -1571,17 +1585,14 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	List *havingClauseColumnList = pull_var_clause_default(queryTree->havingQual);
 	List *columnList = list_concat(targetColumnList, havingClauseColumnList);
 
-	List *flattenedExprList = FlattenJoinVars(columnList, queryTree);
-
 	/* create a target entry for each unique column */
-	List *subqueryTargetEntryList = CreateSubqueryTargetEntryList(flattenedExprList);
+	List *subqueryTargetEntryList = CreateSubqueryTargetEntryList(columnList);
 
 	/*
 	 * Update varno/varattno fields of columns in columnList to
 	 * point to corresponding target entry in subquery target entry list.
 	 */
-	UpdateVarMappingsForExtendedOpNode(columnList, flattenedExprList,
-									   subqueryTargetEntryList);
+	UpdateVarMappingsForExtendedOpNode(columnList, subqueryTargetEntryList);
 
 	/* new query only has target entries, join tree, and rtable*/
 	Query *pushedDownQuery = makeNode(Query);
@@ -1609,7 +1620,7 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	 * distinguish between aggregates and expressions; and we address this later
 	 * in the logical optimizer.
 	 */
-	MultiExtendedOp *extendedOpNode = MultiExtendedOpNode(queryTree);
+	MultiExtendedOp *extendedOpNode = MultiExtendedOpNode(queryTree, originalQuery);
 
 	/*
 	 * Postgres standard planner converts having qual node to a list of and
@@ -1622,6 +1633,27 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	{
 		extendedOpNode->havingQual =
 			(Node *) make_ands_implicit((Expr *) extendedOpNode->havingQual);
+	}
+
+	/*
+	 * Group by on primary key allows all columns to appear in the target
+	 * list, but once we wrap the join tree into a subquery the GROUP BY
+	 * will no longer directly refer to the primary key and referencing
+	 * columns that are not in the GROUP BY would result in an error. To
+	 * prevent that we wrap all the columns that do not appear in the
+	 * GROUP BY in an any_value aggregate.
+	 */
+	if (extendedOpNode->groupClauseList != NIL)
+	{
+		extendedOpNode->targetList = (List *) WrapUngroupedVarsInAnyValueAggregate(
+			(Node *) extendedOpNode->targetList,
+			extendedOpNode->groupClauseList,
+			extendedOpNode->targetList, true);
+
+		extendedOpNode->havingQual = WrapUngroupedVarsInAnyValueAggregate(
+			(Node *) extendedOpNode->havingQual,
+			extendedOpNode->groupClauseList,
+			extendedOpNode->targetList, false);
 	}
 
 	/*
@@ -1643,124 +1675,28 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 
 
 /*
- * FlattenJoinVars iterates over provided columnList to identify
- * Var's that are referenced from join RTE, and reverts back to their
- * original RTEs. Then, returns a new list with reverted types. Note that,
- * length of the original list and created list must be equal.
- *
- * This is required because Postgres allows columns to be referenced using
- * a join alias. Therefore the same column from a table could be referenced
- * twice using its absolute table name (t1.a), and without table name (a).
- * This is a problem when one of them is inside the group by clause and the
- * other is not. Postgres is smart about it to detect that both target columns
- * resolve to the same thing, and allows a single group by clause to cover
- * both target entries when standard planner is called. Since we operate on
- * the original query, we want to make sure we provide correct varno/varattno
- * values to Postgres so that it could produce valid query.
- *
- * Only exception is that, if a join is given an alias name, we do not want to
- * flatten those var's. If we do, deparsing fails since it expects to see a join
- * alias, and cannot access the RTE in the join tree by their names.
- *
- * Also note that in case of full outer joins, a column could be flattened to a
- * coalesce expression if the column appears in the USING clause.
- */
-static List *
-FlattenJoinVars(List *columnList, Query *queryTree)
-{
-	List *flattenedExprList = NIL;
-
-	ListCell *columnCell = NULL;
-	foreach(columnCell, columnList)
-	{
-		Node *column = strip_implicit_coercions(
-			FlattenJoinVarsMutator((Node *) lfirst(columnCell), queryTree));
-		flattenedExprList = lappend(flattenedExprList, copyObject(column));
-	}
-
-	return flattenedExprList;
-}
-
-
-/*
- * FlattenJoinVarsMutator flattens a single column var as outlined in the caller
- * function (FlattenJoinVars). It iterates the join tree to find the
- * lowest Var it can go. This is usually the relation range table var. However
- * if a join operation is given an alias, iteration stops at that level since the
- * query can not reference the inner RTE by name if the join is given an alias.
- */
-static Node *
-FlattenJoinVarsMutator(Node *node, Query *queryTree)
-{
-	if (node == NULL)
-	{
-		return NULL;
-	}
-
-	if (IsA(node, Var))
-	{
-		Var *column = (Var *) node;
-		RangeTblEntry *rte = rt_fetch(column->varno, queryTree->rtable);
-		if (rte->rtekind == RTE_JOIN)
-		{
-			/*
-			 * if join has an alias, it is copied over join RTE. We should
-			 * reference this RTE.
-			 */
-			if (rte->alias != NULL)
-			{
-				return (Node *) column;
-			}
-
-			/* join RTE does not have and alias defined at this level, deeper look is needed */
-			Assert(column->varattno > 0);
-			Node *newColumn = (Node *) list_nth(rte->joinaliasvars, column->varattno - 1);
-			Assert(newColumn != NULL);
-
-			/*
-			 * Ideally we should use expression_tree_mutator here. But it does not call
-			 * mutate function for Vars, thus we make a recursive call to make sure
-			 * not to miss Vars in nested joins.
-			 */
-			return FlattenJoinVarsMutator(newColumn, queryTree);
-		}
-		else
-		{
-			return node;
-		}
-	}
-
-	return expression_tree_mutator(node, FlattenJoinVarsMutator, (void *) queryTree);
-}
-
-
-/*
  * CreateSubqueryTargetEntryList creates a target entry for each unique column
  * in the column list and returns the target entry list.
  */
 static List *
-CreateSubqueryTargetEntryList(List *exprList)
+CreateSubqueryTargetEntryList(List *columnList)
 {
 	AttrNumber resNo = 1;
-	ListCell *exprCell = NULL;
-	List *uniqueExprList = NIL;
+	List *uniqueColumnList = NIL;
 	List *subqueryTargetEntryList = NIL;
 
-	foreach(exprCell, exprList)
+	Node *column = NULL;
+	foreach_ptr(column, columnList)
 	{
-		Node *expr = (Node *) lfirst(exprCell);
-		uniqueExprList = list_append_unique(uniqueExprList, expr);
+		uniqueColumnList = list_append_unique(uniqueColumnList, column);
 	}
 
-	foreach(exprCell, uniqueExprList)
+	foreach_ptr(column, uniqueColumnList)
 	{
-		Node *expr = (Node *) lfirst(exprCell);
 		TargetEntry *newTargetEntry = makeNode(TargetEntry);
-		StringInfo exprNameString = makeStringInfo();
 
-		newTargetEntry->expr = (Expr *) copyObject(expr);
-		appendStringInfo(exprNameString, WORKER_COLUMN_FORMAT, resNo);
-		newTargetEntry->resname = exprNameString->data;
+		newTargetEntry->expr = (Expr *) copyObject(column);
+		newTargetEntry->resname = WorkerColumnName(resNo);
 		newTargetEntry->resjunk = false;
 		newTargetEntry->resno = resNo;
 
@@ -1778,19 +1714,11 @@ CreateSubqueryTargetEntryList(List *exprList)
  * list.
  */
 static void
-UpdateVarMappingsForExtendedOpNode(List *columnList, List *flattenedExprList,
-								   List *subqueryTargetEntryList)
+UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryList)
 {
-	ListCell *columnCell = NULL;
-	ListCell *flattenedExprCell = NULL;
-
-	Assert(list_length(columnList) == list_length(flattenedExprList));
-
-	forboth(columnCell, columnList, flattenedExprCell, flattenedExprList)
+	Var *column = NULL;
+	foreach_ptr(column, columnList)
 	{
-		Var *columnOnTheExtendedNode = (Var *) lfirst(columnCell);
-		Node *flattenedExpr = (Node *) lfirst(flattenedExprCell);
-
 		/*
 		 * As an optimization, subqueryTargetEntryList only consists of
 		 * distinct elements. In other words, any duplicate entries in the
@@ -1802,8 +1730,7 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *flattenedExprList,
 		 * and ensure that the column on the extended op node points to the
 		 * correct target entry.
 		 */
-		UpdateColumnToMatchingTargetEntry(columnOnTheExtendedNode, flattenedExpr,
-										  subqueryTargetEntryList);
+		UpdateColumnToMatchingTargetEntry(column, subqueryTargetEntryList);
 	}
 }
 
@@ -1814,7 +1741,7 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *flattenedExprList,
  * be different from the types of the elements of targetEntryList, we use flattenedExpr.
  */
 static void
-UpdateColumnToMatchingTargetEntry(Var *column, Node *flattenedExpr, List *targetEntryList)
+UpdateColumnToMatchingTargetEntry(Var *column, List *targetEntryList)
 {
 	ListCell *targetEntryCell = NULL;
 
@@ -1826,32 +1753,10 @@ UpdateColumnToMatchingTargetEntry(Var *column, Node *flattenedExpr, List *target
 		{
 			Var *targetEntryVar = (Var *) targetEntry->expr;
 
-			if (IsA(flattenedExpr, Var) && equal(flattenedExpr, targetEntryVar))
+			if (IsA(column, Var) && equal(column, targetEntryVar))
 			{
 				column->varno = 1;
 				column->varattno = targetEntry->resno;
-				break;
-			}
-		}
-		else if (IsA(targetEntry->expr, CoalesceExpr))
-		{
-			/*
-			 * FlattenJoinVars() flattens full oter joins' columns that is
-			 * in the USING part into COALESCE(left_col, right_col)
-			 */
-
-			if (IsA(flattenedExpr, CoalesceExpr) && equal(flattenedExpr,
-														  targetEntry->expr))
-			{
-				Oid expressionType = exprType(flattenedExpr);
-				int32 expressionTypmod = exprTypmod(flattenedExpr);
-				Oid expressionCollation = exprCollation(flattenedExpr);
-
-				column->varno = 1;
-				column->varattno = targetEntry->resno;
-				column->vartype = expressionType;
-				column->vartypmod = expressionTypmod;
-				column->varcollid = expressionCollation;
 				break;
 			}
 		}

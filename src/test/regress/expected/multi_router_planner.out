@@ -123,19 +123,16 @@ INSERT INTO articles_hash VALUES (47,  7, 'abeyance', 1772);
 INSERT INTO articles_hash VALUES (48,  8, 'alkylic', 18610);
 INSERT INTO articles_hash VALUES (49,  9, 'anyone', 2681);
 INSERT INTO articles_hash VALUES (50, 10, 'anjanette', 19519);
-RESET citus.task_executor_type;
 SET client_min_messages TO 'DEBUG2';
 -- insert a single row for the test
 INSERT INTO articles_single_shard_hash VALUES (50, 10, 'anjanette', 19519);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
 -- single-shard tests
 -- test simple select for a single row
 SELECT * FROM articles_hash WHERE author_id = 10 AND id = 50;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  id | author_id |   title   | word_count
 ---------------------------------------------------------------------
  50 |        10 | anjanette |      19519
@@ -144,8 +141,7 @@ DETAIL:  distribution column value: 10
 -- get all titles by a single author
 SELECT title FROM articles_hash WHERE author_id = 10;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
    title
 ---------------------------------------------------------------------
  aggrandize
@@ -160,8 +156,7 @@ SELECT title, word_count FROM articles_hash
 	WHERE author_id = 10
 	ORDER BY word_count DESC NULLS LAST;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
    title    | word_count
 ---------------------------------------------------------------------
  anjanette  |      19519
@@ -177,8 +172,7 @@ SELECT title, id FROM articles_hash
 	ORDER BY id
 	LIMIT 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
+DEBUG:  query has a single distribution column value: 5
   title  | id
 ---------------------------------------------------------------------
  aruru   |  5
@@ -191,7 +185,6 @@ SELECT title, author_id FROM articles_hash
 	WHERE author_id = 7 OR author_id = 8
 	ORDER BY author_id ASC, id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
     title    | author_id
 ---------------------------------------------------------------------
  aseptic     |         7
@@ -210,7 +203,6 @@ DEBUG:  Plan is router executable
 SELECT title, author_id FROM articles_hash
 	WHERE author_id = 7 OR author_id = 8;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
     title    | author_id
 ---------------------------------------------------------------------
  aseptic     |         7
@@ -233,7 +225,6 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles_hash
 	HAVING sum(word_count) > 1000
 	ORDER BY sum(word_count) DESC;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  author_id | corpus_size
 ---------------------------------------------------------------------
         10 |       59955
@@ -249,8 +240,7 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles_hash
 	HAVING sum(word_count) > 1000
 	ORDER BY sum(word_count) DESC;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  author_id | corpus_size
 ---------------------------------------------------------------------
          1 |       35894
@@ -271,7 +261,6 @@ DEBUG:  Router planner cannot handle multi-shard select queries
 
 SELECT * FROM articles_hash WHERE author_id IN (1, 3) ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -288,8 +277,7 @@ DEBUG:  Plan is router executable
 
 SELECT * FROM articles_hash WHERE author_id IN (1, NULL) ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -303,8 +291,7 @@ DETAIL:  distribution column value: 1
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT * FROM first_author;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -314,12 +301,45 @@ DETAIL:  distribution column value: 1
  41
 (5 rows)
 
+-- SELECT FOR UPDATE is supported if not involving reference table
+BEGIN;
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+DEBUG:  Router planner doesn't support SELECT FOR UPDATE in common table expressions involving reference tables.
+DEBUG:  generating subplan XXX_1 for CTE first_author: SELECT articles_hash.id, auref.name FROM public.articles_hash, public.authors_reference auref WHERE ((articles_hash.author_id OPERATOR(pg_catalog.=) 2) AND (auref.id OPERATOR(pg_catalog.=) articles_hash.author_id)) FOR UPDATE OF articles_hash FOR UPDATE OF auref
+DEBUG:  Creating router plan
+DEBUG:  query has a single distribution column value: 2
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: UPDATE public.articles_hash SET title = first_author.name FROM (SELECT intermediate_result.id, intermediate_result.name FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, name character varying(20))) first_author WHERE ((articles_hash.author_id OPERATOR(pg_catalog.=) 2) AND (articles_hash.id OPERATOR(pg_catalog.=) first_author.id))
+DEBUG:  Creating router plan
+DEBUG:  query has a single distribution column value: 2
+WITH first_author AS (
+    SELECT id, word_count FROM articles_hash WHERE author_id = 2
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.word_count::text
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+DEBUG:  Creating router plan
+DEBUG:  query has a single distribution column value: 2
+-- Without FOR UPDATE this is router plannable
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+DEBUG:  Creating router plan
+DEBUG:  query has a single distribution column value: 2
+ROLLBACK;
 -- queries with CTEs are supported even if CTE is not referenced inside query
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT title FROM articles_hash WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
     title
 ---------------------------------------------------------------------
  arsenous
@@ -334,8 +354,7 @@ WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1)
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | id |    title
 ---------------------------------------------------------------------
   1 |         1 |  1 | arsenous
@@ -349,7 +368,6 @@ WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1)
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 3)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | id | title
 ---------------------------------------------------------------------
 (0 rows)
@@ -361,15 +379,12 @@ SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 DEBUG:  cannot run command which targets multiple shards
 DEBUG:  generating subplan XXX_1 for CTE id_author: SELECT id, author_id FROM public.articles_hash WHERE (author_id OPERATOR(pg_catalog.=) 1)
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 DEBUG:  generating subplan XXX_2 for CTE id_title: SELECT id, title FROM public.articles_hash WHERE (author_id OPERATOR(pg_catalog.=) 2)
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id_author.id, id_author.author_id, id_title.id, id_title.title FROM (SELECT intermediate_result.id, intermediate_result.author_id FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint)) id_author, (SELECT intermediate_result.id, intermediate_result.title FROM read_intermediate_result('XXX_2'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, title character varying(20))) id_title WHERE (id_author.id OPERATOR(pg_catalog.=) id_title.id)
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | id | title
 ---------------------------------------------------------------------
 (0 rows)
@@ -390,36 +405,28 @@ SELECT master_create_worker_shards('company_employees', 4, 1);
 
 INSERT INTO company_employees values(1, 1, 0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 2, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 3, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 4, 2);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 5, 4);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(3, 1, 0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 INSERT INTO company_employees values(3, 15, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 INSERT INTO company_employees values(3, 3, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 -- find employees at top 2 level within company hierarchy
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
@@ -433,8 +440,7 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 1))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  company_id | employee_id | manager_id | level
 ---------------------------------------------------------------------
           1 |           1 |          0 |     1
@@ -476,14 +482,12 @@ WITH new_article AS (
     INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9) RETURNING *
 )
 SELECT * FROM new_article;
-DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  only SELECT, UPDATE, or DELETE common table expressions may be router planned
 DEBUG:  generating subplan XXX_1 for CTE new_article: INSERT INTO public.articles_hash (id, author_id, title, word_count) VALUES (1, 1, 'arsenous'::character varying, 9) RETURNING id, author_id, title, word_count
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) new_article
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |          9
@@ -493,13 +497,11 @@ WITH update_article AS (
     UPDATE articles_hash SET word_count = 10 WHERE id = 1 AND word_count = 9 RETURNING *
 )
 SELECT * FROM update_article;
-DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  Router planner cannot handle multi-shard select queries
 DEBUG:  generating subplan XXX_1 for CTE update_article: UPDATE public.articles_hash SET word_count = 10 WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 9)) RETURNING id, author_id, title, word_count
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) update_article
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |         10
@@ -509,13 +511,11 @@ WITH delete_article AS (
     DELETE FROM articles_hash WHERE id = 1 AND word_count = 10 RETURNING *
 )
 SELECT * FROM delete_article;
-DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  Router planner cannot handle multi-shard select queries
 DEBUG:  generating subplan XXX_1 for CTE delete_article: DELETE FROM public.articles_hash WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 10)) RETURNING id, author_id, title, word_count
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) delete_article
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |         10
@@ -546,7 +546,6 @@ SELECT
 	GROUP BY GROUPING SETS ((id),(subtitle))
 	ORDER BY id, subtitle;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | subtitle | count
 ---------------------------------------------------------------------
   1 |          |     1
@@ -582,8 +581,7 @@ HINT:  Consider using an equality filter on the distributed table's partition co
 -- queries which involve functions in FROM clause are supported if it goes to a single worker.
 SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count | position
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572 |        3
@@ -595,7 +593,6 @@ DETAIL:  distribution column value: 1
 
 SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |    title     | word_count | position
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572 |        3
@@ -628,8 +625,7 @@ SELECT * FROM articles_hash
 WHERE author_id IN (SELECT author_id FROM articles_hash WHERE author_id = 2)
 ORDER BY articles_hash.id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
  id | author_id |   title    | word_count
 ---------------------------------------------------------------------
   2 |         2 | abducing   |      13642
@@ -667,8 +663,7 @@ DEBUG:  Router planner cannot handle multi-shard select queries
 DEBUG:  generating subplan XXX_1 for subquery SELECT id, word_count FROM public.articles_hash
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM public.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE ((test.id OPERATOR(pg_catalog.=) articles_hash.id) AND (articles_hash.author_id OPERATOR(pg_catalog.=) 1)) ORDER BY articles_hash.id
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | word_count
 ---------------------------------------------------------------------
   1 |       9572
@@ -690,8 +685,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -706,7 +700,6 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 OR author_id = 17;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -737,8 +730,7 @@ SELECT id as article_id, word_count * id as random_value
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  article_id | random_value
 ---------------------------------------------------------------------
           1 |         9572
@@ -754,8 +746,7 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  first_author | second_word_count
 ---------------------------------------------------------------------
            10 |             17277
@@ -770,8 +761,7 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  first_author | second_word_count
 ---------------------------------------------------------------------
            10 |             19519
@@ -787,15 +777,12 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, single_shard b
 	WHERE a.author_id = 2 and a.author_id = b.author_id
 	LIMIT 3;
-DEBUG:  Found no worker with all shard placements
 DEBUG:  found no worker with all shard placements
 DEBUG:  generating subplan XXX_1 for CTE single_shard: SELECT id, author_id, title, word_count FROM public.articles_single_shard_hash
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT a.author_id AS first_author, b.word_count AS second_word_count FROM public.articles_hash a, (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) b WHERE ((a.author_id OPERATOR(pg_catalog.=) 2) AND (a.author_id OPERATOR(pg_catalog.=) b.author_id)) LIMIT 3
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
  first_author | second_word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -806,8 +793,7 @@ SELECT *
 	WHERE author_id = 1
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -822,8 +808,7 @@ SELECT *
 	LIMIT 2
 	OFFSET 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
  11 |         1 | alamo    |       1347
@@ -838,8 +823,7 @@ SELECT *
 	LIMIT 2
 	OFFSET 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
  31 |         1 | athwartships |       7271
@@ -853,8 +837,7 @@ SELECT id
 	GROUP BY id
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -870,8 +853,7 @@ SELECT DISTINCT id
 	WHERE author_id = 1
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -886,8 +868,7 @@ SELECT avg(word_count)
 	FROM articles_hash
 	WHERE author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
         avg
 ---------------------------------------------------------------------
  12356.400000000000
@@ -899,8 +880,7 @@ SELECT max(word_count) as max, min(word_count) as min,
 	FROM articles_hash
 	WHERE author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
   max  | min  |  sum  | cnt
 ---------------------------------------------------------------------
  18185 | 2728 | 61782 |   5
@@ -912,8 +892,7 @@ SELECT max(word_count)
 	WHERE author_id = 1
 	GROUP BY author_id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
   max
 ---------------------------------------------------------------------
  11814
@@ -927,7 +906,6 @@ SELECT * FROM (
 ) AS combination
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -946,7 +924,6 @@ DEBUG:  Plan is router executable
 UNION
 (SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 3);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  left
 ---------------------------------------------------------------------
  a
@@ -956,7 +933,6 @@ DEBUG:  Plan is router executable
 INTERSECT
 (SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 3);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  left
 ---------------------------------------------------------------------
  a
@@ -969,7 +945,6 @@ SELECT * FROM (
 ) AS combination
 ORDER BY 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  left
 ---------------------------------------------------------------------
  al
@@ -1070,7 +1045,6 @@ ORDER BY 1,2,3,4;
  43 |         3 | affixal      |      12723
 (15 rows)
 
-RESET citus.task_executor_type;
 -- Test various filtering options for router plannable check
 SET client_min_messages to 'DEBUG2';
 -- this is definitely single shard
@@ -1079,8 +1053,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and author_id >= 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1109,8 +1082,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and (id = 1 or id = 41);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -1122,8 +1094,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and (id = random()::int  * 0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1161,8 +1132,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = abs(-1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1205,8 +1175,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and (id = abs(id - 2));
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -1231,8 +1200,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) = true;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1247,8 +1215,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) and id between 0 and 20;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -1260,8 +1227,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) and (id = 1 or id = 31) and title like '%s';
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1273,8 +1239,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (id = 1 or id = 31) and title like '%s' and (author_id = 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1286,8 +1251,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1302,8 +1266,7 @@ SELECT *
 	FROM articles_hash
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1) and (word_count < 3000 or word_count > 8000);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -1311,13 +1274,11 @@ DETAIL:  distribution column value: 1
  41 |         1 | aznavour |      11814
 (3 rows)
 
--- window functions are supported if query is router plannable
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
+DEBUG:  query has a single distribution column value: 5
    prev   |  title   | word_count
 ---------------------------------------------------------------------
           | afrasia  |        864
@@ -1332,8 +1293,7 @@ SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	WHERE author_id = 5
 	ORDER BY word_count DESC;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
+DEBUG:  query has a single distribution column value: 5
    prev   |  title   | word_count
 ---------------------------------------------------------------------
  aminate  | aruru    |      11389
@@ -1347,8 +1307,7 @@ SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | min
 ---------------------------------------------------------------------
  11 |  11
@@ -1362,8 +1321,7 @@ SELECT id, word_count, AVG(word_count) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | word_count |          avg
 ---------------------------------------------------------------------
  11 |       1347 | 1347.0000000000000000
@@ -1377,8 +1335,7 @@ SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  word_count | rank
 ---------------------------------------------------------------------
        1347 |    1
@@ -1388,25 +1345,49 @@ DETAIL:  distribution column value: 1
       11814 |    5
 (5 rows)
 
--- window functions are not supported for not router plannable queries
 SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
-	WHERE author_id = 1 or author_id = 2;
+	WHERE author_id = 1 or author_id = 2
+    ORDER BY 1;
 DEBUG:  Router planner cannot handle multi-shard select queries
-ERROR:  could not run distributed query because the window function that is used cannot be pushed down
-HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions with a PARTITION BY clause containing the distribution column
+ id | min
+---------------------------------------------------------------------
+  1 |   1
+  2 |   1
+ 11 |  11
+ 12 |   1
+ 21 |  11
+ 22 |  11
+ 31 |  11
+ 32 |   1
+ 41 |   1
+ 42 |   1
+(10 rows)
+
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
-	WHERE author_id = 5 or author_id = 2;
+	WHERE author_id = 5 or author_id = 2
+    ORDER BY 2;
 DEBUG:  Router planner cannot handle multi-shard select queries
-ERROR:  could not run distributed query because the window function that is used cannot be pushed down
-HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions with a PARTITION BY clause containing the distribution column
+   prev   |   title    | word_count
+---------------------------------------------------------------------
+ aruru    | abducing   |      13642
+ antipope | adversa    |       3164
+          | afrasia    |        864
+ aminate  | amazon     |      11342
+ antehall | aminate    |       9089
+ adversa  | antehall   |       7707
+ afrasia  | antipope   |       2728
+ ausable  | archiblast |      18185
+ amazon   | aruru      |      11389
+ abducing | ausable    |      15885
+(10 rows)
+
 -- where false queries are router plannable
 SELECT *
 	FROM articles_hash
 	WHERE false;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1415,7 +1396,6 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and false;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1424,7 +1404,6 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1433,7 +1412,6 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id and false;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  first_author | second_word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1442,7 +1420,6 @@ SELECT *
 	FROM articles_hash
 	WHERE null;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1452,7 +1429,6 @@ SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = 10 and int4eq(1, 2);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1461,7 +1437,6 @@ SELECT *
 	FROM articles_hash a
 	WHERE int4eq(1, 2);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1470,8 +1445,7 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id and int4eq(1, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  first_author | second_word_count
 ---------------------------------------------------------------------
            10 |             19519
@@ -1485,7 +1459,6 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id and int4eq(1, 2);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  first_author | second_word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1506,7 +1479,6 @@ SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = null;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1516,7 +1488,6 @@ SELECT *
 	FROM articles_hash a
 	WHERE date_ne_timestamp('1954-04-11', '1954-04-11'::timestamp);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1526,7 +1497,6 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id and
 		date_ne_timestamp('1954-04-11', '1954-04-11'::timestamp);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  first_author | second_word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1541,8 +1511,7 @@ SELECT * FROM (
 ) AS combination
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1559,8 +1528,7 @@ SELECT * FROM (
 ) AS combination
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -1574,8 +1542,7 @@ DETAIL:  distribution column value: 1
 INTERSECT
 (SELECT * FROM articles_hash WHERE author_id = 2 and 1=0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1583,11 +1550,10 @@ DETAIL:  distribution column value: 1
 -- CTEs with where false
 -- terse because distribution column inference varies between pg11 & pg12
 \set VERBOSITY terse
+RESET client_min_messages;
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1 and 1=0)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
-DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | id | title
 ---------------------------------------------------------------------
 (0 rows)
@@ -1595,12 +1561,11 @@ DEBUG:  Plan is router executable
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id and 1=0;
-DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | id | title
 ---------------------------------------------------------------------
 (0 rows)
 
+SET client_min_messages TO DEBUG2;
 \set VERBOSITY DEFAULT
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
@@ -1614,8 +1579,7 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 1))
 SELECT * FROM hierarchy WHERE LEVEL <= 2 and 1=0;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  company_id | employee_id | manager_id | level
 ---------------------------------------------------------------------
 (0 rows)
@@ -1632,8 +1596,7 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 1 AND 1=0))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  company_id | employee_id | manager_id | level
 ---------------------------------------------------------------------
           1 |           1 |          0 |     1
@@ -1651,8 +1614,7 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 1))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  company_id | employee_id | manager_id | level
 ---------------------------------------------------------------------
 (0 rows)
@@ -1662,7 +1624,6 @@ SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
 	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  word_count | rank
 ---------------------------------------------------------------------
 (0 rows)
@@ -1689,7 +1650,6 @@ SELECT author_id FROM articles_hash
 		author_id
 	LIMIT 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  author_id
 ---------------------------------------------------------------------
 (0 rows)
@@ -1713,35 +1673,33 @@ SELECT master_create_distributed_table('articles_range', 'author_id', 'range');
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
 SET citus.log_remote_commands TO on;
 -- single shard select queries are router plannable
 SELECT * FROM articles_range where author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  issuing SELECT id, author_id, title, word_count FROM public.articles_range_840012 articles_range WHERE (author_id OPERATOR(pg_catalog.=) 1)
-DETAIL:  on server postgres@localhost:xxxxx connectionId: 2
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
 
 SELECT * FROM articles_range where author_id = 1 or author_id = 5;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  issuing SELECT id, author_id, title, word_count FROM public.articles_range_840012 articles_range WHERE ((author_id OPERATOR(pg_catalog.=) 1) OR (author_id OPERATOR(pg_catalog.=) 5))
-DETAIL:  on server postgres@localhost:xxxxx connectionId: 2
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -1749,7 +1707,6 @@ DETAIL:  on server postgres@localhost:xxxxx connectionId: 2
 -- zero shard select query is router plannable
 SELECT * FROM articles_range where author_id = 1 and author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  executing the command locally: SELECT id, author_id, title, word_count FROM (SELECT NULL::bigint AS id, NULL::bigint AS author_id, NULL::character varying(20) AS title, NULL::integer AS word_count WHERE false) articles_range(id, author_id, title, word_count) WHERE ((author_id OPERATOR(pg_catalog.=) 1) AND (author_id OPERATOR(pg_catalog.=) 2))
  id | author_id | title | word_count
 ---------------------------------------------------------------------
@@ -1759,9 +1716,8 @@ NOTICE:  executing the command locally: SELECT id, author_id, title, word_count 
 SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  issuing SELECT ar.id, ar.author_id, ar.title, ar.word_count, au.name, au.id FROM (public.articles_range_840012 ar JOIN public.authors_range_840008 au ON ((ar.author_id OPERATOR(pg_catalog.=) au.id))) WHERE (ar.author_id OPERATOR(pg_catalog.=) 1)
-DETAIL:  on server postgres@localhost:xxxxx connectionId: 2
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
 (0 rows)
@@ -1770,7 +1726,6 @@ DETAIL:  on server postgres@localhost:xxxxx connectionId: 2
 SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1 and au.id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  executing the command locally: SELECT ar.id, ar.author_id, ar.title, ar.word_count, au.name, au.id FROM ((SELECT NULL::bigint AS id, NULL::bigint AS author_id, NULL::character varying(20) AS title, NULL::integer AS word_count WHERE false) ar(id, author_id, title, word_count) JOIN (SELECT NULL::character varying(20) AS name, NULL::bigint AS id WHERE false) au(name, id) ON ((ar.author_id OPERATOR(pg_catalog.=) au.id))) WHERE ((ar.author_id OPERATOR(pg_catalog.=) 1) AND (au.id OPERATOR(pg_catalog.=) 2))
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
@@ -1779,7 +1734,7 @@ NOTICE:  executing the command locally: SELECT ar.id, ar.author_id, ar.title, ar
 RESET citus.log_remote_commands;
 -- This query was intended to test "multi-shard join is not router plannable"
 -- To run it using repartition join logic we change the join columns
-SET citus.task_executor_type to "task-tracker";
+SET citus.enable_repartition_joins to ON;
 SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 35;
 DEBUG:  Router planner cannot handle multi-shard select queries
@@ -1796,19 +1751,19 @@ DEBUG:  join prunable for task partitionId 3 and 0
 DEBUG:  join prunable for task partitionId 3 and 1
 DEBUG:  join prunable for task partitionId 3 and 2
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 3
+DETAIL:  Creating dependency on merge taskId 2
 DEBUG:  pruning merge fetch taskId 2
 DETAIL:  Creating dependency on merge taskId 5
 DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 6
+DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 5
 DETAIL:  Creating dependency on merge taskId 10
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 9
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 8
 DETAIL:  Creating dependency on merge taskId 15
 DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 12
+DETAIL:  Creating dependency on merge taskId 8
 DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 20
  id | author_id | title | word_count | name | id
@@ -1853,12 +1808,10 @@ DETAIL:  Creating dependency on merge taskId 20
 ---------------------------------------------------------------------
 (0 rows)
 
-RESET citus.task_executor_type;
 -- bogus query, join on non-partition column, but router plannable due to filters
 SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id)
 	WHERE ar.author_id = 1 and au.id < 10;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
 (0 rows)
@@ -1870,8 +1823,7 @@ DEBUG:  Plan is router executable
 SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
 (0 rows)
@@ -1879,16 +1831,19 @@ DETAIL:  distribution column value: 2
 -- not router plannable
 SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 3;
-DEBUG:  Found no worker with all shard placements
 DEBUG:  found no worker with all shard placements
-DEBUG:  join prunable for intervals [1,10] and [11,30]
-DEBUG:  join prunable for intervals [1,10] and [21,40]
+DEBUG:  join prunable for intervals [1,10] and [11,20]
+DEBUG:  join prunable for intervals [1,10] and [21,30]
 DEBUG:  join prunable for intervals [1,10] and [31,40]
-DEBUG:  join prunable for intervals [11,30] and [1,10]
-DEBUG:  join prunable for intervals [11,30] and [31,40]
-DEBUG:  join prunable for intervals [21,40] and [1,10]
+DEBUG:  join prunable for intervals [11,20] and [1,10]
+DEBUG:  join prunable for intervals [11,20] and [21,30]
+DEBUG:  join prunable for intervals [11,20] and [31,40]
+DEBUG:  join prunable for intervals [21,30] and [1,10]
+DEBUG:  join prunable for intervals [21,30] and [11,20]
+DEBUG:  join prunable for intervals [21,30] and [31,40]
 DEBUG:  join prunable for intervals [31,40] and [1,10]
-DEBUG:  join prunable for intervals [31,40] and [11,30]
+DEBUG:  join prunable for intervals [31,40] and [11,20]
+DEBUG:  join prunable for intervals [31,40] and [21,30]
 DEBUG:  pruning merge fetch taskId 1
 DETAIL:  Creating dependency on merge taskId 2
 DEBUG:  pruning merge fetch taskId 3
@@ -1896,22 +1851,15 @@ DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 5
 DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 4
-DEBUG:  pruning merge fetch taskId 9
-DETAIL:  Creating dependency on merge taskId 6
-DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 13
-DETAIL:  Creating dependency on merge taskId 6
-DEBUG:  pruning merge fetch taskId 15
-DETAIL:  Creating dependency on merge taskId 8
-ERROR:  the query contains a join that requires repartitioning
-HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
+ id | author_id | title | word_count | name | id
+---------------------------------------------------------------------
+(0 rows)
+
 -- join between a range partitioned table and reference table is router plannable
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
 (0 rows)
@@ -1920,7 +1868,6 @@ DEBUG:  Plan is router executable
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1 or ar.author_id = 5;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id | title | word_count | name | id
 ---------------------------------------------------------------------
 (0 rows)
@@ -2055,8 +2002,7 @@ SELECT
 	WHERE
 		author_id = 5;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
+DEBUG:  query has a single distribution column value: 5
  c
 ---------------------------------------------------------------------
  5
@@ -2099,8 +2045,7 @@ SELECT *
 	WHERE author_id = 1
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -2119,8 +2064,7 @@ SELECT *
 	WHERE author_id = 1
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -2139,8 +2083,7 @@ DECLARE test_cursor CURSOR FOR
 		WHERE author_id = 1
 		ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 FETCH test_cursor;
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
@@ -2175,8 +2118,7 @@ COPY (
 	WHERE author_id = 1
 	ORDER BY id) TO STDOUT;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 1	1	arsenous	9572
 11	1	alamo	1347
 21	1	arcading	5890
@@ -2189,15 +2131,13 @@ CREATE TEMP TABLE temp_articles_hash as
 	WHERE author_id = 1
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 -- router plannable queries may include filter for aggregates
 SELECT count(*), count(*) FILTER (WHERE id < 3)
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  count | count
 ---------------------------------------------------------------------
      5 |     1
@@ -2217,11 +2157,11 @@ DEBUG:  Router planner cannot handle multi-shard select queries
 PREPARE author_1_articles as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 EXECUTE author_1_articles;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -2235,11 +2175,11 @@ DETAIL:  distribution column value: 1
 PREPARE author_articles(int) as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = $1;
+	WHERE author_id = $1
+	ORDER BY 1;
 EXECUTE author_articles(1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -2265,8 +2205,7 @@ DEBUG:  Creating router plan
 CONTEXT:  SQL statement "SELECT MAX(id) FROM articles_hash ah
 		WHERE author_id = 1"
 PL/pgSQL function author_articles_max_id() line 5 at SQL statement
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 CONTEXT:  SQL statement "SELECT MAX(id) FROM articles_hash ah
 		WHERE author_id = 1"
 PL/pgSQL function author_articles_max_id() line 5 at SQL statement
@@ -2286,14 +2225,13 @@ BEGIN
 
 END;
 $$ LANGUAGE plpgsql;
-SELECT * FROM author_articles_id_word_count();
+SELECT * FROM author_articles_id_word_count() ORDER BY 1;
 DEBUG:  Creating router plan
 CONTEXT:  SQL statement "SELECT ah.id, ah.word_count
 		FROM articles_hash ah
 		WHERE author_id = 1"
 PL/pgSQL function author_articles_id_word_count() line 4 at RETURN QUERY
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 CONTEXT:  SQL statement "SELECT ah.id, ah.word_count
 		FROM articles_hash ah
 		WHERE author_id = 1"
@@ -2311,8 +2249,7 @@ PL/pgSQL function author_articles_id_word_count() line 4 at RETURN QUERY
 CREATE MATERIALIZED VIEW mv_articles_hash_empty AS
 	SELECT * FROM articles_hash WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 SELECT * FROM mv_articles_hash_empty;
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
@@ -2341,14 +2278,12 @@ SELECT * FROM mv_articles_hash_data ORDER BY 1, 2, 3, 4;
  42 |         2 | ausable      |      15885
 (10 rows)
 
--- router planner/executor is now enabled for task-tracker executor
-SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -2358,17 +2293,16 @@ DETAIL:  distribution column value: 1
  41
 (5 rows)
 
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash VALUES (51, 1, 'amateus', 1814), (52, 1, 'second amateus', 2824);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
--- verify insert is successfull (not router plannable and executable)
+DEBUG:  query has a single distribution column value: 1
+-- verify insert is successful (not router plannable and executable)
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -2380,6 +2314,11 @@ DETAIL:  distribution column value: 1
  52
 (7 rows)
 
+-- https://github.com/citusdata/citus/issues/3624
+UPDATE articles_hash SET id = id
+WHERE author_id = 1 AND title IN (SELECT name FROM authors_reference WHERE random() > 0.5);
+DEBUG:  Creating router plan
+DEBUG:  query has a single distribution column value: 1
 SET client_min_messages to 'NOTICE';
 -- test that a connection failure marks placements invalid
 SET citus.shard_replication_factor TO 2;
@@ -2411,8 +2350,7 @@ GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
 -- we will fail to connect to worker 2, since the user does not exist
 BEGIN;
 INSERT INTO failure_test VALUES (1, 1);
-WARNING:  connection error: localhost:xxxxx
-DETAIL:  FATAL:  role "router_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "router_user" does not exist
 SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 	WHERE shardid IN (
 		SELECT shardid FROM pg_dist_shard
@@ -2429,8 +2367,7 @@ SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 
 ROLLBACK;
 INSERT INTO failure_test VALUES (2, 1);
-WARNING:  connection error: localhost:xxxxx
-DETAIL:  FATAL:  role "router_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "router_user" does not exist
 SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 	WHERE shardid IN (
 		SELECT shardid FROM pg_dist_shard

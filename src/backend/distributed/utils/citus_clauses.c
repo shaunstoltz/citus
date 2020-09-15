@@ -21,75 +21,78 @@
 #include "nodes/nodes.h"
 #include "nodes/primnodes.h"
 #include "optimizer/clauses.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "optimizer/optimizer.h"
+#endif
 #include "optimizer/planmain.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 
 /* private function declarations */
-static bool IsVarNode(Node *node);
+static bool IsVariableExpression(Node *node);
 static Expr * citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 								  Oid result_collation,
-								  MasterEvaluationContext *masterEvaluationContext);
+								  CoordinatorEvaluationContext *
+								  coordinatorEvaluationContext);
 static bool CitusIsVolatileFunctionIdChecker(Oid func_id, void *context);
 static bool CitusIsMutableFunctionIdChecker(Oid func_id, void *context);
-static bool ShouldEvaluateExpressionType(NodeTag nodeTag);
-static bool ShouldEvaluateFunctionWithMasterContext(MasterEvaluationContext *
-													evaluationContext);
+static bool ShouldEvaluateExpression(Expr *expression);
+static bool ShouldEvaluateFunctions(CoordinatorEvaluationContext *evaluationContext);
+static void FixFunctionArguments(Node *expr);
+static bool FixFunctionArgumentsWalker(Node *expr, void *context);
+
 
 /*
- * RequiresMastereEvaluation returns the executor needs to reparse and
+ * RequiresCoordinatorEvaluation returns the executor needs to reparse and
  * try to execute this query, which is the case if the query contains
  * any stable or volatile function.
  */
 bool
-RequiresMasterEvaluation(Query *query)
+RequiresCoordinatorEvaluation(Query *query)
 {
-	return FindNodeCheck((Node *) query, CitusIsMutableFunction);
+	if (query->commandType == CMD_SELECT && !query->hasModifyingCTE)
+	{
+		return false;
+	}
+
+	return FindNodeMatchingCheckFunction((Node *) query, CitusIsMutableFunction);
 }
 
 
 /*
- * ExecuteMasterEvaluableFunctionsAndParameters evaluates expressions and parameters
+ * ExecuteCoordinatorEvaluableExpressions evaluates expressions and parameters
  * that can be resolved to a constant.
  */
 void
-ExecuteMasterEvaluableFunctionsAndParameters(Query *query, PlanState *planState)
+ExecuteCoordinatorEvaluableExpressions(Query *query, PlanState *planState)
 {
-	MasterEvaluationContext masterEvaluationContext;
+	CoordinatorEvaluationContext coordinatorEvaluationContext;
 
-	masterEvaluationContext.planState = planState;
-	masterEvaluationContext.evaluationMode = EVALUATE_FUNCTIONS_PARAMS;
+	coordinatorEvaluationContext.planState = planState;
+	if (query->commandType == CMD_SELECT)
+	{
+		coordinatorEvaluationContext.evaluationMode = EVALUATE_PARAMS;
+	}
+	else
+	{
+		coordinatorEvaluationContext.evaluationMode = EVALUATE_FUNCTIONS_PARAMS;
+	}
 
-	PartiallyEvaluateExpression((Node *) query, &masterEvaluationContext);
+	PartiallyEvaluateExpression((Node *) query, &coordinatorEvaluationContext);
 }
 
 
 /*
- * ExecuteMasterEvaluableParameters evaluates external paramaters that can be
- * resolved to a constant.
- */
-void
-ExecuteMasterEvaluableParameters(Query *query, PlanState *planState)
-{
-	MasterEvaluationContext masterEvaluationContext;
-
-	masterEvaluationContext.planState = planState;
-	masterEvaluationContext.evaluationMode = EVALUATE_PARAMS;
-
-	PartiallyEvaluateExpression((Node *) query, &masterEvaluationContext);
-}
-
-
-/*
- * PartiallyEvaluateExpression descend into an expression tree to evaluate
+ * PartiallyEvaluateExpression descends into an expression tree to evaluate
  * expressions that can be resolved to a constant on the master. Expressions
  * containing a Var are skipped, since the value of the Var is not known
  * on the master.
  */
 Node *
 PartiallyEvaluateExpression(Node *expression,
-							MasterEvaluationContext *masterEvaluationContext)
+							CoordinatorEvaluationContext *coordinatorEvaluationContext)
 {
 	if (expression == NULL || IsA(expression, Const))
 	{
@@ -110,36 +113,94 @@ PartiallyEvaluateExpression(Node *expression,
 											exprType(expression),
 											exprTypmod(expression),
 											exprCollation(expression),
-											masterEvaluationContext);
+											coordinatorEvaluationContext);
 	}
-	else if (ShouldEvaluateExpressionType(nodeTag) &&
-			 ShouldEvaluateFunctionWithMasterContext(masterEvaluationContext))
+	else if (ShouldEvaluateExpression((Expr *) expression) &&
+			 ShouldEvaluateFunctions(coordinatorEvaluationContext))
 	{
-		if (FindNodeCheck(expression, IsVarNode))
+		/*
+		 * The planner normally evaluates constant expressions, but we may be
+		 * working on the original query tree. We could rely on
+		 * citus_evaluate_expr to evaluate constant expressions, but there are
+		 * certain node types that citus_evaluate_expr does not expect because
+		 * the planner normally replaces them (in particular, CollateExpr).
+		 * Hence, we first evaluate constant expressions using
+		 * eval_const_expressions before continuing.
+		 *
+		 * NOTE: We do not use expression_planner here, since all it does
+		 * apart from calling eval_const_expressions is call fix_opfuncids.
+		 * We do not need this, since that is already called in
+		 * citus_evaluate_expr. So we won't needlessly traverse the expression
+		 * tree by calling it another time.
+		 */
+		expression = eval_const_expressions(NULL, expression);
+
+		/*
+		 * It's possible that after evaluating const expressions we
+		 * actually don't need to evaluate this expression anymore e.g:
+		 *
+		 * 1 = 0 AND now() > timestamp '10-10-2000 00:00'
+		 *
+		 * This statement would simply resolve to false, because 1 = 0 is
+		 * false. That's why we now check again if we should evaluate the
+		 * expression and only continue if we still do.
+		 */
+		if (!ShouldEvaluateExpression((Expr *) expression))
 		{
 			return (Node *) expression_tree_mutator(expression,
 													PartiallyEvaluateExpression,
-													masterEvaluationContext);
+													coordinatorEvaluationContext);
+		}
+
+		if (FindNodeMatchingCheckFunction(expression, IsVariableExpression))
+		{
+			/*
+			 * The expression contains a variable expression (e.g. a stable function,
+			 * which has a column reference as its input). That means that we cannot
+			 * evaluate the expression on the coordinator, since the result depends
+			 * on the input.
+			 *
+			 * Skipping function evaluation for these expressions is safe in most
+			 * cases, since the function will always be re-evaluated for every input
+			 * value. An exception is function calls that call another stable function
+			 * that should not be re-evaluated, such as now().
+			 */
+			return (Node *) expression_tree_mutator(expression,
+													PartiallyEvaluateExpression,
+													coordinatorEvaluationContext);
 		}
 
 		return (Node *) citus_evaluate_expr((Expr *) expression,
 											exprType(expression),
 											exprTypmod(expression),
 											exprCollation(expression),
-											masterEvaluationContext);
+											coordinatorEvaluationContext);
 	}
 	else if (nodeTag == T_Query)
 	{
-		return (Node *) query_tree_mutator((Query *) expression,
+		Query *query = (Query *) expression;
+		CoordinatorEvaluationContext subContext = *coordinatorEvaluationContext;
+		if (query->commandType != CMD_SELECT)
+		{
+			/*
+			 * Currently INSERT SELECT evaluates stable functions on master,
+			 * while a plain SELECT does not. For evaluating SELECT evaluationMode is
+			 * EVALUATE_PARAMS, but if recursing into a modifying CTE switch into
+			 * EVALUATE_FUNCTIONS_PARAMS.
+			 */
+			subContext.evaluationMode = EVALUATE_FUNCTIONS_PARAMS;
+		}
+
+		return (Node *) query_tree_mutator(query,
 										   PartiallyEvaluateExpression,
-										   masterEvaluationContext,
+										   &subContext,
 										   QTW_DONT_COPY_QUERY);
 	}
 	else
 	{
 		return (Node *) expression_tree_mutator(expression,
 												PartiallyEvaluateExpression,
-												masterEvaluationContext);
+												coordinatorEvaluationContext);
 	}
 
 	return expression;
@@ -147,12 +208,12 @@ PartiallyEvaluateExpression(Node *expression,
 
 
 /*
- * ShouldEvaluateFunctionWithMasterContext is a helper function  which is used to
+ * ShouldEvaluateFunctions is a helper function which is used to
  * decide whether the function/expression should be evaluated with the input
- * masterEvaluationContext.
+ * coordinatorEvaluationContext.
  */
 static bool
-ShouldEvaluateFunctionWithMasterContext(MasterEvaluationContext *evaluationContext)
+ShouldEvaluateFunctions(CoordinatorEvaluationContext *evaluationContext)
 {
 	if (evaluationContext == NULL)
 	{
@@ -165,15 +226,25 @@ ShouldEvaluateFunctionWithMasterContext(MasterEvaluationContext *evaluationConte
 
 
 /*
- * ShouldEvaluateExpressionType returns true if Citus should evaluate the
+ * ShouldEvaluateExpression returns true if Citus should evaluate the
  * input node on the coordinator.
  */
 static bool
-ShouldEvaluateExpressionType(NodeTag nodeTag)
+ShouldEvaluateExpression(Expr *expression)
 {
+	NodeTag nodeTag = nodeTag(expression);
+
 	switch (nodeTag)
 	{
 		case T_FuncExpr:
+		{
+			FuncExpr *funcExpr = (FuncExpr *) expression;
+
+			/* we cannot evaluate set returning functions */
+			bool isSetReturningFunction = funcExpr->funcretset;
+			return !isSetReturningFunction;
+		}
+
 		case T_OpExpr:
 		case T_DistinctExpr:
 		case T_NullIfExpr:
@@ -195,11 +266,29 @@ ShouldEvaluateExpressionType(NodeTag nodeTag)
 
 
 /*
- * IsVarNode returns whether a node is a Var (column reference).
+ * IsVariableExpression returns whether the given node is a variable expression,
+ * meaning its result depends on the input data and is not constant for the whole
+ * query.
  */
 static bool
-IsVarNode(Node *node)
+IsVariableExpression(Node *node)
 {
+	if (IsA(node, Aggref))
+	{
+		return true;
+	}
+
+	if (IsA(node, WindowFunc))
+	{
+		return true;
+	}
+
+	if (IsA(node, Param))
+	{
+		/* ExecInitExpr cannot handle PARAM_SUBLINK */
+		return ((Param *) node)->paramkind == PARAM_SUBLINK;
+	}
+
 	return IsA(node, Var);
 }
 
@@ -215,7 +304,7 @@ IsVarNode(Node *node)
 static Expr *
 citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 					Oid result_collation,
-					MasterEvaluationContext *masterEvaluationContext)
+					CoordinatorEvaluationContext *coordinatorEvaluationContext)
 {
 	PlanState *planState = NULL;
 	EState     *estate;
@@ -226,22 +315,22 @@ citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 	int16		resultTypLen;
 	bool		resultTypByVal;
 
-	if (masterEvaluationContext)
+	if (coordinatorEvaluationContext)
 	{
-		planState = masterEvaluationContext->planState;
+		planState = coordinatorEvaluationContext->planState;
 
 		if (IsA(expr, Param))
 		{
-			if (masterEvaluationContext->evaluationMode == EVALUATE_NONE)
+			if (coordinatorEvaluationContext->evaluationMode == EVALUATE_NONE)
 			{
 				/* bail out, the caller doesn't want params to be evaluated  */
 				return expr;
 			}
 		}
-		else if (masterEvaluationContext->evaluationMode != EVALUATE_FUNCTIONS_PARAMS)
+		else if (coordinatorEvaluationContext->evaluationMode != EVALUATE_FUNCTIONS_PARAMS)
 		{
 			/* should only get here for node types we should evaluate */
-			Assert(ShouldEvaluateExpressionType(nodeTag(expr)));
+			Assert(ShouldEvaluateExpression(expr));
 
 			/* bail out, the caller doesn't want functions/expressions to be evaluated */
 			return expr;
@@ -255,6 +344,9 @@ citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 
 	/* We can use the estate's working context to avoid memory leaks. */
 	MemoryContext oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	/* handles default values */
+	FixFunctionArguments((Node *) expr);
 
 	/* Make sure any opfuncids are filled in. */
 	fix_opfuncids((Node *) expr);
@@ -314,6 +406,8 @@ citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 							  const_val, const_is_null,
 							  resultTypByVal);
 }
+
+/* *INDENT-ON* */
 
 
 /*
@@ -404,4 +498,38 @@ CitusIsMutableFunction(Node *node)
 }
 
 
-/* *INDENT-ON* */
+/* FixFunctionArguments applies expand_function_arguments to all function calls. */
+static void
+FixFunctionArguments(Node *expr)
+{
+	FixFunctionArgumentsWalker(expr, NULL);
+}
+
+
+/* FixFunctionArgumentsWalker is the helper function for fix_funcargs. */
+static bool
+FixFunctionArgumentsWalker(Node *expr, void *context)
+{
+	if (expr == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(expr, FuncExpr))
+	{
+		FuncExpr *funcExpr = castNode(FuncExpr, expr);
+		HeapTuple func_tuple =
+			SearchSysCache1(PROCOID, ObjectIdGetDatum(funcExpr->funcid));
+		if (!HeapTupleIsValid(func_tuple))
+		{
+			elog(ERROR, "cache lookup failed for function %u", funcExpr->funcid);
+		}
+
+		funcExpr->args = expand_function_arguments(funcExpr->args,
+												   funcExpr->funcresulttype, func_tuple);
+
+		ReleaseSysCache(func_tuple);
+	}
+
+	return expression_tree_walker(expr, FixFunctionArgumentsWalker, NULL);
+}

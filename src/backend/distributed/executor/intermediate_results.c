@@ -20,8 +20,10 @@
 #include "commands/copy.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/connection_management.h"
+#include "distributed/error_codes.h"
 #include "distributed/intermediate_results.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_executor.h"
@@ -51,7 +53,7 @@ typedef struct RemoteFileDestReceiver
 	/* public DestReceiver interface */
 	DestReceiver pub;
 
-	char *resultId;
+	const char *resultId;
 
 	/* descriptor of the tuples that are sent to the worker */
 	TupleDesc tupleDescriptor;
@@ -74,13 +76,15 @@ typedef struct RemoteFileDestReceiver
 	CopyOutState copyOutState;
 	FmgrInfo *columnOutputFunctions;
 
-	/* number of tuples sent */
+	/* statistics */
 	uint64 tuplesSent;
+	uint64 bytesSent;
 } RemoteFileDestReceiver;
 
 
 static void RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 										  TupleDesc inputTupleDescriptor);
+static void PrepareIntermediateResultBroadcast(RemoteFileDestReceiver *resultDest);
 static StringInfo ConstructCopyResultStatement(const char *resultId);
 static void WriteToLocalFile(StringInfo copyData, FileCompat *fileCompat);
 static bool RemoteFileDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest);
@@ -132,7 +136,7 @@ broadcast_intermediate_result(PG_FUNCTION_ARGS)
 	 */
 	UseCoordinatedTransaction();
 
-	List *nodeList = ActivePrimaryWorkerNodeList(NoLock);
+	List *nodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
 	EState *estate = CreateExecutorState();
 	RemoteFileDestReceiver *resultDest =
 		(RemoteFileDestReceiver *) CreateRemoteFileDestReceiver(resultIdString,
@@ -197,7 +201,7 @@ create_intermediate_result(PG_FUNCTION_ARGS)
  * coordinated transaction is started prior to using the DestReceiver.
  */
 DestReceiver *
-CreateRemoteFileDestReceiver(char *resultId, EState *executorState,
+CreateRemoteFileDestReceiver(const char *resultId, EState *executorState,
 							 List *initialNodeList, bool writeLocalFile)
 {
 	RemoteFileDestReceiver *resultDest = (RemoteFileDestReceiver *) palloc0(
@@ -222,6 +226,17 @@ CreateRemoteFileDestReceiver(char *resultId, EState *executorState,
 
 
 /*
+ * RemoteFileDestReceiverBytesSent returns number of bytes sent per remote worker.
+ */
+uint64
+RemoteFileDestReceiverBytesSent(DestReceiver *destReceiver)
+{
+	RemoteFileDestReceiver *remoteDestReceiver = (RemoteFileDestReceiver *) destReceiver;
+	return remoteDestReceiver->bytesSent;
+}
+
+
+/*
  * RemoteFileDestReceiverStartup implements the rStartup interface of
  * RemoteFileDestReceiver. It opens connections to the nodes in initialNodeList,
  * and sends the COPY command on all connections.
@@ -232,15 +247,8 @@ RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 {
 	RemoteFileDestReceiver *resultDest = (RemoteFileDestReceiver *) dest;
 
-	const char *resultId = resultDest->resultId;
-
 	const char *delimiterCharacter = "\t";
 	const char *nullPrintCharacter = "\\N";
-
-	List *initialNodeList = resultDest->initialNodeList;
-	ListCell *initialNodeCell = NULL;
-	List *connectionList = NIL;
-	ListCell *connectionCell = NULL;
 
 	resultDest->tupleDescriptor = inputTupleDescriptor;
 
@@ -256,6 +264,21 @@ RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 
 	resultDest->columnOutputFunctions = ColumnOutputFunctions(inputTupleDescriptor,
 															  copyOutState->binary);
+}
+
+
+/*
+ * PrepareIntermediateResultBroadcast gets a RemoteFileDestReceiver and does
+ * the necessary initilizations including initiating the remote connnections
+ * and creating the local file, which is necessary (it might be both).
+ */
+static void
+PrepareIntermediateResultBroadcast(RemoteFileDestReceiver *resultDest)
+{
+	List *initialNodeList = resultDest->initialNodeList;
+	const char *resultId = resultDest->resultId;
+	List *connectionList = NIL;
+	CopyOutState copyOutState = resultDest->copyOutState;
 
 	if (resultDest->writeLocalFile)
 	{
@@ -272,19 +295,13 @@ RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 																			 fileMode));
 	}
 
-	foreach(initialNodeCell, initialNodeList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, initialNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(initialNodeCell);
-		char *nodeName = workerNode->workerName;
-		int nodePort = workerNode->workerPort;
+		int flags = 0;
 
-		/*
-		 * We prefer to use a connection that is not associcated with
-		 * any placements. The reason is that we claim this connection
-		 * exclusively and that would prevent the consecutive DML/DDL
-		 * use the same connection.
-		 */
-		int flags = REQUIRE_SIDECHANNEL;
+		const char *nodeName = workerNode->workerName;
+		int nodePort = workerNode->workerPort;
 
 		MultiConnection *connection = StartNodeConnection(flags, nodeName, nodePort);
 		ClaimConnectionExclusively(connection);
@@ -298,10 +315,9 @@ RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 	/* must open transaction blocks to use intermediate results */
 	RemoteTransactionsBeginIfNecessary(connectionList);
 
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
 		StringInfo copyCommand = ConstructCopyResultStatement(resultId);
 
 		bool querySent = SendRemoteCommand(connection, copyCommand->data);
@@ -311,9 +327,8 @@ RemoteFileDestReceiverStartup(DestReceiver *dest, int operation,
 		}
 	}
 
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		bool raiseInterrupts = true;
 
 		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
@@ -368,6 +383,15 @@ RemoteFileDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 {
 	RemoteFileDestReceiver *resultDest = (RemoteFileDestReceiver *) dest;
 
+	if (resultDest->tuplesSent == 0)
+	{
+		/*
+		 *  We get the first tuple, lets initialize the remote connections
+		 *  and/or the local file.
+		 */
+		PrepareIntermediateResultBroadcast(resultDest);
+	}
+
 	TupleDesc tupleDescriptor = resultDest->tupleDescriptor;
 
 	List *connectionList = resultDest->connectionList;
@@ -403,6 +427,7 @@ RemoteFileDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	MemoryContextSwitchTo(oldContext);
 
 	resultDest->tuplesSent++;
+	resultDest->bytesSent += copyData->len;
 
 	ResetPerTupleExprContext(executorState);
 
@@ -437,6 +462,17 @@ RemoteFileDestReceiverShutdown(DestReceiver *destReceiver)
 {
 	RemoteFileDestReceiver *resultDest = (RemoteFileDestReceiver *) destReceiver;
 
+	if (resultDest->tuplesSent == 0)
+	{
+		/*
+		 *  We have not received any tuples (when the intermediate result
+		 *  returns zero rows). Still, we want to create the necessary
+		 *  intermediate result files even if they are empty, as the query
+		 *  execution requires the files to be present.
+		 */
+		PrepareIntermediateResultBroadcast(resultDest);
+	}
+
 	List *connectionList = resultDest->connectionList;
 	CopyOutState copyOutState = resultDest->copyOutState;
 
@@ -469,10 +505,9 @@ RemoteFileDestReceiverShutdown(DestReceiver *destReceiver)
 static void
 BroadcastCopyData(StringInfo dataBuffer, List *connectionList)
 {
-	ListCell *connectionCell = NULL;
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		SendCopyDataOverConnection(dataBuffer, connection);
 	}
 }
@@ -558,11 +593,10 @@ char *
 CreateIntermediateResultsDirectory(void)
 {
 	char *resultDirectory = IntermediateResultsDirectory();
-	int makeOK = 0;
 
 	if (!CreatedResultsDirectory)
 	{
-		makeOK = mkdir(resultDirectory, S_IRWXU);
+		int makeOK = mkdir(resultDirectory, S_IRWXU);
 		if (makeOK != 0)
 		{
 			if (errno == EEXIST)
@@ -667,7 +701,33 @@ RemoveIntermediateResultsDirectory(void)
 {
 	if (CreatedResultsDirectory)
 	{
-		CitusRemoveDirectory(IntermediateResultsDirectory());
+		/*
+		 * The shared directory is renamed before deleting it. Otherwise it
+		 * would be possible for another backend to write a file, while we are
+		 * deleting the directory. Since rename is atomic by POSIX standards
+		 * that's not possible. The current PID is included in the new
+		 * filename, so there can be no collisions with other backends.
+		 */
+		char *sharedName = IntermediateResultsDirectory();
+		StringInfo privateName = makeStringInfo();
+		appendStringInfo(privateName, "%s.removed-by-%d", sharedName, MyProcPid);
+		if (rename(sharedName, privateName->data))
+		{
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg(
+						 "could not rename intermediate results directory \"%s\" to \"%s\": %m",
+						 sharedName, privateName->data)));
+
+			/* rename failed for some reason, we do a best effort removal of
+			 * the shared directory */
+
+			PathNameDeleteTemporaryDir(sharedName);
+		}
+		else
+		{
+			PathNameDeleteTemporaryDir(privateName->data);
+		}
 
 		CreatedResultsDirectory = false;
 	}
@@ -679,7 +739,7 @@ RemoveIntermediateResultsDirectory(void)
  * or -1 if the file does not exist.
  */
 int64
-IntermediateResultSize(char *resultId)
+IntermediateResultSize(const char *resultId)
 {
 	struct stat fileStat;
 
@@ -775,11 +835,32 @@ ReadIntermediateResultsIntoFuncOutput(FunctionCallInfo fcinfo, char *copyFormat,
 		int statOK = stat(resultFileName, &fileStat);
 		if (statOK != 0)
 		{
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("result \"%s\" does not exist", resultId)));
+			/*
+			 * When the file does not exist, it could mean two different things.
+			 * First -- and a lot more common -- case is that a failure happened
+			 * in a concurrent backend on the same distributed transaction. And,
+			 * one of the backends in that transaction has already been roll
+			 * backed, which has already removed the file. If we throw an error
+			 * here, the user might see this error instead of the actual error
+			 * message. Instead, we prefer to WARN the user and pretend that the
+			 * file has no data in it. In the end, the user would see the actual
+			 * error message for the failure.
+			 *
+			 * Second, in case of any bugs in intermediate result broadcasts,
+			 * we could try to read a non-existing file. That is most likely
+			 * to happen during development.
+			 */
+			ereport(WARNING, (errcode(ERRCODE_CITUS_INTERMEDIATE_RESULT_NOT_FOUND),
+							  errmsg("Query could not find the intermediate result file "
+									 "\"%s\", it was mostly likely deleted due to an "
+									 "error in a parallel process within the same "
+									 "distributed transaction", resultId)));
 		}
-
-		ReadFileIntoTupleStore(resultFileName, copyFormat, tupleDescriptor, tupleStore);
+		else
+		{
+			ReadFileIntoTupleStore(resultFileName, copyFormat, tupleDescriptor,
+								   tupleStore);
+		}
 	}
 
 	tuplestore_donestoring(tupleStore);

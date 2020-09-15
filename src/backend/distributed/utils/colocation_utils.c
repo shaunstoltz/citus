@@ -21,14 +21,15 @@
 #include "commands/sequence.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/listutils.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
 #include "storage/lmgr.h"
@@ -50,11 +51,13 @@ static int CompareShardPlacementsByNode(const void *leftElement,
 static void UpdateRelationColocationGroup(Oid distributedRelationId, uint32 colocationId);
 static List * ColocationGroupTableList(Oid colocationId);
 static void DeleteColocationGroup(uint32 colocationId);
-
+static uint32 CreateColocationGroupForRelation(Oid sourceRelationId);
+static void BreakColocation(Oid sourceRelationId);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(mark_tables_colocated);
 PG_FUNCTION_INFO_V1(get_colocated_shard_array);
+PG_FUNCTION_INFO_V1(update_distributed_table_colocation);
 
 
 /*
@@ -97,6 +100,74 @@ mark_tables_colocated(PG_FUNCTION_ARGS)
 
 
 /*
+ * update_distributed_table_colocation updates the colocation of a table.
+ * if colocate_with -> 'none' then the table is assigned a new
+ * colocation group.
+ */
+Datum
+update_distributed_table_colocation(PG_FUNCTION_ARGS)
+{
+	Oid targetRelationId = PG_GETARG_OID(0);
+	text *colocateWithTableNameText = PG_GETARG_TEXT_P(1);
+
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+	EnsureTableOwner(targetRelationId);
+	EnsureHashDistributedTable(targetRelationId);
+
+	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
+	if (IsColocateWithNone(colocateWithTableName))
+	{
+		BreakColocation(targetRelationId);
+	}
+	else
+	{
+		Oid colocateWithTableId = ResolveRelationId(colocateWithTableNameText, false);
+		EnsureHashDistributedTable(colocateWithTableId);
+		MarkTablesColocated(colocateWithTableId, targetRelationId);
+	}
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * IsColocateWithNone returns true if the given table is
+ * the special keyword "none".
+ */
+bool
+IsColocateWithNone(char *colocateWithTableName)
+{
+	return pg_strncasecmp(colocateWithTableName, "none", NAMEDATALEN) == 0;
+}
+
+
+/*
+ * BreakColocation breaks the colocations of the given relation id.
+ * If t1, t2 and t3 are colocated and we call this function with t2,
+ * t1 and t3 will stay colocated but t2 will have a new colocation id.
+ * Note that this function does not move any data around for the new colocation.
+ */
+static void
+BreakColocation(Oid sourceRelationId)
+{
+	/*
+	 * Get an exclusive lock on the colocation system catalog. Therefore, we
+	 * can be sure that there will no modifications on the colocation table
+	 * until this transaction is committed.
+	 */
+	Relation pgDistColocation = table_open(DistColocationRelationId(), ExclusiveLock);
+
+	uint32 newColocationId = GetNextColocationId();
+	UpdateRelationColocationGroup(sourceRelationId, newColocationId);
+
+	/* if there is not any remaining table in the colocation group, delete it */
+	DeleteColocationGroupIfNoTablesBelong(sourceRelationId);
+
+	table_close(pgDistColocation, NoLock);
+}
+
+
+/*
  * get_colocated_shards_array returns array of shards ids which are co-located with given
  * shard.
  */
@@ -107,16 +178,14 @@ get_colocated_shard_array(PG_FUNCTION_ARGS)
 	ShardInterval *shardInterval = LoadShardInterval(shardId);
 
 	List *colocatedShardList = ColocatedShardIntervalList(shardInterval);
-	ListCell *colocatedShardCell = NULL;
 	int colocatedShardCount = list_length(colocatedShardList);
 	Datum *colocatedShardsDatumArray = palloc0(colocatedShardCount * sizeof(Datum));
 	Oid arrayTypeId = OIDOID;
 	int colocatedShardIndex = 0;
 
-	foreach(colocatedShardCell, colocatedShardList)
+	ShardInterval *colocatedShardInterval = NULL;
+	foreach_ptr(colocatedShardInterval, colocatedShardList)
 	{
-		ShardInterval *colocatedShardInterval = (ShardInterval *) lfirst(
-			colocatedShardCell);
 		uint64 colocatedShardId = colocatedShardInterval->shardId;
 
 		Datum colocatedShardDatum = Int64GetDatum(colocatedShardId);
@@ -134,6 +203,36 @@ get_colocated_shard_array(PG_FUNCTION_ARGS)
 
 
 /*
+ * CreateColocationGroupForRelation creates colocation entry in
+ * pg_dist_colocation and updated the colocation id in pg_dist_partition
+ * for the given relation.
+ */
+static uint32
+CreateColocationGroupForRelation(Oid sourceRelationId)
+{
+	uint32 shardCount = ShardIntervalCount(sourceRelationId);
+	uint32 shardReplicationFactor = TableShardReplicationFactor(sourceRelationId);
+
+	Var *sourceDistributionColumn = DistPartitionKey(sourceRelationId);
+	Oid sourceDistributionColumnType = InvalidOid;
+	Oid sourceDistributionColumnCollation = InvalidOid;
+
+	/* reference tables has NULL distribution column */
+	if (sourceDistributionColumn != NULL)
+	{
+		sourceDistributionColumnType = sourceDistributionColumn->vartype;
+		sourceDistributionColumnCollation = sourceDistributionColumn->varcollid;
+	}
+
+	uint32 sourceColocationId = CreateColocationGroup(shardCount, shardReplicationFactor,
+													  sourceDistributionColumnType,
+													  sourceDistributionColumnCollation);
+	UpdateRelationColocationGroup(sourceRelationId, sourceColocationId);
+	return sourceColocationId;
+}
+
+
+/*
  * MarkTablesColocated puts both tables to same colocation group. If the
  * source table is in INVALID_COLOCATION_ID group, then it creates a new
  * colocation group and assigns both tables to same colocation group. Otherwise,
@@ -142,6 +241,13 @@ get_colocated_shard_array(PG_FUNCTION_ARGS)
 static void
 MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 {
+	if (IsCitusTableType(sourceRelationId, CITUS_LOCAL_TABLE) ||
+		IsCitusTableType(targetRelationId, CITUS_LOCAL_TABLE))
+	{
+		ereport(ERROR, (errmsg("citus local tables cannot be colocated with "
+							   "other tables")));
+	}
+
 	CheckReplicationModel(sourceRelationId, targetRelationId);
 	CheckDistributionColumnType(sourceRelationId, targetRelationId);
 
@@ -150,7 +256,7 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 	 * can be sure that there will no modifications on the colocation table
 	 * until this transaction is committed.
 	 */
-	Relation pgDistColocation = heap_open(DistColocationRelationId(), ExclusiveLock);
+	Relation pgDistColocation = table_open(DistColocationRelationId(), ExclusiveLock);
 
 	/* check if shard placements are colocated */
 	ErrorIfShardPlacementsNotColocated(sourceRelationId, targetRelationId);
@@ -162,24 +268,7 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 	uint32 sourceColocationId = TableColocationId(sourceRelationId);
 	if (sourceColocationId == INVALID_COLOCATION_ID)
 	{
-		uint32 shardCount = ShardIntervalCount(sourceRelationId);
-		uint32 shardReplicationFactor = TableShardReplicationFactor(sourceRelationId);
-
-		Var *sourceDistributionColumn = DistPartitionKey(sourceRelationId);
-		Oid sourceDistributionColumnType = InvalidOid;
-		Oid sourceDistributionColumnCollation = InvalidOid;
-
-		/* reference tables has NULL distribution column */
-		if (sourceDistributionColumn != NULL)
-		{
-			sourceDistributionColumnType = sourceDistributionColumn->vartype;
-			sourceDistributionColumnCollation = sourceDistributionColumn->varcollid;
-		}
-
-		sourceColocationId = CreateColocationGroup(shardCount, shardReplicationFactor,
-												   sourceDistributionColumnType,
-												   sourceDistributionColumnCollation);
-		UpdateRelationColocationGroup(sourceRelationId, sourceColocationId);
+		sourceColocationId = CreateColocationGroupForRelation(sourceRelationId);
 	}
 
 	uint32 targetColocationId = TableColocationId(targetRelationId);
@@ -190,7 +279,7 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 	/* if there is not any remaining table in the colocation group, delete it */
 	DeleteColocationGroupIfNoTablesBelong(targetColocationId);
 
-	heap_close(pgDistColocation, NoLock);
+	table_close(pgDistColocation, NoLock);
 }
 
 
@@ -335,7 +424,7 @@ ShardsIntervalsEqual(ShardInterval *leftShardInterval, ShardInterval *rightShard
 	char leftIntervalPartitionMethod = PartitionMethod(leftShardInterval->relationId);
 	char rightIntervalPartitionMethod = PartitionMethod(rightShardInterval->relationId);
 
-	/* if both shards are  the same, return true */
+	/* if both shards are the same, return true */
 	if (leftShardInterval->shardId == rightShardInterval->shardId)
 	{
 		return true;
@@ -349,11 +438,12 @@ ShardsIntervalsEqual(ShardInterval *leftShardInterval, ShardInterval *rightShard
 		return false;
 	}
 
-	if (leftIntervalPartitionMethod == DISTRIBUTE_BY_HASH)
+	if (IsCitusTableType(leftShardInterval->relationId, HASH_DISTRIBUTED))
 	{
 		return HashPartitionedShardIntervalsEqual(leftShardInterval, rightShardInterval);
 	}
-	else if (leftIntervalPartitionMethod == DISTRIBUTE_BY_NONE)
+	else if (IsCitusTableType(leftShardInterval->relationId,
+							  CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		/*
 		 * Reference tables has only a single shard and all reference tables
@@ -433,7 +523,7 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType, 
 	ScanKeyData scanKey[4];
 	bool indexOK = true;
 
-	Relation pgDistColocation = heap_open(DistColocationRelationId(), AccessShareLock);
+	Relation pgDistColocation = table_open(DistColocationRelationId(), AccessShareLock);
 
 	/* set scan arguments */
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_colocation_distributioncolumntype,
@@ -460,7 +550,7 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType, 
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistColocation, AccessShareLock);
+	table_close(pgDistColocation, AccessShareLock);
 
 	return colocationId;
 }
@@ -493,7 +583,7 @@ CreateColocationGroup(int shardCount, int replicationFactor, Oid distributionCol
 		ObjectIdGetDatum(distributionColumnCollation);
 
 	/* open colocation relation and insert the new tuple */
-	Relation pgDistColocation = heap_open(DistColocationRelationId(), RowExclusiveLock);
+	Relation pgDistColocation = table_open(DistColocationRelationId(), RowExclusiveLock);
 
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistColocation);
 	HeapTuple heapTuple = heap_form_tuple(tupleDescriptor, values, isNulls);
@@ -502,7 +592,7 @@ CreateColocationGroup(int shardCount, int replicationFactor, Oid distributionCol
 
 	/* increment the counter so that next command can see the row */
 	CommandCounterIncrement();
-	heap_close(pgDistColocation, RowExclusiveLock);
+	table_close(pgDistColocation, RowExclusiveLock);
 
 	return colocationId;
 }
@@ -548,10 +638,10 @@ GetNextColocationId()
 void
 CheckReplicationModel(Oid sourceRelationId, Oid targetRelationId)
 {
-	DistTableCacheEntry *sourceTableEntry = DistributedTableCacheEntry(sourceRelationId);
+	CitusTableCacheEntry *sourceTableEntry = GetCitusTableCacheEntry(sourceRelationId);
 	char sourceReplicationModel = sourceTableEntry->replicationModel;
 
-	DistTableCacheEntry *targetTableEntry = DistributedTableCacheEntry(targetRelationId);
+	CitusTableCacheEntry *targetTableEntry = GetCitusTableCacheEntry(targetRelationId);
 	char targetReplicationModel = targetTableEntry->replicationModel;
 
 	if (sourceReplicationModel != targetReplicationModel)
@@ -635,7 +725,7 @@ UpdateRelationColocationGroup(Oid distributedRelationId, uint32 colocationId)
 	bool isNull[Natts_pg_dist_partition];
 	bool replace[Natts_pg_dist_partition];
 
-	Relation pgDistPartition = heap_open(DistPartitionRelationId(), RowExclusiveLock);
+	Relation pgDistPartition = table_open(DistPartitionRelationId(), RowExclusiveLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_logicalrelid,
@@ -672,7 +762,7 @@ UpdateRelationColocationGroup(Oid distributedRelationId, uint32 colocationId)
 	CommandCounterIncrement();
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistPartition, NoLock);
+	table_close(pgDistPartition, NoLock);
 
 	bool shouldSyncMetadata = ShouldSyncTableMetadata(distributedRelationId);
 	if (shouldSyncMetadata)
@@ -692,7 +782,7 @@ UpdateRelationColocationGroup(Oid distributedRelationId, uint32 colocationId)
 uint32
 TableColocationId(Oid distributedTableId)
 {
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
 
 	return cacheEntry->colocationId;
 }
@@ -801,7 +891,7 @@ ColocationGroupTableList(Oid colocationId)
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_colocationid,
 				BTEqualStrategyNumber, F_INT4EQ, ObjectIdGetDatum(colocationId));
 
-	Relation pgDistPartition = heap_open(DistPartitionRelationId(), AccessShareLock);
+	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistPartition,
 													DistPartitionColocationidIndexId(),
@@ -820,7 +910,7 @@ ColocationGroupTableList(Oid colocationId)
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistPartition, AccessShareLock);
+	table_close(pgDistPartition, AccessShareLock);
 
 	return colocatedTableList;
 }
@@ -837,20 +927,17 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 {
 	Oid distributedTableId = shardInterval->relationId;
 	List *colocatedShardList = NIL;
-	ListCell *colocatedTableCell = NULL;
 
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
-	char partitionMethod = cacheEntry->partitionMethod;
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
 
 	/*
-	 * If distribution type of the table is not hash or reference, each shard of
+	 * If distribution type of the table is append or range, each shard of
 	 * the shard is only co-located with itself.
 	 */
-	if ((partitionMethod == DISTRIBUTE_BY_APPEND) ||
-		(partitionMethod == DISTRIBUTE_BY_RANGE))
+	if (IsCitusTableTypeCacheEntry(cacheEntry, APPEND_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, RANGE_DISTRIBUTED))
 	{
-		ShardInterval *copyShardInterval = CitusMakeNode(ShardInterval);
-		CopyShardInterval(shardInterval, copyShardInterval);
+		ShardInterval *copyShardInterval = CopyShardInterval(shardInterval);
 
 		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
 
@@ -863,11 +950,11 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 	/* ShardIndex have to find index of given shard */
 	Assert(shardIntervalIndex >= 0);
 
-	foreach(colocatedTableCell, colocatedTableList)
+	Oid colocatedTableId = InvalidOid;
+	foreach_oid(colocatedTableId, colocatedTableList)
 	{
-		Oid colocatedTableId = lfirst_oid(colocatedTableCell);
-		DistTableCacheEntry *colocatedTableCacheEntry =
-			DistributedTableCacheEntry(colocatedTableId);
+		CitusTableCacheEntry *colocatedTableCacheEntry =
+			GetCitusTableCacheEntry(colocatedTableId);
 
 		/*
 		 * Since we iterate over co-located tables, shard count of each table should be
@@ -879,8 +966,7 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 		ShardInterval *colocatedShardInterval =
 			colocatedTableCacheEntry->sortedShardIntervalArray[shardIntervalIndex];
 
-		ShardInterval *copyShardInterval = CitusMakeNode(ShardInterval);
-		CopyShardInterval(colocatedShardInterval, copyShardInterval);
+		ShardInterval *copyShardInterval = CopyShardInterval(colocatedShardInterval);
 
 		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
 	}
@@ -919,7 +1005,7 @@ ColocatedTableId(Oid colocationId)
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_colocationid,
 				BTEqualStrategyNumber, F_INT4EQ, ObjectIdGetDatum(colocationId));
 
-	Relation pgDistPartition = heap_open(DistPartitionRelationId(), AccessShareLock);
+	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistPartition,
 													DistPartitionColocationidIndexId(),
@@ -956,7 +1042,7 @@ ColocatedTableId(Oid colocationId)
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistPartition, AccessShareLock);
+	table_close(pgDistPartition, AccessShareLock);
 
 	return colocatedTableId;
 }
@@ -969,7 +1055,7 @@ ColocatedTableId(Oid colocationId)
 uint64
 ColocatedShardIdInRelation(Oid relationId, int shardIndex)
 {
-	DistTableCacheEntry *tableCacheEntry = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *tableCacheEntry = GetCitusTableCacheEntry(relationId);
 
 	return tableCacheEntry->sortedShardIntervalArray[shardIndex]->shardId;
 }
@@ -1007,7 +1093,7 @@ DeleteColocationGroup(uint32 colocationId)
 	ScanKeyData scanKey[1];
 	bool indexOK = false;
 
-	Relation pgDistColocation = heap_open(DistColocationRelationId(), RowExclusiveLock);
+	Relation pgDistColocation = table_open(DistColocationRelationId(), RowExclusiveLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_colocation_colocationid,
 				BTEqualStrategyNumber, F_INT4EQ, UInt32GetDatum(colocationId));
@@ -1030,9 +1116,9 @@ DeleteColocationGroup(uint32 colocationId)
 
 		CitusInvalidateRelcacheByRelid(DistColocationRelationId());
 		CommandCounterIncrement();
-		heap_close(replicaIndex, AccessShareLock);
+		table_close(replicaIndex, AccessShareLock);
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistColocation, RowExclusiveLock);
+	table_close(pgDistColocation, RowExclusiveLock);
 }

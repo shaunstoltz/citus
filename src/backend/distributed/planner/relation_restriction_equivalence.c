@@ -10,6 +10,8 @@
  */
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "distributed/colocation_utils.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/listutils.h"
@@ -22,7 +24,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #else
 #include "nodes/relation.h"
@@ -71,8 +73,8 @@ typedef struct AttributeEquivalenceClassMember
 
 
 static bool ContextContainsLocalRelation(RelationRestrictionContext *restrictionContext);
-static Var * FindTranslatedVar(List *appendRelList, Oid relationOid,
-							   Index relationRteIndex, Index *partitionKeyIndex);
+static Var * FindUnionAllVar(PlannerInfo *root, List *appendRelList, Oid relationOid,
+							 Index relationRteIndex, Index *partitionKeyIndex);
 static bool ContainsMultipleDistributedRelations(PlannerRestrictionContext *
 												 plannerRestrictionContext);
 static List * GenerateAttributeEquivalencesForRelationRestrictions(
@@ -80,10 +82,10 @@ static List * GenerateAttributeEquivalencesForRelationRestrictions(
 static AttributeEquivalenceClass * AttributeEquivalenceClassForEquivalenceClass(
 	EquivalenceClass *plannerEqClass, RelationRestriction *relationRestriction);
 static void AddToAttributeEquivalenceClass(AttributeEquivalenceClass **
-										   attributeEquivalanceClass,
+										   attributeEquivalenceClass,
 										   PlannerInfo *root, Var *varToBeAdded);
 static void AddRteSubqueryToAttributeEquivalenceClass(AttributeEquivalenceClass *
-													  *attributeEquivalanceClass,
+													  *attributeEquivalenceClass,
 													  RangeTblEntry *
 													  rangeTableEntry,
 													  PlannerInfo *root,
@@ -92,7 +94,7 @@ static Query * GetTargetSubquery(PlannerInfo *root, RangeTblEntry *rangeTableEnt
 								 Var *varToBeAdded);
 static void AddUnionAllSetOperationsToAttributeEquivalenceClass(
 	AttributeEquivalenceClass **
-	attributeEquivalanceClass,
+	attributeEquivalenceClass,
 	PlannerInfo *root,
 	Var *varToBeAdded);
 static void AddUnionSetOperationsToAttributeEquivalenceClass(AttributeEquivalenceClass **
@@ -116,16 +118,16 @@ static bool AttributeClassContainsAttributeClassMember(AttributeEquivalenceClass
 													   attributeEquivalenceClass);
 static List * AddAttributeClassToAttributeClassList(List *attributeEquivalenceList,
 													AttributeEquivalenceClass *
-													attributeEquivalance);
-static bool AttributeEquivalancesAreEqual(AttributeEquivalenceClass *
-										  firstAttributeEquivalance,
+													attributeEquivalence);
+static bool AttributeEquivalencesAreEqual(AttributeEquivalenceClass *
+										  firstAttributeEquivalence,
 										  AttributeEquivalenceClass *
-										  secondAttributeEquivalance);
+										  secondAttributeEquivalence);
 static AttributeEquivalenceClass * GenerateCommonEquivalence(List *
 															 attributeEquivalenceList,
 															 RelationRestrictionContext *
 															 relationRestrictionContext);
-static AttributeEquivalenceClass * GenerateEquivalanceClassForRelationRestriction(
+static AttributeEquivalenceClass * GenerateEquivalenceClassForRelationRestriction(
 	RelationRestrictionContext
 	*
 	relationRestrictionContext);
@@ -147,6 +149,7 @@ static JoinRestrictionContext * FilterJoinRestrictionContext(
 static bool RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
 													rangeTableArrayLength, Relids
 													queryRteIdentities);
+static int RangeTableOffsetCompat(PlannerInfo *root, AppendRelInfo *appendRelInfo);
 static Relids QueryRteIdentities(Query *queryTree);
 static bool JoinRestrictionListExistsInContext(JoinRestriction *joinRestrictionInput,
 											   JoinRestrictionContext *
@@ -231,7 +234,7 @@ ContextContainsLocalRelation(RelationRestrictionContext *restrictionContext)
  *   select count(*) from (
  *       select user_id, user_id from users_table
  *   union
- *       select 2, user_id  from users_table) u;
+ *       select 2, user_id from users_table) u;
  *
  * For the above query, although the second item in the target list make this query
  * safe to push down, the function would fail to return true.
@@ -244,11 +247,11 @@ SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext
 	JoinRestrictionContext *joinRestrictionContext =
 		plannerRestrictionContext->joinRestrictionContext;
 	Index unionQueryPartitionKeyIndex = 0;
-	AttributeEquivalenceClass *attributeEquivalance =
+	AttributeEquivalenceClass *attributeEquivalence =
 		palloc0(sizeof(AttributeEquivalenceClass));
 	ListCell *relationRestrictionCell = NULL;
 
-	attributeEquivalance->equivalenceId = attributeEquivalenceId++;
+	attributeEquivalence->equivalenceId = attributeEquivalenceId++;
 
 	/*
 	 * Ensure that the partition column is in the same place across all
@@ -273,10 +276,10 @@ SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext
 		 */
 		if (appendRelList != NULL)
 		{
-			varToBeAdded = FindTranslatedVar(appendRelList,
-											 relationRestriction->relationId,
-											 relationRestriction->index,
-											 &partitionKeyIndex);
+			varToBeAdded = FindUnionAllVar(relationPlannerRoot, appendRelList,
+										   relationRestriction->relationId,
+										   relationRestriction->index,
+										   &partitionKeyIndex);
 
 			/* union does not have partition key in the target list */
 			if (partitionKeyIndex == 0)
@@ -326,7 +329,8 @@ SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext
 			continue;
 		}
 
-		AddToAttributeEquivalenceClass(&attributeEquivalance, relationPlannerRoot,
+		Assert(varToBeAdded != NULL);
+		AddToAttributeEquivalenceClass(&attributeEquivalence, relationPlannerRoot,
 									   varToBeAdded);
 	}
 
@@ -347,7 +351,7 @@ SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext
 					joinRestrictionAttributeEquivalenceList);
 
 	allAttributeEquivalenceList = lappend(allAttributeEquivalenceList,
-										  attributeEquivalance);
+										  attributeEquivalence);
 
 	if (!EquivalenceListContainsRelationsEquality(allAttributeEquivalenceList,
 												  restrictionContext))
@@ -367,22 +371,16 @@ SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext
 
 
 /*
- * FindTranslatedVar iterates on the appendRelList and tries to find a translated
- * child var identified by the relation id and the relation rte index.
- *
- * Note that postgres translates UNION ALL target list elements into translated_vars
- * list on the corresponding AppendRelInfo struct. For details, see the related
- * structs.
- *
- * The function returns NULL if it cannot find a translated var.
+ * FindUnionAllVar finds the variable used in union all for the side that has
+ * relationRteIndex as its index and the same varattno as the partition key of
+ * the given relation with relationOid.
  */
 static Var *
-FindTranslatedVar(List *appendRelList, Oid relationOid, Index relationRteIndex,
-				  Index *partitionKeyIndex)
+FindUnionAllVar(PlannerInfo *root, List *appendRelList, Oid relationOid,
+				Index relationRteIndex, Index *partitionKeyIndex)
 {
 	ListCell *appendRelCell = NULL;
 	AppendRelInfo *targetAppendRelInfo = NULL;
-	ListCell *translatedVarCell = NULL;
 	AttrNumber childAttrNumber = 0;
 
 	*partitionKeyIndex = 0;
@@ -392,25 +390,41 @@ FindTranslatedVar(List *appendRelList, Oid relationOid, Index relationRteIndex,
 	{
 		AppendRelInfo *appendRelInfo = (AppendRelInfo *) lfirst(appendRelCell);
 
+
+		int rtoffset = RangeTableOffsetCompat(root, appendRelInfo);
+
 		/*
 		 * We're only interested in the child rel that is equal to the
 		 * relation we're investigating.
 		 */
-		if (appendRelInfo->child_relid == relationRteIndex)
+		if (appendRelInfo->child_relid - rtoffset == relationRteIndex)
 		{
 			targetAppendRelInfo = appendRelInfo;
 			break;
 		}
 	}
 
-	/* we couldn't find the necessary append rel info */
-	if (targetAppendRelInfo == NULL)
+	if (!targetAppendRelInfo)
 	{
 		return NULL;
 	}
 
-	Var *relationPartitionKey = DistPartitionKey(relationOid);
+	Var *relationPartitionKey = DistPartitionKeyOrError(relationOid);
 
+	#if PG_VERSION_NUM >= PG_VERSION_13
+	for (; childAttrNumber < targetAppendRelInfo->num_child_cols; childAttrNumber++)
+	{
+		int curAttNo = targetAppendRelInfo->parent_colnos[childAttrNumber];
+		if (curAttNo == relationPartitionKey->varattno)
+		{
+			*partitionKeyIndex = (childAttrNumber + 1);
+			int rtoffset = RangeTableOffsetCompat(root, targetAppendRelInfo);
+			relationPartitionKey->varno = targetAppendRelInfo->child_relid - rtoffset;
+			return relationPartitionKey;
+		}
+	}
+	#else
+	ListCell *translatedVarCell;
 	List *translaterVars = targetAppendRelInfo->translated_vars;
 	foreach(translatedVarCell, translaterVars)
 	{
@@ -432,7 +446,7 @@ FindTranslatedVar(List *appendRelList, Oid relationOid, Index relationRteIndex,
 			return targetVar;
 		}
 	}
-
+	#endif
 	return NULL;
 }
 
@@ -480,19 +494,19 @@ RestrictionEquivalenceForPartitionKeys(PlannerRestrictionContext *restrictionCon
 
 	List *attributeEquivalenceList = GenerateAllAttributeEquivalences(restrictionContext);
 
-	return RestrictionEquivalenceForPartitionKeysViaEquivalances(restrictionContext,
+	return RestrictionEquivalenceForPartitionKeysViaEquivalences(restrictionContext,
 																 attributeEquivalenceList);
 }
 
 
 /*
- * RestrictionEquivalenceForPartitionKeysViaEquivalances follows the same rules
+ * RestrictionEquivalenceForPartitionKeysViaEquivalences follows the same rules
  * with RestrictionEquivalenceForPartitionKeys(). The only difference is that
- * this function allows passing pre-computed attribute equivalances along with
+ * this function allows passing pre-computed attribute equivalences along with
  * the planner restriction context.
  */
 bool
-RestrictionEquivalenceForPartitionKeysViaEquivalances(PlannerRestrictionContext *
+RestrictionEquivalenceForPartitionKeysViaEquivalences(PlannerRestrictionContext *
 													  plannerRestrictionContext,
 													  List *allAttributeEquivalenceList)
 {
@@ -548,7 +562,7 @@ ContainsMultipleDistributedRelations(PlannerRestrictionContext *
 
 
 /*
- * GenerateAllAttributeEquivalances gets the planner restriction context and returns
+ * GenerateAllAttributeEquivalences gets the planner restriction context and returns
  * the list of all attribute equivalences based on both join restrictions and relation
  * restrictions.
  */
@@ -591,8 +605,10 @@ ReferenceRelationCount(RelationRestrictionContext *restrictionContext)
 	{
 		RelationRestriction *relationRestriction =
 			(RelationRestriction *) lfirst(relationRestrictionCell);
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(
+			relationRestriction->relationId);
 
-		if (PartitionMethod(relationRestriction->relationId) == DISTRIBUTE_BY_NONE)
+		if (IsCitusTableTypeCacheEntry(cacheEntry, REFERENCE_TABLE))
 		{
 			referenceRelationCount++;
 		}
@@ -643,8 +659,9 @@ EquivalenceListContainsRelationsEquality(List *attributeEquivalenceList,
 			(RelationRestriction *) lfirst(relationRestrictionCell);
 		int rteIdentity = GetRTEIdentity(relationRestriction->rte);
 
-		/* we shouldn't check for the equality of reference tables */
-		if (PartitionMethod(relationRestriction->relationId) == DISTRIBUTE_BY_NONE)
+		/* we shouldn't check for the equality of non-distributed tables */
+		if (IsCitusTableType(relationRestriction->relationId,
+							 CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
 			continue;
 		}
@@ -700,13 +717,13 @@ GenerateAttributeEquivalencesForRelationRestrictions(RelationRestrictionContext
 			EquivalenceClass *plannerEqClass =
 				(EquivalenceClass *) lfirst(equivalenceClassCell);
 
-			AttributeEquivalenceClass *attributeEquivalance =
+			AttributeEquivalenceClass *attributeEquivalence =
 				AttributeEquivalenceClassForEquivalenceClass(plannerEqClass,
 															 relationRestriction);
 
 			attributeEquivalenceList =
 				AddAttributeClassToAttributeClassList(attributeEquivalenceList,
-													  attributeEquivalance);
+													  attributeEquivalence);
 		}
 	}
 
@@ -728,12 +745,12 @@ static AttributeEquivalenceClass *
 AttributeEquivalenceClassForEquivalenceClass(EquivalenceClass *plannerEqClass,
 											 RelationRestriction *relationRestriction)
 {
-	AttributeEquivalenceClass *attributeEquivalance =
+	AttributeEquivalenceClass *attributeEquivalence =
 		palloc0(sizeof(AttributeEquivalenceClass));
 	ListCell *equivilanceMemberCell = NULL;
 	PlannerInfo *plannerInfo = relationRestriction->plannerInfo;
 
-	attributeEquivalance->equivalenceId = attributeEquivalenceId++;
+	attributeEquivalence->equivalenceId = attributeEquivalenceId++;
 
 	foreach(equivilanceMemberCell, plannerEqClass->ec_members)
 	{
@@ -755,19 +772,19 @@ AttributeEquivalenceClassForEquivalenceClass(EquivalenceClass *plannerEqClass,
 										equivalenceParam, &outerNodeRoot);
 			if (expressionVar)
 			{
-				AddToAttributeEquivalenceClass(&attributeEquivalance, outerNodeRoot,
+				AddToAttributeEquivalenceClass(&attributeEquivalence, outerNodeRoot,
 											   expressionVar);
 			}
 		}
 		else if (IsA(strippedEquivalenceExpr, Var))
 		{
 			expressionVar = (Var *) strippedEquivalenceExpr;
-			AddToAttributeEquivalenceClass(&attributeEquivalance, plannerInfo,
+			AddToAttributeEquivalenceClass(&attributeEquivalence, plannerInfo,
 										   expressionVar);
 		}
 	}
 
-	return attributeEquivalance;
+	return attributeEquivalence;
 }
 
 
@@ -868,7 +885,7 @@ SearchPlannerParamList(List *plannerParamList, Param *plannerParam)
 
 
 /*
- * GenerateCommonEquivalence gets a list of unrelated AttributeEquiavalanceClass
+ * GenerateCommonEquivalence gets a list of unrelated AttributeEquiavalenceClass
  * whose all members are partition keys.
  *
  * With the equivalence classes, the function follows the algorithm
@@ -903,7 +920,7 @@ GenerateCommonEquivalence(List *attributeEquivalenceList,
 	 * on the common class.
 	 */
 	AttributeEquivalenceClass *firstEquivalenceClass =
-		GenerateEquivalanceClassForRelationRestriction(relationRestrictionContext);
+		GenerateEquivalenceClassForRelationRestriction(relationRestrictionContext);
 
 	/* we skip the calculation if there are not enough information */
 	if (equivalenceListSize < 1 || firstEquivalenceClass == NULL)
@@ -978,11 +995,11 @@ GenerateCommonEquivalence(List *attributeEquivalenceList,
 
 
 /*
- * GenerateEquivalanceClassForRelationRestriction generates an AttributeEquivalenceClass
+ * GenerateEquivalenceClassForRelationRestriction generates an AttributeEquivalenceClass
  * with a single AttributeEquivalenceClassMember.
  */
 static AttributeEquivalenceClass *
-GenerateEquivalanceClassForRelationRestriction(
+GenerateEquivalenceClassForRelationRestriction(
 	RelationRestrictionContext *relationRestrictionContext)
 {
 	ListCell *relationRestrictionCell = NULL;
@@ -1113,19 +1130,19 @@ GenerateAttributeEquivalencesForJoinRestrictions(JoinRestrictionContext *
 			Var *leftVar = (Var *) strippedLeftExpr;
 			Var *rightVar = (Var *) strippedRightExpr;
 
-			AttributeEquivalenceClass *attributeEquivalance = palloc0(
+			AttributeEquivalenceClass *attributeEquivalence = palloc0(
 				sizeof(AttributeEquivalenceClass));
-			attributeEquivalance->equivalenceId = attributeEquivalenceId++;
+			attributeEquivalence->equivalenceId = attributeEquivalenceId++;
 
-			AddToAttributeEquivalenceClass(&attributeEquivalance,
+			AddToAttributeEquivalenceClass(&attributeEquivalence,
 										   joinRestriction->plannerInfo, leftVar);
 
-			AddToAttributeEquivalenceClass(&attributeEquivalance,
+			AddToAttributeEquivalenceClass(&attributeEquivalence,
 										   joinRestriction->plannerInfo, rightVar);
 
 			attributeEquivalenceList =
 				AddAttributeClassToAttributeClassList(attributeEquivalenceList,
-													  attributeEquivalance);
+													  attributeEquivalence);
 		}
 	}
 
@@ -1161,7 +1178,7 @@ GenerateAttributeEquivalencesForJoinRestrictions(JoinRestrictionContext *
  *               equivalence class
  */
 static void
-AddToAttributeEquivalenceClass(AttributeEquivalenceClass **attributeEquivalanceClass,
+AddToAttributeEquivalenceClass(AttributeEquivalenceClass **attributeEquivalenceClass,
 							   PlannerInfo *root, Var *varToBeAdded)
 {
 	/* punt if it's a whole-row var rather than a plain column reference */
@@ -1179,13 +1196,13 @@ AddToAttributeEquivalenceClass(AttributeEquivalenceClass **attributeEquivalanceC
 	RangeTblEntry *rangeTableEntry = root->simple_rte_array[varToBeAdded->varno];
 	if (rangeTableEntry->rtekind == RTE_RELATION)
 	{
-		AddRteRelationToAttributeEquivalenceClass(attributeEquivalanceClass,
+		AddRteRelationToAttributeEquivalenceClass(attributeEquivalenceClass,
 												  rangeTableEntry,
 												  varToBeAdded);
 	}
 	else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
 	{
-		AddRteSubqueryToAttributeEquivalenceClass(attributeEquivalanceClass,
+		AddRteSubqueryToAttributeEquivalenceClass(attributeEquivalenceClass,
 												  rangeTableEntry, root,
 												  varToBeAdded);
 	}
@@ -1200,7 +1217,7 @@ AddToAttributeEquivalenceClass(AttributeEquivalenceClass **attributeEquivalanceC
  */
 static void
 AddRteSubqueryToAttributeEquivalenceClass(AttributeEquivalenceClass
-										  **attributeEquivalanceClass,
+										  **attributeEquivalenceClass,
 										  RangeTblEntry *rangeTableEntry,
 										  PlannerInfo *root, Var *varToBeAdded)
 {
@@ -1257,12 +1274,12 @@ AddRteSubqueryToAttributeEquivalenceClass(AttributeEquivalenceClass
 	 */
 	if (rangeTableEntry->inh)
 	{
-		AddUnionAllSetOperationsToAttributeEquivalenceClass(attributeEquivalanceClass,
+		AddUnionAllSetOperationsToAttributeEquivalenceClass(attributeEquivalenceClass,
 															root, varToBeAdded);
 	}
 	else if (targetSubquery->setOperations)
 	{
-		AddUnionSetOperationsToAttributeEquivalenceClass(attributeEquivalanceClass,
+		AddUnionSetOperationsToAttributeEquivalenceClass(attributeEquivalenceClass,
 														 baseRelOptInfo->subroot,
 														 (SetOperationStmt *)
 														 targetSubquery->setOperations,
@@ -1270,7 +1287,7 @@ AddRteSubqueryToAttributeEquivalenceClass(AttributeEquivalenceClass
 	}
 	else if (varToBeAdded && IsA(varToBeAdded, Var) && varToBeAdded->varlevelsup == 0)
 	{
-		AddToAttributeEquivalenceClass(attributeEquivalanceClass,
+		AddToAttributeEquivalenceClass(attributeEquivalenceClass,
 									   baseRelOptInfo->subroot, varToBeAdded);
 	}
 }
@@ -1323,7 +1340,7 @@ GetTargetSubquery(PlannerInfo *root, RangeTblEntry *rangeTableEntry, Var *varToB
  */
 static void
 AddUnionAllSetOperationsToAttributeEquivalenceClass(AttributeEquivalenceClass **
-													attributeEquivalanceClass,
+													attributeEquivalenceClass,
 													PlannerInfo *root,
 													Var *varToBeAdded)
 {
@@ -1343,13 +1360,39 @@ AddUnionAllSetOperationsToAttributeEquivalenceClass(AttributeEquivalenceClass **
 		{
 			continue;
 		}
+		int rtoffset = RangeTableOffsetCompat(root, appendRelInfo);
 
 		/* set the varno accordingly for this specific child */
-		varToBeAdded->varno = appendRelInfo->child_relid;
+		varToBeAdded->varno = appendRelInfo->child_relid - rtoffset;
 
-		AddToAttributeEquivalenceClass(attributeEquivalanceClass, root,
+		AddToAttributeEquivalenceClass(attributeEquivalenceClass, root,
 									   varToBeAdded);
 	}
+}
+
+
+/*
+ * RangeTableOffsetCompat returns the range table offset(in glob->finalrtable) for the appendRelInfo.
+ * For PG < 13 this is a no op.
+ */
+static int
+RangeTableOffsetCompat(PlannerInfo *root, AppendRelInfo *appendRelInfo)
+{
+	#if PG_VERSION_NUM >= PG_VERSION_13
+	int i = 1;
+	for (; i < root->simple_rel_array_size; i++)
+	{
+		RangeTblEntry *rte = root->simple_rte_array[i];
+		if (rte->inh)
+		{
+			break;
+		}
+	}
+	int indexInRtable = (i - 1);
+	return appendRelInfo->parent_relid - 1 - (indexInRtable);
+	#else
+	return 0;
+	#endif
 }
 
 
@@ -1399,7 +1442,7 @@ AddRteRelationToAttributeEquivalenceClass(AttributeEquivalenceClass **
 	Oid relationId = rangeTableEntry->relid;
 
 	/* we don't consider local tables in the equality on columns */
-	if (!IsDistributedTable(relationId))
+	if (!IsCitusTable(relationId))
 	{
 		return;
 	}
@@ -1462,9 +1505,9 @@ AttributeClassContainsAttributeClassMember(AttributeEquivalenceClassMember *inpu
 
 /*
  * AddAttributeClassToAttributeClassList checks for certain properties of the
- * input attributeEquivalance before adding it to the attributeEquivalenceList.
+ * input attributeEquivalence before adding it to the attributeEquivalenceList.
  *
- * Firstly, the function skips adding NULL attributeEquivalance to the list.
+ * Firstly, the function skips adding NULL attributeEquivalence to the list.
  * Secondly, since an attribute equivalence class with a single member does
  * not contribute to our purposes, we skip such classed adding to the list.
  * Finally, we don't want to add an equivalence class whose exact equivalent
@@ -1472,11 +1515,11 @@ AttributeClassContainsAttributeClassMember(AttributeEquivalenceClassMember *inpu
  */
 static List *
 AddAttributeClassToAttributeClassList(List *attributeEquivalenceList,
-									  AttributeEquivalenceClass *attributeEquivalance)
+									  AttributeEquivalenceClass *attributeEquivalence)
 {
-	ListCell *attributeEquivalanceCell = NULL;
+	ListCell *attributeEquivalenceCell = NULL;
 
-	if (attributeEquivalance == NULL)
+	if (attributeEquivalence == NULL)
 	{
 		return attributeEquivalenceList;
 	}
@@ -1485,46 +1528,46 @@ AddAttributeClassToAttributeClassList(List *attributeEquivalenceList,
 	 * Note that in some cases we allow having equivalentAttributes with zero or
 	 * one elements. For the details, see AddToAttributeEquivalenceClass().
 	 */
-	List *equivalentAttributes = attributeEquivalance->equivalentAttributes;
+	List *equivalentAttributes = attributeEquivalence->equivalentAttributes;
 	if (list_length(equivalentAttributes) < 2)
 	{
 		return attributeEquivalenceList;
 	}
 
-	/* we don't want to add an attributeEquivalance which already exists */
-	foreach(attributeEquivalanceCell, attributeEquivalenceList)
+	/* we don't want to add an attributeEquivalence which already exists */
+	foreach(attributeEquivalenceCell, attributeEquivalenceList)
 	{
-		AttributeEquivalenceClass *currentAttributeEquivalance =
-			(AttributeEquivalenceClass *) lfirst(attributeEquivalanceCell);
+		AttributeEquivalenceClass *currentAttributeEquivalence =
+			(AttributeEquivalenceClass *) lfirst(attributeEquivalenceCell);
 
-		if (AttributeEquivalancesAreEqual(currentAttributeEquivalance,
-										  attributeEquivalance))
+		if (AttributeEquivalencesAreEqual(currentAttributeEquivalence,
+										  attributeEquivalence))
 		{
 			return attributeEquivalenceList;
 		}
 	}
 
 	attributeEquivalenceList = lappend(attributeEquivalenceList,
-									   attributeEquivalance);
+									   attributeEquivalence);
 
 	return attributeEquivalenceList;
 }
 
 
 /*
- *  AttributeEquivalancesAreEqual returns true if both input attribute equivalence
+ *  AttributeEquivalencesAreEqual returns true if both input attribute equivalence
  *  classes contains exactly the same members.
  */
 static bool
-AttributeEquivalancesAreEqual(AttributeEquivalenceClass *firstAttributeEquivalance,
-							  AttributeEquivalenceClass *secondAttributeEquivalance)
+AttributeEquivalencesAreEqual(AttributeEquivalenceClass *firstAttributeEquivalence,
+							  AttributeEquivalenceClass *secondAttributeEquivalence)
 {
 	List *firstEquivalenceMemberList =
-		firstAttributeEquivalance->equivalentAttributes;
+		firstAttributeEquivalence->equivalentAttributes;
 	List *secondEquivalenceMemberList =
-		secondAttributeEquivalance->equivalentAttributes;
-	ListCell *firstAttributeEquivalanceCell = NULL;
-	ListCell *secondAttributeEquivalanceCell = NULL;
+		secondAttributeEquivalence->equivalentAttributes;
+	ListCell *firstAttributeEquivalenceCell = NULL;
+	ListCell *secondAttributeEquivalenceCell = NULL;
 
 	if (list_length(firstEquivalenceMemberList) != list_length(
 			secondEquivalenceMemberList))
@@ -1532,17 +1575,17 @@ AttributeEquivalancesAreEqual(AttributeEquivalenceClass *firstAttributeEquivalan
 		return false;
 	}
 
-	foreach(firstAttributeEquivalanceCell, firstEquivalenceMemberList)
+	foreach(firstAttributeEquivalenceCell, firstEquivalenceMemberList)
 	{
 		AttributeEquivalenceClassMember *firstEqMember =
-			(AttributeEquivalenceClassMember *) lfirst(firstAttributeEquivalanceCell);
+			(AttributeEquivalenceClassMember *) lfirst(firstAttributeEquivalenceCell);
 		bool foundAnEquivalentMember = false;
 
-		foreach(secondAttributeEquivalanceCell, secondEquivalenceMemberList)
+		foreach(secondAttributeEquivalenceCell, secondEquivalenceMemberList)
 		{
 			AttributeEquivalenceClassMember *secondEqMember =
 				(AttributeEquivalenceClassMember *) lfirst(
-					secondAttributeEquivalanceCell);
+					secondAttributeEquivalenceCell);
 
 			if (firstEqMember->rteIdentity == secondEqMember->rteIdentity &&
 				firstEqMember->varattno == secondEqMember->varattno)
@@ -1650,8 +1693,8 @@ RelationRestrictionPartitionKeyIndex(RelationRestriction *relationRestriction)
 		partitionKeyTargetAttrIndex++;
 
 		if (!targetEntry->resjunk &&
-			IsPartitionColumn(targetExpression, relationPlannerParseQuery) &&
-			IsA(targetExpression, Var))
+			IsA(targetExpression, Var) &&
+			IsPartitionColumn(targetExpression, relationPlannerParseQuery))
 		{
 			Var *targetColumn = (Var *) targetExpression;
 
@@ -1681,7 +1724,7 @@ AllRelationsInRestrictionContextColocated(RelationRestrictionContext *restrictio
 	{
 		Oid relationId = relationRestriction->relationId;
 
-		if (PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+		if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
 			continue;
 		}
@@ -1720,7 +1763,7 @@ DistributedRelationIdList(Query *query)
 		TableEntry *tableEntry = (TableEntry *) lfirst(tableEntryCell);
 		Oid relationId = tableEntry->relationId;
 
-		if (!IsDistributedTable(relationId))
+		if (!IsCitusTable(relationId))
 		{
 			continue;
 		}

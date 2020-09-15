@@ -25,10 +25,11 @@ insert into test_am values (1, 1);
 select create_distributed_table('test_am','id');
 
 -- Test generated columns
+-- val1 after val2 to test https://github.com/citusdata/citus/issues/3538
 create table gen1 (
 	id int,
-	val1 int,
-	val2 int GENERATED ALWAYS AS (val1 + 2) STORED
+	val2 int GENERATED ALWAYS AS (val1 + 2) STORED,
+	val1 int
 );
 create table gen2 (
 	id int,
@@ -42,11 +43,17 @@ insert into gen2 (id, val1) values (1,4),(3,6),(5,2),(7,2);
 select create_distributed_table('gen1', 'id');
 select create_distributed_table('gen2', 'val2');
 
+copy gen1 to :'temp_dir''pg12_copy_test_generated';
+
 insert into gen1 (id, val1) values (2,4),(4,6),(6,2),(8,2);
 insert into gen2 (id, val1) values (2,4),(4,6),(6,2),(8,2);
 
 select * from gen1 order by 1,2,3;
 select * from gen2 order by 1,2,3;
+
+truncate gen1;
+copy gen1 from :'temp_dir''pg12_copy_test_generated';
+select * from gen1 order by 1,2,3;
 
 -- Test new VACUUM/ANALYZE options
 analyze (skip_locked) gen1;
@@ -256,7 +263,7 @@ SELECT DISTINCT y FROM test;
 -- non deterministic collations
 CREATE COLLATION test_pg12.case_insensitive (
 	provider = icu,
-	locale = 'und-u-ks-level2',
+	locale = '@colStrength=secondary',
 	deterministic = false
 );
 

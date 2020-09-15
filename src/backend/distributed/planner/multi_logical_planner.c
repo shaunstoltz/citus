@@ -14,6 +14,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/heapam.h"
 #include "access/nbtree.h"
 #include "catalog/pg_am.h"
@@ -27,6 +29,7 @@
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/relation_restriction_equivalence.h"
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/query_utils.h"
@@ -35,7 +38,7 @@
 #include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #else
@@ -67,11 +70,13 @@ typedef MultiNode *(*RuleApplyFunction) (MultiNode *leftNode, MultiNode *rightNo
 										 List *partitionColumnList, JoinType joinType,
 										 List *joinClauses);
 
+typedef bool (*CheckNodeFunc)(Node *);
+
 static RuleApplyFunction RuleApplyFunctionArray[JOIN_RULE_LAST] = { 0 }; /* join rules */
 
 /* Local functions forward declarations */
-static bool AllTargetExpressionsAreColumnReferences(List *targetEntryList);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
+static Oid NodeTryGetRteRelid(Node *node);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
 static bool ErrorHintRequired(const char *errorHint, Query *queryTree);
@@ -79,7 +84,9 @@ static bool HasTablesample(Query *queryTree);
 static bool HasComplexRangeTableType(Query *queryTree);
 static bool IsReadIntermediateResultFunction(Node *node);
 static bool IsReadIntermediateResultArrayFunction(Node *node);
+static bool IsCitusExtraDataContainerFunc(Node *node);
 static bool IsFunctionWithOid(Node *node, Oid funcOid);
+static bool IsGroupingFunc(Node *node);
 static bool ExtractFromExpressionWalker(Node *node,
 										QualifierWalkerContext *walkerContext);
 static List * MultiTableNodeList(List *tableEntryList, List *rangeTableList);
@@ -130,7 +137,7 @@ static MultiNode * ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNo
 /*
  * MultiLogicalPlanCreate takes in both the original query and its corresponding modified
  * query tree yield by the standard planner. It uses helper functions to create logical
- * plan and adds a root node to top of it. The  original query is only used for subquery
+ * plan and adds a root node to top of it. The original query is only used for subquery
  * pushdown planning.
  *
  * We also pass queryTree and plannerRestrictionContext to the planner. They
@@ -164,20 +171,20 @@ MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 
 
 /*
- * FindNodeCheck finds a node for which the check function returns true.
+ * FindNodeMatchingCheckFunction finds a node for which the checker function returns true.
  *
  * To call this function directly with an RTE, use:
- * range_table_walker(rte, FindNodeCheck, check, QTW_EXAMINE_RTES_BEFORE)
+ * range_table_walker(rte, FindNodeMatchingCheckFunction, checker, QTW_EXAMINE_RTES_BEFORE)
  */
 bool
-FindNodeCheck(Node *node, bool (*check)(Node *))
+FindNodeMatchingCheckFunction(Node *node, CheckNodeFunc checker)
 {
 	if (node == NULL)
 	{
 		return false;
 	}
 
-	if (check(node))
+	if (checker(node))
 	{
 		return true;
 	}
@@ -189,71 +196,11 @@ FindNodeCheck(Node *node, bool (*check)(Node *))
 	}
 	else if (IsA(node, Query))
 	{
-		return query_tree_walker((Query *) node, FindNodeCheck, check,
+		return query_tree_walker((Query *) node, FindNodeMatchingCheckFunction, checker,
 								 QTW_EXAMINE_RTES_BEFORE);
 	}
 
-	return expression_tree_walker(node, FindNodeCheck, check);
-}
-
-
-/*
- * SingleRelationRepartitionSubquery returns true if it is eligible single
- * repartition query planning in the sense that:
- *   - None of the levels of the subquery contains a join
- *   - Only a single RTE_RELATION exists, which means only a single table
- *     name is specified on the whole query
- *   - No sublinks exists in the subquery
- *   - No window functions in the subquery
- *
- * Note that the caller should still call DeferErrorIfUnsupportedSubqueryRepartition()
- * to ensure that Citus supports the subquery. Also, this function is designed to run
- * on the original query.
- */
-bool
-SingleRelationRepartitionSubquery(Query *queryTree)
-{
-	List *rangeTableIndexList = NULL;
-	List *rangeTableList = queryTree->rtable;
-
-	/* we don't support subqueries in WHERE */
-	if (queryTree->hasSubLinks)
-	{
-		return false;
-	}
-
-	/* we don't support window functions */
-	if (queryTree->hasWindowFuncs)
-	{
-		return false;
-	}
-
-	/*
-	 * Don't allow joins and set operations. If join appears in the queryTree, the
-	 * length would be greater than 1. If only set operations exists, the length
-	 * would be 0.
-	 */
-	ExtractRangeTableIndexWalker((Node *) queryTree->jointree,
-								 &rangeTableIndexList);
-	if (list_length(rangeTableIndexList) != 1)
-	{
-		return false;
-	}
-
-	int rangeTableIndex = linitial_int(rangeTableIndexList);
-	RangeTblEntry *rangeTableEntry = rt_fetch(rangeTableIndex, rangeTableList);
-	if (rangeTableEntry->rtekind == RTE_RELATION)
-	{
-		return true;
-	}
-	else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
-	{
-		Query *subqueryTree = rangeTableEntry->subquery;
-
-		return SingleRelationRepartitionSubquery(subqueryTree);
-	}
-
-	return false;
+	return expression_tree_walker(node, FindNodeMatchingCheckFunction, checker);
 }
 
 
@@ -280,11 +227,10 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 		FindReferencedTableColumn(targetExpression, NIL, query, &relationId, &column);
 
 		/*
-		 * If the expression belongs to a reference table continue searching for
+		 * If the expression belongs to a non-distributed table continue searching for
 		 * other partition keys.
 		 */
-		if (IsDistributedTable(relationId) && PartitionMethod(relationId) ==
-			DISTRIBUTE_BY_NONE)
+		if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
 			continue;
 		}
@@ -317,13 +263,12 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 
 	/*
 	 * We could still behave as if the target list is on partition column if
-	 * all range table entries are reference tables or intermediate results,
-	 * and all target expressions are column references to the given query level.
+	 * range table entries don't contain a distributed table.
 	 */
 	if (!targetListOnPartitionColumn)
 	{
-		if (!FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE) &&
-			AllTargetExpressionsAreColumnReferences(targetEntryList))
+		if (!FindNodeMatchingCheckFunctionInRangeTableList(query->rtable,
+														   IsDistributedTableRTE))
 		{
 			targetListOnPartitionColumn = true;
 		}
@@ -334,115 +279,107 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 
 
 /*
- * AllTargetExpressionsAreColumnReferences returns true if non of the
- * elements in the target entry list belong to an outer query (for
- * example the query is a sublink and references to another query
- * in the from list).
- *
- * The function also returns true if any of the  target entries is not
- * a column itself. This might be too restrictive, but, given that we're
- * handling a very specific type of queries, that seems acceptable for now.
- */
-static bool
-AllTargetExpressionsAreColumnReferences(List *targetEntryList)
-{
-	ListCell *targetEntryCell = NULL;
-
-	foreach(targetEntryCell, targetEntryList)
-	{
-		TargetEntry *targetEntry = lfirst(targetEntryCell);
-		Var *candidateColumn = NULL;
-		Expr *strippedColumnExpression = (Expr *) strip_implicit_coercions(
-			(Node *) targetEntry->expr);
-
-		if (IsA(strippedColumnExpression, Var))
-		{
-			candidateColumn = (Var *) strippedColumnExpression;
-		}
-		else if (IsA(strippedColumnExpression, FieldSelect))
-		{
-			FieldSelect *compositeField = (FieldSelect *) strippedColumnExpression;
-			Expr *fieldExpression = compositeField->arg;
-
-			if (IsA(fieldExpression, Var))
-			{
-				candidateColumn = (Var *) fieldExpression;
-			}
-		}
-
-		/* we don't support target entries that are not columns */
-		if (candidateColumn == NULL)
-		{
-			return false;
-		}
-
-		if (candidateColumn->varlevelsup > 0)
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
-
-/*
- * FindNodeCheckInRangeTableList finds a node for which the check
+ * FindNodeMatchingCheckFunctionInRangeTableList finds a node for which the checker
  * function returns true.
  *
- * FindNodeCheckInRangeTableList relies on FindNodeCheck() but only
- * considers the range table entries.
+ * FindNodeMatchingCheckFunctionInRangeTableList relies on
+ * FindNodeMatchingCheckFunction() but only considers the range table entries.
  */
 bool
-FindNodeCheckInRangeTableList(List *rtable, bool (*check)(Node *))
+FindNodeMatchingCheckFunctionInRangeTableList(List *rtable, CheckNodeFunc checker)
 {
-	return range_table_walker(rtable, FindNodeCheck, check, QTW_EXAMINE_RTES_BEFORE);
+	return range_table_walker(rtable, FindNodeMatchingCheckFunction, checker,
+							  QTW_EXAMINE_RTES_BEFORE);
 }
 
 
 /*
- * QueryContainsDistributedTableRTE determines whether the given
- * query contains a distributed table.
+ * NodeTryGetRteRelid returns the relid of the given RTE_RELATION RangeTableEntry.
+ * Returns InvalidOid if any of these assumptions fail for given node.
+ */
+static Oid
+NodeTryGetRteRelid(Node *node)
+{
+	if (node == NULL)
+	{
+		return InvalidOid;
+	}
+
+	if (!IsA(node, RangeTblEntry))
+	{
+		return InvalidOid;
+	}
+
+	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
+
+	if (!(rangeTableEntry->rtekind == RTE_RELATION &&
+		  rangeTableEntry->relkind == RELKIND_RELATION))
+	{
+		return InvalidOid;
+	}
+
+	return rangeTableEntry->relid;
+}
+
+
+/*
+ * IsCitusTableRTE gets a node and returns true if the node is a
+ * range table relation entry that points to a distributed relation.
  */
 bool
-QueryContainsDistributedTableRTE(Query *query)
+IsCitusTableRTE(Node *node)
 {
-	return FindNodeCheck((Node *) query, IsDistributedTableRTE);
+	Oid relationId = NodeTryGetRteRelid(node);
+	return relationId != InvalidOid && IsCitusTable(relationId);
+}
+
+
+/*
+ * IsPostgresLocalTableRte gets a node and returns true if the node is a
+ * range table relation entry that points to a postgres local table.
+ */
+bool
+IsPostgresLocalTableRte(Node *node)
+{
+	Oid relationId = NodeTryGetRteRelid(node);
+	return OidIsValid(relationId) && !IsCitusTable(relationId);
 }
 
 
 /*
  * IsDistributedTableRTE gets a node and returns true if the node
- * is a range table relation entry that points to a distributed
- * relation (i.e., excluding reference tables).
+ * is a range table relation entry that points to a distributed relation,
+ * returning false still if the relation is a reference table.
  */
 bool
 IsDistributedTableRTE(Node *node)
 {
-	if (node == NULL)
-	{
-		return false;
-	}
+	Oid relationId = NodeTryGetRteRelid(node);
+	return relationId != InvalidOid && IsCitusTableType(relationId, DISTRIBUTED_TABLE);
+}
 
-	if (!IsA(node, RangeTblEntry))
-	{
-		return false;
-	}
 
-	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
-	if (rangeTableEntry->rtekind != RTE_RELATION)
-	{
-		return false;
-	}
+/*
+ * IsReferenceTableRTE gets a node and returns true if the node
+ * is a range table relation entry that points to a reference table.
+ */
+bool
+IsReferenceTableRTE(Node *node)
+{
+	Oid relationId = NodeTryGetRteRelid(node);
+	return relationId != InvalidOid && IsCitusTableType(relationId, REFERENCE_TABLE);
+}
 
-	Oid relationId = rangeTableEntry->relid;
-	if (!IsDistributedTable(relationId) ||
-		PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
-	{
-		return false;
-	}
 
-	return true;
+/*
+ * IsCitusLocalTableRTE gets a node and returns true if the node
+ * is a range table relation entry that points to a citus local table.
+ */
+bool
+IsCitusLocalTableRTE(Node *node)
+{
+	Oid relationId = NodeTryGetRteRelid(node);
+	return OidIsValid(relationId) && IsCitusTableType(relationId, CITUS_LOCAL_TABLE);
 }
 
 
@@ -758,7 +695,7 @@ MultiNodeTree(Query *queryTree)
 	 * distinguish between aggregates and expressions; and we address this later
 	 * in the logical optimizer.
 	 */
-	MultiExtendedOp *extendedOpNode = MultiExtendedOpNode(queryTree);
+	MultiExtendedOp *extendedOpNode = MultiExtendedOpNode(queryTree, queryTree);
 	SetChild((MultiUnaryNode *) extendedOpNode, currentTopNode);
 	currentTopNode = (MultiNode *) extendedOpNode;
 
@@ -773,7 +710,7 @@ MultiNodeTree(Query *queryTree)
 bool
 ContainsReadIntermediateResultFunction(Node *node)
 {
-	return FindNodeCheck(node, IsReadIntermediateResultFunction);
+	return FindNodeMatchingCheckFunction(node, IsReadIntermediateResultFunction);
 }
 
 
@@ -785,7 +722,7 @@ ContainsReadIntermediateResultFunction(Node *node)
 bool
 ContainsReadIntermediateResultArrayFunction(Node *node)
 {
-	return FindNodeCheck(node, IsReadIntermediateResultArrayFunction);
+	return FindNodeMatchingCheckFunction(node, IsReadIntermediateResultArrayFunction);
 }
 
 
@@ -812,6 +749,40 @@ IsReadIntermediateResultArrayFunction(Node *node)
 
 
 /*
+ * IsCitusExtraDataContainerRelation determines whether a range table entry contains a
+ * call to the citus_extradata_container function.
+ */
+bool
+IsCitusExtraDataContainerRelation(RangeTblEntry *rte)
+{
+	if (rte->rtekind != RTE_FUNCTION || list_length(rte->functions) != 1)
+	{
+		/* avoid more expensive checks below for non-functions */
+		return false;
+	}
+
+	if (!CitusHasBeenLoaded() || !CheckCitusVersion(DEBUG5))
+	{
+		return false;
+	}
+
+	return FindNodeMatchingCheckFunction((Node *) rte->functions,
+										 IsCitusExtraDataContainerFunc);
+}
+
+
+/*
+ * IsCitusExtraDataContainerFunc determines whether a given node is a function call
+ * to the citus_extradata_container function.
+ */
+static bool
+IsCitusExtraDataContainerFunc(Node *node)
+{
+	return IsFunctionWithOid(node, CitusExtraDataContainerFuncId());
+}
+
+
+/*
  * IsFunctionWithOid determines whether a given node is a function call
  * to the read_intermediate_result function.
  */
@@ -829,6 +800,16 @@ IsFunctionWithOid(Node *node, Oid funcOid)
 	}
 
 	return false;
+}
+
+
+/*
+ * IsGroupingFunc returns whether node is a GroupingFunc.
+ */
+static bool
+IsGroupingFunc(Node *node)
+{
+	return IsA(node, GroupingFunc);
 }
 
 
@@ -871,7 +852,6 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 {
 	char *errorMessage = NULL;
 	bool preconditionsSatisfied = true;
-	StringInfo errorInfo = NULL;
 	const char *errorHint = NULL;
 	const char *joinHint = "Consider joining tables on partition column and have "
 						   "equal filter on joining columns.";
@@ -888,18 +868,6 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorMessage = "could not run distributed query with subquery outside the "
 					   "FROM, WHERE and HAVING clauses";
 		errorHint = filterHint;
-	}
-
-	if (queryTree->hasWindowFuncs &&
-		!SafeToPushdownWindowFunction(queryTree, &errorInfo))
-	{
-		preconditionsSatisfied = false;
-		errorMessage = "could not run distributed query because the window "
-					   "function that is used cannot be pushed down";
-		errorHint = "Window functions are supported in two ways. Either add "
-					"an equality filter on the distributed tables' partition "
-					"column or use the window functions with a PARTITION BY "
-					"clause containing the distribution column";
 	}
 
 	if (queryTree->setOperations)
@@ -939,6 +907,13 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorHint = filterHint;
 	}
 
+	if (FindNodeMatchingCheckFunction((Node *) queryTree, IsGroupingFunc))
+	{
+		preconditionsSatisfied = false;
+		errorMessage = "could not run distributed query with GROUPING";
+		errorHint = filterHint;
+	}
+
 	bool hasTablesample = HasTablesample(queryTree);
 	if (hasTablesample)
 	{
@@ -965,6 +940,27 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorHint = filterHint;
 	}
 
+	if (FindNodeMatchingCheckFunction((Node *) queryTree->limitCount, IsNodeSubquery))
+	{
+		preconditionsSatisfied = false;
+		errorMessage = "subquery in LIMIT is not supported in multi-shard queries";
+	}
+
+	if (FindNodeMatchingCheckFunction((Node *) queryTree->limitOffset, IsNodeSubquery))
+	{
+		preconditionsSatisfied = false;
+		errorMessage = "subquery in OFFSET is not supported in multi-shard queries";
+	}
+
+	RTEListProperties *queryRteListProperties = GetRTEListPropertiesForQuery(queryTree);
+	if (queryRteListProperties->hasCitusLocalTable ||
+		queryRteListProperties->hasPostgresLocalTable)
+	{
+		preconditionsSatisfied = false;
+		errorMessage = "direct joins between distributed and local tables are "
+					   "not supported";
+		errorHint = LOCAL_TABLE_SUBQUERY_CTE_HINT;
+	}
 
 	/* finally check and error out if not satisfied */
 	if (!preconditionsSatisfied)
@@ -1060,12 +1056,11 @@ ErrorHintRequired(const char *errorHint, Query *queryTree)
 	foreach(relationIdCell, distributedRelationIdList)
 	{
 		Oid relationId = lfirst_oid(relationIdCell);
-		char partitionMethod = PartitionMethod(relationId);
-		if (partitionMethod == DISTRIBUTE_BY_NONE)
+		if (IsCitusTableType(relationId, REFERENCE_TABLE))
 		{
 			continue;
 		}
-		else if (partitionMethod == DISTRIBUTE_BY_HASH)
+		else if (IsCitusTableType(relationId, HASH_DISTRIBUTED))
 		{
 			int colocationId = TableColocationId(relationId);
 			colocationIdList = list_append_unique_int(colocationIdList, colocationId);
@@ -1087,7 +1082,7 @@ ErrorHintRequired(const char *errorHint, Query *queryTree)
 
 
 /*
- * DeferErrorIfSubqueryNotSupported checks that we can perform distributed planning for
+ * DeferErrorIfUnsupportedSubqueryRepartition checks that we can perform distributed planning for
  * the given subquery. If not, a deferred error is returned. The function recursively
  * does this check to all lower levels of the subquery.
  */
@@ -1774,7 +1769,7 @@ MultiProjectNode(List *targetEntryList)
 
 /* Builds the extended operator node using fields from the given query tree. */
 MultiExtendedOp *
-MultiExtendedOpNode(Query *queryTree)
+MultiExtendedOpNode(Query *queryTree, Query *originalQuery)
 {
 	MultiExtendedOp *extendedOpNode = CitusMakeNode(MultiExtendedOp);
 	extendedOpNode->targetList = queryTree->targetList;
@@ -1787,6 +1782,9 @@ MultiExtendedOpNode(Query *queryTree)
 	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;
 	extendedOpNode->hasWindowFuncs = queryTree->hasWindowFuncs;
 	extendedOpNode->windowClause = queryTree->windowClause;
+	extendedOpNode->onlyPushableWindowFunctions =
+		!queryTree->hasWindowFuncs ||
+		SafeToPushdownWindowFunction(originalQuery, NULL);
 
 	return extendedOpNode;
 }

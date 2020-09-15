@@ -21,6 +21,7 @@
 #include "distributed/backend_data.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
+#include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
@@ -90,23 +91,21 @@ WaitGraph *
 BuildGlobalWaitGraph(void)
 {
 	List *workerNodeList = ActiveReadableNodeList();
-	ListCell *workerNodeCell = NULL;
 	char *nodeUser = CitusExtensionOwnerName();
 	List *connectionList = NIL;
-	ListCell *connectionCell = NULL;
-	int localNodeId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 
 	WaitGraph *waitGraph = BuildLocalWaitGraph();
 
 	/* open connections in parallel */
-	foreach(workerNodeCell, workerNodeList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-		char *nodeName = workerNode->workerName;
+		const char *nodeName = workerNode->workerName;
 		int nodePort = workerNode->workerPort;
 		int connectionFlags = 0;
 
-		if (workerNode->groupId == localNodeId)
+		if (workerNode->groupId == localGroupId)
 		{
 			/* we already have local wait edges */
 			continue;
@@ -122,9 +121,9 @@ BuildGlobalWaitGraph(void)
 	FinishConnectionListEstablishment(connectionList);
 
 	/* send commands in parallel */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		const char *command = "SELECT * FROM dump_local_wait_edges()";
 
 		int querySent = SendRemoteCommand(connection, command);
@@ -135,9 +134,8 @@ BuildGlobalWaitGraph(void)
 	}
 
 	/* receive dump_local_wait_edges results */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		bool raiseInterrupts = true;
 
 		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
@@ -450,7 +448,7 @@ BuildLocalWaitGraph(void)
  * In general for the purpose of distributed deadlock detection, we should
  * skip if the process blocked on the locks that may not be part of deadlocks.
  * Those locks are held for a short duration while the relation or the index
- * is actually  extended on the disk and released as soon as the extension is
+ * is actually extended on the disk and released as soon as the extension is
  * done, even before the execution of the command that triggered the extension
  * finishes. Thus, recording such waits on our lock graphs could yield detecting
  * wrong distributed deadlocks.

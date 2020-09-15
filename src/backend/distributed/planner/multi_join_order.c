@@ -12,6 +12,9 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include <limits.h>
 
 #include "access/nbtree.h"
@@ -25,7 +28,7 @@
 #include "distributed/pg_dist_partition.h"
 #include "distributed/worker_protocol.h"
 #include "lib/stringinfo.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "optimizer/optimizer.h"
 #else
 #include "optimizer/var.h"
@@ -820,12 +823,12 @@ ReferenceJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 		return NULL;
 	}
 
-	char candidatePartitionMethod = PartitionMethod(candidateTable->relationId);
-	char leftPartitionMethod = PartitionMethod(currentJoinNode->tableEntry->relationId);
-
-	if (!IsSupportedReferenceJoin(joinType,
-								  leftPartitionMethod == DISTRIBUTE_BY_NONE,
-								  candidatePartitionMethod == DISTRIBUTE_BY_NONE))
+	bool leftIsReferenceTable = IsCitusTableType(
+		currentJoinNode->tableEntry->relationId,
+		REFERENCE_TABLE);
+	bool rightIsReferenceTable = IsCitusTableType(candidateTable->relationId,
+												  REFERENCE_TABLE);
+	if (!IsSupportedReferenceJoin(joinType, leftIsReferenceTable, rightIsReferenceTable))
 	{
 		return NULL;
 	}
@@ -871,12 +874,13 @@ static JoinOrderNode *
 CartesianProductReferenceJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 							  List *applicableJoinClauses, JoinType joinType)
 {
-	char candidatePartitionMethod = PartitionMethod(candidateTable->relationId);
-	char leftPartitionMethod = PartitionMethod(currentJoinNode->tableEntry->relationId);
+	bool leftIsReferenceTable = IsCitusTableType(
+		currentJoinNode->tableEntry->relationId,
+		REFERENCE_TABLE);
+	bool rightIsReferenceTable = IsCitusTableType(candidateTable->relationId,
+												  REFERENCE_TABLE);
 
-	if (!IsSupportedReferenceJoin(joinType,
-								  leftPartitionMethod == DISTRIBUTE_BY_NONE,
-								  candidatePartitionMethod == DISTRIBUTE_BY_NONE))
+	if (!IsSupportedReferenceJoin(joinType, leftIsReferenceTable, rightIsReferenceTable))
 	{
 		return NULL;
 	}
@@ -1362,7 +1366,7 @@ PartitionColumn(Oid relationId, uint32 rangeTableId)
 
 	partitionColumn = partitionKey;
 	partitionColumn->varno = rangeTableId;
-	partitionColumn->varnoold = rangeTableId;
+	partitionColumn->varnosyn = rangeTableId;
 
 	return partitionColumn;
 }
@@ -1380,10 +1384,10 @@ PartitionColumn(Oid relationId, uint32 rangeTableId)
 Var *
 DistPartitionKey(Oid relationId)
 {
-	DistTableCacheEntry *partitionEntry = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *partitionEntry = GetCitusTableCacheEntry(relationId);
 
-	/* reference tables do not have partition column */
-	if (partitionEntry->partitionMethod == DISTRIBUTE_BY_NONE)
+	/* non-distributed tables do not have partition column */
+	if (IsCitusTableTypeCacheEntry(partitionEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		return NULL;
 	}
@@ -1392,12 +1396,32 @@ DistPartitionKey(Oid relationId)
 }
 
 
+/*
+ * DistPartitionKeyOrError is the same as DistPartitionKey but errors out instead
+ * of returning NULL if this is called with a relationId of a reference table.
+ */
+Var *
+DistPartitionKeyOrError(Oid relationId)
+{
+	Var *partitionKey = DistPartitionKey(relationId);
+
+	if (partitionKey == NULL)
+	{
+		ereport(ERROR, (errmsg(
+							"no distribution column found for relation %d, because it is a reference table",
+							relationId)));
+	}
+
+	return partitionKey;
+}
+
+
 /* Returns the partition method for the given relation. */
 char
 PartitionMethod(Oid relationId)
 {
 	/* errors out if not a distributed table */
-	DistTableCacheEntry *partitionEntry = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *partitionEntry = GetCitusTableCacheEntry(relationId);
 
 	char partitionMethod = partitionEntry->partitionMethod;
 
@@ -1410,7 +1434,7 @@ char
 TableReplicationModel(Oid relationId)
 {
 	/* errors out if not a distributed table */
-	DistTableCacheEntry *partitionEntry = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *partitionEntry = GetCitusTableCacheEntry(relationId);
 
 	char replicationModel = partitionEntry->replicationModel;
 

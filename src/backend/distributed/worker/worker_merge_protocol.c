@@ -14,10 +14,13 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "funcapi.h"
 #include "miscadmin.h"
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
 #include "access/table.h"
 #endif
@@ -31,8 +34,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
-#include "distributed/task_tracker_protocol.h"
-#include "distributed/task_tracker.h"
+
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
@@ -51,6 +53,7 @@ static void CreateTaskTable(StringInfo schemaName, StringInfo relationName,
 							List *columnNameList, List *columnTypeList);
 static void CopyTaskFilesFromDirectory(StringInfo schemaName, StringInfo relationName,
 									   StringInfo sourceDirectoryName, Oid userId);
+static void CreateJobSchema(StringInfo schemaName, char *schemaOwner);
 
 
 /* exports for SQL callable functions */
@@ -86,6 +89,58 @@ worker_create_schema(PG_FUNCTION_ARGS)
 
 
 /*
+ * CreateJobSchema creates a job schema with the given schema name. Note that
+ * this function ensures that our pg_ prefixed schema names can be created.
+ * Further note that the created schema does not become visible to other
+ * processes until the transaction commits.
+ *
+ * If schemaOwner is NULL, then current user is used.
+ */
+static void
+CreateJobSchema(StringInfo schemaName, char *schemaOwner)
+{
+	const char *queryString = NULL;
+
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
+	RoleSpec currentUserRole = { 0 };
+
+	/* allow schema names that start with pg_ */
+	bool oldAllowSystemTableMods = allowSystemTableMods;
+	allowSystemTableMods = true;
+
+	/* ensure we're allowed to create this schema */
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
+
+	if (schemaOwner == NULL)
+	{
+		schemaOwner = GetUserNameFromId(savedUserId, false);
+	}
+
+	/* build a CREATE SCHEMA statement */
+	currentUserRole.type = T_RoleSpec;
+	currentUserRole.roletype = ROLESPEC_CSTRING;
+	currentUserRole.rolename = schemaOwner;
+	currentUserRole.location = -1;
+
+	CreateSchemaStmt *createSchemaStmt = makeNode(CreateSchemaStmt);
+	createSchemaStmt->schemaname = schemaName->data;
+	createSchemaStmt->schemaElts = NIL;
+
+	/* actually create schema with the current user as owner */
+	createSchemaStmt->authrole = &currentUserRole;
+	CreateSchemaCommand(createSchemaStmt, queryString, -1, -1);
+
+	CommandCounterIncrement();
+
+	/* and reset environment */
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+	allowSystemTableMods = oldAllowSystemTableMods;
+}
+
+
+/*
  * worker_repartition_cleanup removes the job directory and schema with the given job id .
  */
 Datum
@@ -108,7 +163,7 @@ worker_repartition_cleanup(PG_FUNCTION_ARGS)
 
 /*
  * worker_merge_files_into_table creates a task table within the job's schema,
- * which should have already been created by the task tracker protocol, and
+ * which should have already been created by repartition join execution, and
  * copies files in its task directory into this table. If the schema doesn't
  * exist, the function defaults to the 'public' schema. Note that, unlike
  * partitioning functions, this function is not always idempotent. On success,
@@ -145,8 +200,8 @@ worker_merge_files_into_table(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * If the schema for the job isn't already created by the task tracker
-	 * protocol, we fall to using the default 'public' schema.
+	 * If the schema for the job isn't already created by the repartition join
+	 * execution, we fall to using the default 'public' schema.
 	 */
 	bool schemaExists = JobSchemaExists(jobSchemaName);
 	if (!schemaExists)
@@ -190,106 +245,11 @@ worker_merge_files_into_table(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * worker_merge_files_and_run_query creates a merge task table within the job's
- * schema, which should have already been created by the task tracker protocol.
- * It copies files in its task directory into this table. Then it runs final
- * query to create result table of the job.
- *
- * Note that here we followed a different approach to create a task table for merge
- * files than worker_merge_files_into_table(). In future we should unify these
- * two approaches. For this purpose creating a directory_fdw extension and using
- * it would make sense. Then we can merge files with a query or without query
- * through directory_fdw.
- */
+/* This UDF is deprecated.*/
 Datum
 worker_merge_files_and_run_query(PG_FUNCTION_ARGS)
 {
-	uint64 jobId = PG_GETARG_INT64(0);
-	uint32 taskId = PG_GETARG_UINT32(1);
-	text *createMergeTableQueryText = PG_GETARG_TEXT_P(2);
-	text *createIntermediateTableQueryText = PG_GETARG_TEXT_P(3);
-
-	const char *createMergeTableQuery = text_to_cstring(createMergeTableQueryText);
-	const char *createIntermediateTableQuery =
-		text_to_cstring(createIntermediateTableQueryText);
-
-	StringInfo taskDirectoryName = TaskDirectoryName(jobId, taskId);
-	StringInfo jobSchemaName = JobSchemaName(jobId);
-	StringInfo intermediateTableName = TaskTableName(taskId);
-	StringInfo mergeTableName = makeStringInfo();
-	StringInfo setSearchPathString = makeStringInfo();
-	Oid savedUserId = InvalidOid;
-	int savedSecurityContext = 0;
-	Oid userId = GetUserId();
-
-	CheckCitusVersion(ERROR);
-
-	/*
-	 * If the schema for the job isn't already created by the task tracker
-	 * protocol, we fall to using the default 'public' schema.
-	 */
-	bool schemaExists = JobSchemaExists(jobSchemaName);
-	if (!schemaExists)
-	{
-		resetStringInfo(jobSchemaName);
-		appendStringInfoString(jobSchemaName, "public");
-	}
-	else
-	{
-		Oid schemaId = get_namespace_oid(jobSchemaName->data, false);
-
-		EnsureSchemaOwner(schemaId);
-	}
-
-	appendStringInfo(setSearchPathString, SET_SEARCH_PATH_COMMAND, jobSchemaName->data);
-
-	/* Add "public" to search path to access UDFs in public schema */
-	appendStringInfo(setSearchPathString, ",public");
-
-	int connected = SPI_connect();
-	if (connected != SPI_OK_CONNECT)
-	{
-		ereport(ERROR, (errmsg("could not connect to SPI manager")));
-	}
-
-	int setSearchPathResult = SPI_exec(setSearchPathString->data, 0);
-	if (setSearchPathResult < 0)
-	{
-		ereport(ERROR, (errmsg("execution was not successful \"%s\"",
-							   setSearchPathString->data)));
-	}
-
-	int createMergeTableResult = SPI_exec(createMergeTableQuery, 0);
-	if (createMergeTableResult < 0)
-	{
-		ereport(ERROR, (errmsg("execution was not successful \"%s\"",
-							   createMergeTableQuery)));
-	}
-
-	/* need superuser to copy from files */
-	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
-	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
-
-	appendStringInfo(mergeTableName, "%s%s", intermediateTableName->data,
-					 MERGE_TABLE_SUFFIX);
-	CopyTaskFilesFromDirectory(jobSchemaName, mergeTableName, taskDirectoryName,
-							   userId);
-
-	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
-
-	int createIntermediateTableResult = SPI_exec(createIntermediateTableQuery, 0);
-	if (createIntermediateTableResult < 0)
-	{
-		ereport(ERROR, (errmsg("execution was not successful \"%s\"",
-							   createIntermediateTableQuery)));
-	}
-
-	int finished = SPI_finish();
-	if (finished != SPI_OK_FINISH)
-	{
-		ereport(ERROR, (errmsg("could not disconnect from SPI manager")));
-	}
+	ereport(ERROR, (errmsg("This UDF is deprecated.")));
 
 	PG_RETURN_VOID();
 }
@@ -307,7 +267,7 @@ Datum
 worker_cleanup_job_schema_cache(PG_FUNCTION_ARGS)
 {
 	Relation pgNamespace = NULL;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	TableScanDesc scanDescriptor = NULL;
 #else
 	HeapScanDesc scanDescriptor = NULL;
@@ -318,8 +278,8 @@ worker_cleanup_job_schema_cache(PG_FUNCTION_ARGS)
 
 	CheckCitusVersion(ERROR);
 
-	pgNamespace = heap_open(NamespaceRelationId, AccessExclusiveLock);
-#if PG_VERSION_NUM >= 120000
+	pgNamespace = table_open(NamespaceRelationId, AccessExclusiveLock);
+#if PG_VERSION_NUM >= PG_VERSION_12
 	scanDescriptor = table_beginscan_catalog(pgNamespace, scanKeyCount, scanKey);
 #else
 	scanDescriptor = heap_beginscan_catalog(pgNamespace, scanKeyCount, scanKey);
@@ -344,7 +304,7 @@ worker_cleanup_job_schema_cache(PG_FUNCTION_ARGS)
 	}
 
 	heap_endscan(scanDescriptor);
-	heap_close(pgNamespace, AccessExclusiveLock);
+	table_close(pgNamespace, AccessExclusiveLock);
 
 	PG_RETURN_VOID();
 }
@@ -464,12 +424,11 @@ CreateTaskTable(StringInfo schemaName, StringInfo relationName,
 	Assert(schemaName != NULL);
 	Assert(relationName != NULL);
 
-	/*
-	 * This new relation doesn't log to WAL, as the table creation and data copy
-	 * statements occur in the same transaction. Still, we want to make the
-	 * relation unlogged once we upgrade to PostgreSQL 9.1.
-	 */
 	RangeVar *relation = makeRangeVar(schemaName->data, relationName->data, -1);
+
+	/* this table will only exist for the duration of the query, avoid writing to WAL */
+	relation->relpersistence = RELPERSISTENCE_UNLOGGED;
+
 	List *columnDefinitionList = ColumnDefinitionList(columnNameList, columnTypeList);
 
 	CreateStmt *createStatement = CreateStatement(relation, columnDefinitionList);

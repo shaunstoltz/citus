@@ -15,6 +15,7 @@
 #include "catalog/namespace.h"
 #include "commands/defrem.h"
 #include "distributed/commands.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "nodes/parsenodes.h"
 
@@ -34,7 +35,7 @@ ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt)
 	/* create is easy: just prohibit any distributed OWNED BY */
 	if (OptionsSpecifyOwnedBy(createSeqStmt->options, &ownedByTableId))
 	{
-		if (IsDistributedTable(ownedByTableId))
+		if (IsCitusTable(ownedByTableId))
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cannot create sequences that specify a distributed "
@@ -78,7 +79,7 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 	/* see whether the sequence is already owned by a distributed table */
 	if (sequenceOwned)
 	{
-		hasDistributedOwner = IsDistributedTable(ownedByTableId);
+		hasDistributedOwner = IsCitusTable(ownedByTableId);
 	}
 
 	if (OptionsSpecifyOwnedBy(alterSeqStmt->options, &newOwnedByTableId))
@@ -90,7 +91,7 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 							errmsg("cannot alter OWNED BY option of a sequence "
 								   "already owned by a distributed table")));
 		}
-		else if (!hasDistributedOwner && IsDistributedTable(newOwnedByTableId))
+		else if (!hasDistributedOwner && IsCitusTable(newOwnedByTableId))
 		{
 			/* and don't let local sequences get a distributed OWNED BY */
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -113,11 +114,9 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 static bool
 OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId)
 {
-	ListCell *optionCell = NULL;
-
-	foreach(optionCell, optionList)
+	DefElem *defElem = NULL;
+	foreach_ptr(defElem, optionList)
 	{
-		DefElem *defElem = (DefElem *) lfirst(optionCell);
 		if (strcmp(defElem->defname, "owned_by") == 0)
 		{
 			List *ownedByNames = defGetQualifiedName(defElem);

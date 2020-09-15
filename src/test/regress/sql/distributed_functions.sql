@@ -9,6 +9,29 @@ CREATE SCHEMA function_tests2 AUTHORIZATION functionuser;
 SET search_path TO function_tests;
 SET citus.shard_count TO 4;
 
+-- test notice
+CREATE TABLE notices (
+    id int primary key,
+    message text
+);
+SELECT create_distributed_table('notices', 'id');
+INSERT INTO notices VALUES (1, 'hello world');
+
+CREATE FUNCTION notice(text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE '%', $1;
+END;
+$$;
+SELECT create_distributed_function('notice(text)');
+SELECT notice(message) FROM notices WHERE id = 1;
+
+-- should not see a NOTICE if worker_min_messages is WARNING
+SET citus.worker_min_messages TO WARNING;
+SELECT notice(message) FROM notices WHERE id = 1;
+RESET citus.worker_min_messages;
+
 -- Create and distribute a simple function
 CREATE FUNCTION eq(macaddr, macaddr) RETURNS bool
     AS 'select $1 = $2;'
@@ -358,7 +381,7 @@ SET citus.replication_model TO "statement";
 SELECT create_distributed_table('replicated_table_func_test', 'a');
 SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', '$1', colocate_with:='replicated_table_func_test');
 
-SELECT public.wait_until_metadata_sync();
+SELECT public.wait_until_metadata_sync(30000);
 
 -- a function can be colocated with a different distribution argument type
 -- as long as there is a coercion path
@@ -373,10 +396,6 @@ SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', colo
 
 -- a function cannot be colocated with a local table
 CREATE TABLE replicated_table_func_test_3 (a macaddr8);
-SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', 'val1', colocate_with:='replicated_table_func_test_3');
-
--- a function cannot be colocated with a reference table
-SELECT create_reference_table('replicated_table_func_test_3');
 SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', 'val1', colocate_with:='replicated_table_func_test_3');
 
 -- finally, colocate the function with a distributed table
@@ -399,6 +418,13 @@ SELECT pg_dist_partition.colocationid = objects.colocationid as table_and_functi
 FROM pg_dist_partition, citus.pg_dist_object as objects
 WHERE pg_dist_partition.logicalrelid = 'replicated_table_func_test_4'::regclass AND
 	  objects.objid = 'eq_with_param_names(macaddr, macaddr)'::regprocedure;
+
+-- a function cannot be colocated with a reference table when a distribution column is provided
+SELECT create_reference_table('replicated_table_func_test_3');
+SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', 'val1', colocate_with:='replicated_table_func_test_3');
+
+-- a function can be colocated with a reference table when the distribution argument is omitted
+SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', colocate_with:='replicated_table_func_test_3');
 
 -- function with a macaddr8 dist. arg can be colocated with macaddr
 -- column of a distributed table. In general, if there is a coercion
@@ -426,7 +452,7 @@ SET citus.shard_count TO 55;
 SELECT create_distributed_function('eq_with_param_names(macaddr, macaddr)', 'val1');
 
 -- sync metadata to workers for consistent results when clearing objects
-SELECT public.wait_until_metadata_sync();
+SELECT public.wait_until_metadata_sync(30000);
 
 
 SET citus.shard_replication_factor TO 1;

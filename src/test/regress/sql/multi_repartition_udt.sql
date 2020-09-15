@@ -3,6 +3,7 @@
 --
 
 SET citus.next_shard_id TO 535000;
+SET citus.enable_repartition_joins to ON;
 
 -- START type creation
 
@@ -65,7 +66,7 @@ CREATE TABLE repartition_udt_other (
 -- proceed with type creation as above; thus the OIDs will be different.
 -- so that the OID is off.
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 
 -- START type creation
 -- ... as well as a function to use as its comparator...
@@ -109,7 +110,7 @@ FUNCTION 1 test_udt_hash(test_udt);
 
 -- END type creation
 
-\c - - - :worker_2_port
+\c - - :public_worker_2_host :worker_2_port
 
 -- START type creation
 -- ... as well as a function to use as its comparator...
@@ -155,11 +156,12 @@ FUNCTION 1 test_udt_hash(test_udt);
 
 -- Connect to master
 
-\c - - - :master_port
+\c - - :master_host :master_port
 
 -- Distribute and populate the two tables.
 SET citus.shard_count TO 3;
 SET citus.shard_replication_factor TO 1;
+SET citus.enable_repartition_joins to ON;
 SELECT create_distributed_table('repartition_udt', 'pk', 'hash');
 SET citus.shard_count TO 5;
 SELECT create_distributed_table('repartition_udt_other', 'pk', 'hash');
@@ -188,10 +190,10 @@ SELECT * FROM repartition_udt JOIN repartition_udt_other
 	WHERE repartition_udt.pk = 1;
 
 -- Query that should result in a repartition join on UDT column.
-SET citus.task_executor_type = 'task-tracker';
 SET citus.log_multi_join_order = true;
 
-EXPLAIN SELECT * FROM repartition_udt JOIN repartition_udt_other
+EXPLAIN (COSTS OFF)
+SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.udtcol = repartition_udt_other.udtcol
 	WHERE repartition_udt.pk > 1;
 

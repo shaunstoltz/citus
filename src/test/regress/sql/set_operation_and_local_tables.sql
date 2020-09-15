@@ -1,6 +1,8 @@
 CREATE SCHEMA recursive_set_local;
 SET search_path TO recursive_set_local, public;
 
+SET citus.enable_repartition_joins to ON;
+
 CREATE TABLE recursive_set_local.test (x int, y int);
 SELECT create_distributed_table('test', 'x');
 
@@ -74,9 +76,11 @@ FROM
 SELECT * FROM test a WHERE x IN (SELECT x FROM test b UNION SELECT y FROM test c UNION SELECT y FROM local_test d) ORDER BY 1,2;
 
 -- same query with subquery in where is wrapped in CTE
+SET citus.enable_cte_inlining TO off;
 SELECT * FROM test a WHERE x IN (WITH cte AS (SELECT x FROM test b UNION SELECT y FROM test c UNION SELECT y FROM local_test d) SELECT * FROM cte) ORDER BY 1,2;
+RESET citus.enable_cte_inlining;
 
--- not supported since local table is joined with a set operation
+-- supported since final step only has local table and intermediate result
 SELECT * FROM ((SELECT * FROM test) EXCEPT (SELECT * FROM test ORDER BY x LIMIT 1)) u JOIN local_test USING (x) ORDER BY 1,2;
 
 -- though we replace some queries including the local query, the intermediate result is on the outer part of an outer join
@@ -91,12 +95,10 @@ SELECT * FROM ((SELECT * FROM local_test) INTERSECT (SELECT * FROM test ORDER BY
 -- set operations and the sublink can be recursively planned
 SELECT * FROM ((SELECT x FROM test) UNION (SELECT x FROM (SELECT x FROM local_test) as foo WHERE x IN (SELECT x FROM test))) u ORDER BY 1;
 
-SET citus.task_executor_type TO 'task-tracker';
 
 --  repartition is recursively planned before the set operation
 (SELECT x FROM test) INTERSECT (SELECT t1.x FROM test as t1, test as t2 WHERE t1.x = t2.y LIMIT 2) INTERSECT (((SELECT x FROM local_test) UNION ALL (SELECT x FROM test)) INTERSECT (SELECT i FROM generate_series(0, 100) i)) ORDER BY 1 DESC;
 
-SET citus.task_executor_type TO 'adaptive';
 
 RESET client_min_messages;
 DROP SCHEMA recursive_set_local CASCADE;

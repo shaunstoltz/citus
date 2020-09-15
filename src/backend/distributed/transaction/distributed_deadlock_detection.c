@@ -18,10 +18,10 @@
 #include "distributed/backend_data.h"
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/errormessage.h"
-#include "distributed/log_utils.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
+#include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/transaction_identifier.h"
 #include "nodes/pg_list.h"
@@ -105,7 +105,7 @@ CheckForDistributedDeadlocks(void)
 {
 	HASH_SEQ_STATUS status;
 	TransactionNode *transactionNode = NULL;
-	int localGroupId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 	List *workerNodeList = ActiveReadableNodeList();
 
 	/*
@@ -153,7 +153,6 @@ CheckForDistributedDeadlocks(void)
 		if (deadlockFound)
 		{
 			TransactionNode *youngestAliveTransaction = NULL;
-			ListCell *participantTransactionCell = NULL;
 
 			/*
 			 * There should generally be at least two transactions to get into a
@@ -174,10 +173,9 @@ CheckForDistributedDeadlocks(void)
 			 * We're also searching for the youngest transactions initiated by
 			 * this node.
 			 */
-			foreach(participantTransactionCell, deadlockPath)
+			TransactionNode *currentNode = NULL;
+			foreach_ptr(currentNode, deadlockPath)
 			{
-				TransactionNode *currentNode =
-					(TransactionNode *) lfirst(participantTransactionCell);
 				bool transactionAssociatedWithProc =
 					AssociateDistributedTransactionWithBackendProc(currentNode);
 
@@ -226,7 +224,7 @@ CheckForDistributedDeadlocks(void)
  * transaction node and checks for a cycle (i.e., the node can be reached again
  * while traversing the graph).
  *
- * Finding a cycle  indicates a distributed deadlock and the function returns
+ * Finding a cycle indicates a distributed deadlock and the function returns
  * true on that case. Also, the deadlockPath is filled with the transaction
  * nodes that form the cycle.
  */
@@ -299,16 +297,13 @@ static void
 PrependOutgoingNodesToQueue(TransactionNode *transactionNode, int currentStackDepth,
 							List **toBeVisitedNodes)
 {
-	ListCell *currentWaitForCell = NULL;
-
 	/* as we traverse outgoing edges, increment the depth */
 	currentStackDepth++;
 
 	/* prepend to the list to continue depth-first search */
-	foreach(currentWaitForCell, transactionNode->waitsFor)
+	TransactionNode *waitForTransaction = NULL;
+	foreach_ptr(waitForTransaction, transactionNode->waitsFor)
 	{
-		TransactionNode *waitForTransaction =
-			(TransactionNode *) lfirst(currentWaitForCell);
 		QueuedTransactionNode *queuedNode = palloc0(sizeof(QueuedTransactionNode));
 
 		queuedNode->transactionNode = waitForTransaction;
@@ -373,6 +368,8 @@ ResetVisitedFields(HTAB *adjacencyList)
 static bool
 AssociateDistributedTransactionWithBackendProc(TransactionNode *transactionNode)
 {
+	int32 localGroupId PG_USED_FOR_ASSERTS_ONLY = GetLocalGroupId();
+
 	for (int backendIndex = 0; backendIndex < MaxBackends; ++backendIndex)
 	{
 		PGPROC *currentProc = &ProcGlobal->allProcs[backendIndex];
@@ -408,7 +405,7 @@ AssociateDistributedTransactionWithBackendProc(TransactionNode *transactionNode)
 		}
 
 		/* at the point we should only have transactions initiated by this node */
-		Assert(currentTransactionId->initiatorNodeIdentifier == GetLocalGroupId());
+		Assert(currentTransactionId->initiatorNodeIdentifier == localGroupId);
 
 		transactionNode->initiatorProc = currentProc;
 
@@ -670,12 +667,10 @@ char *
 WaitsForToString(List *waitsFor)
 {
 	StringInfo transactionIdStr = makeStringInfo();
-	ListCell *waitsForCell = NULL;
 
-	foreach(waitsForCell, waitsFor)
+	TransactionNode *waitingNode = NULL;
+	foreach_ptr(waitingNode, waitsFor)
 	{
-		TransactionNode *waitingNode = (TransactionNode *) lfirst(waitsForCell);
-
 		if (transactionIdStr->len != 0)
 		{
 			appendStringInfoString(transactionIdStr, ",");

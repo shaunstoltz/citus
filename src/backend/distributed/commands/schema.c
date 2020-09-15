@@ -22,11 +22,15 @@
 #include <distributed/connection_management.h>
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_cache.h"
 #include <distributed/metadata_sync.h>
+#include "distributed/reference_table_utils.h"
+#include "distributed/resource_lock.h"
 #include <distributed/remote_commands.h>
 #include <distributed/remote_commands.h>
+#include "distributed/version_compat.h"
 #include "nodes/parsenodes.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -51,18 +55,16 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString)
 	int scanKeyCount = 1;
 	Oid scanIndexId = InvalidOid;
 	bool useIndex = false;
-	ListCell *dropSchemaCell;
 
 	if (dropStatement->behavior != DROP_CASCADE)
 	{
 		return NIL;
 	}
 
-	foreach(dropSchemaCell, dropStatement->objects)
+	Value *schemaValue = NULL;
+	foreach_ptr(schemaValue, dropStatement->objects)
 	{
-		Value *schemaValue = (Value *) lfirst(dropSchemaCell);
-		char *schemaString = strVal(schemaValue);
-
+		const char *schemaString = strVal(schemaValue);
 		Oid namespaceOid = get_namespace_oid(schemaString, true);
 
 		if (namespaceOid == InvalidOid)
@@ -70,7 +72,7 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString)
 			continue;
 		}
 
-		pgClass = heap_open(RelationRelationId, AccessShareLock);
+		pgClass = table_open(RelationRelationId, AccessShareLock);
 
 		ScanKeyInit(&scanKey[0], Anum_pg_class_relnamespace, BTEqualStrategyNumber,
 					F_OIDEQ, namespaceOid);
@@ -85,10 +87,17 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString)
 			Oid relationId = get_relname_relid(relationName, namespaceOid);
 
 			/* we're not interested in non-valid, non-distributed relations */
-			if (relationId == InvalidOid || !IsDistributedTable(relationId))
+			if (relationId == InvalidOid || !IsCitusTable(relationId))
 			{
 				heapTuple = systable_getnext(scanDescriptor);
 				continue;
+			}
+
+			if (IsCitusTableType(relationId, REFERENCE_TABLE))
+			{
+				/* prevent concurrent EnsureReferenceTablesExistOnAllNodes */
+				int colocationId = CreateReferenceTableColocationId();
+				LockColocationId(colocationId, ExclusiveLock);
 			}
 
 			/* invalidate foreign key cache if the table involved in any foreign key */
@@ -97,7 +106,7 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString)
 				MarkInvalidateForeignKeyGraph();
 
 				systable_endscan(scanDescriptor);
-				heap_close(pgClass, NoLock);
+				table_close(pgClass, NoLock);
 				return NIL;
 			}
 
@@ -105,7 +114,7 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString)
 		}
 
 		systable_endscan(scanDescriptor);
-		heap_close(pgClass, NoLock);
+		table_close(pgClass, NoLock);
 	}
 
 	return NIL;
@@ -140,7 +149,7 @@ PreprocessGrantOnSchemaStmt(Node *node, const char *queryString)
 
 	stmt->objects = originalObjects;
 
-	return NodeDDLTaskList(ALL_WORKERS, list_make1(sql));
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, list_make1(sql));
 }
 
 
@@ -152,11 +161,11 @@ static List *
 FilterDistributedSchemas(List *schemas)
 {
 	List *distributedSchemas = NIL;
-	ListCell *cell = NULL;
 
-	foreach(cell, schemas)
+	Value *schemaValue = NULL;
+	foreach_ptr(schemaValue, schemas)
 	{
-		char *schemaName = strVal(lfirst(cell));
+		const char *schemaName = strVal(schemaValue);
 		Oid schemaOid = get_namespace_oid(schemaName, true);
 
 		if (!OidIsValid(schemaOid))
@@ -172,7 +181,7 @@ FilterDistributedSchemas(List *schemas)
 			continue;
 		}
 
-		distributedSchemas = lappend(distributedSchemas, makeString(schemaName));
+		distributedSchemas = lappend(distributedSchemas, schemaValue);
 	}
 
 	return distributedSchemas;

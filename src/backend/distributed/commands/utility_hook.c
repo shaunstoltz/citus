@@ -25,6 +25,8 @@
  *-------------------------------------------------------------------------
  */
 
+#include "distributed/pg_version_constants.h"
+
 #include "postgres.h"
 #include "miscadmin.h"
 
@@ -37,6 +39,7 @@
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
+#include "distributed/adaptive_executor.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/multi_copy.h"
@@ -46,11 +49,12 @@
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/maintenanced.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
+#include "distributed/multi_physical_planner.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transmit.h"
 #include "distributed/version_compat.h"
@@ -63,7 +67,6 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
-
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
 PropSetCmdBehavior PropagateSetCommands = PROPSETCMD_NONE; /* SET prop off */
 static bool shouldInvalidateForeignKeyGraph = false;
@@ -75,6 +78,9 @@ static int activeDropSchemaOrDBs = 0;
 static void ExecuteDistributedDDLJob(DDLJob *ddlJob);
 static char * SetSearchPathToCurrentSearchPathCommand(void);
 static char * CurrentSearchPath(void);
+static void IncrementUtilityHookCountersIfNecessary(Node *parsetree);
+static void PostStandardProcessUtility(Node *parsetree);
+static void DecrementUtilityHookCountersIfNecessary(Node *parsetree);
 static bool IsDropSchemaOrDB(Node *parsetree);
 
 
@@ -84,7 +90,8 @@ static bool IsDropSchemaOrDB(Node *parsetree);
  */
 void
 CitusProcessUtility(Node *node, const char *queryString, ProcessUtilityContext context,
-					ParamListInfo params, DestReceiver *dest, char *completionTag)
+					ParamListInfo params, DestReceiver *dest,
+					QueryCompletionCompat *completionTag)
 {
 	PlannedStmt *plannedStmt = makeNode(PlannedStmt);
 	plannedStmt->commandType = CMD_UTILITY;
@@ -111,7 +118,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 					 ParamListInfo params,
 					 struct QueryEnvironment *queryEnv,
 					 DestReceiver *dest,
-					 char *completionTag)
+					 QueryCompletionCompat *completionTag)
 {
 	Node *parsetree = pstmt->utilityStmt;
 	List *ddlJobs = NIL;
@@ -140,9 +147,9 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		return;
 	}
 
-	bool checkCreateAlterExtensionVersion = IsCreateAlterExtensionUpdateCitusStmt(
+	bool isCreateAlterExtensionUpdateCitusStmt = IsCreateAlterExtensionUpdateCitusStmt(
 		parsetree);
-	if (EnableVersionChecks && checkCreateAlterExtensionVersion)
+	if (EnableVersionChecks && isCreateAlterExtensionUpdateCitusStmt)
 	{
 		ErrorIfUnstableCreateOrAlterExtensionStmt(parsetree);
 	}
@@ -166,13 +173,11 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 
 		if (IsTransactionBlock())
 		{
-			ListCell *optionCell = NULL;
 			bool analyze = false;
 
-			foreach(optionCell, explainStmt->options)
+			DefElem *option = NULL;
+			foreach_ptr(option, explainStmt->options)
 			{
-				DefElem *option = (DefElem *) lfirst(optionCell);
-
 				if (strcmp(option->defname, "analyze") == 0)
 				{
 					analyze = defGetBoolean(option);
@@ -276,7 +281,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		return;
 	}
 
-	/* process SET LOCAL stmts of whitelisted GUCs in multi-stmt xacts */
+	/* process SET LOCAL stmts of allowed GUCs in multi-stmt xacts */
 	if (IsA(parsetree, VariableSetStmt))
 	{
 		VariableSetStmt *setStmt = (VariableSetStmt *) parsetree;
@@ -334,20 +339,20 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		parsetree = copyObject(parsetree);
 		parsetree = ProcessCopyStmt((CopyStmt *) parsetree, completionTag, queryString);
 
-		MemoryContext previousContext = MemoryContextSwitchTo(planContext);
-		parsetree = copyObject(parsetree);
-		MemoryContextSwitchTo(previousContext);
-
 		if (parsetree == NULL)
 		{
 			return;
 		}
 
+		MemoryContext previousContext = MemoryContextSwitchTo(planContext);
+		parsetree = copyObject(parsetree);
+		MemoryContextSwitchTo(previousContext);
+
 		/*
 		 * we need to set the parsetree here already as we copy and replace the original
 		 * parsetree during ddl propagation. In reality we need to refactor the code above
 		 * to not juggle copy the parsetree and leak it to a potential cache above the
-		 * utillity hook.
+		 * utility hook.
 		 */
 		pstmt->utilityStmt = parsetree;
 	}
@@ -366,7 +371,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 
 	if (IsA(parsetree, TruncateStmt))
 	{
-		PostprocessTruncateStatement((TruncateStmt *) parsetree);
+		PreprocessTruncateStatement((TruncateStmt *) parsetree);
 	}
 
 	/* only generate worker DDLJobs if propagation is enabled */
@@ -452,22 +457,44 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		}
 	}
 
+	if (IsDropCitusExtensionStmt(parsetree))
+	{
+		StopMaintenanceDaemon(MyDatabaseId);
+	}
+
 	pstmt->utilityStmt = parsetree;
 
 	PG_TRY();
 	{
-		if (IsA(parsetree, AlterTableStmt))
-		{
-			activeAlterTables++;
-		}
+		IncrementUtilityHookCountersIfNecessary(parsetree);
 
-		if (IsDropSchemaOrDB(parsetree))
+		/*
+		 * Check if we are running ALTER EXTENSION citus UPDATE (TO "<version>") command and
+		 * the available version is different than the current version of Citus. In this case,
+		 * ALTER EXTENSION citus UPDATE command can actually update Citus to a new version.
+		 */
+		bool isAlterExtensionUpdateCitusStmt = isCreateAlterExtensionUpdateCitusStmt &&
+											   IsA(parsetree, AlterExtensionStmt);
+
+		bool citusCanBeUpdatedToAvailableVersion = false;
+
+		if (isAlterExtensionUpdateCitusStmt)
 		{
-			activeDropSchemaOrDBs++;
+			citusCanBeUpdatedToAvailableVersion = !InstalledAndAvailableVersionsSame();
 		}
 
 		standard_ProcessUtility(pstmt, queryString, context,
 								params, queryEnv, dest, completionTag);
+
+		/*
+		 * if we are running ALTER EXTENSION citus UPDATE (to "<version>") command, we may need
+		 * to mark existing objects as distributed depending on the "version" parameter if
+		 * specified in "ALTER EXTENSION citus UPDATE" command
+		 */
+		if (isAlterExtensionUpdateCitusStmt && citusCanBeUpdatedToAvailableVersion)
+		{
+			PostprocessAlterExtensionCitusUpdateStmt(parsetree);
+		}
 
 		/*
 		 * Postgres added the following CommandCounterIncrement as a patch in:
@@ -485,27 +512,11 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		 */
 		CommandCounterIncrement();
 
-		if (IsA(parsetree, AlterTableStmt))
-		{
-			activeAlterTables--;
-		}
-
-		if (IsDropSchemaOrDB(parsetree))
-		{
-			activeDropSchemaOrDBs--;
-		}
+		PostStandardProcessUtility(parsetree);
 	}
 	PG_CATCH();
 	{
-		if (IsA(parsetree, AlterTableStmt))
-		{
-			activeAlterTables--;
-		}
-
-		if (IsDropSchemaOrDB(parsetree))
-		{
-			activeDropSchemaOrDBs--;
-		}
+		PostStandardProcessUtility(parsetree);
 
 		PG_RE_THROW();
 	}
@@ -527,41 +538,21 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 			}
 		}
 
-		if (IsA(parsetree, AlterRoleSetStmt) && EnableAlterRolePropagation)
-		{
-			ereport(NOTICE, (errmsg("Citus partially supports ALTER ROLE for "
-									"distributed databases"),
-
-							 errdetail(
-								 "Citus does not propagate ALTER ROLE ... SET/RESET "
-								 "commands to workers"),
-
-							 errhint("You can manually alter roles on workers.")));
-		}
-
 		if (IsA(parsetree, RenameStmt) && ((RenameStmt *) parsetree)->renameType ==
 			OBJECT_ROLE && EnableAlterRolePropagation)
 		{
-			ereport(NOTICE, (errmsg("Citus partially supports ALTER ROLE for "
-									"distributed databases"),
-
-							 errdetail(
-								 "Citus does not propagate ALTER ROLE ... RENAME TO "
-								 "commands to workers"),
-
-							 errhint("You can manually alter roles on workers.")));
+			ereport(NOTICE, (errmsg("not propagating ALTER ROLE ... RENAME TO commands "
+									"to worker nodes"),
+							 errhint("Connect to worker nodes directly to manually "
+									 "rename the role")));
 		}
 	}
 
-	/*
-	 * We only process CREATE TABLE ... PARTITION OF commands in the function below
-	 * to handle the case when user creates a table as a partition of distributed table.
-	 */
 	if (IsA(parsetree, CreateStmt))
 	{
 		CreateStmt *createStatement = (CreateStmt *) parsetree;
 
-		PostprocessCreateTableStmtPartitionOf(createStatement, queryString);
+		PostprocessCreateTableStmt(createStatement, queryString);
 	}
 
 	/*
@@ -574,16 +565,6 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 
 		PostprocessAlterTableStmtAttachPartition(alterTableStatement, queryString);
 	}
-
-	/*
-	 * Re-forming the foreign key graph relies on the command being executed
-	 * on the local table first. However, in order to decide whether the
-	 * command leads to an invalidation, we need to check before the command
-	 * is being executed since we read pg_constraint table. Thus, we maintain a
-	 * local flag and do the invalidation after multi_ProcessUtility,
-	 * before ExecuteDistributedDDLJob().
-	 */
-	InvalidateForeignKeyGraphForDDL();
 
 	/* after local command has completed, finish by executing worker DDLJobs, if any */
 	if (ddlJobs != NIL)
@@ -608,11 +589,14 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		PostprocessVacuumStmt(vacuumStmt, queryString);
 	}
 
-	/*
-	 * Ensure value is valid, we can't do some checks during CREATE
-	 * EXTENSION. This is important to register some invalidation callbacks.
-	 */
-	CitusHasBeenLoaded();
+	if (!IsDropCitusExtensionStmt(parsetree) && !IsA(parsetree, DropdbStmt))
+	{
+		/*
+		 * Ensure value is valid, we can't do some checks during CREATE
+		 * EXTENSION. This is important to register some invalidation callbacks.
+		 */
+		CitusHasBeenLoaded();
+	}
 }
 
 
@@ -653,16 +637,19 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 
 	EnsureCoordinator();
 
-	if (ddlJob->targetRelationId != InvalidOid)
+	Oid targetRelationId = ddlJob->targetRelationId;
+
+	if (OidIsValid(targetRelationId))
 	{
 		/*
-		 * Only for ddlJobs that are targetting a relation (table) we want to sync its
-		 * metadata and verify some properties around the table.
+		 * Only for ddlJobs that are targetting a relation (table) we want to sync
+		 * its metadata and verify some properties around the table.
 		 */
-		shouldSyncMetadata = ShouldSyncTableMetadata(ddlJob->targetRelationId);
-		EnsurePartitionTableNotReplicated(ddlJob->targetRelationId);
+		shouldSyncMetadata = ShouldSyncTableMetadata(targetRelationId);
+		EnsurePartitionTableNotReplicated(targetRelationId);
 	}
 
+	bool localExecutionSupported = true;
 
 	if (!ddlJob->concurrentIndexCmd)
 	{
@@ -684,8 +671,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 			SendCommandToWorkersWithMetadata((char *) ddlJob->commandString);
 		}
 
-		/* use adaptive executor when enabled */
-		ExecuteUtilityTaskListWithoutResults(ddlJob->taskList);
+		ExecuteUtilityTaskList(ddlJob->taskList, localExecutionSupported);
 	}
 	else
 	{
@@ -696,8 +682,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 
 		PG_TRY();
 		{
-			/* use adaptive executor when enabled */
-			ExecuteUtilityTaskListWithoutResults(ddlJob->taskList);
+			ExecuteUtilityTaskList(ddlJob->taskList, localExecutionSupported);
 
 			if (shouldSyncMetadata)
 			{
@@ -774,12 +759,12 @@ CurrentSearchPath(void)
 {
 	StringInfo currentSearchPath = makeStringInfo();
 	List *searchPathList = fetch_search_path(false);
-	ListCell *searchPathCell;
 	bool schemaAdded = false;
 
-	foreach(searchPathCell, searchPathList)
+	Oid searchPathOid = InvalidOid;
+	foreach_oid(searchPathOid, searchPathList)
 	{
-		char *schemaName = get_namespace_name(lfirst_oid(searchPathCell));
+		char *schemaName = get_namespace_name(searchPathOid);
 
 		/* watch out for deleted namespace */
 		if (schemaName)
@@ -799,6 +784,68 @@ CurrentSearchPath(void)
 	list_free(searchPathList);
 
 	return (currentSearchPath->len > 0 ? currentSearchPath->data : NULL);
+}
+
+
+/*
+ * IncrementUtilityHookCountersIfNecessary increments activeAlterTables and
+ * activeDropSchemaOrDBs counters if utility command being processed implies
+ * to do so.
+ */
+static void
+IncrementUtilityHookCountersIfNecessary(Node *parsetree)
+{
+	if (IsA(parsetree, AlterTableStmt))
+	{
+		activeAlterTables++;
+	}
+
+	if (IsDropSchemaOrDB(parsetree))
+	{
+		activeDropSchemaOrDBs++;
+	}
+}
+
+
+/*
+ * PostStandardProcessUtility performs operations to alter (backend) global
+ * state of citus utility hook. Those operations should be done after standard
+ * process utility executes even if it errors out.
+ */
+static void
+PostStandardProcessUtility(Node *parsetree)
+{
+	DecrementUtilityHookCountersIfNecessary(parsetree);
+
+	/*
+	 * Re-forming the foreign key graph relies on the command being executed
+	 * on the local table first. However, in order to decide whether the
+	 * command leads to an invalidation, we need to check before the command
+	 * is being executed since we read pg_constraint table. Thus, we maintain a
+	 * local flag and do the invalidation after multi_ProcessUtility,
+	 * before ExecuteDistributedDDLJob().
+	 */
+	InvalidateForeignKeyGraphForDDL();
+}
+
+
+/*
+ * DecrementUtilityHookCountersIfNecessary decrements activeAlterTables and
+ * activeDropSchemaOrDBs counters if utility command being processed implies
+ * to do so.
+ */
+static void
+DecrementUtilityHookCountersIfNecessary(Node *parsetree)
+{
+	if (IsA(parsetree, AlterTableStmt))
+	{
+		activeAlterTables--;
+	}
+
+	if (IsDropSchemaOrDB(parsetree))
+	{
+		activeDropSchemaOrDBs--;
+	}
 }
 
 
@@ -838,7 +885,6 @@ DDLTaskList(Oid relationId, const char *commandString)
 {
 	List *taskList = NIL;
 	List *shardIntervalList = LoadShardIntervalList(relationId);
-	ListCell *shardIntervalCell = NULL;
 	Oid schemaId = get_rel_namespace(relationId);
 	char *schemaName = get_namespace_name(schemaId);
 	char *escapedSchemaName = quote_literal_cstr(schemaName);
@@ -849,9 +895,9 @@ DDLTaskList(Oid relationId, const char *commandString)
 	/* lock metadata before getting placement lists */
 	LockShardListMetadata(shardIntervalList, ShareLock);
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
 		StringInfo applyCommand = makeStringInfo();
 
@@ -887,26 +933,23 @@ List *
 NodeDDLTaskList(TargetWorkerSet targets, List *commands)
 {
 	List *workerNodes = TargetWorkerSetNodeList(targets, NoLock);
-	char *concatenatedCommands = StringJoin(commands, ';');
-	ListCell *workerNodeCell = NULL;
 
 	if (list_length(workerNodes) <= 0)
 	{
 		/*
 		 * if there are no nodes we don't have to plan any ddl tasks. Planning them would
-		 * cause a hang in the executor.
+		 * cause the executor to stop responding.
 		 */
 		return NIL;
 	}
 
 	Task *task = CitusMakeNode(Task);
 	task->taskType = DDL_TASK;
-	SetTaskQueryString(task, concatenatedCommands);
+	SetTaskQueryStringList(task, commands);
 
-	foreach(workerNodeCell, workerNodes)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodes)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-
 		ShardPlacement *targetPlacement = CitusMakeNode(ShardPlacement);
 		targetPlacement->nodeName = workerNode->workerName;
 		targetPlacement->nodePort = workerNode->workerPort;

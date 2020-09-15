@@ -156,7 +156,7 @@ typedef struct MultiCartesianProduct
 /*
  * MultiExtendedOp defines a set of extended operators that operate on columns
  * in relational algebra. This node allows us to distinguish between operations
- * in the master and worker nodes, and also captures the following:
+ * in the coordinator and worker nodes, and also captures the following:
  *
  * (1) Aggregate functions such as sums or averages;
  * (2) Grouping of attributes; these groupings may also be tied to aggregates;
@@ -176,9 +176,10 @@ typedef struct MultiExtendedOp
 	Node *limitOffset;
 	Node *havingQual;
 	List *distinctClause;
+	List *windowClause;
 	bool hasDistinctOn;
 	bool hasWindowFuncs;
-	List *windowClause;
+	bool onlyPushableWindowFunctions;
 } MultiExtendedOp;
 
 
@@ -186,12 +187,17 @@ typedef struct MultiExtendedOp
 extern MultiTreeRoot * MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 											  PlannerRestrictionContext *
 											  plannerRestrictionContext);
-extern bool FindNodeCheck(Node *node, bool (*check)(Node *));
-extern bool SingleRelationRepartitionSubquery(Query *queryTree);
+extern bool FindNodeMatchingCheckFunction(Node *node, bool (*check)(Node *));
 extern bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
-extern bool FindNodeCheckInRangeTableList(List *rtable, bool (*check)(Node *));
+extern bool FindNodeMatchingCheckFunctionInRangeTableList(List *rtable, bool (*check)(
+															  Node *));
+extern bool IsCitusTableRTE(Node *node);
+extern bool IsPostgresLocalTableRte(Node *node);
 extern bool IsDistributedTableRTE(Node *node);
+extern bool IsReferenceTableRTE(Node *node);
+extern bool IsCitusLocalTableRTE(Node *node);
 extern bool QueryContainsDistributedTableRTE(Query *query);
+extern bool IsCitusExtraDataContainerRelation(RangeTblEntry *rte);
 extern bool ContainsReadIntermediateResultFunction(Node *node);
 extern bool ContainsReadIntermediateResultArrayFunction(Node *node);
 extern char * FindIntermediateResultIdIfExists(RangeTblEntry *rte);
@@ -217,7 +223,7 @@ extern List * pull_var_clause_default(Node *node);
 extern bool OperatorImplementsEquality(Oid opno);
 extern DeferredErrorMessage * DeferErrorIfUnsupportedClause(List *clauseList);
 extern MultiProject * MultiProjectNode(List *targetEntryList);
-extern MultiExtendedOp * MultiExtendedOpNode(Query *queryTree);
+extern MultiExtendedOp * MultiExtendedOpNode(Query *queryTree, Query *originalQuery);
 extern DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryRepartition(Query *
 																		 subqueryTree);
 extern MultiNode * MultiNodeTree(Query *queryTree);

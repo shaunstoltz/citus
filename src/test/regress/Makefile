@@ -15,6 +15,10 @@ endif
 MAKEFILE_DIR := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 export PATH := $(MAKEFILE_DIR)/bin:$(PATH)
 export PG_REGRESS_DIFF_OPTS = -dU10 -w
+# Use lower isolation test timeout, the 5 minute default is waaay too long for
+# us so we use 5 seconds instead. We should detect blockages very quickly and
+# the queries we run are also very fast.
+export PGISOLATIONTIMEOUT = 5
 
 ##
 ## Citus regression support
@@ -38,7 +42,7 @@ output_files := $(patsubst $(citus_abs_srcdir)/output/%.source,expected/%.out, $
 # intermediate, for muscle memory backward compatibility.
 check: check-full
 # check-full triggers all tests that ought to be run routinely
-check-full: check-multi check-multi-mx check-multi-task-tracker-extra check-worker check-follower-cluster check-failure
+check-full: check-multi check-multi-mx check-worker check-follower-cluster check-failure
 
 
 ISOLATION_DEPDIR=.deps/isolation
@@ -64,14 +68,15 @@ create-symbolic-link:
 # it runs the spec files from build/specs and checks the expected output from build/expected.
 # /specs is renamed as /spec because postgres first look at the specs file under current directory,
 # so this is renamed to avoid that since we are running the isolation tests from build/specs now.
-$(generated_isolation_files): $(citus_abs_srcdir)/build/specs/%: $(citus_abs_srcdir)/spec/%
+$(generated_isolation_files): $(citus_abs_srcdir)/build/specs/%: $(citus_abs_srcdir)/spec/% Makefile
 	@mkdir -p $(citus_abs_srcdir)/$(ISOLATION_DEPDIR) $(citus_abs_srcdir)/$(ISOLATION_BUILDDIR)
-	# -MF is used to store dependency files(.Po) in another directory for separation
-	# -MT is used to change the target of the rule emitted by dependency generation.
-	# -P is used to inhibit generation of linemarkers in the output from the preprocessor.
-	# -undef is used to not predefine any system-specific or GCC-specific macros.
-	# `man cpp` for further information
-	cd $(citus_abs_srcdir) && cpp -undef -w -P -MMD -MP -MF$(ISOLATION_DEPDIR)/$(*F).Po -MT$@ $< > $@
+	@# -MF is used to store dependency files(.Po) in another directory for separation
+	@# -MT is used to change the target of the rule emitted by dependency generation.
+	@# -P is used to inhibit generation of linemarkers in the output from the preprocessor.
+	@# -undef is used to not predefine any system-specific or GCC-specific macros.
+	@# `man cpp` for further information
+	@# sed is used to strip the final // comments, because OSX cpp is weird
+	cd $(citus_abs_srcdir) && cpp -undef -w -P -MMD -MP -MF$(ISOLATION_DEPDIR)/$(*F).Po -MT$@ $< | sed '/^\/\//d' | sed '/^$$/d' > $@
 
 
 Isolation_Po_files := $(wildcard $(ISOLATION_DEPDIR)/*.Po)
@@ -92,11 +97,6 @@ check-base: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/base_schedule $(EXTRA_TESTS)
 
-check-base-non-adaptive: all
-	$(pg_regress_multi_check) --load-extension=citus \
-	--server-option=citus.task_executor_type=real-time \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/base_schedule $(EXTRA_TESTS)
-
 # check-minimal only sets up the cluster
 check-minimal: all
 	$(pg_regress_multi_check) --load-extension=citus \
@@ -111,6 +111,11 @@ check-base-mx: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/mx_base_schedule $(EXTRA_TESTS)
 
+check-minimal-mx: all
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/mx_minimal_schedule $(EXTRA_TESTS)
+
+
 check-empty: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) $(EXTRA_TESTS)
@@ -119,25 +124,13 @@ check-multi: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
-check-multi-non-adaptive: all
-	$(pg_regress_multi_check) --load-extension=citus \
-	--server-option=citus.task_executor_type=real-time \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
+check-multi-hyperscale: all
+	$(pg_regress_multi_check) --conninfo="$(conninfo)" --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule_hyperscale $(EXTRA_TESTS)
 
-check-failure-non-adaptive: all
-	$(pg_regress_multi_check) --load-extension=citus --mitmproxy \
-	--server-option=citus.task_executor_type=real-time \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/failure_schedule $(EXTRA_TESTS)
-
-check-failure-non-adaptive-base: all
-	$(pg_regress_multi_check) --load-extension=citus --mitmproxy \
-	--server-option=citus.task_executor_type=real-time \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/failure_base_schedule $(EXTRA_TESTS)
-
-check-isolation-non-adaptive: all  $(isolation_test_files)
-	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
-	--server-option=citus.task_executor_type=real-time \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/isolation_schedule $(EXTRA_TESTS)
+check-multi-hyperscale-superuser: all
+	$(pg_regress_multi_check) --conninfo="$(conninfo)" --worker-1-public-hostname="$(worker_1_public_hostname)" --worker-2-public-hostname="$(worker_2_public_hostname)" --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule_hyperscale_superuser $(EXTRA_TESTS)
 
 check-multi-vg: all
 	$(pg_regress_multi_check) --load-extension=citus --valgrind \
@@ -150,19 +143,19 @@ check-isolation: all  $(isolation_test_files)
 
 check-isolation-base: all  $(isolation_test_files)
 	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
-	-- $(MULTI_REGRESS_OPTS) $(EXTRA_TESTS)
+	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/base_isolation_schedule $(EXTRA_TESTS)
 
 check-vanilla: all
+	# it is possible that sometimes vanilla tests will fail, which is related to postgres.
+	# So we try it once more if it fails to prevent some failures in our CI.
+	${MAKE} check-vanilla-internal  || ${MAKE} check-vanilla-internal
+
+check-vanilla-internal:
 	$(pg_regress_multi_check) --load-extension=citus --vanillatest
 
 check-multi-mx: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_mx_schedule $(EXTRA_TESTS)
-
-check-multi-task-tracker-extra: all
-	$(pg_regress_multi_check) --load-extension=citus \
-	--server-option=citus.task_executor_type=task-tracker \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_task_tracker_extra_schedule $(EXTRA_TESTS)
 
 check-follower-cluster: all
 	$(pg_regress_multi_check) --load-extension=citus --follower-cluster \

@@ -12,24 +12,42 @@
 #define LOCAL_EXECUTION_H
 
 #include "distributed/citus_custom_scan.h"
+#include "distributed/tuple_destination.h"
+
+/*
+ * Used as TupleDestination->putTuple's placementIndex when executing
+ * local tasks.
+ */
+#define LOCAL_PLACEMENT_INDEX -1
 
 /* enabled with GUCs*/
 extern bool EnableLocalExecution;
 extern bool LogLocalCommands;
 
-extern bool TransactionAccessedLocalPlacement;
-extern bool TransactionConnectedToLocalGroup;
+typedef enum LocalExecutionStatus
+{
+	LOCAL_EXECUTION_REQUIRED,
+	LOCAL_EXECUTION_OPTIONAL,
+	LOCAL_EXECUTION_DISABLED
+} LocalExecutionStatus;
 
-extern uint64 ExecuteLocalTaskList(CitusScanState *scanState, List *taskList);
+extern enum LocalExecutionStatus CurrentLocalExecutionStatus;
+
+/* extern function declarations */
+extern uint64 ExecuteLocalTaskList(List *taskList, TupleDestination *defaultTupleDest);
+extern uint64 ExecuteLocalUtilityTaskList(List *utilityTaskList);
+extern uint64 ExecuteLocalTaskListExtended(List *taskList, ParamListInfo
+										   orig_paramListInfo,
+										   DistributedPlan *distributedPlan,
+										   TupleDestination *defaultTupleDest,
+										   bool isUtilityCommand);
 extern void ExtractLocalAndRemoteTasks(bool readOnlyPlan, List *taskList,
 									   List **localTaskList, List **remoteTaskList);
 extern bool ShouldExecuteTasksLocally(List *taskList);
+extern bool AnyTaskAccessesLocalNode(List *taskList);
+extern bool TaskAccessesLocalNode(Task *task);
 extern void ErrorIfTransactionAccessedPlacementsLocally(void);
-extern void SetTaskQueryAndPlacementList(Task *task, Query *query, List *placementList);
-extern char * TaskQueryString(Task *task);
-extern bool TaskAccessesLocalNode(Task *task);
 extern void DisableLocalExecution(void);
-extern bool AnyTaskAccessesRemoteNode(List *taskList);
-extern bool TaskAccessesLocalNode(Task *task);
+extern void SetLocalExecutionStatus(LocalExecutionStatus newStatus);
 
 #endif /* LOCAL_EXECUTION_H */

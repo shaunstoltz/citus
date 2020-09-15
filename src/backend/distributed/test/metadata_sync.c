@@ -40,7 +40,6 @@ master_metadata_snapshot(PG_FUNCTION_ARGS)
 	List *dropSnapshotCommands = MetadataDropCommands();
 	List *createSnapshotCommands = MetadataCreateCommands();
 	List *snapshotCommandList = NIL;
-	ListCell *snapshotCommandCell = NULL;
 	int snapshotCommandIndex = 0;
 	Oid ddlCommandTypeId = TEXTOID;
 
@@ -50,9 +49,9 @@ master_metadata_snapshot(PG_FUNCTION_ARGS)
 	int snapshotCommandCount = list_length(snapshotCommandList);
 	Datum *snapshotCommandDatumArray = palloc0(snapshotCommandCount * sizeof(Datum));
 
-	foreach(snapshotCommandCell, snapshotCommandList)
+	const char *metadataSnapshotCommand = NULL;
+	foreach_ptr(metadataSnapshotCommand, snapshotCommandList)
 	{
-		char *metadataSnapshotCommand = (char *) lfirst(snapshotCommandCell);
 		Datum metadataSnapshotCommandDatum = CStringGetTextDatum(metadataSnapshotCommand);
 
 		snapshotCommandDatumArray[snapshotCommandIndex] = metadataSnapshotCommandDatum;
@@ -76,14 +75,12 @@ wait_until_metadata_sync(PG_FUNCTION_ARGS)
 {
 	uint32 timeout = PG_GETARG_UINT32(0);
 
-	List *workerList = ActivePrimaryWorkerNodeList(NoLock);
-	ListCell *workerCell = NULL;
+	List *workerList = ActivePrimaryNonCoordinatorNodeList(NoLock);
 	bool waitNotifications = false;
 
-	foreach(workerCell, workerList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerCell);
-
 		/* if already has metadata, no need to do it again */
 		if (workerNode->hasMetadata && !workerNode->metadataSynced)
 		{

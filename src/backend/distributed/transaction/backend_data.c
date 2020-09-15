@@ -11,6 +11,9 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "miscadmin.h"
 
 #include "funcapi.h"
@@ -28,7 +31,7 @@
 #include "distributed/tuplestore.h"
 #include "nodes/execnodes.h"
 #include "postmaster/autovacuum.h" /* to access autovacuum_max_workers */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "replication/walsender.h"
 #endif
 #include "storage/ipc.h"
@@ -214,10 +217,8 @@ Datum
 get_global_active_transactions(PG_FUNCTION_ARGS)
 {
 	TupleDesc tupleDescriptor = NULL;
-	List *workerNodeList = ActivePrimaryWorkerNodeList(NoLock);
-	ListCell *workerNodeCell = NULL;
+	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
 	List *connectionList = NIL;
-	ListCell *connectionCell = NULL;
 	StringInfo queryToSend = makeStringInfo();
 
 	CheckCitusVersion(ERROR);
@@ -228,15 +229,17 @@ get_global_active_transactions(PG_FUNCTION_ARGS)
 	/* add active transactions for local node */
 	StoreAllActiveTransactions(tupleStore, tupleDescriptor);
 
+	int32 localGroupId = GetLocalGroupId();
+
 	/* open connections in parallel */
-	foreach(workerNodeCell, workerNodeList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-		char *nodeName = workerNode->workerName;
+		const char *nodeName = workerNode->workerName;
 		int nodePort = workerNode->workerPort;
 		int connectionFlags = 0;
 
-		if (workerNode->groupId == GetLocalGroupId())
+		if (workerNode->groupId == localGroupId)
 		{
 			/* we already get these transactions via GetAllActiveTransactions() */
 			continue;
@@ -251,10 +254,9 @@ get_global_active_transactions(PG_FUNCTION_ARGS)
 	FinishConnectionListEstablishment(connectionList);
 
 	/* send commands in parallel */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
 		int querySent = SendRemoteCommand(connection, queryToSend->data);
 		if (querySent == 0)
 		{
@@ -263,9 +265,8 @@ get_global_active_transactions(PG_FUNCTION_ARGS)
 	}
 
 	/* receive query results */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		bool raiseInterrupts = true;
 		Datum values[ACTIVE_TRANSACTION_COLUMN_COUNT];
 		bool isNulls[ACTIVE_TRANSACTION_COLUMN_COUNT];
@@ -583,7 +584,7 @@ TotalProcCount(void)
 	 */
 	totalProcs = maxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	totalProcs += max_wal_senders;
 #endif
 
@@ -644,6 +645,7 @@ UnSetDistributedTransactionId(void)
 
 		MyBackendData->databaseId = 0;
 		MyBackendData->userId = 0;
+		MyBackendData->cancelledDueToDeadlock = false;
 		MyBackendData->transactionId.initiatorNodeIdentifier = 0;
 		MyBackendData->transactionId.transactionOriginator = false;
 		MyBackendData->transactionId.transactionNumber = 0;
@@ -730,7 +732,7 @@ AssignDistributedTransactionId(void)
 		&backendManagementShmemData->nextTransactionNumber;
 
 	uint64 nextTransactionNumber = pg_atomic_fetch_add_u64(transactionNumberSequence, 1);
-	int localGroupId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 	TimestampTz currentTimestamp = GetCurrentTimestamp();
 	Oid userId = GetUserId();
 
@@ -762,7 +764,7 @@ MarkCitusInitiatedCoordinatorBackend(void)
 	 * GetLocalGroupId may throw exception which can cause leaving spin lock
 	 * unreleased. Calling GetLocalGroupId function before the lock to avoid this.
 	 */
-	int localGroupId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 
 	SpinLockAcquire(&MyBackendData->mutex);
 
@@ -806,7 +808,7 @@ GetBackendDataForProc(PGPROC *proc, BackendData *result)
 
 	SpinLockAcquire(&backendData->mutex);
 
-	memcpy(result, backendData, sizeof(BackendData));
+	*result = *backendData;
 
 	SpinLockRelease(&backendData->mutex);
 }
@@ -854,9 +856,13 @@ CancelTransactionDueToDeadlock(PGPROC *proc)
  * MyBackendGotCancelledDueToDeadlock returns whether the current distributed
  * transaction was cancelled due to a deadlock. If the backend is not in a
  * distributed transaction, the function returns false.
+ * We keep some session level state to keep track of if we were cancelled
+ * because of a distributed deadlock. When clearState is true, this function
+ * also resets that state. So after calling this function with clearState true,
+ * a second would always return false.
  */
 bool
-MyBackendGotCancelledDueToDeadlock(void)
+MyBackendGotCancelledDueToDeadlock(bool clearState)
 {
 	bool cancelledDueToDeadlock = false;
 
@@ -871,6 +877,10 @@ MyBackendGotCancelledDueToDeadlock(void)
 	if (IsInDistributedTransaction(MyBackendData))
 	{
 		cancelledDueToDeadlock = MyBackendData->cancelledDueToDeadlock;
+	}
+	if (clearState)
+	{
+		MyBackendData->cancelledDueToDeadlock = false;
 	}
 
 	SpinLockRelease(&MyBackendData->mutex);

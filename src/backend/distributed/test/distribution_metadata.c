@@ -21,8 +21,8 @@
 #include "catalog/pg_type.h"
 #include "distributed/distribution_column.h"
 #include "distributed/listutils.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_physical_planner.h"
@@ -62,7 +62,6 @@ Datum
 load_shard_id_array(PG_FUNCTION_ARGS)
 {
 	Oid distributedTableId = PG_GETARG_OID(0);
-	ListCell *shardCell = NULL;
 	int shardIdIndex = 0;
 	Oid shardIdTypeId = INT8OID;
 
@@ -71,10 +70,10 @@ load_shard_id_array(PG_FUNCTION_ARGS)
 	int shardIdCount = list_length(shardList);
 	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
 
-	foreach(shardCell, shardList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardList)
 	{
-		ShardInterval *shardId = (ShardInterval *) lfirst(shardCell);
-		Datum shardIdDatum = Int64GetDatum(shardId->shardId);
+		Datum shardIdDatum = Int64GetDatum(shardInterval->shardId);
 
 		shardIdDatumArray[shardIdIndex] = shardIdDatum;
 		shardIdIndex++;
@@ -123,7 +122,6 @@ load_shard_placement_array(PG_FUNCTION_ARGS)
 	int64 shardId = PG_GETARG_INT64(0);
 	bool onlyActive = PG_GETARG_BOOL(1);
 	List *placementList = NIL;
-	ListCell *placementCell = NULL;
 	int placementIndex = 0;
 	Oid placementTypeId = TEXTOID;
 	StringInfo placementInfo = makeStringInfo();
@@ -142,9 +140,9 @@ load_shard_placement_array(PG_FUNCTION_ARGS)
 	int placementCount = list_length(placementList);
 	Datum *placementDatumArray = palloc0(placementCount * sizeof(Datum));
 
-	foreach(placementCell, placementList)
+	ShardPlacement *placement = NULL;
+	foreach_ptr(placement, placementList)
 	{
-		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
 		appendStringInfo(placementInfo, "%s:%d", placement->nodeName,
 						 placement->nodePort);
 
@@ -200,9 +198,9 @@ Datum
 is_distributed_table(PG_FUNCTION_ARGS)
 {
 	Oid distributedTableId = PG_GETARG_OID(0);
-	bool isDistributedTable = IsDistributedTable(distributedTableId);
+	bool isCitusTable = IsCitusTable(distributedTableId);
 
-	PG_RETURN_BOOL(isDistributedTable);
+	PG_RETURN_BOOL(isCitusTable);
 }
 
 
@@ -219,8 +217,8 @@ create_monolithic_shard_row(PG_FUNCTION_ARGS)
 	StringInfo maxInfo = makeStringInfo();
 	uint64 newShardId = GetNextShardId();
 
-	appendStringInfo(minInfo, "%d", INT32_MIN);
-	appendStringInfo(maxInfo, "%d", INT32_MAX);
+	appendStringInfo(minInfo, "%d", PG_INT32_MIN);
+	appendStringInfo(maxInfo, "%d", PG_INT32_MAX);
 
 	text *minInfoText = cstring_to_text(minInfo->data);
 	text *maxInfoText = cstring_to_text(maxInfo->data);
@@ -256,20 +254,17 @@ relation_count_in_query(PG_FUNCTION_ARGS)
 
 	char *queryStringChar = text_to_cstring(queryString);
 	List *parseTreeList = pg_parse_query(queryStringChar);
-	ListCell *parseTreeCell = NULL;
 
-	foreach(parseTreeCell, parseTreeList)
+	Node *parsetree = NULL;
+	foreach_ptr(parsetree, parseTreeList)
 	{
-		Node *parsetree = (Node *) lfirst(parseTreeCell);
-		ListCell *queryTreeCell = NULL;
-
 		List *queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree,
 													 queryStringChar,
 													 NULL, 0, NULL);
 
-		foreach(queryTreeCell, queryTreeList)
+		Query *query = NULL;
+		foreach_ptr(query, queryTreeList)
 		{
-			Query *query = lfirst(queryTreeCell);
 			List *rangeTableList = NIL;
 
 			ExtractRangeTableRelationWalker((Node *) query, &rangeTableList);

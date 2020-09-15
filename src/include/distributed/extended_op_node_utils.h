@@ -15,7 +15,7 @@
 
 /*
  * ExtendedOpNodeProperties is a helper structure that is used to
- * share the common information among the worker and master extended
+ * share the common information among the worker and coordinator extended
  * op nodes.
  *
  * It is designed to be a read-only singleton object per extended op node
@@ -27,13 +27,21 @@ typedef struct ExtendedOpNodeProperties
 	bool repartitionSubquery;
 	bool hasNonPartitionColumnDistinctAgg;
 	bool pullDistinctColumns;
-	bool pushDownWindowFunctions;
+	bool hasWindowFuncs;
+	bool onlyPushableWindowFunctions;
 	bool pullUpIntermediateRows;
+	bool pushDownGroupingAndHaving;
+
+	/* indicates whether the MultiExtendedOp has a GROUP BY */
+	bool hasGroupBy;
+
+	/* indicates whether the MultiExtendedOp has an aggregate on the target list */
+	bool hasAggregate;
 } ExtendedOpNodeProperties;
 
 
 extern ExtendedOpNodeProperties BuildExtendedOpNodeProperties(
-	MultiExtendedOp *extendedOpNode, bool pullUpIntermediateRows);
+	MultiExtendedOp *extendedOpNode, bool hasNonDistributableAggregates);
 
 
 #endif /* EXTENDED_OP_NODE_UTILS_H_ */

@@ -12,9 +12,11 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "nodes/plannodes.h"
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #else
 #include "nodes/relation.h"
@@ -28,7 +30,6 @@
 /* values used by jobs and tasks which do not require identifiers */
 #define INVALID_JOB_ID 0
 #define INVALID_TASK_ID 0
-#define MULTI_TASK_QUERY_INFO_OFF 0  /* do not log multi-task queries */
 
 #define CURSOR_OPT_FORCE_DISTRIBUTED 0x080000
 
@@ -134,6 +135,24 @@ typedef struct RelationRowLock
 } RelationRowLock;
 
 
+/*
+ * Parameters to be set according to range table entries of a query.
+ */
+typedef struct RTEListProperties
+{
+	bool hasPostgresLocalTable;
+
+	bool hasReferenceTable;
+	bool hasCitusLocalTable;
+
+	/* includes hash, append and range partitioned tables */
+	bool hasDistributedTable;
+
+	/* union of above three */
+	bool hasCitusTable;
+} RTEListProperties;
+
+
 typedef struct DistributedPlanningContext
 {
 	/* The parsed query that is given to the planner. It is a slightly modified
@@ -161,8 +180,47 @@ typedef struct DistributedPlanningContext
 } DistributedPlanningContext;
 
 
-extern PlannedStmt * distributed_planner(Query *parse, int cursorOptions,
+/*
+ * CitusCustomScanPath is injected into the planner during the combine query planning
+ * phase of the logical planner.
+ *
+ * We call out to the standard planner to plan the combine query part for the output of
+ * the logical planner. This makes it easier to implement new sql features into the
+ * logical planner by not having to manually implement the plan creation for the combine
+ * query on the coordinator..
+ */
+typedef struct CitusCustomScanPath
+{
+	CustomPath custom_path;
+
+	/*
+	 * Custom scan node computed by the citus planner that will produce the tuples for the
+	 * path we are injecting during the planning of the combine query
+	 */
+	CustomScan *remoteScan;
+} CitusCustomScanPath;
+
+
+#if PG_VERSION_NUM >= PG_VERSION_13
+extern PlannedStmt * distributed_planner(Query *parse,
+										 const char *query_string,
+										 int cursorOptions,
 										 ParamListInfo boundParams);
+#else
+extern PlannedStmt * distributed_planner(Query *parse,
+										 int cursorOptions,
+										 ParamListInfo boundParams);
+#endif
+
+
+/*
+ * Common hint message to workaround using postgres local and citus local tables
+ * in distributed queries
+ */
+#define LOCAL_TABLE_SUBQUERY_CTE_HINT \
+	"Use CTE's or subqueries to select from local tables and use them in joins"
+
+
 extern List * ExtractRangeTableEntryList(Query *query);
 extern bool NeedsDistributedPlanning(Query *query);
 extern struct DistributedPlan * GetDistributedPlan(CustomScan *node);
@@ -174,16 +232,26 @@ extern void multi_join_restriction_hook(PlannerInfo *root,
 										RelOptInfo *innerrel,
 										JoinType jointype,
 										JoinPathExtraData *extra);
+extern bool HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams);
 extern bool IsModifyCommand(Query *query);
-extern bool IsModifyDistributedPlan(struct DistributedPlan *distributedPlan);
 extern void EnsurePartitionTableNotReplicated(Oid relationId);
 extern Node * ResolveExternalParams(Node *inputNode, ParamListInfo boundParams);
 extern bool IsMultiTaskPlan(struct DistributedPlan *distributedPlan);
 extern RangeTblEntry * RemoteScanRangeTableEntry(List *columnNameList);
 extern int GetRTEIdentity(RangeTblEntry *rte);
+extern LOCKMODE GetQueryLockMode(Query *query);
 extern int32 BlessRecordExpression(Expr *expr);
 extern void DissuadePlannerFromUsingPlan(PlannedStmt *plan);
 extern PlannedStmt * FinalizePlan(PlannedStmt *localPlan,
 								  struct DistributedPlan *distributedPlan);
+extern RTEListProperties * GetRTEListPropertiesForQuery(Query *query);
+
+
+extern struct DistributedPlan * CreateDistributedPlan(uint64 planId, Query *originalQuery,
+													  Query *query, ParamListInfo
+													  boundParams, bool
+													  hasUnresolvedParams,
+													  PlannerRestrictionContext *
+													  plannerRestrictionContext);
 
 #endif /* DISTRIBUTED_PLANNER_H */

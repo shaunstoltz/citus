@@ -22,10 +22,12 @@
 #include "distributed/commands/multi_copy.h"
 #include "distributed/connection_management.h"
 #include "distributed/intermediate_results.h"
+#include "distributed/listutils.h"
 #include "distributed/multi_executor.h"
 #include "distributed/remote_commands.h"
 #include "distributed/tuplestore.h"
 #include "distributed/listutils.h"
+#include "distributed/version_compat.h"
 #include "tcop/tcopprot.h"
 
 PG_FUNCTION_INFO_V1(partition_task_list_results);
@@ -48,9 +50,10 @@ partition_task_list_results(PG_FUNCTION_ARGS)
 	bool binaryFormat = PG_GETARG_BOOL(3);
 
 	Query *parsedQuery = ParseQueryString(queryString, NULL, 0);
-	PlannedStmt *queryPlan = pg_plan_query(parsedQuery,
-										   CURSOR_OPT_PARALLEL_OK,
-										   NULL);
+	PlannedStmt *queryPlan = pg_plan_query_compat(parsedQuery,
+												  queryString,
+												  CURSOR_OPT_PARALLEL_OK,
+												  NULL);
 	if (!IsCitusCustomScan(queryPlan->planTree))
 	{
 		ereport(ERROR, (errmsg("query must be distributed and shouldn't require "
@@ -63,14 +66,19 @@ partition_task_list_results(PG_FUNCTION_ARGS)
 	Job *job = distributedPlan->workerJob;
 	List *taskList = job->taskList;
 
-	DistTableCacheEntry *targetRelation = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *targetRelation = GetCitusTableCacheEntry(relationId);
 
 	/*
 	 * Here SELECT query's target list should match column list of target relation,
 	 * so their partition column indexes are equal.
 	 */
-	int partitionColumnIndex = targetRelation->partitionMethod != DISTRIBUTE_BY_NONE ?
-							   targetRelation->partitionColumn->varattno - 1 : 0;
+	int partitionColumnIndex = 0;
+
+	if (IsCitusTableTypeCacheEntry(targetRelation, DISTRIBUTED_TABLE) && IsA(
+			targetRelation->partitionColumn, Var))
+	{
+		partitionColumnIndex = targetRelation->partitionColumn->varattno - 1;
+	}
 
 	List *fragmentList = PartitionTasklistResults(resultIdPrefix, taskList,
 												  partitionColumnIndex,
@@ -79,12 +87,9 @@ partition_task_list_results(PG_FUNCTION_ARGS)
 	TupleDesc tupleDescriptor = NULL;
 	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDescriptor);
 
-	ListCell *fragmentCell = NULL;
-
-	foreach(fragmentCell, fragmentList)
+	DistributedResultFragment *fragment = NULL;
+	foreach_ptr(fragment, fragmentList)
 	{
-		DistributedResultFragment *fragment = lfirst(fragmentCell);
-
 		bool columnNulls[5] = { 0 };
 		Datum columnValues[5] = {
 			CStringGetTextDatum(fragment->resultId),
@@ -119,9 +124,10 @@ redistribute_task_list_results(PG_FUNCTION_ARGS)
 	bool binaryFormat = PG_GETARG_BOOL(3);
 
 	Query *parsedQuery = ParseQueryString(queryString, NULL, 0);
-	PlannedStmt *queryPlan = pg_plan_query(parsedQuery,
-										   CURSOR_OPT_PARALLEL_OK,
-										   NULL);
+	PlannedStmt *queryPlan = pg_plan_query_compat(parsedQuery,
+												  queryString,
+												  CURSOR_OPT_PARALLEL_OK,
+												  NULL);
 	if (!IsCitusCustomScan(queryPlan->planTree))
 	{
 		ereport(ERROR, (errmsg("query must be distributed and shouldn't require "
@@ -134,13 +140,14 @@ redistribute_task_list_results(PG_FUNCTION_ARGS)
 	Job *job = distributedPlan->workerJob;
 	List *taskList = job->taskList;
 
-	DistTableCacheEntry *targetRelation = DistributedTableCacheEntry(relationId);
+	CitusTableCacheEntry *targetRelation = GetCitusTableCacheEntry(relationId);
 
 	/*
 	 * Here SELECT query's target list should match column list of target relation,
 	 * so their partition column indexes are equal.
 	 */
-	int partitionColumnIndex = targetRelation->partitionMethod != DISTRIBUTE_BY_NONE ?
+	int partitionColumnIndex = IsCitusTableTypeCacheEntry(targetRelation,
+														  DISTRIBUTED_TABLE) ?
 							   targetRelation->partitionColumn->varattno - 1 : 0;
 
 	List **shardResultIds = RedistributeTaskListResults(resultIdPrefix, taskList,
@@ -161,11 +168,10 @@ redistribute_task_list_results(PG_FUNCTION_ARGS)
 		Datum *resultIdValues = palloc0(fragmentCount * sizeof(Datum));
 		List *sortedResultIds = SortList(shardResultIds[shardIndex], pg_qsort_strcmp);
 
-		ListCell *resultIdCell = NULL;
+		const char *resultId = NULL;
 		int resultIdIndex = 0;
-		foreach(resultIdCell, sortedResultIds)
+		foreach_ptr(resultId, sortedResultIds)
 		{
-			char *resultId = lfirst(resultIdCell);
 			resultIdValues[resultIdIndex++] = CStringGetTextDatum(resultId);
 		}
 

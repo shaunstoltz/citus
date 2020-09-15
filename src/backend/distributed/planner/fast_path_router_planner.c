@@ -34,6 +34,8 @@
  */
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "distributed/distributed_planner.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/multi_physical_planner.h" /* only to use some utility functions */
@@ -42,13 +44,13 @@
 #include "distributed/pg_dist_partition.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shard_pruning.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/makefuncs.h"
 #endif
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "optimizer/optimizer.h"
 #else
 #include "optimizer/clauses.h"
@@ -133,7 +135,7 @@ GeneratePlaceHolderPlannedStmt(Query *parse)
 	result->planTree = (Plan *) plan;
 	result->hasReturning = (parse->returningList != NIL);
 
-	Oid relationId = ExtractFirstDistributedTableId(parse);
+	Oid relationId = ExtractFirstCitusTableId(parse);
 	result->relationOids = list_make1_oid(relationId);
 
 	return result;
@@ -202,16 +204,17 @@ FastPathRouterQuery(Query *query, Node **distributionKeyValue)
 
 	/* we don't want to deal with append/range distributed tables */
 	Oid distributedTableId = rangeTableEntry->relid;
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
-	if (!(cacheEntry->partitionMethod == DISTRIBUTE_BY_HASH ||
-		  cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE))
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
+	if (IsCitusTableTypeCacheEntry(cacheEntry, RANGE_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, APPEND_DISTRIBUTED))
 	{
 		return false;
 	}
 
 	/* WHERE clause should not be empty for distributed tables */
 	if (joinTree == NULL ||
-		(cacheEntry->partitionMethod != DISTRIBUTE_BY_NONE && joinTree->quals == NULL))
+		(IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) && joinTree->quals ==
+		 NULL))
 	{
 		return false;
 	}
@@ -356,26 +359,17 @@ ConjunctionContainsColumnFilter(Node *node, Var *column, Node **distributionKeyV
 static bool
 DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn, Node **distributionKeyValue)
 {
-	Node *leftOperand = NULL;
-	Node *rightOperand = NULL;
 	Param *paramClause = NULL;
 	Const *constantClause = NULL;
 
 	Var *columnInExpr = NULL;
 
-	if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
+	Node *leftOperand;
+	Node *rightOperand;
+	if (!BinaryOpExpression(clause, &leftOperand, &rightOperand))
 	{
-		leftOperand = get_leftop(clause);
-		rightOperand = get_rightop(clause);
+		return false;
 	}
-	else
-	{
-		return false; /* not a binary opclause */
-	}
-
-	/* strip coercions before doing check */
-	leftOperand = strip_implicit_coercions(leftOperand);
-	rightOperand = strip_implicit_coercions(rightOperand);
 
 	if (IsA(rightOperand, Param) && IsA(leftOperand, Var))
 	{

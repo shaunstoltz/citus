@@ -97,7 +97,14 @@ static DistributeObjectOps Any_AlterRole = {
 	.qualify = NULL,
 	.preprocess = NULL,
 	.postprocess = PostprocessAlterRoleStmt,
-	.address = NULL,
+	.address = AlterRoleStmtObjectAddress,
+};
+static DistributeObjectOps Any_AlterRoleSet = {
+	.deparse = DeparseAlterRoleSetStmt,
+	.qualify = QualifyAlterRoleSetStmt,
+	.preprocess = PreprocessAlterRoleSetStmt,
+	.postprocess = NULL,
+	.address = AlterRoleSetStmtObjectAddress,
 };
 static DistributeObjectOps Any_AlterTableMoveAll = {
 	.deparse = NULL,
@@ -147,6 +154,13 @@ static DistributeObjectOps Any_CreatePolicy = {
 	.preprocess = PreprocessCreatePolicyStmt,
 	.postprocess = NULL,
 	.address = NULL,
+};
+static DistributeObjectOps Any_CreateTrigger = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateTriggerStmt,
+	.address = CreateTriggerStmtObjectAddress,
 };
 static DistributeObjectOps Any_Grant = {
 	.deparse = NULL,
@@ -337,6 +351,13 @@ static DistributeObjectOps Routine_AlterObjectDepends = {
 	.postprocess = NULL,
 	.address = AlterFunctionDependsStmtObjectAddress,
 };
+static DistributeObjectOps Trigger_AlterObjectDepends = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = NULL,
+	.postprocess = PostprocessAlterTriggerDependsStmt,
+	.address = NULL,
+};
 static DistributeObjectOps Routine_AlterObjectSchema = {
 	.deparse = DeparseAlterFunctionSchemaStmt,
 	.qualify = QualifyAlterFunctionSchemaStmt,
@@ -428,12 +449,26 @@ static DistributeObjectOps Type_Drop = {
 	.postprocess = NULL,
 	.address = NULL,
 };
+static DistributeObjectOps Trigger_Drop = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = PreprocessDropTriggerStmt,
+	.postprocess = NULL,
+	.address = NULL,
+};
 static DistributeObjectOps Type_Rename = {
 	.deparse = DeparseRenameTypeStmt,
 	.qualify = QualifyRenameTypeStmt,
 	.preprocess = PreprocessRenameTypeStmt,
 	.postprocess = NULL,
 	.address = RenameTypeStmtObjectAddress,
+};
+static DistributeObjectOps Trigger_Rename = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = NULL,
+	.postprocess = PostprocessAlterTriggerRenameStmt,
+	.address = NULL,
 };
 
 
@@ -485,6 +520,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_ROUTINE:
 				{
 					return &Routine_AlterObjectDepends;
+				}
+
+				case OBJECT_TRIGGER:
+				{
+					return &Trigger_AlterObjectDepends;
 				}
 
 				default:
@@ -598,6 +638,11 @@ GetDistributeObjectOps(Node *node)
 			return &Any_AlterRole;
 		}
 
+		case T_AlterRoleSetStmt:
+		{
+			return &Any_AlterRoleSet;
+		}
+
 		case T_AlterTableStmt:
 		{
 			AlterTableStmt *stmt = castNode(AlterTableStmt, node);
@@ -663,6 +708,11 @@ GetDistributeObjectOps(Node *node)
 		case T_CreatePolicyStmt:
 		{
 			return &Any_CreatePolicy;
+		}
+
+		case T_CreateTrigStmt:
+		{
+			return &Any_CreateTrigger;
 		}
 
 		case T_DefineStmt:
@@ -747,6 +797,11 @@ GetDistributeObjectOps(Node *node)
 					return &Type_Drop;
 				}
 
+				case OBJECT_TRIGGER:
+				{
+					return &Trigger_Drop;
+				}
+
 				default:
 				{
 					return &NoDistributeOps;
@@ -819,6 +874,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_TYPE:
 				{
 					return &Type_Rename;
+				}
+
+				case OBJECT_TRIGGER:
+				{
+					return &Trigger_Rename;
 				}
 
 				default:

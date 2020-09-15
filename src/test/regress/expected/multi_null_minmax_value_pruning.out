@@ -7,7 +7,6 @@ SET client_min_messages TO DEBUG2;
 SET citus.explain_all_tasks TO on;
 -- to avoid differing explain output - executor doesn't matter,
 -- because were testing pruning here.
-RESET citus.task_executor_type;
 -- Change configuration to treat lineitem and orders tables as large
 SET citus.log_multi_join_order to true;
 SET citus.enable_repartition_joins to ON;
@@ -211,8 +210,6 @@ $Q$);
 DEBUG:  Router planner does not support append-partitioned tables.
 CONTEXT:  PL/pgSQL function coordinator_plan(text) line 3 at FOR over EXECUTE statement
 LOG:  join order: [ "lineitem" ]
-CONTEXT:  PL/pgSQL function coordinator_plan(text) line 3 at FOR over EXECUTE statement
-DEBUG:  Plan is router executable
 CONTEXT:  PL/pgSQL function coordinator_plan(text) line 3 at FOR over EXECUTE statement
        coordinator_plan
 ---------------------------------------------------------------------

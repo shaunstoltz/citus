@@ -536,7 +536,7 @@ WHERE
 	colocated_table_test.value_1 = colocated_table_test_2.value_1 AND colocated_table_test.value_2 = reference_table_test.value_2
 ORDER BY 1;
 
-SET citus.task_executor_type to "task-tracker";
+SET citus.enable_repartition_joins to ON;
 SELECT
 	colocated_table_test.value_2
 FROM
@@ -557,6 +557,15 @@ ORDER BY 1;
 SET client_min_messages TO NOTICE;
 SET citus.log_multi_join_order TO FALSE;
 
--- clean up tables
 \c - - - :master_port
-DROP TABLE reference_table_test, reference_table_test_second, reference_table_test_third;;
+
+-- issue 3766
+CREATE TABLE numbers(a int);
+SELECT create_reference_table('numbers');
+SET client_min_messages TO debug4;
+INSERT INTO numbers VALUES (1), (2), (3), (4);
+SELECT count(*) FROM numbers;
+RESET client_min_messages;
+
+-- clean up tables
+DROP TABLE reference_table_test, reference_table_test_second, reference_table_test_third, numbers;

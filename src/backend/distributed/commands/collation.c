@@ -13,16 +13,18 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_collation.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/commands.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/worker_create_or_replace.h"
+#include "distributed/pg_version_constants.h"
 #include "distributed/worker_manager.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
@@ -58,7 +60,7 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 	const char *collctype;
 	const char *collname;
 	Oid collnamespace;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	bool collisdeterministic;
 #endif
 
@@ -74,7 +76,7 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 	collctype = NameStr(collationForm->collctype);
 	collnamespace = collationForm->collnamespace;
 	collname = NameStr(collationForm->collname);
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	collisdeterministic = collationForm->collisdeterministic;
 #endif
 
@@ -115,7 +117,7 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 						 quote_literal_cstr(collctype));
 	}
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	if (!collisdeterministic)
 	{
 		appendStringInfoString(&collationNameDef, ", deterministic = false");
@@ -189,14 +191,13 @@ static List *
 FilterNameListForDistributedCollations(List *objects, bool missing_ok,
 									   List **objectAddresses)
 {
-	ListCell *objectCell = NULL;
 	List *result = NIL;
 
 	*objectAddresses = NIL;
 
-	foreach(objectCell, objects)
+	List *collName = NULL;
+	foreach_ptr(collName, objects)
 	{
-		List *collName = lfirst(objectCell);
 		Oid collOid = get_collation_oid(collName, true);
 		ObjectAddress collAddress = { 0 };
 
@@ -277,7 +278,7 @@ PreprocessDropCollationStmt(Node *node, const char *queryString)
 								(void *) dropStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -310,7 +311,7 @@ PreprocessAlterCollationOwnerStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -345,7 +346,7 @@ PreprocessRenameCollationStmt(Node *node, const char *queryString)
 								(void *) renameStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -378,7 +379,7 @@ PreprocessAlterCollationSchemaStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -529,16 +530,17 @@ GenerateBackupNameForCollationCollision(const ObjectAddress *address)
 
 	while (true)
 	{
-		int suffixLength = snprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
-									count);
+		int suffixLength = SafeSnprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
+										count);
 
 		/* trim the base name at the end to leave space for the suffix and trailing \0 */
 		baseLength = Min(baseLength, NAMEDATALEN - suffixLength - 1);
 
 		/* clear newName before copying the potentially trimmed baseName and suffix */
 		memset(newName, 0, NAMEDATALEN);
-		strncpy(newName, baseName, baseLength);
-		strncpy(newName + baseLength, suffix, suffixLength);
+		strncpy_s(newName, NAMEDATALEN, baseName, baseLength);
+		strncpy_s(newName + baseLength, NAMEDATALEN - baseLength, suffix,
+				  suffixLength);
 
 		List *newCollationName = list_make2(namespace, makeString(newName));
 
@@ -602,6 +604,6 @@ PostprocessDefineCollationStmt(Node *node, const char *queryString)
 
 	MarkObjectDistributed(&collationAddress);
 
-	return NodeDDLTaskList(ALL_WORKERS, CreateCollationDDLsIdempotent(
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, CreateCollationDDLsIdempotent(
 							   collationAddress.objectId));
 }

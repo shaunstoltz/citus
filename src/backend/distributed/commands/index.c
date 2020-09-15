@@ -10,7 +10,8 @@
 
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 120000
+#include "distributed/pg_version_constants.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
 #endif
 #include "access/htup_details.h"
@@ -25,7 +26,8 @@
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distributed_planner.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/resource_lock.h"
@@ -69,7 +71,7 @@ struct DropRelationCallbackState
  */
 struct ReindexIndexCallbackState
 {
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	bool concurrent;
 #endif
 	Oid locked_table_oid;
@@ -100,7 +102,7 @@ IsIndexRenameStmt(RenameStmt *renameStmt)
  * PreprocessIndexStmt determines whether a given CREATE INDEX statement involves
  * a distributed table. If so (and if the statement does not use unsupported
  * options), it modifies the input statement to ensure proper execution against
- * the master node table and creates a DDLJob to encapsulate information needed
+ * the coordinator node table and creates a DDLJob to encapsulate information needed
  * during the worker node portion of DDL execution before returning that DDLJob
  * in a List. If no distributed table is involved, this function returns NIL.
  */
@@ -136,10 +138,10 @@ PreprocessIndexStmt(Node *node, const char *createIndexCommand)
 		 * checked permissions, and will only fail when executing the actual
 		 * index statements.
 		 */
-		Relation relation = heap_openrv(createIndexStatement->relation, lockmode);
+		Relation relation = table_openrv(createIndexStatement->relation, lockmode);
 		Oid relationId = RelationGetRelid(relation);
 
-		bool isDistributedRelation = IsDistributedTable(relationId);
+		bool isCitusRelation = IsCitusTable(relationId);
 
 		if (createIndexStatement->relation->schemaname == NULL)
 		{
@@ -158,9 +160,9 @@ PreprocessIndexStmt(Node *node, const char *createIndexCommand)
 				relationContext, namespaceName);
 		}
 
-		heap_close(relation, NoLock);
+		table_close(relation, NoLock);
 
-		if (isDistributedRelation)
+		if (isCitusRelation)
 		{
 			char *indexName = createIndexStatement->idxname;
 			char *namespaceName = createIndexStatement->relation->schemaname;
@@ -192,7 +194,7 @@ PreprocessIndexStmt(Node *node, const char *createIndexCommand)
  * PreprocessReindexStmt determines whether a given REINDEX statement involves
  * a distributed table. If so (and if the statement does not use unsupported
  * options), it modifies the input statement to ensure proper execution against
- * the master node table and creates a DDLJob to encapsulate information needed
+ * the coordinator node table and creates a DDLJob to encapsulate information needed
  * during the worker node portion of DDL execution before returning that DDLJob
  * in a List. If no distributed table is involved, this function returns NIL.
  */
@@ -211,8 +213,8 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
 	{
 		Relation relation = NULL;
 		Oid relationId = InvalidOid;
-		bool isDistributedRelation = false;
-#if PG_VERSION_NUM >= 120000
+		bool isCitusRelation = false;
+#if PG_VERSION_NUM >= PG_VERSION_12
 		LOCKMODE lockmode = reindexStatement->concurrent ? ShareUpdateExclusiveLock :
 							AccessExclusiveLock;
 #else
@@ -227,7 +229,7 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
 		{
 			Oid indOid;
 			struct ReindexIndexCallbackState state;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			state.concurrent = reindexStatement->concurrent;
 #endif
 			state.locked_table_oid = InvalidOid;
@@ -244,11 +246,11 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
 			RangeVarGetRelidExtended(reindexStatement->relation, lockmode, 0,
 									 RangeVarCallbackOwnsTable, NULL);
 
-			relation = heap_openrv(reindexStatement->relation, NoLock);
+			relation = table_openrv(reindexStatement->relation, NoLock);
 			relationId = RelationGetRelid(relation);
 		}
 
-		isDistributedRelation = IsDistributedTable(relationId);
+		isCitusRelation = IsCitusTable(relationId);
 
 		if (reindexStatement->relation->schemaname == NULL)
 		{
@@ -273,14 +275,14 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
 		}
 		else
 		{
-			heap_close(relation, NoLock);
+			table_close(relation, NoLock);
 		}
 
-		if (isDistributedRelation)
+		if (isCitusRelation)
 		{
 			DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 			ddlJob->targetRelationId = relationId;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			ddlJob->concurrentIndexCmd = reindexStatement->concurrent;
 #else
 			ddlJob->concurrentIndexCmd = false;
@@ -300,7 +302,7 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
  * PreprocessDropIndexStmt determines whether a given DROP INDEX statement involves
  * a distributed table. If so (and if the statement does not use unsupported
  * options), it modifies the input statement to ensure proper execution against
- * the master node table and creates a DDLJob to encapsulate information needed
+ * the coordinator node table and creates a DDLJob to encapsulate information needed
  * during the worker node portion of DDL execution before returning that DDLJob
  * in a List. If no distributed table is involved, this function returns NIL.
  */
@@ -309,20 +311,19 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand)
 {
 	DropStmt *dropIndexStatement = castNode(DropStmt, node);
 	List *ddlJobs = NIL;
-	ListCell *dropObjectCell = NULL;
 	Oid distributedIndexId = InvalidOid;
 	Oid distributedRelationId = InvalidOid;
 
 	Assert(dropIndexStatement->removeType == OBJECT_INDEX);
 
 	/* check if any of the indexes being dropped belong to a distributed table */
-	foreach(dropObjectCell, dropIndexStatement->objects)
+	List *objectNameList = NULL;
+	foreach_ptr(objectNameList, dropIndexStatement->objects)
 	{
 		struct DropRelationCallbackState state;
 		uint32 rvrFlags = RVR_MISSING_OK;
 		LOCKMODE lockmode = AccessExclusiveLock;
 
-		List *objectNameList = (List *) lfirst(dropObjectCell);
 		RangeVar *rangeVar = makeRangeVarFromNameList(objectNameList);
 
 		/*
@@ -359,8 +360,8 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand)
 		}
 
 		Oid relationId = IndexGetRelation(indexId, false);
-		bool isDistributedRelation = IsDistributedTable(relationId);
-		if (isDistributedRelation)
+		bool isCitusRelation = IsCitusTable(relationId);
+		if (isCitusRelation)
 		{
 			distributedIndexId = indexId;
 			distributedRelationId = relationId;
@@ -410,18 +411,28 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 		return NIL;
 	}
 
+	/*
+	 * We make sure schema name is not null in the PreprocessIndexStmt
+	 */
+	Oid schemaId = get_namespace_oid(indexStmt->relation->schemaname, true);
+	Oid relationId = get_relname_relid(indexStmt->relation->relname, schemaId);
+	if (!IsCitusTable(relationId))
+	{
+		return NIL;
+	}
+
 	/* commit the current transaction and start anew */
 	CommitTransactionCommand();
 	StartTransactionCommand();
 
 	/* get the affected relation and index */
-	Relation relation = heap_openrv(indexStmt->relation, ShareUpdateExclusiveLock);
+	Relation relation = table_openrv(indexStmt->relation, ShareUpdateExclusiveLock);
 	Oid indexRelationId = get_relname_relid(indexStmt->idxname,
-											RelationGetNamespace(relation));
+											schemaId);
 	Relation indexRelation = index_open(indexRelationId, RowExclusiveLock);
 
 	/* close relations but retain locks */
-	heap_close(relation, NoLock);
+	table_close(relation, NoLock);
 	index_close(indexRelation, NoLock);
 
 	/* mark index as invalid, in-place (cannot be rolled back) */
@@ -432,7 +443,7 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 	StartTransactionCommand();
 
 	/* now, update index's validity in a way that can roll back */
-	Relation pg_index = heap_open(IndexRelationId, RowExclusiveLock);
+	Relation pg_index = table_open(IndexRelationId, RowExclusiveLock);
 
 	HeapTuple indexTuple = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(
 												   indexRelationId));
@@ -446,7 +457,7 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 
 	/* clean up; index now marked valid, but ROLLBACK will mark invalid */
 	heap_freetuple(indexTuple);
-	heap_close(pg_index, RowExclusiveLock);
+	table_close(pg_index, RowExclusiveLock);
 
 	return NIL;
 }
@@ -463,13 +474,11 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 void
 ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
 {
-	List *commandList = alterTableStatement->cmds;
-	ListCell *commandCell = NULL;
-
 	/* error out if any of the subcommands are unsupported */
-	foreach(commandCell, commandList)
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 		AlterTableType alterTableType = command->subtype;
 
 		switch (alterTableType)
@@ -508,7 +517,6 @@ CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt)
 {
 	List *taskList = NIL;
 	List *shardIntervalList = LoadShardIntervalList(relationId);
-	ListCell *shardIntervalCell = NULL;
 	StringInfoData ddlString;
 	uint64 jobId = INVALID_JOB_ID;
 	int taskId = 1;
@@ -518,9 +526,9 @@ CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt)
 	/* lock metadata before getting placement lists */
 	LockShardListMetadata(shardIntervalList, ShareLock);
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
 
 		deparse_shard_index_statement(indexStmt, relationId, shardId, &ddlString);
@@ -553,7 +561,6 @@ CreateReindexTaskList(Oid relationId, ReindexStmt *reindexStmt)
 {
 	List *taskList = NIL;
 	List *shardIntervalList = LoadShardIntervalList(relationId);
-	ListCell *shardIntervalCell = NULL;
 	StringInfoData ddlString;
 	uint64 jobId = INVALID_JOB_ID;
 	int taskId = 1;
@@ -563,9 +570,9 @@ CreateReindexTaskList(Oid relationId, ReindexStmt *reindexStmt)
 	/* lock metadata before getting placement lists */
 	LockShardListMetadata(shardIntervalList, ShareLock);
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
 
 		deparse_shard_reindex_statement(reindexStmt, relationId, shardId, &ddlString);
@@ -706,7 +713,7 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation, Oid relId, Oid oldRelI
 	 * non-concurrent case and table locks used by index_concurrently_*() for
 	 * concurrent case.
 	 */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	table_lockmode = state->concurrent ? ShareUpdateExclusiveLock : ShareLock;
 #else
 	table_lockmode = ShareLock;
@@ -793,32 +800,30 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 		/* caller uses ShareLock for non-concurrent indexes, use the same lock here */
 		LOCKMODE lockMode = ShareLock;
 		Oid relationId = RangeVarGetRelid(relation, lockMode, missingOk);
-		Var *partitionKey = DistPartitionKey(relationId);
-		char partitionMethod = PartitionMethod(relationId);
-		ListCell *indexParameterCell = NULL;
 		bool indexContainsPartitionColumn = false;
 
 		/*
-		 * Reference tables do not have partition key, and unique constraints
-		 * are allowed for them. Thus, we added a short-circuit for reference tables.
+		 * Non-distributed tables do not have partition key, and unique constraints
+		 * are allowed for them. Thus, we added a short-circuit for non-distributed tables.
 		 */
-		if (partitionMethod == DISTRIBUTE_BY_NONE)
+		if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
 			return;
 		}
 
-		if (partitionMethod == DISTRIBUTE_BY_APPEND)
+		if (IsCitusTableType(relationId, APPEND_DISTRIBUTED))
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("creating unique indexes on append-partitioned tables "
 								   "is currently unsupported")));
 		}
 
+		Var *partitionKey = DistPartitionKeyOrError(relationId);
 		List *indexParameterList = createIndexStatement->indexParams;
-		foreach(indexParameterCell, indexParameterList)
+		IndexElem *indexElement = NULL;
+		foreach_ptr(indexElement, indexParameterList)
 		{
-			IndexElem *indexElement = (IndexElem *) lfirst(indexParameterCell);
-			char *columnName = indexElement->name;
+			const char *columnName = indexElement->name;
 
 			/* column name is null for index expressions, skip it */
 			if (columnName == NULL)
@@ -872,7 +877,6 @@ DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt)
 {
 	List *taskList = NIL;
 	List *shardIntervalList = LoadShardIntervalList(relationId);
-	ListCell *shardIntervalCell = NULL;
 	char *indexName = get_rel_name(indexId);
 	Oid schemaId = get_rel_namespace(indexId);
 	char *schemaName = get_namespace_name(schemaId);
@@ -885,9 +889,9 @@ DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt)
 	/* lock metadata before getting placement lists */
 	LockShardListMetadata(shardIntervalList, ShareLock);
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
 		char *shardIndexName = pstrdup(indexName);
 

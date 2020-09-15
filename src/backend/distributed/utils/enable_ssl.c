@@ -37,7 +37,22 @@
 #define X509_SUBJECT_COMMON_NAME "CN"
 
 #define POSTGRES_DEFAULT_SSL_CIPHERS "HIGH:MEDIUM:+3DES:!aNULL"
-#define CITUS_DEFAULT_SSL_CIPHERS "TLSv1.2+HIGH:!aNULL:!eNULL"
+#define CITUS_DEFAULT_SSL_CIPHERS_OLD "TLSv1.2+HIGH:!aNULL:!eNULL"
+
+/*
+ * Microsoft approved cipher string.
+ * This cipher string implicitely enables only TLSv1.2+, because these ciphers
+ * were all added in TLSv1.2. This can be confirmed by running:
+ * openssl -v <below strings concatenated>
+ */
+#define CITUS_DEFAULT_SSL_CIPHERS "ECDHE-ECDSA-AES128-GCM-SHA256:" \
+								  "ECDHE-ECDSA-AES256-GCM-SHA384:" \
+								  "ECDHE-RSA-AES128-GCM-SHA256:" \
+								  "ECDHE-RSA-AES256-GCM-SHA384:" \
+								  "ECDHE-ECDSA-AES128-SHA256:" \
+								  "ECDHE-ECDSA-AES256-SHA384:" \
+								  "ECDHE-RSA-AES128-SHA256:" \
+								  "ECDHE-RSA-AES256-SHA384"
 #define SET_CITUS_SSL_CIPHERS_QUERY \
 	"ALTER SYSTEM SET ssl_ciphers TO '" CITUS_DEFAULT_SSL_CIPHERS "';"
 
@@ -191,7 +206,7 @@ ShouldUseAutoSSL(void)
 	const char *sslmode = NULL;
 	sslmode = GetConnParam("sslmode");
 
-	if (strcmp(sslmode, "require") == 0)
+	if (sslmode != NULL && strcmp(sslmode, "require") == 0)
 	{
 		return true;
 	}
@@ -352,8 +367,8 @@ CreateCertificate(EVP_PKEY *privateKey)
 	 * Postgres does not check the validity on the certificates, but we can't omit the
 	 * dates either to create a certificate that can be parsed. We settled on a validity
 	 * of 0 seconds. When postgres would fix the validity check in a future version it
-	 * would fail right after an upgrade instead of setting a time bomb till certificate
-	 * expiration date.
+	 * would fail right after an upgrade. Instead of working until the certificate
+	 * expiration date and then suddenly erroring out.
 	 */
 	X509_gmtime_adj(X509_get_notBefore(certificate), 0);
 	X509_gmtime_adj(X509_get_notAfter(certificate), 0);
@@ -392,7 +407,14 @@ StoreCertificate(EVP_PKEY *privateKey, X509 *certificate)
 
 
 	/* Open the private key file and write the private key in PEM format to it */
-	FILE *privateKeyFile = fopen(privateKeyFilename, "wb");
+	int privateKeyFileDescriptor = open(privateKeyFilename, O_WRONLY | O_CREAT, 0600);
+	if (privateKeyFileDescriptor == -1)
+	{
+		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
+							   privateKeyFilename)));
+	}
+
+	FILE *privateKeyFile = fdopen(privateKeyFileDescriptor, "wb");
 	if (!privateKeyFile)
 	{
 		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
@@ -407,8 +429,15 @@ StoreCertificate(EVP_PKEY *privateKey, X509 *certificate)
 		ereport(ERROR, (errmsg("unable to store private key")));
 	}
 
+	int certificateFileDescriptor = open(certificateFilename, O_WRONLY | O_CREAT, 0600);
+	if (certificateFileDescriptor == -1)
+	{
+		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
+							   privateKeyFilename)));
+	}
+
 	/* Open the certificate file and write the certificate in the PEM format to it */
-	FILE *certificateFile = fopen(certificateFilename, "wb");
+	FILE *certificateFile = fdopen(certificateFileDescriptor, "wb");
 	if (!certificateFile)
 	{
 		ereport(ERROR, (errmsg("unable to open certificate file '%s' for writing",

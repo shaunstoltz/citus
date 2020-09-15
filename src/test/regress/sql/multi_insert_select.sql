@@ -677,6 +677,14 @@ SET client_min_messages TO WARNING;
    raw_events_first INNER JOIN raw_events_second ON raw_events_first.value_1 = raw_events_second.value_1;
 $Q$);
 
+-- EXPLAIN ANALYZE is not supported for INSERT ... SELECT via coordinator
+EXPLAIN (costs off, analyze on)
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.value_1 = raw_events_second.value_1;
+
 -- even if there is a filter on the partition key, since the join is not on the partition key we reject
 -- this query
 INSERT INTO agg_events (user_id)
@@ -1982,21 +1990,52 @@ SELECT create_distributed_table('dist_table_with_sequence', 'user_id');
 INSERT INTO dist_table_with_sequence (value_1)
 SELECT s FROM generate_series(1,5) s;
 
-SELECT * FROM dist_table_with_sequence ORDER BY user_id;
+SELECT * FROM dist_table_with_sequence ORDER BY user_id, value_1;
 
 -- from a distributed query
 INSERT INTO dist_table_with_sequence (value_1)
-SELECT value_1 FROM dist_table_with_sequence;
+SELECT value_1 FROM dist_table_with_sequence ORDER BY value_1;
 
-SELECT * FROM dist_table_with_sequence ORDER BY user_id;
+SELECT * FROM dist_table_with_sequence ORDER BY user_id, value_1;
+
+TRUNCATE dist_table_with_sequence;
+
+INSERT INTO dist_table_with_sequence (user_id)
+SELECT user_id FROM raw_events_second ORDER BY user_id;
+
+SELECT * FROM dist_table_with_sequence ORDER BY user_id, value_1;
+
+WITH top10 AS (
+  SELECT user_id FROM raw_events_second WHERE value_1 IS NOT NULL ORDER BY value_1 LIMIT 10
+)
+INSERT INTO dist_table_with_sequence (value_1)
+SELECT * FROM top10;
+
+SELECT * FROM dist_table_with_sequence ORDER BY user_id, value_1;
+
+-- router queries become logical planner queries when there is a nextval call
+INSERT INTO dist_table_with_sequence (user_id)
+SELECT user_id FROM dist_table_with_sequence WHERE user_id = 1;
+
+SELECT * FROM dist_table_with_sequence ORDER BY user_id, value_1;
+
+DROP TABLE dist_table_with_sequence;
 
 -- Select from distributed table into reference table
-CREATE TABLE ref_table (user_id int, value_1 int);
+CREATE TABLE ref_table (user_id serial, value_1 int);
 SELECT create_reference_table('ref_table');
 
 INSERT INTO ref_table
 SELECT user_id, value_1 FROM raw_events_second;
 
+SELECT * FROM ref_table ORDER BY user_id, value_1;
+
+INSERT INTO ref_table (value_1)
+SELECT value_1 FROM raw_events_second ORDER BY value_1;
+
+SELECT * FROM ref_table ORDER BY user_id, value_1;
+
+INSERT INTO ref_table SELECT * FROM ref_table;
 SELECT * FROM ref_table ORDER BY user_id, value_1;
 
 DROP TABLE ref_table;

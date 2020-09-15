@@ -12,8 +12,8 @@
 #include "miscadmin.h"
 
 #include "distributed/commands/utility_hook.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/worker_transaction.h"
 #include "utils/builtins.h"
@@ -72,7 +72,7 @@ master_remove_partition_metadata(PG_FUNCTION_ARGS)
 	 * user-friendly, but this function is really only meant to be called
 	 * from the trigger.
 	 */
-	if (!IsDistributedTable(relationId) || !EnableDDLPropagation)
+	if (!IsCitusTable(relationId) || !EnableDDLPropagation)
 	{
 		PG_RETURN_VOID();
 	}
@@ -132,7 +132,7 @@ MasterRemoveDistributedTableMetadataFromWorkers(Oid relationId, char *schemaName
 	 * user-friendly, but this function is really only meant to be called
 	 * from the trigger.
 	 */
-	if (!IsDistributedTable(relationId) || !EnableDDLPropagation)
+	if (!IsCitusTable(relationId) || !EnableDDLPropagation)
 	{
 		return;
 	}

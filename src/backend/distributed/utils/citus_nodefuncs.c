@@ -10,6 +10,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "catalog/pg_type.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_nodefuncs.h"
@@ -38,7 +40,6 @@ static const char *CitusNodeTagNamesD[] = {
 	"UsedDistributedSubPlan",
 	"Task",
 	"LocalPlannedStatement",
-	"TaskExecution",
 	"ShardInterval",
 	"ShardPlacement",
 	"RelationShard",
@@ -72,9 +73,10 @@ PG_FUNCTION_INFO_V1(citus_extradata_container);
  * will not be handled by out/readfuncs.c. For the current uses that's ok.
  */
 void
-SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
-					 char *fragmentSchemaName, char *fragmentTableName,
-					 List *tableIdList)
+SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind, char *fragmentSchemaName,
+					 char *fragmentTableName, List *tableIdList, List *funcColumnNames,
+					 List *funcColumnTypes, List *funcColumnTypeMods,
+					 List *funcCollations)
 {
 	Assert(rte->eref);
 
@@ -127,6 +129,7 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 	/* create function expression to store our faux arguments in */
 	FuncExpr *fauxFuncExpr = makeNode(FuncExpr);
 	fauxFuncExpr->funcid = CitusExtraDataContainerFuncId();
+	fauxFuncExpr->funcresulttype = RECORDOID;
 	fauxFuncExpr->funcretset = true;
 	fauxFuncExpr->location = -1;
 	fauxFuncExpr->args = list_make4(rteKindData, fragmentSchemaData,
@@ -137,6 +140,10 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 
 	/* set the column count to pass ruleutils checks, not used elsewhere */
 	fauxFunction->funccolcount = list_length(rte->eref->colnames);
+	fauxFunction->funccolnames = funcColumnNames;
+	fauxFunction->funccoltypes = funcColumnTypes;
+	fauxFunction->funccoltypmods = funcColumnTypeMods;
+	fauxFunction->funccolcollations = funcCollations;
 
 	rte->rtekind = RTE_FUNCTION;
 	rte->functions = list_make1(fauxFunction);
@@ -281,7 +288,7 @@ ModifyRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 
 	SetRangeTblExtraData(rte, rteKind,
 						 fragmentSchemaName, fragmentTableName,
-						 tableIdList);
+						 tableIdList, NIL, NIL, NIL, NIL);
 }
 
 
@@ -301,7 +308,7 @@ GetRangeTblKind(RangeTblEntry *rte)
 		case RTE_JOIN:
 		case RTE_VALUES:
 		case RTE_CTE:
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		case RTE_RESULT:
 #endif
 			{
@@ -335,7 +342,6 @@ Datum
 citus_extradata_container(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR, (errmsg("not supposed to get here, did you cheat?")));
-
 	PG_RETURN_NULL();
 }
 
@@ -364,7 +370,7 @@ EqualUnsupportedCitusNode(const struct ExtensibleNode *a,
 		CopyNode##type, \
 		EqualUnsupportedCitusNode, \
 		Out##type, \
-		Read##type \
+		ReadUnsupportedCitusNode \
 	}
 
 #define DEFINE_NODE_METHODS_NO_READ(type) \
@@ -392,7 +398,6 @@ const ExtensibleNodeMethods nodeMethods[] =
 	DEFINE_NODE_METHODS(RelationRowLock),
 	DEFINE_NODE_METHODS(Task),
 	DEFINE_NODE_METHODS(LocalPlannedStatement),
-	DEFINE_NODE_METHODS(TaskExecution),
 	DEFINE_NODE_METHODS(DeferredErrorMessage),
 	DEFINE_NODE_METHODS(GroupShardPlacement),
 

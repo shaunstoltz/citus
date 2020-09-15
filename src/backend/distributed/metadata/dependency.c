@@ -10,25 +10,40 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
+#include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_proc_d.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_rewrite_d.h"
+#include "catalog/pg_shdepend.h"
 #include "catalog/pg_type.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "common/hashfn.h"
+#endif
+#include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/version_compat.h"
+#include "miscadmin.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
 /*
  * ObjectAddressCollector keeps track of collected ObjectAddresses. This can be used
- * together with recurse_pg_depend.
+ * together with RecurseObjectDependencies.
  *
  * We keep three different datastructures for the following reasons
  *  - A List ordered by insert/collect order
@@ -43,35 +58,129 @@ typedef struct ObjectAddressCollector
 	HTAB *visitedObjects;
 } ObjectAddressCollector;
 
+/*
+ * DependencyMode distinguishes the data stored in DependencyDefinition. For details see
+ * DependencyDefinition's inline comments in the data union.
+ */
+typedef enum DependencyMode
+{
+	DependencyObjectAddress,
+	DependencyPgDepend,
+	DependencyPgShDepend
+} DependencyMode;
+
+typedef struct DependencyDefinition
+{
+	/* describe how the dependency data is stored in the data field */
+	DependencyMode mode;
+
+	/*
+	 * Dependencies can be found in different ways and therefore stored differently on the
+	 * definition.
+	 */
+	union
+	{
+		/*
+		 * pg_depend is used for dependencies found in the database local pg_depend table.
+		 * The entry is copied while scanning the table. The record can be inspected
+		 * during the chasing algorithm to follow dependencies of different classes, or
+		 * based on dependency type.
+		 */
+		FormData_pg_depend pg_depend;
+
+		/*
+		 * pg_shdepend is used for dependencies found in the global pg_shdepend table.
+		 * The entry is copied while scanning the table. The record can be inspected
+		 * during the chasing algorithm to follow dependencies of different classes, or
+		 * based on dependency type.
+		 */
+		FormData_pg_shdepend pg_shdepend;
+
+		/*
+		 * address is used for dependencies that are artificially added during the
+		 * chasing. Since they are added by citus code we assume the dependency needs to
+		 * be chased anyway, ofcourse it will only actually be chased if the object is a
+		 * suppported object by citus
+		 */
+		ObjectAddress address;
+	} data;
+} DependencyDefinition;
+
+/*
+ * ViewDependencyNode represents a view (or possibly a table) in a dependency graph of
+ * views.
+ */
+typedef struct ViewDependencyNode
+{
+	Oid id;
+	int remainingDependencyCount;
+	List *dependingNodes;
+}ViewDependencyNode;
+
+
+static List * GetRelationTriggerFunctionDepencyList(Oid relationId);
+static DependencyDefinition * CreateObjectAddressDependencyDef(Oid classId, Oid objectId);
+static ObjectAddress DependencyDefinitionObjectAddress(DependencyDefinition *definition);
 
 /* forward declarations for functions to interact with the ObjectAddressCollector */
 static void InitObjectAddressCollector(ObjectAddressCollector *collector);
 static void CollectObjectAddress(ObjectAddressCollector *collector,
 								 const ObjectAddress *address);
-static bool IsObjectAddressCollected(const ObjectAddress *findAddress,
+static bool IsObjectAddressCollected(ObjectAddress findAddress,
 									 ObjectAddressCollector *collector);
 static void MarkObjectVisited(ObjectAddressCollector *collector,
-							  const ObjectAddress *target);
+							  ObjectAddress target);
 static bool TargetObjectVisited(ObjectAddressCollector *collector,
-								const ObjectAddress *target);
+								ObjectAddress target);
+
+typedef List *(*expandFn)(ObjectAddressCollector *collector, ObjectAddress target);
+typedef bool (*followFn)(ObjectAddressCollector *collector,
+						 DependencyDefinition *definition);
+typedef void (*applyFn)(ObjectAddressCollector *collector,
+						DependencyDefinition *definition);
 
 /* forward declaration of functions that recurse pg_depend */
-static void recurse_pg_depend(const ObjectAddress *target,
-							  List * (*expand)(ObjectAddressCollector *collector,
-											   const ObjectAddress *target),
-							  bool (*follow)(ObjectAddressCollector *collector,
-											 Form_pg_depend row),
-							  void (*apply)(ObjectAddressCollector *collector,
-											Form_pg_depend row),
-							  ObjectAddressCollector *collector);
+static void RecurseObjectDependencies(ObjectAddress target, expandFn expand,
+									  followFn follow, applyFn apply,
+									  ObjectAddressCollector *collector);
+static List * DependencyDefinitionFromPgDepend(ObjectAddress target);
+static List * DependencyDefinitionFromPgShDepend(ObjectAddress target);
 static bool FollowAllSupportedDependencies(ObjectAddressCollector *collector,
-										   Form_pg_depend pg_depend);
+										   DependencyDefinition *definition);
 static bool FollowNewSupportedDependencies(ObjectAddressCollector *collector,
-										   Form_pg_depend pg_depend);
+										   DependencyDefinition *definition);
 static void ApplyAddToDependencyList(ObjectAddressCollector *collector,
-									 Form_pg_depend pg_depend);
+									 DependencyDefinition *definition);
 static List * ExpandCitusSupportedTypes(ObjectAddressCollector *collector,
-										const ObjectAddress *target);
+										ObjectAddress target);
+static ViewDependencyNode * BuildViewDependencyGraph(Oid relationId, HTAB *nodeMap);
+static Oid GetDependingView(Form_pg_depend pg_depend);
+
+
+/*
+ * GetUniqueDependenciesList takes a list of object addresses and returns a new list
+ * of ObjectAddesses whose elements are unique.
+ */
+List *
+GetUniqueDependenciesList(List *objectAddressesList)
+{
+	ObjectAddressCollector objectAddressCollector = { 0 };
+	InitObjectAddressCollector(&objectAddressCollector);
+
+	ObjectAddress *objectAddress = NULL;
+	foreach_ptr(objectAddress, objectAddressesList)
+	{
+		if (IsObjectAddressCollected(*objectAddress, &objectAddressCollector))
+		{
+			/* skip objects that are already collected */
+			continue;
+		}
+
+		CollectObjectAddress(&objectAddressCollector, objectAddress);
+	}
+
+	return objectAddressCollector.dependencyList;
+}
 
 
 /*
@@ -83,14 +192,13 @@ List *
 GetDependenciesForObject(const ObjectAddress *target)
 {
 	ObjectAddressCollector collector = { 0 };
-
 	InitObjectAddressCollector(&collector);
 
-	recurse_pg_depend(target,
-					  &ExpandCitusSupportedTypes,
-					  &FollowNewSupportedDependencies,
-					  &ApplyAddToDependencyList,
-					  &collector);
+	RecurseObjectDependencies(*target,
+							  &ExpandCitusSupportedTypes,
+							  &FollowNewSupportedDependencies,
+							  &ApplyAddToDependencyList,
+							  &collector);
 
 	return collector.dependencyList;
 }
@@ -112,25 +220,22 @@ List *
 OrderObjectAddressListInDependencyOrder(List *objectAddressList)
 {
 	ObjectAddressCollector collector = { 0 };
-	ListCell *objectAddressCell = NULL;
-
 	InitObjectAddressCollector(&collector);
 
-	foreach(objectAddressCell, objectAddressList)
+	ObjectAddress *objectAddress = NULL;
+	foreach_ptr(objectAddress, objectAddressList)
 	{
-		ObjectAddress *objectAddress = (ObjectAddress *) lfirst(objectAddressCell);
-
-		if (IsObjectAddressCollected(objectAddress, &collector))
+		if (IsObjectAddressCollected(*objectAddress, &collector))
 		{
 			/* skip objects that are already ordered */
 			continue;
 		}
 
-		recurse_pg_depend(objectAddress,
-						  &ExpandCitusSupportedTypes,
-						  &FollowAllSupportedDependencies,
-						  &ApplyAddToDependencyList,
-						  &collector);
+		RecurseObjectDependencies(*objectAddress,
+								  &ExpandCitusSupportedTypes,
+								  &FollowAllSupportedDependencies,
+								  &ApplyAddToDependencyList,
+								  &collector);
 
 		CollectObjectAddress(&collector, objectAddress);
 	}
@@ -140,22 +245,20 @@ OrderObjectAddressListInDependencyOrder(List *objectAddressList)
 
 
 /*
- * recurse_pg_depend recursively visits pg_depend entries.
+ * RecurseObjectDependencies recursively visits all dependencies of an object. It sources
+ * the dependencies from pg_depend and pg_shdepend while 'expanding' the list via an
+ * optional `expand` function.
  *
- * `expand` allows based on the target ObjectAddress to generate extra entries for ease of
- * traversal.
- *
- * Starting from the target ObjectAddress. For every existing and generated entry the
- * `follow` function will be called. When `follow` returns true it will recursively visit
- * the dependencies for that object. recurse_pg_depend will visit therefore all pg_depend
- * entries.
+ * Starting from the target ObjectAddress. For every dependency found the `follow`
+ * function will be called. When `follow` returns true it will recursively visit the
+ * dependencies for that object.
  *
  * Visiting will happen in depth first order, which is useful to create or sorted lists of
  * dependencies to create.
  *
- * For all pg_depend entries that should be visited the apply function will be called.
- * This function is designed to be the mutating function for the context being passed.
- * Although nothing prevents the follow function to also mutate the context.
+ * For all dependencies that should be visited the apply function will be called. This
+ * function is designed to be the mutating function for the context being passed. Although
+ * nothing prevents the follow function to also mutate the context.
  *
  *  - follow will be called on the way down, so the invocation order is top to bottom of
  *    the dependency tree
@@ -163,18 +266,9 @@ OrderObjectAddressListInDependencyOrder(List *objectAddressList)
  *    not called for entries for which follow has returned false.
  */
 static void
-recurse_pg_depend(const ObjectAddress *target,
-				  List * (*expand)(ObjectAddressCollector *collector,
-								   const ObjectAddress *target),
-				  bool (*follow)(ObjectAddressCollector *collector, Form_pg_depend row),
-				  void (*apply)(ObjectAddressCollector *collector, Form_pg_depend row),
-				  ObjectAddressCollector *collector)
+RecurseObjectDependencies(ObjectAddress target, expandFn expand, followFn follow,
+						  applyFn apply, ObjectAddressCollector *collector)
 {
-	ScanKeyData key[2];
-	HeapTuple depTup = NULL;
-	List *pgDependEntries = NIL;
-	ListCell *pgDependCell = NULL;
-
 	if (TargetObjectVisited(collector, target))
 	{
 		/* prevent infinite loops due to circular dependencies */
@@ -183,51 +277,24 @@ recurse_pg_depend(const ObjectAddress *target,
 
 	MarkObjectVisited(collector, target);
 
-	/*
-	 * iterate the actual pg_depend catalog
-	 */
-	Relation depRel = heap_open(DependRelationId, AccessShareLock);
+	/* lookup both pg_depend and pg_shdepend for dependencies */
+	List *pgDependDefinitions = DependencyDefinitionFromPgDepend(target);
+	List *pgShDependDefinitions = DependencyDefinitionFromPgShDepend(target);
+	List *dependenyDefinitionList = list_concat(pgDependDefinitions,
+												pgShDependDefinitions);
 
-	/* scan pg_depend for classid = $1 AND objid = $2 using pg_depend_depender_index */
-	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(target->classId));
-	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(target->objectId));
-	SysScanDesc depScan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2,
-											 key);
-
-	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
-	{
-		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
-		Form_pg_depend pg_depend_copy = palloc0(sizeof(FormData_pg_depend));
-
-		*pg_depend_copy = *pg_depend;
-
-		pgDependEntries = lappend(pgDependEntries, pg_depend_copy);
-	}
-
-	systable_endscan(depScan);
-	relation_close(depRel, AccessShareLock);
-
-	/*
-	 * concat expanded entries if applicable
-	 */
+	/* concat expanded entries if applicable */
 	if (expand != NULL)
 	{
 		List *expandedEntries = expand(collector, target);
-		pgDependEntries = list_concat(pgDependEntries, expandedEntries);
+		dependenyDefinitionList = list_concat(dependenyDefinitionList, expandedEntries);
 	}
 
-	/*
-	 * Iterate all entries and recurse depth first
-	 */
-	foreach(pgDependCell, pgDependEntries)
+	/* iterate all entries and recurse depth first */
+	DependencyDefinition *dependencyDefinition = NULL;
+	foreach_ptr(dependencyDefinition, dependenyDefinitionList)
 	{
-		Form_pg_depend pg_depend = (Form_pg_depend) lfirst(pgDependCell);
-		ObjectAddress address = { 0 };
-		ObjectAddressSet(address, pg_depend->refclassid, pg_depend->refobjid);
-
-		if (follow == NULL || !follow(collector, pg_depend))
+		if (follow == NULL || !follow(collector, dependencyDefinition))
 		{
 			/* skip all pg_depend entries the user didn't want to follow */
 			continue;
@@ -237,14 +304,104 @@ recurse_pg_depend(const ObjectAddress *target,
 		 * recurse depth first, this makes sure we call apply for the deepest dependency
 		 * first.
 		 */
-		recurse_pg_depend(&address, expand, follow, apply, collector);
+		ObjectAddress address = DependencyDefinitionObjectAddress(dependencyDefinition);
+		RecurseObjectDependencies(address, expand, follow, apply, collector);
 
 		/* now apply changes for current entry */
 		if (apply != NULL)
 		{
-			apply(collector, pg_depend);
+			apply(collector, dependencyDefinition);
 		}
 	}
+}
+
+
+/*
+ * DependencyDefinitionFromPgDepend loads all pg_depend records describing the
+ * dependencies of target.
+ */
+static List *
+DependencyDefinitionFromPgDepend(ObjectAddress target)
+{
+	ScanKeyData key[2];
+	HeapTuple depTup = NULL;
+	List *dependenyDefinitionList = NIL;
+
+	/*
+	 * iterate the actual pg_depend catalog
+	 */
+	Relation depRel = table_open(DependRelationId, AccessShareLock);
+
+	/* scan pg_depend for classid = $1 AND objid = $2 using pg_depend_depender_index */
+	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.classId));
+	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.objectId));
+	SysScanDesc depScan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2,
+											 key);
+
+	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
+	{
+		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
+		DependencyDefinition *dependency = palloc0(sizeof(DependencyDefinition));
+
+		/* keep track of all pg_depend records as dependency definitions */
+		dependency->mode = DependencyPgDepend;
+		dependency->data.pg_depend = *pg_depend;
+		dependenyDefinitionList = lappend(dependenyDefinitionList, dependency);
+	}
+
+	systable_endscan(depScan);
+	relation_close(depRel, AccessShareLock);
+
+	return dependenyDefinitionList;
+}
+
+
+/*
+ * DependencyDefinitionFromPgDepend loads all pg_shdepend records describing the
+ * dependencies of target.
+ */
+static List *
+DependencyDefinitionFromPgShDepend(ObjectAddress target)
+{
+	ScanKeyData key[3];
+	HeapTuple depTup = NULL;
+	List *dependenyDefinitionList = NIL;
+
+	/*
+	 * iterate the actual pg_shdepend catalog
+	 */
+	Relation shdepRel = table_open(SharedDependRelationId, AccessShareLock);
+
+	/*
+	 * Scan pg_shdepend for dbid = $1 AND classid = $2 AND objid = $3 using
+	 * pg_shdepend_depender_index
+	 */
+	ScanKeyInit(&key[0], Anum_pg_shdepend_dbid, BTEqualStrategyNumber, F_OIDEQ,
+				MyDatabaseId);
+	ScanKeyInit(&key[1], Anum_pg_shdepend_classid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.classId));
+	ScanKeyInit(&key[2], Anum_pg_shdepend_objid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.objectId));
+	SysScanDesc shdepScan = systable_beginscan(shdepRel, SharedDependDependerIndexId,
+											   true, NULL, 3, key);
+
+	while (HeapTupleIsValid(depTup = systable_getnext(shdepScan)))
+	{
+		Form_pg_shdepend pg_shdepend = (Form_pg_shdepend) GETSTRUCT(depTup);
+		DependencyDefinition *dependency = palloc0(sizeof(DependencyDefinition));
+
+		/* keep track of all pg_shdepend records as dependency definitions */
+		dependency->mode = DependencyPgShDepend;
+		dependency->data.pg_shdepend = *pg_shdepend;
+		dependenyDefinitionList = lappend(dependenyDefinitionList, dependency);
+	}
+
+	systable_endscan(shdepScan);
+	relation_close(shdepRel, AccessShareLock);
+
+	return dependenyDefinitionList;
 }
 
 
@@ -279,12 +436,12 @@ InitObjectAddressCollector(ObjectAddressCollector *collector)
  * traversing pg_depend.
  */
 static bool
-TargetObjectVisited(ObjectAddressCollector *collector, const ObjectAddress *target)
+TargetObjectVisited(ObjectAddressCollector *collector, ObjectAddress target)
 {
 	bool found = false;
 
 	/* find in set */
-	hash_search(collector->visitedObjects, target, HASH_FIND, &found);
+	hash_search(collector->visitedObjects, &target, HASH_FIND, &found);
 
 	return found;
 }
@@ -295,19 +452,19 @@ TargetObjectVisited(ObjectAddressCollector *collector, const ObjectAddress *targ
  * pg_depend.
  */
 static void
-MarkObjectVisited(ObjectAddressCollector *collector, const ObjectAddress *target)
+MarkObjectVisited(ObjectAddressCollector *collector, ObjectAddress target)
 {
 	bool found = false;
 
 	/* add to set */
 	ObjectAddress *address = (ObjectAddress *) hash_search(collector->visitedObjects,
-														   target,
+														   &target,
 														   HASH_ENTER, &found);
 
 	if (!found)
 	{
 		/* copy object address in */
-		*address = *target;
+		*address = target;
 	}
 }
 
@@ -341,13 +498,13 @@ CollectObjectAddress(ObjectAddressCollector *collector, const ObjectAddress *col
  * already in a (unsorted) list of ObjectAddresses
  */
 static bool
-IsObjectAddressCollected(const ObjectAddress *findAddress,
+IsObjectAddressCollected(ObjectAddress findAddress,
 						 ObjectAddressCollector *collector)
 {
 	bool found = false;
 
 	/* add to set */
-	hash_search(collector->dependencySet, findAddress, HASH_FIND, &found);
+	hash_search(collector->dependencySet, &findAddress, HASH_FIND, &found);
 
 	return found;
 }
@@ -398,6 +555,20 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 		case OCLASS_PROC:
 		{
 			return true;
+		}
+
+		case OCLASS_ROLE:
+		{
+			/*
+			 * Community only supports the extension owner as a distributed object to
+			 * propagate alter statements for this user
+			 */
+			if (address->objectId == CitusExtensionOwner())
+			{
+				return true;
+			}
+
+			return false;
 		}
 
 		case OCLASS_EXTENSION:
@@ -461,6 +632,20 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 
 
 /*
+ * IsTableOwnedByExtension returns whether the table with the given relation ID is
+ * owned by an extension.
+ */
+bool
+IsTableOwnedByExtension(Oid relationId)
+{
+	ObjectAddress tableAddress = { 0 };
+	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+
+	return IsObjectAddressOwnedByExtension(&tableAddress, NULL);
+}
+
+
+/*
  * IsObjectAddressOwnedByExtension returns whether or not the object is owned by an
  * extension. It is assumed that an object having a dependency on an extension is created
  * by that extension and therefore owned by that extension.
@@ -476,7 +661,7 @@ IsObjectAddressOwnedByExtension(const ObjectAddress *target,
 	HeapTuple depTup = NULL;
 	bool result = false;
 
-	Relation depRel = heap_open(DependRelationId, AccessShareLock);
+	Relation depRel = table_open(DependRelationId, AccessShareLock);
 
 	/* scan pg_depend for classid = $1 AND objid = $2 using pg_depend_depender_index */
 	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ,
@@ -502,7 +687,7 @@ IsObjectAddressOwnedByExtension(const ObjectAddress *target,
 	}
 
 	systable_endscan(depScan);
-	heap_close(depRel, AccessShareLock);
+	table_close(depRel, AccessShareLock);
 
 	return result;
 }
@@ -513,30 +698,35 @@ IsObjectAddressOwnedByExtension(const ObjectAddress *target,
  * objects which should be distributed before the root object can safely be created.
  */
 static bool
-FollowNewSupportedDependencies(ObjectAddressCollector *collector, Form_pg_depend
-							   pg_depend)
+FollowNewSupportedDependencies(ObjectAddressCollector *collector,
+							   DependencyDefinition *definition)
 {
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, pg_depend->refclassid, pg_depend->refobjid);
-
-	/*
-	 *  Follow only normal and extension dependencies. The latter is used to reach the
-	 *  extensions, the objects that directly depend on the extension are eliminated
-	 *  during the "apply" phase.
-	 *
-	 *  Other dependencies are internal dependencies and managed by postgres.
-	 */
-	if (pg_depend->deptype != DEPENDENCY_NORMAL &&
-		pg_depend->deptype != DEPENDENCY_EXTENSION)
+	if (definition->mode == DependencyPgDepend)
 	{
-		return false;
+		/*
+		 *  For dependencies found in pg_depend:
+		 *
+		 *  Follow only normal and extension dependencies. The latter is used to reach the
+		 *  extensions, the objects that directly depend on the extension are eliminated
+		 *  during the "apply" phase.
+		 *
+		 *  Other dependencies are internal dependencies and managed by postgres.
+		 */
+		if (definition->data.pg_depend.deptype != DEPENDENCY_NORMAL &&
+			definition->data.pg_depend.deptype != DEPENDENCY_EXTENSION)
+		{
+			return false;
+		}
 	}
+
+	/* rest of the tests are to see if we want to follow the actual dependency */
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
 
 	/*
 	 * If the object is already in our dependency list we do not have to follow any
 	 * further
 	 */
-	if (IsObjectAddressCollected(&address, collector))
+	if (IsObjectAddressCollected(address, collector))
 	{
 		return false;
 	}
@@ -578,30 +768,35 @@ FollowNewSupportedDependencies(ObjectAddressCollector *collector, Form_pg_depend
  * This is used to sort a list of dependencies in dependency order.
  */
 static bool
-FollowAllSupportedDependencies(ObjectAddressCollector *collector, Form_pg_depend
-							   pg_depend)
+FollowAllSupportedDependencies(ObjectAddressCollector *collector,
+							   DependencyDefinition *definition)
 {
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, pg_depend->refclassid, pg_depend->refobjid);
-
-	/*
-	 *  Follow only normal and extension dependencies. The latter is used to reach the
-	 *  extensions, the objects that directly depend on the extension are eliminated
-	 *  during the "apply" phase.
-	 *
-	 *  Other dependencies are internal dependencies and managed by postgres.
-	 */
-	if (pg_depend->deptype != DEPENDENCY_NORMAL &&
-		pg_depend->deptype != DEPENDENCY_EXTENSION)
+	if (definition->mode == DependencyPgDepend)
 	{
-		return false;
+		/*
+		 *  For dependencies found in pg_depend:
+		 *
+		 *  Follow only normal and extension dependencies. The latter is used to reach the
+		 *  extensions, the objects that directly depend on the extension are eliminated
+		 *  during the "apply" phase.
+		 *
+		 *  Other dependencies are internal dependencies and managed by postgres.
+		 */
+		if (definition->data.pg_depend.deptype != DEPENDENCY_NORMAL &&
+			definition->data.pg_depend.deptype != DEPENDENCY_EXTENSION)
+		{
+			return false;
+		}
 	}
+
+	/* rest of the tests are to see if we want to follow the actual dependency */
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
 
 	/*
 	 * If the object is already in our dependency list we do not have to follow any
 	 * further
 	 */
-	if (IsObjectAddressCollected(&address, collector))
+	if (IsObjectAddressCollected(address, collector))
 	{
 		return false;
 	}
@@ -629,20 +824,23 @@ FollowAllSupportedDependencies(ObjectAddressCollector *collector, Form_pg_depend
 
 
 /*
- * ApplyAddToDependencyList is an apply function for recurse_pg_depend that will collect
+ * ApplyAddToDependencyList is an apply function for RecurseObjectDependencies that will collect
  * all the ObjectAddresses for pg_depend entries to the context. The context here is
  * assumed to be a (ObjectAddressCollector *) to the location where all ObjectAddresses
  * will be collected.
  */
 static void
-ApplyAddToDependencyList(ObjectAddressCollector *collector, Form_pg_depend pg_depend)
+ApplyAddToDependencyList(ObjectAddressCollector *collector,
+						 DependencyDefinition *definition)
 {
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, pg_depend->refclassid, pg_depend->refobjid);
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
 
 	/*
 	 * Objects owned by an extension are assumed to be created on the workers by creating
 	 * the extension in the cluster, we we don't want explicitly create them.
+	 *
+	 * Since we do need to capture the extension as a dependency we are following the
+	 * object instead of breaking the traversal there.
 	 */
 	if (IsObjectAddressOwnedByExtension(&address, NULL))
 	{
@@ -662,11 +860,11 @@ ApplyAddToDependencyList(ObjectAddressCollector *collector, Form_pg_depend pg_de
  * relation describing the type.
  */
 static List *
-ExpandCitusSupportedTypes(ObjectAddressCollector *collector, const ObjectAddress *target)
+ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress target)
 {
 	List *result = NIL;
 
-	switch (target->classId)
+	switch (target.classId)
 	{
 		case TypeRelationId:
 		{
@@ -675,20 +873,11 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, const ObjectAddress
 			 * are described with their dependencies by the relation that describes the
 			 * composite type.
 			 */
-			if (get_typtype(target->objectId) == TYPTYPE_COMPOSITE)
+			if (get_typtype(target.objectId) == TYPTYPE_COMPOSITE)
 			{
-				Form_pg_depend dependency = palloc0(sizeof(FormData_pg_depend));
-				dependency->classid = target->classId;
-				dependency->objid = target->objectId;
-				dependency->objsubid = target->objectSubId;
-
-				/* add outward edge to the type's relation */
-				dependency->refclassid = RelationRelationId;
-				dependency->refobjid = get_typ_typrelid(target->objectId);
-				dependency->refobjsubid = 0;
-
-				dependency->deptype = DEPENDENCY_NORMAL;
-
+				Oid typeRelationId = get_typ_typrelid(target.objectId);
+				DependencyDefinition *dependency =
+					CreateObjectAddressDependencyDef(RelationRelationId, typeRelationId);
 				result = lappend(result, dependency);
 			}
 
@@ -698,24 +887,32 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, const ObjectAddress
 			 * as that would cause a cyclic dependency on others, instead we expand here
 			 * to follow the dependency on the element type.
 			 */
-			if (type_is_array(target->objectId))
+			if (type_is_array(target.objectId))
 			{
-				Form_pg_depend dependency = palloc0(sizeof(FormData_pg_depend));
-				dependency->classid = target->classId;
-				dependency->objid = target->objectId;
-				dependency->objsubid = target->objectSubId;
-
-				/* add outward edge to the element type */
-				dependency->refclassid = TypeRelationId;
-				dependency->refobjid = get_element_type(target->objectId);
-				dependency->refobjsubid = 0;
-
-				dependency->deptype = DEPENDENCY_NORMAL;
-
+				Oid typeId = get_element_type(target.objectId);
+				DependencyDefinition *dependency =
+					CreateObjectAddressDependencyDef(TypeRelationId, typeId);
 				result = lappend(result, dependency);
 			}
 
 			break;
+		}
+
+		case RelationRelationId:
+		{
+			/*
+			 * Triggers both depend to the relations and to the functions they
+			 * execute. Also, pg_depend records dependencies from triggers to the
+			 * functions but not from relations to their triggers. Given above two,
+			 * we directly expand depencies for the relations to trigger functions.
+			 * That way, we won't attempt to create the trigger as a dependency of
+			 * the relation, which would fail as the relation itself is not created
+			 * yet when ensuring dependencies.
+			 */
+			Oid relationId = target.objectId;
+			List *triggerFunctionDepencyList =
+				GetRelationTriggerFunctionDepencyList(relationId);
+			result = list_concat(result, triggerFunctionDepencyList);
 		}
 
 		default:
@@ -725,4 +922,228 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, const ObjectAddress
 		}
 	}
 	return result;
+}
+
+
+/*
+ * GetRelationTriggerFunctionDepencyList returns a list of DependencyDefinition
+ * objects for the functions that triggers of the relation with relationId depends.
+ */
+static List *
+GetRelationTriggerFunctionDepencyList(Oid relationId)
+{
+	List *dependencyList = NIL;
+
+	List *triggerIdList = GetExplicitTriggerIdList(relationId);
+	Oid triggerId = InvalidOid;
+	foreach_oid(triggerId, triggerIdList)
+	{
+		Oid functionId = GetTriggerFunctionId(triggerId);
+		DependencyDefinition *dependency =
+			CreateObjectAddressDependencyDef(ProcedureRelationId, functionId);
+		dependencyList = lappend(dependencyList, dependency);
+	}
+
+	return dependencyList;
+}
+
+
+/*
+ * CreateObjectAddressDependencyDef returns DependencyDefinition object that
+ * stores the ObjectAddress for the database object identified by classId and
+ * objectId.
+ */
+static DependencyDefinition *
+CreateObjectAddressDependencyDef(Oid classId, Oid objectId)
+{
+	DependencyDefinition *dependency = palloc0(sizeof(DependencyDefinition));
+	dependency->mode = DependencyObjectAddress;
+	ObjectAddressSet(dependency->data.address, classId, objectId);
+	return dependency;
+}
+
+
+/*
+ * DependencyDefinitionObjectAddress returns the object address of the dependency defined
+ * by the dependency definition, irregardless what the source of the definition is
+ */
+static ObjectAddress
+DependencyDefinitionObjectAddress(DependencyDefinition *definition)
+{
+	switch (definition->mode)
+	{
+		case DependencyObjectAddress:
+		{
+			return definition->data.address;
+		}
+
+		case DependencyPgDepend:
+		{
+			ObjectAddress address = { 0 };
+			ObjectAddressSet(address,
+							 definition->data.pg_depend.refclassid,
+							 definition->data.pg_depend.refobjid);
+			return address;
+		}
+
+		case DependencyPgShDepend:
+		{
+			ObjectAddress address = { 0 };
+			ObjectAddressSet(address,
+							 definition->data.pg_shdepend.refclassid,
+							 definition->data.pg_shdepend.refobjid);
+			return address;
+		}
+	}
+
+	ereport(ERROR, (errmsg("unsupported dependency definition mode")));
+}
+
+
+/*
+ * BuildViewDependencyGraph gets a relation (or a view) and builds a dependency graph for the
+ * depending views.
+ */
+static ViewDependencyNode *
+BuildViewDependencyGraph(Oid relationId, HTAB *nodeMap)
+{
+	bool found = false;
+	ViewDependencyNode *node = (ViewDependencyNode *) hash_search(nodeMap, &relationId,
+																  HASH_ENTER, &found);
+
+	if (found)
+	{
+		return node;
+	}
+
+	node->id = relationId;
+	node->remainingDependencyCount = 0;
+	node->dependingNodes = NIL;
+
+	ObjectAddress target = { 0 };
+	ObjectAddressSet(target, RelationRelationId, relationId);
+
+	ScanKeyData key[2];
+	HeapTuple depTup = NULL;
+
+	/*
+	 * iterate the actual pg_depend catalog
+	 */
+	Relation depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.classId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(target.objectId));
+	SysScanDesc depScan = systable_beginscan(depRel, DependReferenceIndexId,
+											 true, NULL, 2, key);
+
+	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
+	{
+		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
+
+		Oid dependingView = GetDependingView(pg_depend);
+		if (dependingView != InvalidOid)
+		{
+			ViewDependencyNode *dependingNode = BuildViewDependencyGraph(dependingView,
+																		 nodeMap);
+
+			node->dependingNodes = lappend(node->dependingNodes, dependingNode);
+			dependingNode->remainingDependencyCount++;
+		}
+	}
+
+	systable_endscan(depScan);
+	relation_close(depRel, AccessShareLock);
+
+	return node;
+}
+
+
+/*
+ * GetDependingViews takes a relation id, finds the views that depend on the relation
+ * and returns list of the oids of those views. It recurses on the pg_depend table to
+ * find the views that recursively depend on the table.
+ *
+ * The returned views will have the correct order for creating them, from the point of
+ * dependencies between.
+ */
+List *
+GetDependingViews(Oid relationId)
+{
+	HASHCTL info;
+	memset(&info, 0, sizeof(info));
+	info.keysize = sizeof(Oid);
+	info.entrysize = sizeof(ViewDependencyNode);
+	info.hash = oid_hash;
+	uint32 hashFlags = (HASH_ELEM | HASH_FUNCTION);
+	HTAB *nodeMap = hash_create("view dependency map (oid)", 32, &info, hashFlags);
+
+	ViewDependencyNode *tableNode = BuildViewDependencyGraph(relationId, nodeMap);
+
+	List *dependingViews = NIL;
+	List *nodeQueue = list_make1(tableNode);
+	ViewDependencyNode *node = NULL;
+	foreach_ptr(node, nodeQueue)
+	{
+		ViewDependencyNode *dependingNode = NULL;
+		foreach_ptr(dependingNode, node->dependingNodes)
+		{
+			dependingNode->remainingDependencyCount--;
+			if (dependingNode->remainingDependencyCount == 0)
+			{
+				nodeQueue = lappend(nodeQueue, dependingNode);
+				dependingViews = lappend_oid(dependingViews, dependingNode->id);
+			}
+		}
+	}
+	return dependingViews;
+}
+
+
+/*
+ * GetDependingView gets a row of pg_depend and returns the oid of the view that is depended.
+ * If the depended object is not a rewrite object, the object to rewrite is not a view or it
+ * is the same view with the depending one InvalidOid is returned.
+ */
+Oid
+GetDependingView(Form_pg_depend pg_depend)
+{
+	if (pg_depend->classid != RewriteRelationId)
+	{
+		return InvalidOid;
+	}
+
+	Relation rewriteRel = table_open(RewriteRelationId, AccessShareLock);
+	ScanKeyData rkey[1];
+
+#if PG_VERSION_NUM >= PG_VERSION_12
+	ScanKeyInit(&rkey[0],
+				Anum_pg_rewrite_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(pg_depend->objid));
+#else
+	ScanKeyInit(&rkey[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(pg_depend->objid));
+#endif
+
+	SysScanDesc rscan = systable_beginscan(rewriteRel, RewriteOidIndexId,
+										   true, NULL, 1, rkey);
+
+	HeapTuple rewriteTup = systable_getnext(rscan);
+	Form_pg_rewrite pg_rewrite = (Form_pg_rewrite) GETSTRUCT(rewriteTup);
+
+	bool isView = get_rel_relkind(pg_rewrite->ev_class) == RELKIND_VIEW;
+	bool isDifferentThanRef = pg_rewrite->ev_class != pg_depend->refobjid;
+
+	systable_endscan(rscan);
+	relation_close(rewriteRel, AccessShareLock);
+
+	if (isView && isDifferentThanRef)
+	{
+		return pg_rewrite->ev_class;
+	}
+	return InvalidOid;
 }

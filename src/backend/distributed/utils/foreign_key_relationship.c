@@ -12,12 +12,14 @@
 
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 120000
+#include "distributed/pg_version_constants.h"
+
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
 #endif
 #include "access/htup_details.h"
 #include "access/stratnum.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/table.h"
 #endif
 #include "catalog/pg_constraint.h"
@@ -29,6 +31,9 @@
 #include "storage/lockdefs.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "common/hashfn.h"
+#endif
 #include "utils/memutils.h"
 
 
@@ -126,7 +131,6 @@ GetForeignConstraintRelationshipHelper(Oid relationId, bool isReferencing)
 {
 	List *foreignConstraintList = NIL;
 	List *foreignNodeList = NIL;
-	ListCell *nodeCell = NULL;
 	bool isFound = false;
 
 	CreateForeignConstraintRelationshipGraph();
@@ -151,11 +155,9 @@ GetForeignConstraintRelationshipHelper(Oid relationId, bool isReferencing)
 	 * We need only their OIDs, we get back node list to make their visited
 	 * variable to false for using them iteratively.
 	 */
-	foreach(nodeCell, foreignNodeList)
+	ForeignConstraintRelationshipNode *currentNode = NULL;
+	foreach_ptr(currentNode, foreignNodeList)
 	{
-		ForeignConstraintRelationshipNode *currentNode =
-			(ForeignConstraintRelationshipNode *) lfirst(nodeCell);
-
 		foreignConstraintList = lappend_oid(foreignConstraintList,
 											currentNode->relationId);
 		currentNode->visited = false;
@@ -257,7 +259,6 @@ static void
 GetConnectedListHelper(ForeignConstraintRelationshipNode *node, List **adjacentNodeList,
 					   bool isReferencing)
 {
-	ListCell *nodeCell = NULL;
 	List *neighbourList = NIL;
 
 	node->visited = true;
@@ -271,10 +272,9 @@ GetConnectedListHelper(ForeignConstraintRelationshipNode *node, List **adjacentN
 		neighbourList = node->adjacencyList;
 	}
 
-	foreach(nodeCell, neighbourList)
+	ForeignConstraintRelationshipNode *neighborNode = NULL;
+	foreach_ptr(neighborNode, neighbourList)
 	{
-		ForeignConstraintRelationshipNode *neighborNode =
-			(ForeignConstraintRelationshipNode *) lfirst(nodeCell);
 		if (neighborNode->visited == false)
 		{
 			*adjacentNodeList = lappend(*adjacentNodeList, neighborNode);
@@ -298,9 +298,8 @@ PopulateAdjacencyLists(void)
 	Oid prevReferencingOid = InvalidOid;
 	Oid prevReferencedOid = InvalidOid;
 	List *frelEdgeList = NIL;
-	ListCell *frelEdgeCell = NULL;
 
-	Relation pgConstraint = heap_open(ConstraintRelationId, AccessShareLock);
+	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_constraint_contype, BTEqualStrategyNumber, F_CHAREQ,
 				CharGetDatum(CONSTRAINT_FOREIGN));
@@ -327,11 +326,9 @@ PopulateAdjacencyLists(void)
 	 */
 	frelEdgeList = SortList(frelEdgeList, CompareForeignConstraintRelationshipEdges);
 
-	foreach(frelEdgeCell, frelEdgeList)
+	ForeignConstraintRelationshipEdge *currentFConstraintRelationshipEdge = NULL;
+	foreach_ptr(currentFConstraintRelationshipEdge, frelEdgeList)
 	{
-		ForeignConstraintRelationshipEdge *currentFConstraintRelationshipEdge =
-			(ForeignConstraintRelationshipEdge *) lfirst(frelEdgeCell);
-
 		/* we just saw this edge, no need to add it twice */
 		if (currentFConstraintRelationshipEdge->referencingRelationOID ==
 			prevReferencingOid &&
@@ -351,7 +348,7 @@ PopulateAdjacencyLists(void)
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgConstraint, AccessShareLock);
+	table_close(pgConstraint, AccessShareLock);
 }
 
 

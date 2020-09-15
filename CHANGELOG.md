@@ -1,3 +1,282 @@
+### citus v9.4.0 (July 28, 2020) ###
+
+* Improves COPY by honoring max_adaptive_executor_pool_size config
+
+* Adds support for insert into local table select from distributed table
+
+* Adds support to partially push down tdigest aggregates
+
+* Adds support for receiving binary encoded results from workers using
+  citus.enable_binary_protocol
+
+* Enables joins between local tables and CTEs
+
+* Adds showing query text in EXPLAIN output when explain verbose is true
+
+* Adds support for showing CTE statistics in EXPLAIN ANALYZE
+
+* Adds support for showing amount of data received in EXPLAIN ANALYZE
+
+* Introduces downgrade paths in migration scripts
+
+* Avoids returning incorrect results when changing roles in a transaction
+
+* Fixes `ALTER TABLE IF EXISTS SET SCHEMA` with non-existing table bug
+
+* Fixes `CREATE INDEX CONCURRENTLY` with no index name on a postgres table bug
+
+* Fixes a bug that could cause crashes with certain compile flags
+
+* Fixes a bug with lists of configuration values in ALTER ROLE SET statements
+
+* Fixes a bug that occurs when coordinator is added as a worker node
+
+* Fixes a crash because of overflow in partition id with certain compile flags
+
+* Fixes a crash that may happen if no worker nodes are added
+
+* Fixes a crash that occurs when inserting implicitly coerced constants
+
+* Fixes a crash when aggregating empty tables
+
+* Fixes a memory leak in subtransaction memory handling
+
+* Fixes crash when using rollback to savepoint after cancellation of DML
+
+* Fixes deparsing for queries with anonymous column references
+
+* Fixes distribution of composite types failing to include typemods
+
+* Fixes explain analyze on adaptive executor repartitions
+
+* Fixes possible error throwing in abort handle
+
+* Fixes segfault when evaluating func calls with default params on coordinator
+
+* Fixes several EXPLAIN ANALYZE issues
+
+* Fixes write queries with const expressions and COLLATE in various places
+
+* Fixes wrong cancellation message about distributed deadlocks
+
+* Reports correct INSERT/SELECT method in EXPLAIN
+
+* Disallows triggers on citus tables
+
+### citus v9.3.5 (July 24, 2020) ###
+
+* Fixes `ALTER TABLE IF EXISTS SET SCHEMA` with non-existing table bug
+
+* Fixes `CREATE INDEX CONCURRENTLY` with no index name on a postgres table bug
+
+* Fixes a crash because of overflow in partition id with certain compile flags
+
+### citus v9.3.4 (July 21, 2020) ###
+
+* Fixes a bug that could cause crashes with certain compile flags
+
+* Fixes a bug with lists of configuration values in ALTER ROLE SET statements
+
+* Fixes deparsing for queries with anonymous column references
+
+### citus v9.3.3 (July 10, 2020) ###
+
+* Fixes a memory leak in subtransaction memory handling
+
+### citus v9.3.2 (Jun 22, 2020) ###
+
+* Fixes a version bump issue in 9.3.1
+
+### citus v9.2.6 (Jun 22, 2020) ###
+
+* Fixes a version bump issue in 9.2.5
+
+### citus v9.3.1 (Jun 17, 2020) ###
+
+* Adds support to partially push down tdigest aggregates
+
+* Fixes a crash that occurs when inserting implicitly coerced constants
+
+### citus v9.2.5 (Jun 17, 2020) ###
+
+* Adds support to partially push down tdigest aggregates
+
+* Fixes an issue with distributing tables having generated cols not at the end
+
+### citus v9.3.0 (May 6, 2020) ###
+
+* Adds `max_shared_pool_size` to control number of connections across sessions
+
+* Adds support for window functions on coordinator
+
+* Improves shard pruning logic to understand OR-conditions
+
+* Prevents using an extra connection for intermediate result multi-casts
+
+* Adds propagation of `ALTER ROLE .. SET` statements
+
+* Adds `update_distributed_table_colocation` UDF to update colocation of tables
+
+* Introduces a UDF to truncate local data after distributing a table
+
+* Adds support for creating temp schemas in parallel
+
+* Adds support for evaluation of `nextval` in the target list on coordinator
+
+* Adds support for local execution of `COPY/TRUNCATE/DROP/DDL` commands
+
+* Adds support for local execution of shard creation
+
+* Uses local execution in a transaction block
+
+* Adds support for querying distributed table sizes concurrently
+
+* Allows `master_copy_shard_placement` to replicate placements to new nodes
+
+* Allows table type to be used in target list
+
+* Avoids having multiple maintenance daemons active for a single database
+
+* Defers reference table replication to shard creation time
+
+* Enables joins between local tables and reference tables in transaction blocks
+
+* Ignores pruned target list entries in coordinator plan
+
+* Improves `SIGTERM` handling of maintenance daemon
+
+* Increases the default of `citus.node_connection_timeout` to 30 seconds
+
+* Fixes a bug that occurs when creating remote tasks in local execution
+
+* Fixes a bug that causes some DML queries containing aggregates to fail
+
+* Fixes a bug that could cause failures in queries with subqueries or CTEs
+
+* Fixes a bug that may cause some connection failures to throw errors
+
+* Fixes a bug which caused queries with SRFs and function evalution to fail
+
+* Fixes a bug with generated columns when executing `COPY dist_table TO file`
+
+* Fixes a crash when using non-constant limit clauses
+
+* Fixes a failure when composite types used in prepared statements
+
+* Fixes a possible segfault when dropping dist. table in a transaction block
+
+* Fixes a possible segfault when non-pushdownable aggs are solely used in HAVING
+
+* Fixes a segfault when executing queries using `GROUPING`
+
+* Fixes an error when using `LEFT JOIN with GROUP BY` on primary key
+
+* Fixes an issue with distributing tables having generated cols not at the end
+
+* Fixes automatic SSL permission issue when using "initdb --allow-group-access"
+
+* Fixes errors which could occur when subqueries are parameters to aggregates
+
+* Fixes possible issues by invalidating the plan cache in `master_update_node`
+
+* Fixes timing issues which could be caused by changing system clock
+
+### citus v9.2.4 (March 30, 2020) ###
+
+* Fixes a release problem in 9.2.3
+
+### citus v9.2.3 (March 25, 2020) ###
+
+* Do not use C functions that have been banned by Microsoft
+
+* Fixes a bug that causes wrong results with complex outer joins
+
+* Fixes issues found using static analysis
+
+* Fixes left join shard pruning in pushdown planner
+
+* Fixes possibility for segmentation fault in internal aggregate functions
+
+* Fixes possible segfault when non pushdownable aggregates are used in `HAVING`
+
+* Improves correctness of planning subqueries in `HAVING`
+
+* Prevents using old connections for security if `citus.node_conninfo` changed
+
+* Uses Microsoft approved cipher string for default TLS setup
+
+### citus v9.0.2 (March 6, 2020) ###
+
+* Fixes build errors on EL/OL 6 based distros
+
+* Fixes a bug that caused maintenance daemon to fail on standby nodes
+
+* Disallows distributed function creation when replication_model is `statement`
+
+### citus v9.2.2 (March 5, 2020) ###
+
+* Fixes a bug that caused some prepared stmts with function calls to fail
+
+* Fixes a bug that caused some prepared stmts with composite types to fail
+
+* Fixes a bug that caused missing subplan results in workers
+
+* Improves performance of re-partition joins
+
+### citus v9.2.1 (February 14, 2020) ###
+
+* Fixes a bug that could cause crashes if distribution key is NULL
+
+### citus v9.2.0 (February 10, 2020) ###
+
+* Adds support for `INSERT...SELECT` queries with re-partitioning
+
+* Adds `citus.coordinator_aggregation_strategy` to support more aggregates
+
+* Adds caching of local plans on shards for Citus MX
+
+* Adds compatibility support for dist. object infrastructure from old versions
+
+* Adds defering shard-pruning for fast-path router queries to execution
+
+* Adds propagation of `GRANT ... ON SCHEMA` queries
+
+* Adds support for CTE pushdown via CTE inlining in distributed planning
+
+* Adds support for `ALTER TABLE ... SET SCHEMA` propagation.
+
+* Adds support for `DROP ROUTINE` & `ALTER ROUTINE` commands
+
+* Adds support for any inner join on a reference table
+
+* Changes `citus.log_remote_commands` level to `NOTICE`
+
+* Disallows marking ref. table shards unhealthy in the presence of savepoints
+
+* Disallows placing new shards with shards in TO_DELETE state
+
+* Enables local execution of queries that do not need any data access
+
+* Fixes Makefile trying to cleanup PG directory during install
+
+* Fixes a bug causing errors when planning a query with multiple subqueries
+
+* Fixes a possible deadlock that could happen during shard moves
+
+* Fixes a problem when adding a new node due to tables referenced in func body
+
+* Fixes an issue that could cause joins with reference tables to be slow
+
+* Fixes cached metadata for shard is inconsistent issue
+
+* Fixes inserting multiple composite types as partition key in VALUES
+
+* Fixes unnecessary repartition on joins with more than 4 tables
+
+* Prevents wrong results for replicated partitioned tables after failure
+
+* Restricts LIMIT approximation for non-commutative aggregates
+
 ### citus v9.1.2 (December 30, 2019) ###
 
 * Fixes a bug that prevents installation from source
@@ -878,7 +1157,7 @@
 
 * Adds user-facing UDFs for locking shard resources and metadata
 
-* Refactors connection and transaction management; giving a consistent experience
+* Refactors connection and transaction management; giving consistent experience
 
 * Enhances `COPY` with fully transactional semantics
 
@@ -894,7 +1173,7 @@
 
 * Enhances `SERIAL` compatibility with MX tables
 
-* Adds an `node_connection_timeout` parameter to control node connection timeouts
+* Adds `node_connection_timeout` parameter to control node connection timeouts
 
 * Adds `enable_deadlock_prevention` setting to permit multi-node transactions
 

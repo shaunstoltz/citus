@@ -11,6 +11,9 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "c.h"
 #include "fmgr.h"
 
@@ -20,12 +23,12 @@
 #include "catalog/pg_type.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_pruning.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #endif
@@ -173,7 +176,11 @@ MakeTextPartitionExpression(Oid distributedTableId, text *value)
 	if (value != NULL)
 	{
 		OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
-		Const *rightConst = (Const *) get_rightop((Expr *) equalityExpr);
+		Node *rightOp = get_rightop((Expr *) equalityExpr);
+
+		Assert(rightOp != NULL);
+		Assert(IsA(rightOp, Const));
+		Const *rightConst = (Const *) rightOp;
 
 		rightConst->constvalue = (Datum) value;
 		rightConst->constisnull = false;
@@ -202,7 +209,6 @@ MakeTextPartitionExpression(Oid distributedTableId, text *value)
 static ArrayType *
 PrunedShardIdsForTable(Oid distributedTableId, List *whereClauseList)
 {
-	ListCell *shardCell = NULL;
 	int shardIdIndex = 0;
 	Oid shardIdTypeId = INT8OID;
 	Index tableId = 1;
@@ -213,10 +219,10 @@ PrunedShardIdsForTable(Oid distributedTableId, List *whereClauseList)
 	int shardIdCount = list_length(shardList);
 	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
 
-	foreach(shardCell, shardList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardList)
 	{
-		ShardInterval *shardId = (ShardInterval *) lfirst(shardCell);
-		Datum shardIdDatum = Int64GetDatum(shardId->shardId);
+		Datum shardIdDatum = Int64GetDatum(shardInterval->shardId);
 
 		shardIdDatumArray[shardIdIndex] = shardIdDatum;
 		shardIdIndex++;
@@ -238,7 +244,7 @@ SortedShardIntervalArray(Oid distributedTableId)
 {
 	Oid shardIdTypeId = INT8OID;
 
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
 	ShardInterval **shardIntervalArray = cacheEntry->sortedShardIntervalArray;
 	int shardIdCount = cacheEntry->shardIntervalArrayLength;
 	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));

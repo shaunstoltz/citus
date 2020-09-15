@@ -12,15 +12,53 @@
 #define VERSION_COMPAT_H
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "commands/explain.h"
 #include "catalog/namespace.h"
+#include "distributed/citus_safe_lib.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_func.h"
-#if (PG_VERSION_NUM >= 120000)
+#if (PG_VERSION_NUM >= PG_VERSION_12)
 #include "optimizer/optimizer.h"
 #endif
 
-#if PG_VERSION_NUM >= 120000
+#if (PG_VERSION_NUM >= PG_VERSION_13)
+#include "tcop/tcopprot.h"
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_13
+#define lnext_compat(l, r) lnext(l, r)
+#define list_delete_cell_compat(l, c, p) list_delete_cell(l, c)
+#define pg_plan_query_compat(p, q, c, b) pg_plan_query(p, q, c, b)
+#define planner_compat(p, c, b) planner(p, NULL, c, b)
+#define standard_planner_compat(a, c, d) standard_planner(a, NULL, c, d)
+#define GetSequencesOwnedByRelation(a) getOwnedSequences(a)
+#define GetSequencesOwnedByColumn(a, b) getOwnedSequences_internal(a, b, 0)
+#define CMDTAG_SELECT_COMPAT CMDTAG_SELECT
+#define ExplainOnePlanCompat(a, b, c, d, e, f, g, h) \
+	ExplainOnePlan(a, b, c, d, e, f, g, h)
+#define SetListCellPtr(a, b) ((a)->ptr_value = (b))
+#define RangeTableEntryFromNSItem(a) ((a)->p_rte)
+#define QueryCompletionCompat QueryCompletion
+#else /* pre PG13 */
+#define lnext_compat(l, r) lnext(r)
+#define list_delete_cell_compat(l, c, p) list_delete_cell(l, c, p)
+#define pg_plan_query_compat(p, q, c, b) pg_plan_query(p, c, b)
+#define planner_compat(p, c, b) planner(p, c, b)
+#define standard_planner_compat(a, c, d) standard_planner(a, c, d)
+#define CMDTAG_SELECT_COMPAT "SELECT"
+#define GetSequencesOwnedByRelation(a) getOwnedSequences(a, InvalidAttrNumber)
+#define GetSequencesOwnedByColumn(a, b) getOwnedSequences(a, b)
+#define ExplainOnePlanCompat(a, b, c, d, e, f, g, h) ExplainOnePlan(a, b, c, d, e, f, g)
+#define SetListCellPtr(a, b) ((a)->data.ptr_value = (b))
+#define RangeTableEntryFromNSItem(a) (a)
+#define QueryCompletionCompat char
+#define varattnosyn varoattno
+#define varnosyn varnoold
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_12
 
 #define MakeSingleTupleTableSlotCompat MakeSingleTupleTableSlot
 #define AllocSetContextCreateExtended AllocSetContextCreateInternal
@@ -71,16 +109,22 @@ FileReadCompat(FileCompat *file, char *buffer, int amount, uint32 wait_event_inf
 static inline FileCompat
 FileCompatFromFileStart(File fileDesc)
 {
-	FileCompat fc = {
-		.fd = fileDesc,
-		.offset = 0
-	};
+	FileCompat fc;
+
+	/* ensure uninitialized padding doesn't escape the function */
+	memset_struct_0(fc);
+	fc.fd = fileDesc;
+	fc.offset = 0;
 
 	return fc;
 }
 
 
 #else /* pre PG12 */
+#define table_open(r, l) heap_open(r, l)
+#define table_openrv(r, l) heap_openrv(r, l)
+#define table_openrv_extended(r, l, m) heap_openrv_extended(r, l, m)
+#define table_close(r, l) heap_close(r, l)
 #define QTW_EXAMINE_RTES_BEFORE QTW_EXAMINE_RTES
 #define MakeSingleTupleTableSlotCompat(tupleDesc, tts_opts) \
 	MakeSingleTupleTableSlot(tupleDesc)

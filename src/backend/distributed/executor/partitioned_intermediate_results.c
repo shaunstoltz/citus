@@ -20,12 +20,13 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "distributed/intermediate_results.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/remote_commands.h"
 #include "distributed/tuplestore.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
 #include "nodes/makefuncs.h"
 #include "nodes/primnodes.h"
@@ -50,7 +51,7 @@ typedef struct PartitionedResultDestReceiver
 	bool binaryCopy;
 
 	/* used for deciding which partition a shard belongs to. */
-	DistTableCacheEntry *shardSearchInfo;
+	CitusTableCacheEntry *shardSearchInfo;
 
 	MemoryContext perTupleContext;
 
@@ -71,10 +72,10 @@ typedef struct PartitionedResultDestReceiver
 } PartitionedResultDestReceiver;
 
 static Portal StartPortalForQueryExecution(const char *queryString);
-static DistTableCacheEntry * QueryTupleShardSearchInfo(ArrayType *minValuesArray,
-													   ArrayType *maxValuesArray,
-													   char partitionMethod,
-													   Var *partitionColumn);
+static CitusTableCacheEntry * QueryTupleShardSearchInfo(ArrayType *minValuesArray,
+														ArrayType *maxValuesArray,
+														char partitionMethod,
+														Var *partitionColumn);
 static PartitionedResultDestReceiver * CreatePartitionedResultDestReceiver(char *resultId,
 																		   int
 																		   partitionColumnIndex,
@@ -83,7 +84,7 @@ static PartitionedResultDestReceiver * CreatePartitionedResultDestReceiver(char 
 																		   TupleDesc
 																		   tupleDescriptor,
 																		   bool binaryCopy,
-																		   DistTableCacheEntry
+																		   CitusTableCacheEntry
 																		   *
 																		   shardSearchInfo,
 																		   MemoryContext
@@ -193,8 +194,8 @@ worker_partition_query_result(PG_FUNCTION_ARGS)
 								   partitionColumnAttr->atttypmod,
 								   partitionColumnAttr->attcollation, 0);
 
-	/* construct an artificial DistTableCacheEntry for shard pruning */
-	DistTableCacheEntry *shardSearchInfo =
+	/* construct an artificial CitusTableCacheEntry for shard pruning */
+	CitusTableCacheEntry *shardSearchInfo =
 		QueryTupleShardSearchInfo(minValuesArray, maxValuesArray,
 								  partitionMethod, partitionColumn);
 
@@ -258,14 +259,15 @@ StartPortalForQueryExecution(const char *queryString)
 	Query *query = ParseQueryString(queryString, NULL, 0);
 
 	int cursorOptions = CURSOR_OPT_PARALLEL_OK;
-	PlannedStmt *queryPlan = pg_plan_query(query, cursorOptions, NULL);
+	PlannedStmt *queryPlan = pg_plan_query_compat(query, NULL, cursorOptions, NULL);
 
 	Portal portal = CreateNewPortal();
 
 	/* don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
 
-	PortalDefineQuery(portal, NULL, queryString, "SELECT", list_make1(queryPlan), NULL);
+	PortalDefineQuery(portal, NULL, queryString, CMDTAG_SELECT_COMPAT,
+					  list_make1(queryPlan), NULL);
 	int eflags = 0;
 	PortalStart(portal, NULL, eflags, GetActiveSnapshot());
 
@@ -274,11 +276,11 @@ StartPortalForQueryExecution(const char *queryString)
 
 
 /*
- * QueryTupleShardSearchInfo returns a DistTableCacheEntry which has enough
+ * QueryTupleShardSearchInfo returns a CitusTableCacheEntry which has enough
  * information so that FindShardInterval() can find the shard corresponding
  * to a tuple.
  */
-static DistTableCacheEntry *
+static CitusTableCacheEntry *
 QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 						  char partitionMethod, Var *partitionColumn)
 {
@@ -335,7 +337,7 @@ QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 		shardIntervalArray[partitionIndex]->shardIndex = partitionIndex;
 	}
 
-	DistTableCacheEntry *result = palloc0(sizeof(DistTableCacheEntry));
+	CitusTableCacheEntry *result = palloc0(sizeof(CitusTableCacheEntry));
 	result->partitionMethod = partitionMethod;
 	result->partitionColumn = partitionColumn;
 	result->shardIntervalCompareFunction = shardIntervalCompare;
@@ -364,7 +366,8 @@ QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 static PartitionedResultDestReceiver *
 CreatePartitionedResultDestReceiver(char *resultIdPrefix, int partitionColumnIndex,
 									int partitionCount, TupleDesc tupleDescriptor,
-									bool binaryCopy, DistTableCacheEntry *shardSearchInfo,
+									bool binaryCopy,
+									CitusTableCacheEntry *shardSearchInfo,
 									MemoryContext perTupleContext)
 {
 	PartitionedResultDestReceiver *resultDest =

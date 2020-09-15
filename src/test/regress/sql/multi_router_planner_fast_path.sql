@@ -67,7 +67,6 @@ INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572), (2,  2, 'abducing', 
 								 (44,  4, 'anteport', 16793),(45,  5, 'afrasia', 864),(46,  6, 'atlanta', 17702),(47,  7, 'abeyance', 1772),
 								 (48,  8, 'alkylic', 18610),(49,  9, 'anyone', 2681),(50, 10, 'anjanette', 19519);
 
-RESET citus.task_executor_type;
 SET client_min_messages TO 'DEBUG2';
 
 -- test simple select for a single row
@@ -666,6 +665,25 @@ EXECUTE author_articles(1);
 EXECUTE author_articles(1);
 EXECUTE author_articles(1);
 
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+EXECUTE author_articles(NULL);
+
+PREPARE author_articles_update(int) AS
+	UPDATE articles_hash SET title = 'test' WHERE author_id = $1;
+
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+EXECUTE author_articles_update(NULL);
+
 -- queries inside plpgsql functions could be router plannable
 CREATE OR REPLACE FUNCTION author_articles_max_id() RETURNS int AS $$
 DECLARE
@@ -787,13 +805,10 @@ CREATE MATERIALIZED VIEW mv_articles_hash_empty AS
 SELECT * FROM mv_articles_hash_empty;
 
 
--- fast-path router planner/executor is enabled for task-tracker executor
-SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
 	WHERE author_id = 1;
 
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash VALUES (51, 1, 'amateus', 1814), (52, 1, 'second amateus', 2824);
 
 -- verify insert is successfull (not router plannable and executable)

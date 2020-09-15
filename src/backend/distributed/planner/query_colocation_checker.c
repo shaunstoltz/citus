@@ -12,7 +12,7 @@
  *
  * We also used a hacky solution for picking relations as the anchor range
  * table entries. The hack is that we wrap them into a subquery. This is only
- * necessary since some of the attribute equivalance checks are based on
+ * necessary since some of the attribute equivalence checks are based on
  * queries rather than range table entries.
  *
  * Copyright (c) Citus Data, Inc.
@@ -25,6 +25,7 @@
 #include "distributed/query_colocation_checker.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/relation_restriction_equivalence.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_planner.h" /* only to access utility functions */
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -47,7 +48,7 @@ static List * UnionRelationRestrictionLists(List *firstRelationList,
 ColocatedJoinChecker
 CreateColocatedJoinChecker(Query *subquery, PlannerRestrictionContext *restrictionContext)
 {
-	ColocatedJoinChecker colocatedJoinChecker;
+	ColocatedJoinChecker colocatedJoinChecker = { 0 };
 
 	Query *anchorSubquery = NULL;
 
@@ -135,13 +136,14 @@ AnchorRte(Query *subquery)
 		 * distributed table and doesn't have a set operation.
 		 *
 		 * TODO: The set operation restriction might sound weird, but, the restriction
-		 * equivalance generation functions ignore set operations. We should
+		 * equivalence generation functions ignore set operations. We should
 		 * integrate the logic in SafeToPushdownUnionSubquery() to
 		 * GenerateAllAttributeEquivalences() such that the latter becomes aware of
 		 * the set operations.
 		 */
 		if (anchorRangeTblEntry == NULL && currentRte->rtekind == RTE_SUBQUERY &&
-			QueryContainsDistributedTableRTE(currentRte->subquery) &&
+			FindNodeMatchingCheckFunction((Node *) currentRte->subquery,
+										  IsDistributedTableRTE) &&
 			currentRte->subquery->setOperations == NULL &&
 			!ContainsUnionSubquery(currentRte->subquery))
 		{
@@ -152,10 +154,10 @@ AnchorRte(Query *subquery)
 		{
 			Oid relationId = currentRte->relid;
 
-			if (PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+			if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 			{
 				/*
-				 * Reference tables should not be the anchor rte since they
+				 * Non-distributed tables should not be the anchor rte since they
 				 * don't have distribution key.
 				 */
 				continue;
@@ -179,7 +181,7 @@ bool
 SubqueryColocated(Query *subquery, ColocatedJoinChecker *checker)
 {
 	List *anchorRelationRestrictionList = checker->anchorRelationRestrictionList;
-	List *anchorAttributeEquivalances = checker->anchorAttributeEquivalences;
+	List *anchorAttributeEquivalences = checker->anchorAttributeEquivalences;
 
 	PlannerRestrictionContext *restrictionContext = checker->subqueryPlannerRestriction;
 	PlannerRestrictionContext *filteredPlannerContext =
@@ -191,12 +193,16 @@ SubqueryColocated(Query *subquery, ColocatedJoinChecker *checker)
 	/*
 	 * There are no relations in the input subquery, such as a subquery
 	 * that consist of only intermediate results or without FROM
-	 * clause.
+	 * clause or subquery in WHERE clause anded with FALSE.
+	 *
+	 * Note that for the subquery in WHERE clause, the input original
+	 * subquery (a.k.a., which didn't go through standard_planner()) may
+	 * contain distributed relations, but postgres is smart enough to
+	 * not generate the restriction information. That's the reason for
+	 * not asserting non-existence of distributed relations.
 	 */
 	if (list_length(filteredRestrictionList) == 0)
 	{
-		Assert(!QueryContainsDistributedTableRTE(subquery));
-
 		return true;
 	}
 
@@ -211,10 +217,10 @@ SubqueryColocated(Query *subquery, ColocatedJoinChecker *checker)
 									  filteredRestrictionList);
 
 	/*
-	 * We already have the attributeEquivalances, thus, only need to prepare
+	 * We already have the attributeEquivalences, thus, only need to prepare
 	 * the planner restrictions with unioned relations for our purpose of
 	 * distribution key equality. Note that we don't need to calculate the
-	 * join restrictions, we're already relying on the attributeEquivalances
+	 * join restrictions, we're already relying on the attributeEquivalences
 	 * provided by the context.
 	 */
 	RelationRestrictionContext *unionedRelationRestrictionContext = palloc0(
@@ -227,9 +233,9 @@ SubqueryColocated(Query *subquery, ColocatedJoinChecker *checker)
 	unionedPlannerRestrictionContext->relationRestrictionContext =
 		unionedRelationRestrictionContext;
 
-	if (!RestrictionEquivalenceForPartitionKeysViaEquivalances(
+	if (!RestrictionEquivalenceForPartitionKeysViaEquivalences(
 			unionedPlannerRestrictionContext,
-			anchorAttributeEquivalances))
+			anchorAttributeEquivalences))
 	{
 		return false;
 	}

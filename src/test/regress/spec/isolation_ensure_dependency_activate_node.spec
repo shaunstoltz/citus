@@ -149,11 +149,6 @@ step "s2-print-distributed-objects"
 
 session "s3"
 
-step "s3-public-schema"
-{
-    SET search_path TO public;
-}
-
 step "s3-use-schema"
 {
     SET search_path TO myschema;
@@ -170,11 +165,6 @@ step "s3-create-table"
 step "s3-wait-for-metadata-sync"
 {
     SELECT public.wait_until_metadata_sync(5000);
-}
-
-step "s3-listen-channel"
-{
-   LISTEN metadata_sync;
 }
 
 step "s3-create-schema2"
@@ -206,7 +196,7 @@ permutation "s1-print-distributed-objects" "s1-begin" "s2-begin" "s2-create-sche
 // concurrency tests with multi schema distribution
 permutation "s1-print-distributed-objects" "s2-create-schema" "s1-begin" "s2-begin" "s3-begin" "s1-add-worker" "s2-create-table" "s3-use-schema" "s3-create-table" "s1-commit" "s2-commit" "s3-commit" "s2-print-distributed-objects"
 permutation "s1-print-distributed-objects" "s1-add-worker" "s2-create-schema" "s2-begin" "s3-begin" "s3-use-schema" "s2-create-table" "s3-create-table" "s2-commit" "s3-commit" "s2-print-distributed-objects"
-permutation "s1-print-distributed-objects" "s1-begin" "s2-begin" "s3-begin" "s1-add-worker" "s2-create-schema" "s3-create-schema2" "s2-create-table" "s3-create-table" "s1-commit" "s2-commit" "s3-commit" "s2-print-distributed-objects"
+permutation "s1-print-distributed-objects" "s1-begin" "s2-begin" "s3-begin" "s1-add-worker" "s2-create-schema" "s3-create-schema2" "s2-create-table" "s3-create-table" "s1-commit" "s3-commit" "s2-commit" "s2-print-distributed-objects"
 
 // type and schema tests
 permutation "s1-print-distributed-objects" "s1-begin" "s1-add-worker" "s2-public-schema" "s2-create-type" "s1-commit" "s2-print-distributed-objects"

@@ -32,13 +32,15 @@ group by s_i_id
 having   sum(s_order_cnt) > (select max(s_order_cnt) - 3 as having_query from stock);
 
 
-explain select     s_i_id, sum(s_order_cnt) as ordercount
+explain (costs false)
+select     s_i_id, sum(s_order_cnt) as ordercount
 from     stock s
 group by s_i_id
 having   (select true)
 order by s_i_id;
 
-explain select     s_i_id, sum(s_order_cnt) as ordercount
+explain (costs false)
+select     s_i_id, sum(s_order_cnt) as ordercount
 from     stock s
 group by s_i_id
 having   (select true);
@@ -157,7 +159,7 @@ having   sum(s_order_cnt) >
         where mod((s_w_id * s_i_id),10000) = s_suppkey
         and s_nationkey = n_nationkey
         and n_name = 'GERMANY')
-order by ordercount desc;
+order by s_i_id, ordercount desc;
 
 insert into stock VALUES
 (10033, 1, 1, 1, 100000, 1, '', '','','','','','','','','','');
@@ -174,7 +176,7 @@ having   sum(s_order_cnt) >
         where mod((s_w_id * s_i_id),10000) = s_suppkey
         and s_nationkey = n_nationkey
         and n_name = 'GERMANY')
-order by ordercount desc;
+order by s_i_id, ordercount desc;
 
 BEGIN;
 SET LOCAL client_min_messages TO WARNING;

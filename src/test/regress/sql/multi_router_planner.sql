@@ -111,7 +111,6 @@ INSERT INTO articles_hash VALUES (50, 10, 'anjanette', 19519);
 
 
 
-RESET citus.task_executor_type;
 SET client_min_messages TO 'DEBUG2';
 
 -- insert a single row for the test
@@ -170,6 +169,32 @@ SELECT * FROM articles_hash WHERE author_id IN (1, NULL) ORDER BY id;
 -- queries with CTEs are supported
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT * FROM first_author;
+
+-- SELECT FOR UPDATE is supported if not involving reference table
+BEGIN;
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+
+WITH first_author AS (
+    SELECT id, word_count FROM articles_hash WHERE author_id = 2
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.word_count::text
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+
+-- Without FOR UPDATE this is router plannable
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+ROLLBACK;
 
 -- queries with CTEs are supported even if CTE is not referenced inside query
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
@@ -481,7 +506,6 @@ SELECT *
 	WHERE author_id >= 1 AND author_id <= 3
 ORDER BY 1,2,3,4;
 
-RESET citus.task_executor_type;
 
 -- Test various filtering options for router plannable check
 SET client_min_messages to 'DEBUG2';
@@ -572,7 +596,6 @@ SELECT *
 	FROM articles_hash
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1) and (word_count < 3000 or word_count > 8000);
 
--- window functions are supported if query is router plannable
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5;
@@ -594,14 +617,15 @@ SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
 	FROM articles_hash
 	WHERE author_id = 1;
 
--- window functions are not supported for not router plannable queries
 SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
-	WHERE author_id = 1 or author_id = 2;
+	WHERE author_id = 1 or author_id = 2
+    ORDER BY 1;
 
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
-	WHERE author_id = 5 or author_id = 2;
+	WHERE author_id = 5 or author_id = 2
+    ORDER BY 2;
 
 -- where false queries are router plannable
 SELECT *
@@ -688,6 +712,7 @@ INTERSECT
 -- CTEs with where false
 -- terse because distribution column inference varies between pg11 & pg12
 \set VERBOSITY terse
+RESET client_min_messages;
 
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1 and 1=0)
@@ -697,6 +722,7 @@ WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1)
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id and 1=0;
 
+SET client_min_messages TO DEBUG2;
 \set VERBOSITY DEFAULT
 
 WITH RECURSIVE hierarchy as (
@@ -769,10 +795,10 @@ SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
@@ -781,10 +807,10 @@ SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
@@ -810,7 +836,7 @@ RESET citus.log_remote_commands;
 
 -- This query was intended to test "multi-shard join is not router plannable"
 -- To run it using repartition join logic we change the join columns
-SET citus.task_executor_type to "task-tracker";
+SET citus.enable_repartition_joins to ON;
 SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 35;
 
@@ -819,7 +845,6 @@ SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 -- change the join columns.
 SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 1 or au.id = 5;
-RESET citus.task_executor_type;
 
 -- bogus query, join on non-partition column, but router plannable due to filters
 SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id)
@@ -835,7 +860,6 @@ SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 -- not router plannable
 SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 3;
-
 -- join between a range partitioned table and reference table is router plannable
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
@@ -1038,7 +1062,8 @@ SELECT count(*), count(*) FILTER (WHERE id < 3)
 PREPARE author_1_articles as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 
 EXECUTE author_1_articles;
 
@@ -1046,7 +1071,8 @@ EXECUTE author_1_articles;
 PREPARE author_articles(int) as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = $1;
+	WHERE author_id = $1
+	ORDER BY 1;
 
 EXECUTE author_articles(1);
 
@@ -1076,7 +1102,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-SELECT * FROM author_articles_id_word_count();
+SELECT * FROM author_articles_id_word_count() ORDER BY 1;
 
 -- materialized views can be created for router plannable queries
 CREATE MATERIALIZED VIEW mv_articles_hash_empty AS
@@ -1087,19 +1113,22 @@ CREATE MATERIALIZED VIEW mv_articles_hash_data AS
 	SELECT * FROM articles_hash WHERE author_id in (1,2);
 SELECT * FROM mv_articles_hash_data ORDER BY 1, 2, 3, 4;
 
--- router planner/executor is now enabled for task-tracker executor
-SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash VALUES (51, 1, 'amateus', 1814), (52, 1, 'second amateus', 2824);
 
--- verify insert is successfull (not router plannable and executable)
+-- verify insert is successful (not router plannable and executable)
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
+
+-- https://github.com/citusdata/citus/issues/3624
+UPDATE articles_hash SET id = id
+WHERE author_id = 1 AND title IN (SELECT name FROM authors_reference WHERE random() > 0.5);
 
 SET client_min_messages to 'NOTICE';
 

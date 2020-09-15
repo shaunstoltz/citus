@@ -25,9 +25,6 @@
  *   subqueries if the subquery can be executed on each shard by replacing
  *   table names with shard names and concatenating the result.
  *
- * - Task-tracker queries that can be executed through a tree of
- *   re-partitioning operations.
- *
  *   These queries have very limited SQL support and only support basic
  *   inner joins and subqueries without joins.
  *
@@ -50,6 +47,9 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "funcapi.h"
 
 #include "catalog/pg_type.h"
@@ -59,6 +59,7 @@
 #include "distributed/commands/multi_copy.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/errormessage.h"
+#include "distributed/listutils.h"
 #include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_planner.h"
@@ -80,7 +81,7 @@
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #else
 #include "nodes/relation.h"
@@ -147,7 +148,7 @@ static void RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 														 colocatedJoinChecker,
 														 RecursivePlanningContext *
 														 recursivePlanningContext);
-static List * SublinkList(Query *originalQuery);
+static List * SublinkListFromWhere(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static bool ShouldRecursivelyPlanAllSubqueriesInWhere(Query *query);
 static bool RecursivelyPlanAllSubqueries(Node *node,
@@ -164,7 +165,7 @@ static bool ShouldRecursivelyPlanSetOperation(Query *query,
 											  RecursivePlanningContext *context);
 static void RecursivelyPlanSetOperations(Query *query, Node *node,
 										 RecursivePlanningContext *context);
-static bool IsLocalTableRTE(Node *node);
+static bool IsLocalTableRteOrMatView(Node *node);
 static void RecursivelyPlanSubquery(Query *subquery,
 									RecursivePlanningContext *planningContext);
 static DistributedSubPlan * CreateDistributedSubPlan(uint32 subPlanId,
@@ -173,6 +174,7 @@ static bool CteReferenceListWalker(Node *node, CteReferenceWalkerContext *contex
 static bool ContainsReferencesToOuterQuery(Query *query);
 static bool ContainsReferencesToOuterQueryWalker(Node *node,
 												 VarLevelsUpWalkerContext *context);
+static bool NodeContainsSubqueryReferencingOuterQuery(Node *node);
 static void WrapFunctionsInSubqueries(Query *query);
 static void TransformFunctionRTE(RangeTblEntry *rangeTblEntry);
 static bool ShouldTransformRTE(RangeTblEntry *rangeTableEntry);
@@ -314,6 +316,18 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanAllSubqueries((Node *) query->jointree->quals, context);
 	}
 
+	if (query->havingQual != NULL)
+	{
+		if (NodeContainsSubqueryReferencingOuterQuery(query->havingQual))
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "Subqueries in HAVING cannot refer to outer query",
+								 NULL, NULL);
+		}
+
+		RecursivelyPlanAllSubqueries(query->havingQual, context);
+	}
+
 	/*
 	 * If the query doesn't have distribution key equality,
 	 * recursively plan some of its subqueries.
@@ -362,7 +376,8 @@ ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 	}
 
 	/* direct joins with local tables are not supported by any of Citus planners */
-	if (FindNodeCheckInRangeTableList(subquery->rtable, IsLocalTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(subquery->rtable,
+													  IsLocalTableRteOrMatView))
 	{
 		return false;
 	}
@@ -442,7 +457,7 @@ RecursivelyPlanNonColocatedSubqueries(Query *subquery, RecursivePlanningContext 
  * RecursivelyPlanNonColocatedJoinWalker gets a join node and walks over it to find
  * subqueries that live under the node.
  *
- * When a subquery found, its checked whether the subquery is colocated with the
+ * When a subquery found, it's checked whether the subquery is colocated with the
  * anchor subquery specified in the nonColocatedJoinContext. If not,
  * the subquery is recursively planned.
  */
@@ -518,7 +533,7 @@ RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
  * RecursivelyPlanNonColocatedJoinWalker gets a query and walks over its sublinks
  * to find subqueries that live in WHERE clause.
  *
- * When a subquery found, its checked whether the subquery is colocated with the
+ * When a subquery found, it's checked whether the subquery is colocated with the
  * anchor subquery specified in the nonColocatedJoinContext. If not,
  * the subquery is recursively planned.
  */
@@ -528,7 +543,7 @@ RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 											 RecursivePlanningContext *
 											 recursivePlanningContext)
 {
-	List *sublinkList = SublinkList(query);
+	List *sublinkList = SublinkListFromWhere(query);
 	ListCell *sublinkCell = NULL;
 
 	foreach(sublinkCell, sublinkList)
@@ -551,12 +566,12 @@ RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 
 
 /*
- * SublinkList finds the subquery nodes in the where clause of the given query. Note
+ * SublinkListFromWhere finds the subquery nodes in the where clause of the given query. Note
  * that the function should be called on the original query given that postgres
  * standard_planner() may convert the subqueries in WHERE clause to joins.
  */
 static List *
-SublinkList(Query *originalQuery)
+SublinkListFromWhere(Query *originalQuery)
 {
 	FromExpr *joinTree = originalQuery->jointree;
 	List *sublinkList = NIL;
@@ -622,7 +637,8 @@ ShouldRecursivelyPlanAllSubqueriesInWhere(Query *query)
 		return false;
 	}
 
-	if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(query->rtable,
+													  IsDistributedTableRTE))
 	{
 		/* there is a distributed table in the FROM clause */
 		return false;
@@ -648,8 +664,7 @@ RecursivelyPlanAllSubqueries(Node *node, RecursivePlanningContext *planningConte
 	if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
-
-		if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+		if (FindNodeMatchingCheckFunctionInRangeTableList(query->rtable, IsCitusTableRTE))
 		{
 			RecursivelyPlanSubquery(query, planningContext);
 		}
@@ -863,7 +878,8 @@ RecursivelyPlanSubqueryWalker(Node *node, RecursivePlanningContext *context)
 static bool
 ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context)
 {
-	if (FindNodeCheckInRangeTableList(subquery->rtable, IsLocalTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(subquery->rtable,
+													  IsLocalTableRteOrMatView))
 	{
 		/*
 		 * Postgres can always plan queries that don't require distributed planning.
@@ -875,7 +891,7 @@ ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context
 		 * do not contain any other local tables.
 		 */
 	}
-	else if (DeferErrorIfCannotPushdownSubquery(subquery, false) == NULL)
+	else if (CanPushdownSubquery(subquery, false))
 	{
 		/*
 		 * We should do one more check for the distribution key equality.
@@ -896,16 +912,7 @@ ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context
 
 		/*
 		 * Citus can pushdown this subquery, no need to recursively
-		 * plan which is much expensive than pushdown.
-		 */
-		return false;
-	}
-	else if (TaskExecutorType == MULTI_EXECUTOR_TASK_TRACKER &&
-			 SingleRelationRepartitionSubquery(subquery))
-	{
-		/*
-		 * Citus can plan this and execute via repartitioning. Thus,
-		 * no need to recursively plan.
+		 * plan which is much more expensive than pushdown.
 		 */
 		return false;
 	}
@@ -1025,7 +1032,7 @@ RecursivelyPlanSetOperations(Query *query, Node *node,
 		Query *subquery = rangeTableEntry->subquery;
 
 		if (rangeTableEntry->rtekind == RTE_SUBQUERY &&
-			QueryContainsDistributedTableRTE(subquery))
+			FindNodeMatchingCheckFunction((Node *) subquery, IsDistributedTableRTE))
 		{
 			RecursivelyPlanSubquery(subquery, context);
 		}
@@ -1040,12 +1047,12 @@ RecursivelyPlanSetOperations(Query *query, Node *node,
 
 
 /*
- * IsLocalTableRTE gets a node and returns true if the node
- * is a range table relation entry that points to a local
- * relation (i.e., not a distributed relation).
+ * IsLocalTableRteOrMatView gets a node and returns true if the node is a range
+ * table entry that points to a postgres local or citus local table or to a
+ * materialized view.
  */
 static bool
-IsLocalTableRTE(Node *node)
+IsLocalTableRteOrMatView(Node *node)
 {
 	if (node == NULL)
 	{
@@ -1069,13 +1076,18 @@ IsLocalTableRTE(Node *node)
 	}
 
 	Oid relationId = rangeTableEntry->relid;
-	if (IsDistributedTable(relationId))
+	if (!IsCitusTable(relationId))
 	{
-		return false;
+		/* postgres local table or a materialized view */
+		return true;
+	}
+	else if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+	{
+		return true;
 	}
 
-	/* local table found */
-	return true;
+	/* no local table found */
+	return false;
 }
 
 
@@ -1142,7 +1154,7 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 	}
 
 	/* finally update the input subquery to point the result query */
-	memcpy(subquery, resultQuery, sizeof(Query));
+	*subquery = *resultQuery;
 }
 
 
@@ -1170,7 +1182,7 @@ CreateDistributedSubPlan(uint32 subPlanId, Query *subPlanQuery)
 	}
 
 	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
-	subPlan->plan = planner(subPlanQuery, cursorOptions, NULL);
+	subPlan->plan = planner_compat(subPlanQuery, cursorOptions, NULL);
 	subPlan->subPlanId = subPlanId;
 
 	return subPlan;
@@ -1223,7 +1235,7 @@ CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context)
 
 /*
  * ContainsReferencesToOuterQuery determines whether the given query contains
- * any Vars that point outside of the query itself. Such queries cannot be
+ * anything that points outside of the query itself. Such queries cannot be
  * planned recursively.
  */
 static bool
@@ -1299,6 +1311,29 @@ ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *conte
 
 	return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker,
 								  context);
+}
+
+
+/*
+ * NodeContainsSubqueryReferencingOuterQuery determines whether the given node
+ * contains anything that points outside of the query itself.
+ */
+static bool
+NodeContainsSubqueryReferencingOuterQuery(Node *node)
+{
+	List *sublinks = NIL;
+	ExtractSublinkWalker(node, &sublinks);
+
+	SubLink *sublink;
+	foreach_ptr(sublink, sublinks)
+	{
+		if (ContainsReferencesToOuterQuery(castNode(Query, sublink->subselect)))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -1397,7 +1432,12 @@ TransformFunctionRTE(RangeTblEntry *rangeTblEntry)
 		 *
 		 * We will iterate over Tuple Description attributes. i.e (c1 int, c2 text)
 		 */
-		for (targetColumnIndex = 0; targetColumnIndex < tupleDesc->natts;
+		if (tupleDesc->natts > MaxAttrNumber)
+		{
+			ereport(ERROR, (errmsg("bad number of tuple descriptor attributes")));
+		}
+		AttrNumber natts = tupleDesc->natts;
+		for (targetColumnIndex = 0; targetColumnIndex < natts;
 			 targetColumnIndex++)
 		{
 			FormData_pg_attribute *attribute = TupleDescAttr(tupleDesc,
@@ -1565,7 +1605,7 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 
 
 /*
- * BuildSubPlanResultQuery returns a query of the form:
+ * BuildReadIntermediateResultsArrayQuery returns a query of the form:
  *
  * SELECT
  *   <target list>
@@ -1649,8 +1689,8 @@ BuildReadIntermediateResultsQuery(List *targetEntryList, List *columnAliasList,
 		functionColumnVar->vartypmod = columnTypMod;
 		functionColumnVar->varcollid = columnCollation;
 		functionColumnVar->varlevelsup = 0;
-		functionColumnVar->varnoold = 1;
-		functionColumnVar->varoattno = columnNumber;
+		functionColumnVar->varnosyn = 1;
+		functionColumnVar->varattnosyn = columnNumber;
 		functionColumnVar->location = -1;
 
 		TargetEntry *newTargetEntry = makeNode(TargetEntry);

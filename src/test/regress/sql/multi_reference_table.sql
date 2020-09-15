@@ -281,7 +281,6 @@ GROUP BY
 	GROUPING sets ((value_4), (value_3))
 ORDER BY 1, 2, 3;
 
-
 -- distinct clauses also work fine
 SELECT DISTINCT
 	value_4
@@ -620,7 +619,7 @@ SET citus.shard_count TO 6;
 SET citus.shard_replication_factor TO 2;
 
 CREATE TABLE colocated_table_test (value_1 int, value_2 float, value_3 text, value_4 timestamp);
-SELECT create_distributed_table('colocated_table_test', 'value_1');
+    SELECT create_distributed_table('colocated_table_test', 'value_1');
 
 CREATE TABLE colocated_table_test_2 (value_1 int, value_2 float, value_3 text, value_4 timestamp);
 SELECT create_distributed_table('colocated_table_test_2', 'value_1');
@@ -678,26 +677,26 @@ WHERE
 	colocated_table_test.value_1 = colocated_table_test_2.value_1 AND colocated_table_test.value_2 = reference_table_test.value_2
 ORDER BY 1;
 
-SET citus.task_executor_type to "task-tracker";
+SET citus.enable_repartition_joins to ON;
 SELECT
 	colocated_table_test.value_2
 FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE
-	colocated_table_test.value_2 = colocated_table_test_2.value_2 AND colocated_table_test.value_2 = reference_table_test.value_2;
+	colocated_table_test.value_2 = colocated_table_test_2.value_2 AND colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY colocated_table_test.value_2;
 
 SELECT
 	reference_table_test.value_2
 FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE
-	colocated_table_test.value_1 = reference_table_test.value_1 AND colocated_table_test_2.value_1 = reference_table_test.value_1;
-
+	colocated_table_test.value_1 = reference_table_test.value_1 AND colocated_table_test_2.value_1 = reference_table_test.value_1
+ORDER BY reference_table_test.value_2;
 
 SET citus.log_multi_join_order TO FALSE;
 
 SET citus.shard_count TO DEFAULT;
-SET citus.task_executor_type to "adaptive";
 
 -- some INSERT .. SELECT queries that involve both hash distributed and reference tables
 
@@ -808,7 +807,8 @@ SELECT
 FROM
 	reference_table_test_sixth, reference_table_test_seventh
 WHERE
-	reference_table_test_sixth.value_4 = reference_table_test_seventh.value_4;
+	reference_table_test_sixth.value_4 = reference_table_test_seventh.value_4
+ORDER BY 1;
 
 -- last test with cross schemas
 SET search_path TO 'public';
@@ -818,7 +818,8 @@ SELECT
 FROM
 	colocated_table_test_2, reference_schema.reference_table_test_sixth as reftable
 WHERE
-	colocated_table_test_2.value_4 = reftable.value_4;
+	colocated_table_test_2.value_4 = reftable.value_4
+ORDER BY 1, 2;
 
 
 -- let's now test TRUNCATE and DROP TABLE
@@ -964,8 +965,7 @@ SELECT select_count_all();
 TRUNCATE reference_table_test;
 
 -- reference tables work with composite key
--- and we even do not need to create hash
--- function etc.
+-- and we even do not need to create hash function etc.
 
 -- first create the type on all nodes
 CREATE TYPE reference_comp_key as (key text, value text);
@@ -1006,6 +1006,16 @@ BEGIN;
 ALTER TABLE reference_table_test ADD COLUMN value_dummy INT;
 INSERT INTO reference_table_test VALUES (2, 2.0, '2', '2016-12-02');
 ROLLBACK;
+
+-- Previous issue failed to rename reference tables in subqueries
+EXPLAIN (COSTS OFF) SELECT value_1, count(*) FROM colocated_table_test GROUP BY value_1
+HAVING (SELECT rt.value_2 FROM reference_table_test rt where rt.value_2 = 2) > 0
+ORDER BY 1;
+
+WITH a as (SELECT rt.value_2 FROM reference_table_test rt where rt.value_2 = 2)
+SELECT ct.value_1, count(*) FROM colocated_table_test ct join a on ct.value_1 = a.value_2
+WHERE exists (select * from a)
+GROUP BY 1 ORDER BY 1;
 
 -- clean up tables, ...
 SET client_min_messages TO ERROR;

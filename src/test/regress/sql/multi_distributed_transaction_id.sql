@@ -58,7 +58,7 @@ BEGIN;
 
 	SELECT initiator_node_identifier, transaction_number, transaction_stamp, (process_id = pg_backend_pid()) FROM get_current_transaction_id();
 
-	\c - - - :master_port
+	\c - - :master_host :master_port
 
 	SELECT initiator_node_identifier, transaction_number, transaction_stamp, (process_id = pg_backend_pid()) FROM get_current_transaction_id();
 
@@ -98,6 +98,7 @@ ANALYSE parallel_id_test;
 
 SET LOCAL max_parallel_workers_per_gather TO 2;
 SET LOCAL parallel_tuple_cost TO 0;
+SET LOCAL parallel_setup_cost TO 0;
 
 EXPLAIN (COSTS OFF)
 SELECT a FROM parallel_id_test WHERE a = parallel_worker_transaction_id_test();

@@ -43,6 +43,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -50,17 +52,19 @@
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata/distobject.h"
-#include "distributed/metadata/namespace.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/transaction_management.h"
 #include "distributed/worker_create_or_replace.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
 #include "miscadmin.h"
@@ -159,7 +163,7 @@ PreprocessCompositeTypeStmt(Node *node, const char *queryString)
 								(void *) compositeTypeStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -225,7 +229,7 @@ PreprocessAlterTypeStmt(Node *node, const char *queryString)
 								(void *) alterTypeStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -268,7 +272,7 @@ PreprocessCreateEnumStmt(Node *node, const char *queryString)
 								(void *) createEnumStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -344,7 +348,7 @@ PreprocessAlterEnumStmt(Node *node, const char *queryString)
 	 * creating a DDLTaksList we won't return anything here. During the processing phase
 	 * we directly connect to workers and execute the commands remotely.
 	 */
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 	if (AlterEnumIsAddValue(castNode(AlterEnumStmt, node)))
 	{
 		/*
@@ -359,7 +363,7 @@ PreprocessAlterEnumStmt(Node *node, const char *queryString)
 						  (void *) alterEnumStmtSql,
 						  ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -390,7 +394,7 @@ PostprocessAlterEnumStmt(Node *node, const char *queryString)
 	 * From pg12 and up we use the normal infrastructure and create the ddl jobs during
 	 * planning.
 	 */
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 	AlterEnumStmt *stmt = castNode(AlterEnumStmt, node);
 	ObjectAddress typeAddress = GetObjectAddressFromParseTree((Node *) stmt, false);
 	if (!ShouldPropagateObject(&typeAddress))
@@ -451,7 +455,6 @@ PreprocessDropTypeStmt(Node *node, const char *queryString)
 	 * the old list to put back
 	 */
 	List *oldTypes = stmt->objects;
-	ListCell *addressCell = NULL;
 
 	if (!ShouldPropagate())
 	{
@@ -477,9 +480,9 @@ PreprocessDropTypeStmt(Node *node, const char *queryString)
 	 * remove the entries for the distributed objects on dropping
 	 */
 	List *distributedTypeAddresses = TypeNameListToObjectAddresses(distributedTypes);
-	foreach(addressCell, distributedTypeAddresses)
+	ObjectAddress *address = NULL;
+	foreach_ptr(address, distributedTypeAddresses)
 	{
-		ObjectAddress *address = (ObjectAddress *) lfirst(addressCell);
 		UnmarkObjectDistributed(address);
 	}
 
@@ -488,17 +491,17 @@ PreprocessDropTypeStmt(Node *node, const char *queryString)
 	 * deparse to an executable sql statement for the workers
 	 */
 	stmt->objects = distributedTypes;
-	const char *dropStmtSql = DeparseTreeNode((Node *) stmt);
+	char *dropStmtSql = DeparseTreeNode((Node *) stmt);
 	stmt->objects = oldTypes;
 
 	EnsureSequentialModeForTypeDDL();
 
 	/* to prevent recursion with mx we disable ddl propagation */
 	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) dropStmtSql,
+								dropStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -532,7 +535,7 @@ PreprocessRenameTypeStmt(Node *node, const char *queryString)
 								(void *) renameStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -565,7 +568,7 @@ PreprocessRenameTypeAttributeStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -598,7 +601,7 @@ PreprocessAlterTypeSchemaStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -655,7 +658,7 @@ PreprocessAlterTypeOwnerStmt(Node *node, const char *queryString)
 								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -710,15 +713,13 @@ RecreateCompositeTypeStmt(Oid typeOid)
 /*
  * attributeFormToColumnDef returns a ColumnDef * describing the field and its property
  * for a pg_attribute entry.
- *
- * Note: Current implementation is only covering the features supported by composite types
  */
 static ColumnDef *
 attributeFormToColumnDef(Form_pg_attribute attributeForm)
 {
 	return makeColumnDef(NameStr(attributeForm->attname),
 						 attributeForm->atttypid,
-						 -1,
+						 attributeForm->atttypmod,
 						 attributeForm->attcollation);
 }
 
@@ -791,7 +792,7 @@ EnumValsList(Oid typeOid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(typeOid));
 
-	Relation enum_rel = heap_open(EnumRelationId, AccessShareLock);
+	Relation enum_rel = table_open(EnumRelationId, AccessShareLock);
 	SysScanDesc enum_scan = systable_beginscan(enum_rel,
 											   EnumTypIdSortOrderIndexId,
 											   true, NULL,
@@ -805,7 +806,7 @@ EnumValsList(Oid typeOid)
 	}
 
 	systable_endscan(enum_scan);
-	heap_close(enum_rel, AccessShareLock);
+	table_close(enum_rel, AccessShareLock);
 	return vals;
 }
 
@@ -833,7 +834,7 @@ CompositeTypeStmtObjectAddress(Node *node, bool missing_ok)
 
 /*
  * CreateEnumStmtObjectAddress finds the ObjectAddress for the enum type described by the
- * CreateEnumStmt. If missing_ok is false this function throws an error if the  type does
+ * CreateEnumStmt. If missing_ok is false this function throws an error if the type does
  * not exist.
  *
  * Never returns NULL, but the objid in the address could be invalid if missing_ok was set
@@ -854,7 +855,7 @@ CreateEnumStmtObjectAddress(Node *node, bool missing_ok)
 
 /*
  * AlterTypeStmtObjectAddress finds the ObjectAddress for the type described by the ALTER
- * TYPE statement. If missing_ok is false this function throws an error if the  type does
+ * TYPE statement. If missing_ok is false this function throws an error if the type does
  * not exist.
  *
  * Never returns NULL, but the objid in the address could be invalid if missing_ok was set
@@ -1075,16 +1076,17 @@ GenerateBackupNameForTypeCollision(const ObjectAddress *address)
 
 	while (true)
 	{
-		int suffixLength = snprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
-									count);
+		int suffixLength = SafeSnprintf(suffix, NAMEDATALEN - 1, "(citus_backup_%d)",
+										count);
 
 		/* trim the base name at the end to leave space for the suffix and trailing \0 */
 		baseLength = Min(baseLength, NAMEDATALEN - suffixLength - 1);
 
 		/* clear newName before copying the potentially trimmed baseName and suffix */
 		memset(newName, 0, NAMEDATALEN);
-		strncpy(newName, baseName, baseLength);
-		strncpy(newName + baseLength, suffix, suffixLength);
+		strncpy_s(newName, NAMEDATALEN, baseName, baseLength);
+		strncpy_s(newName + baseLength, NAMEDATALEN - baseLength, suffix,
+				  suffixLength);
 
 		rel->relname = newName;
 		TypeName *newTypeName = makeTypeNameFromNameList(MakeNameListFromRangeVar(rel));
@@ -1111,11 +1113,10 @@ GenerateBackupNameForTypeCollision(const ObjectAddress *address)
 static List *
 FilterNameListForDistributedTypes(List *objects, bool missing_ok)
 {
-	ListCell *objectCell = NULL;
 	List *result = NIL;
-	foreach(objectCell, objects)
+	TypeName *typeName = NULL;
+	foreach_ptr(typeName, objects)
 	{
-		TypeName *typeName = castNode(TypeName, lfirst(objectCell));
 		Oid typeOid = LookupTypeNameOid(NULL, typeName, missing_ok);
 		ObjectAddress typeAddress = { 0 };
 
@@ -1142,11 +1143,10 @@ FilterNameListForDistributedTypes(List *objects, bool missing_ok)
 static List *
 TypeNameListToObjectAddresses(List *objects)
 {
-	ListCell *objectCell = NULL;
 	List *result = NIL;
-	foreach(objectCell, objects)
+	TypeName *typeName = NULL;
+	foreach_ptr(typeName, objects)
 	{
-		TypeName *typeName = castNode(TypeName, lfirst(objectCell));
 		Oid typeOid = LookupTypeNameOid(NULL, typeName, false);
 		ObjectAddress *typeAddress = palloc0(sizeof(ObjectAddress));
 		ObjectAddressSet(*typeAddress, TypeRelationId, typeOid);

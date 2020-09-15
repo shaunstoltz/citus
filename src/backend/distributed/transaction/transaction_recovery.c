@@ -13,13 +13,16 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "miscadmin.h"
 #include "libpq-fe.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
 #endif
 #include "access/heapam.h"
@@ -92,7 +95,8 @@ LogTransactionRecord(int32 groupId, char *transactionName)
 	values[Anum_pg_dist_transaction_gid - 1] = CStringGetTextDatum(transactionName);
 
 	/* open transaction relation and insert new tuple */
-	Relation pgDistTransaction = heap_open(DistTransactionRelationId(), RowExclusiveLock);
+	Relation pgDistTransaction = table_open(DistTransactionRelationId(),
+											RowExclusiveLock);
 
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistTransaction);
 	HeapTuple heapTuple = heap_form_tuple(tupleDescriptor, values, isNulls);
@@ -102,7 +106,7 @@ LogTransactionRecord(int32 groupId, char *transactionName)
 	CommandCounterIncrement();
 
 	/* close relation and invalidate previous cache entry */
-	heap_close(pgDistTransaction, NoLock);
+	table_close(pgDistTransaction, NoLock);
 }
 
 
@@ -113,15 +117,12 @@ LogTransactionRecord(int32 groupId, char *transactionName)
 int
 RecoverTwoPhaseCommits(void)
 {
-	ListCell *workerNodeCell = NULL;
 	int recoveredTransactionCount = 0;
 
 	List *workerList = ActivePrimaryNodeList(NoLock);
-
-	foreach(workerNodeCell, workerList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-
 		recoveredTransactionCount += RecoverWorkerTransactions(workerNode);
 	}
 
@@ -171,8 +172,8 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
 	/* take table lock first to avoid running concurrently */
-	Relation pgDistTransaction = heap_open(DistTransactionRelationId(),
-										   ShareUpdateExclusiveLock);
+	Relation pgDistTransaction = table_open(DistTransactionRelationId(),
+											ShareUpdateExclusiveLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistTransaction);
 
 	/*
@@ -305,7 +306,7 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 			 *
 			 * If a transaction started and committed just after we observed the
 			 * set of prepared transactions, and just before we called
-			 * ActiveDistributedTransactionNumbers, then we would see  a recovery
+			 * ActiveDistributedTransactionNumbers, then we would see a recovery
 			 * record without a prepared transaction in pendingTransactionSet,
 			 * but there may be prepared transactions that failed to commit.
 			 * We should not delete the records for those prepared transactions,
@@ -344,7 +345,7 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistTransaction, NoLock);
+	table_close(pgDistTransaction, NoLock);
 
 	if (!recoveryFailed)
 	{
@@ -399,7 +400,7 @@ PendingWorkerTransactionList(MultiConnection *connection)
 	StringInfo command = makeStringInfo();
 	bool raiseInterrupts = true;
 	List *transactionNames = NIL;
-	int coordinatorId = GetLocalGroupId();
+	int32 coordinatorId = GetLocalGroupId();
 
 	appendStringInfo(command, "SELECT gid FROM pg_prepared_xacts "
 							  "WHERE gid LIKE 'citus\\_%d\\_%%'",

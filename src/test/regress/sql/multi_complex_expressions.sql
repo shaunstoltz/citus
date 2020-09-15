@@ -167,7 +167,6 @@ SELECT * FROM (SELECT o_orderkey FROM orders ORDER BY o_orderkey OFFSET 20) sq O
 SELECT o_orderkey FROM orders ORDER BY o_orderkey LIMIT 10 OFFSET 20;
 
 -- LIMIT/OFFSET with a subquery
-SET citus.task_executor_type TO 'task-tracker';
 
 SELECT
 	customer_keys.o_custkey,
@@ -181,7 +180,30 @@ ORDER BY
 	customer_keys.o_custkey DESC
 LIMIT 10 OFFSET 20;
 
-RESET citus.task_executor_type;
+SELECT
+	customer_keys.o_custkey,
+	SUM(order_count) AS total_order_count
+FROM
+	(SELECT o_custkey, o_orderstatus, COUNT(*) over (partition by o_orderstatus) AS order_count
+	 FROM orders GROUP BY o_custkey, o_orderstatus ) customer_keys
+GROUP BY
+	customer_keys.o_custkey
+ORDER BY
+	customer_keys.o_custkey DESC
+LIMIT 10 OFFSET 20;
+
+SELECT
+	customer_keys.o_custkey,
+	SUM(order_count1 + order_count) AS total_order_count
+FROM
+	(SELECT o_custkey, o_orderstatus, count(*) order_count1, COUNT(*) over (partition by o_orderstatus) AS order_count
+	 FROM orders GROUP BY o_custkey, o_orderstatus ) customer_keys
+GROUP BY
+	customer_keys.o_custkey
+ORDER BY
+	customer_keys.o_custkey DESC
+LIMIT 10 OFFSET 20;
+
 SET client_min_messages TO DEBUG1;
 
 -- Ensure that we push down LIMIT and OFFSET properly

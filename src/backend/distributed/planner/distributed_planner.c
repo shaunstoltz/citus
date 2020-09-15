@@ -8,6 +8,9 @@
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "funcapi.h"
 
 #include <float.h>
@@ -19,12 +22,14 @@
 #include "catalog/pg_type.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/cte_inline.h"
 #include "distributed/function_call_delegation.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/intermediate_result_pruning.h"
 #include "distributed/intermediate_results.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/distributed_planner.h"
@@ -33,11 +38,12 @@
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_master_planner.h"
+#include "distributed/combine_query_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/query_utils.h"
 #include "distributed/recursive_planning.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/shard_utils.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
 #include "executor/executor.h"
@@ -45,7 +51,7 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "parser/parse_type.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #else
@@ -53,6 +59,7 @@
 #endif
 #include "optimizer/pathnode.h"
 #include "optimizer/planner.h"
+#include "optimizer/planmain.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -61,7 +68,7 @@
 
 
 static List *plannerRestrictionContextList = NIL;
-int MultiTaskQueryLogLevel = MULTI_TASK_QUERY_INFO_OFF; /* multi-task query log level */
+int MultiTaskQueryLogLevel = CITUS_LOG_LEVEL_OFF; /* multi-task query log level */
 static uint64 NextPlanId = 1;
 
 /* keep track of planner call stack levels */
@@ -80,13 +87,6 @@ static PlannedStmt * TryCreateDistributedPlannedStmt(PlannedStmt *localPlan,
 													 boundParams,
 													 PlannerRestrictionContext *
 													 plannerRestrictionContext);
-static DistributedPlan * CreateDistributedPlan(uint64 planId, Query *originalQuery,
-											   Query *query, ParamListInfo boundParams,
-											   bool hasUnresolvedParams,
-											   PlannerRestrictionContext *
-											   plannerRestrictionContext);
-static void FinalizeDistributedPlan(DistributedPlan *plan, Query *originalQuery);
-static void RecordSubPlansUsedInPlan(DistributedPlan *plan, Query *originalQuery);
 static DeferredErrorMessage * DeferErrorIfPartitionTableNotSingleReplicated(Oid
 																			relationId);
 
@@ -98,6 +98,8 @@ static PlannedStmt * FinalizeNonRouterPlan(PlannedStmt *localPlan,
 										   DistributedPlan *distributedPlan,
 										   CustomScan *customScan);
 static PlannedStmt * FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan);
+static List * makeTargetListFromCustomScanList(List *custom_scan_tlist);
+static List * makeCustomScanTargetlistFromExistingTargetList(List *existingTargetlist);
 static int32 BlessRecordExpressionList(List *exprs);
 static void CheckNodeIsDumpable(Node *node);
 static Node * CheckNodeCopyAndSerialization(Node *node);
@@ -117,33 +119,27 @@ static PlannerRestrictionContext * CurrentPlannerRestrictionContext(void);
 static void PopPlannerRestrictionContext(void);
 static void ResetPlannerRestrictionContext(
 	PlannerRestrictionContext *plannerRestrictionContext);
-static bool HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams);
-static bool IsLocalReferenceTableJoin(Query *parse, List *rangeTableList);
-static bool QueryIsNotSimpleSelect(Node *node);
-static bool UpdateReferenceTablesWithShard(Node *node, void *context);
 static PlannedStmt * PlanFastPathDistributedStmt(DistributedPlanningContext *planContext,
 												 Node *distributionKeyValue);
 static PlannedStmt * PlanDistributedStmt(DistributedPlanningContext *planContext,
-										 List *rangeTableList, int rteIdCounter);
+										 int rteIdCounter);
+static RTEListProperties * GetRTEListProperties(List *rangeTableList);
 
 
 /* Distributed planner hook */
 PlannedStmt *
-distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
+distributed_planner(Query *parse,
+	#if PG_VERSION_NUM >= PG_VERSION_13
+					const char *query_string,
+	#endif
+					int cursorOptions,
+					ParamListInfo boundParams)
 {
-	PlannedStmt *result = NULL;
 	bool needsDistributedPlanning = false;
-	bool setPartitionedTablesInherited = false;
-	List *rangeTableList = ExtractRangeTableEntryList(parse);
-	int rteIdCounter = 1;
 	bool fastPathRouterQuery = false;
 	Node *distributionKeyValue = NULL;
-	DistributedPlanningContext planContext = {
-		.query = parse,
-		.cursorOptions = cursorOptions,
-		.boundParams = boundParams,
-	};
 
+	List *rangeTableList = ExtractRangeTableEntryList(parse);
 
 	if (cursorOptions & CURSOR_OPT_FORCE_DISTRIBUTED)
 	{
@@ -154,25 +150,20 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	}
 	else if (CitusHasBeenLoaded())
 	{
-		if (IsLocalReferenceTableJoin(parse, rangeTableList))
+		needsDistributedPlanning = ListContainsDistributedTableRTE(rangeTableList);
+		if (needsDistributedPlanning)
 		{
-			/*
-			 * For joins between reference tables and local tables, we replace
-			 * reference table names with shard tables names in the query, so
-			 * we can use the standard_planner for planning it locally.
-			 */
-			needsDistributedPlanning = false;
-			UpdateReferenceTablesWithShard((Node *) parse, NULL);
-		}
-		else
-		{
-			needsDistributedPlanning = ListContainsDistributedTableRTE(rangeTableList);
-			if (needsDistributedPlanning)
-			{
-				fastPathRouterQuery = FastPathRouterQuery(parse, &distributionKeyValue);
-			}
+			fastPathRouterQuery = FastPathRouterQuery(parse, &distributionKeyValue);
 		}
 	}
+
+	int rteIdCounter = 1;
+
+	DistributedPlanningContext planContext = {
+		.query = parse,
+		.cursorOptions = cursorOptions,
+		.boundParams = boundParams,
+	};
 
 	if (fastPathRouterQuery)
 	{
@@ -187,21 +178,6 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	else if (needsDistributedPlanning)
 	{
 		/*
-		 * Inserting into a local table needs to go through the regular postgres
-		 * planner/executor, but the SELECT needs to go through Citus. We currently
-		 * don't have a way of doing both things and therefore error out, but do
-		 * have a handy tip for users.
-		 */
-		if (InsertSelectIntoLocalTable(parse))
-		{
-			ereport(ERROR, (errmsg("cannot INSERT rows from a distributed query into a "
-								   "local table"),
-							errhint("Consider using CREATE TEMPORARY TABLE tmp AS "
-									"SELECT ... and inserting from the temporary "
-									"table.")));
-		}
-
-		/*
 		 * standard_planner scribbles on it's input, but for deparsing we need the
 		 * unmodified form. Note that before copying we call
 		 * AssignRTEIdentities, which is needed because these identities need
@@ -210,7 +186,7 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		rteIdCounter = AssignRTEIdentities(rangeTableList, rteIdCounter);
 		planContext.originalQuery = copyObject(parse);
 
-		setPartitionedTablesInherited = false;
+		bool setPartitionedTablesInherited = false;
 		AdjustPartitioningForDistributedPlanning(rangeTableList,
 												 setPartitionedTablesInherited);
 	}
@@ -232,6 +208,7 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	 */
 	PlannerLevel++;
 
+	PlannedStmt *result = NULL;
 
 	PG_TRY();
 	{
@@ -246,12 +223,12 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 			 * restriction information per table and parse tree transformations made by
 			 * postgres' planner.
 			 */
-			planContext.plan = standard_planner(planContext.query,
-												planContext.cursorOptions,
-												planContext.boundParams);
+			planContext.plan = standard_planner_compat(planContext.query,
+													   planContext.cursorOptions,
+													   planContext.boundParams);
 			if (needsDistributedPlanning)
 			{
-				result = PlanDistributedStmt(&planContext, rangeTableList, rteIdCounter);
+				result = PlanDistributedStmt(&planContext, rteIdCounter);
 			}
 			else if ((result = TryToDelegateFunctionCall(&planContext)) == NULL)
 			{
@@ -302,11 +279,11 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 List *
 ExtractRangeTableEntryList(Query *query)
 {
-	List *rangeTblList = NIL;
+	List *rteList = NIL;
 
-	ExtractRangeTableEntryWalker((Node *) query, &rangeTblList);
+	ExtractRangeTableEntryWalker((Node *) query, &rteList);
 
-	return rangeTblList;
+	return rteList;
 }
 
 
@@ -321,13 +298,12 @@ ExtractRangeTableEntryList(Query *query)
 bool
 NeedsDistributedPlanning(Query *query)
 {
-	List *allRTEs = NIL;
-	CmdType commandType = query->commandType;
-
 	if (!CitusHasBeenLoaded())
 	{
 		return false;
 	}
+
+	CmdType commandType = query->commandType;
 
 	if (commandType != CMD_SELECT && commandType != CMD_INSERT &&
 		commandType != CMD_UPDATE && commandType != CMD_DELETE)
@@ -335,7 +311,7 @@ NeedsDistributedPlanning(Query *query)
 		return false;
 	}
 
-	ExtractRangeTableEntryWalker((Node *) query, &allRTEs);
+	List *allRTEs = ExtractRangeTableEntryList(query);
 
 	return ListContainsDistributedTableRTE(allRTEs);
 }
@@ -360,7 +336,7 @@ ListContainsDistributedTableRTE(List *rangeTableList)
 			continue;
 		}
 
-		if (IsDistributedTable(rangeTableEntry->relid))
+		if (IsCitusTable(rangeTableEntry->relid))
 		{
 			return true;
 		}
@@ -438,7 +414,7 @@ AdjustPartitioningForDistributedPlanning(List *rangeTableList,
 		 * value before and after dropping to the standart_planner.
 		 */
 		if (rangeTableEntry->rtekind == RTE_RELATION &&
-			IsDistributedTable(rangeTableEntry->relid) &&
+			IsCitusTable(rangeTableEntry->relid) &&
 			PartitionedTable(rangeTableEntry->relid))
 		{
 			rangeTableEntry->inh = setPartitionedTablesInherited;
@@ -490,6 +466,28 @@ GetRTEIdentity(RangeTblEntry *rte)
 
 
 /*
+ * GetQueryLockMode returns the necessary lock mode to be acquired for the
+ * given query. (See comment written in RangeTblEntry->rellockmode)
+ */
+LOCKMODE
+GetQueryLockMode(Query *query)
+{
+	if (IsModifyCommand(query))
+	{
+		return RowExclusiveLock;
+	}
+	else if (query->hasForUpdate)
+	{
+		return RowShareLock;
+	}
+	else
+	{
+		return AccessShareLock;
+	}
+}
+
+
+/*
  * IsModifyCommand returns true if the query performs modifications, false
  * otherwise.
  */
@@ -537,17 +535,6 @@ IsUpdateOrDelete(Query *query)
 
 
 /*
- * IsModifyDistributedPlan returns true if the multi plan performs modifications,
- * false otherwise.
- */
-bool
-IsModifyDistributedPlan(DistributedPlan *distributedPlan)
-{
-	return distributedPlan->modLevel > ROW_MODIFY_READONLY;
-}
-
-
-/*
  * PlanFastPathDistributedStmt creates a distributed planned statement using
  * the FastPathPlanner.
  */
@@ -587,11 +574,10 @@ PlanFastPathDistributedStmt(DistributedPlanningContext *planContext,
  */
 static PlannedStmt *
 PlanDistributedStmt(DistributedPlanningContext *planContext,
-					List *rangeTableList,
 					int rteIdCounter)
 {
 	/* may've inlined new relation rtes */
-	rangeTableList = ExtractRangeTableEntryList(planContext->query);
+	List *rangeTableList = ExtractRangeTableEntryList(planContext->query);
 	rteIdCounter = AssignRTEIdentities(rangeTableList, rteIdCounter);
 
 
@@ -768,7 +754,7 @@ InlineCtesAndCreateDistributedPlannedStmt(uint64 planId,
 	/* after inlining, we shouldn't have any inlinable CTEs */
 	Assert(!QueryTreeContainsInlinableCTE(copyOfOriginalQuery));
 
-	#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 	Query *query = planContext->query;
 
 	/*
@@ -794,7 +780,7 @@ InlineCtesAndCreateDistributedPlannedStmt(uint64 planId,
 														  planContext->
 														  plannerRestrictionContext);
 
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 
 	/*
 	 * Set back the original query, in case the planning failed and we need to go
@@ -874,7 +860,7 @@ TryCreateDistributedPlannedStmt(PlannedStmt *localPlan,
  *    - If any, go back to step 1 by calling itself recursively
  * 3. Logical planner
  */
-static DistributedPlan *
+DistributedPlan *
 CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamListInfo
 					  boundParams, bool hasUnresolvedParams,
 					  PlannerRestrictionContext *plannerRestrictionContext)
@@ -889,7 +875,7 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 		Oid targetRelationId = ModifyQueryResultRelationId(query);
 		EnsurePartitionTableNotReplicated(targetRelationId);
 
-		if (InsertSelectIntoDistributedTable(originalQuery))
+		if (InsertSelectIntoCitusTable(originalQuery))
 		{
 			if (hasUnresolvedParams)
 			{
@@ -902,7 +888,24 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 			}
 
 			distributedPlan =
-				CreateInsertSelectPlan(planId, originalQuery, plannerRestrictionContext);
+				CreateInsertSelectPlan(planId, originalQuery, plannerRestrictionContext,
+									   boundParams);
+		}
+		else if (InsertSelectIntoLocalTable(originalQuery))
+		{
+			if (hasUnresolvedParams)
+			{
+				/*
+				 * Unresolved parameters can cause performance regressions in
+				 * INSERT...SELECT when the partition column is a parameter
+				 * because we don't perform any additional pruning in the executor.
+				 */
+				return NULL;
+			}
+			distributedPlan =
+				CreateInsertSelectIntoLocalTablePlan(planId, originalQuery, boundParams,
+													 hasUnresolvedParams,
+													 plannerRestrictionContext);
 		}
 		else
 		{
@@ -916,8 +919,6 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 
 		if (distributedPlan->planningError == NULL)
 		{
-			FinalizeDistributedPlan(distributedPlan, originalQuery);
-
 			return distributedPlan;
 		}
 		else
@@ -938,8 +939,6 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 										   plannerRestrictionContext);
 		if (distributedPlan->planningError == NULL)
 		{
-			FinalizeDistributedPlan(distributedPlan, originalQuery);
-
 			return distributedPlan;
 		}
 		else
@@ -976,6 +975,7 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 	 */
 	originalQuery = (Query *) ResolveExternalParams((Node *) originalQuery,
 													boundParams);
+	Assert(originalQuery != NULL);
 
 	/*
 	 * Plan subqueries and CTEs that cannot be pushed down by recursively
@@ -1022,17 +1022,18 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 		 * being contiguous.
 		 */
 
-		standard_planner(newQuery, 0, boundParams);
+		standard_planner_compat(newQuery, 0, boundParams);
 
 		/* overwrite the old transformed query with the new transformed query */
-		memcpy(query, newQuery, sizeof(Query));
+		*query = *newQuery;
 
 		/* recurse into CreateDistributedPlan with subqueries/CTEs replaced */
 		distributedPlan = CreateDistributedPlan(planId, originalQuery, query, NULL, false,
 												plannerRestrictionContext);
-		distributedPlan->subPlanList = subPlanList;
 
-		FinalizeDistributedPlan(distributedPlan, originalQuery);
+		/* distributedPlan cannot be null since hasUnresolvedParams argument was false */
+		Assert(distributedPlan != NULL);
+		distributedPlan->subPlanList = subPlanList;
 
 		return distributedPlan;
 	}
@@ -1044,8 +1045,6 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 	 */
 	if (IsModifyCommand(originalQuery))
 	{
-		FinalizeDistributedPlan(distributedPlan, originalQuery);
-
 		return distributedPlan;
 	}
 
@@ -1077,84 +1076,7 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 	/* distributed plan currently should always succeed or error out */
 	Assert(distributedPlan && distributedPlan->planningError == NULL);
 
-	FinalizeDistributedPlan(distributedPlan, originalQuery);
-
 	return distributedPlan;
-}
-
-
-/*
- * FinalizeDistributedPlan is the final step of distributed planning. The function
- * currently only implements some optimizations for intermediate result(s) pruning.
- */
-static void
-FinalizeDistributedPlan(DistributedPlan *plan, Query *originalQuery)
-{
-	/*
-	 * Fast path queries, we cannot have any subplans by their definition,
-	 * so skip expensive traversals.
-	 */
-	if (!plan->fastPathRouterPlan)
-	{
-		RecordSubPlansUsedInPlan(plan, originalQuery);
-	}
-}
-
-
-/*
- * RecordSubPlansUsedInPlan gets a distributed plan a queryTree, and
- * updates the usedSubPlanNodeList of the distributed plan.
- *
- * The function simply pulls all the subPlans that are used in the queryTree
- * with one exception: subPlans in the HAVING clause. The reason is explained
- * in the function.
- */
-static void
-RecordSubPlansUsedInPlan(DistributedPlan *plan, Query *originalQuery)
-{
-	Node *havingQual = originalQuery->havingQual;
-
-	/* temporarily set to NULL, we're going to restore before the function returns */
-	originalQuery->havingQual = NULL;
-
-	/*
-	 * Mark the subplans as needed on remote side. Note that this decision is revisited
-	 * on execution, when the query only consists of intermediate results.
-	 */
-	List *subplansExceptHaving = FindSubPlansUsedInNode((Node *) originalQuery);
-	UpdateUsedPlanListLocation(subplansExceptHaving, SUBPLAN_ACCESS_REMOTE);
-
-	/* do the same for HAVING part of the query */
-	List *subplansInHaving = NIL;
-	if (originalQuery->hasSubLinks &&
-		FindNodeCheck(havingQual, IsNodeSubquery))
-	{
-		subplansInHaving = FindSubPlansUsedInNode(havingQual);
-		if (plan->masterQuery)
-		{
-			/*
-			 * If we have the master query, we're sure that the result is needed locally.
-			 * Otherwise, such as router queries, the plan may not be required locally.
-			 * Note that if the query consists of only intermediate results, the executor
-			 * may still prefer to write locally.
-			 *
-			 * If any of the subplansInHaving is used in other parts of the query,
-			 * we'll later merge it those subPlans and send it to remote.
-			 */
-			UpdateUsedPlanListLocation(subplansInHaving, SUBPLAN_ACCESS_LOCAL);
-		}
-		else
-		{
-			UpdateUsedPlanListLocation(subplansInHaving, SUBPLAN_ACCESS_REMOTE);
-		}
-	}
-
-	/* set back the havingQual and the calculated subplans */
-	originalQuery->havingQual = havingQual;
-
-	/* merge the used subplans */
-	plan->usedSubPlanNodeList =
-		MergeUsedSubPlanLists(subplansExceptHaving, subplansInHaving);
 }
 
 
@@ -1329,6 +1251,9 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 	CustomScan *customScan = makeNode(CustomScan);
 	MultiExecutorType executorType = MULTI_EXECUTOR_INVALID_FIRST;
 
+	/* this field is used in JobExecutorType */
+	distributedPlan->relationIdList = localPlan->relationOids;
+
 	if (!distributedPlan->planningError)
 	{
 		executorType = JobExecutorType(distributedPlan);
@@ -1342,15 +1267,9 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 			break;
 		}
 
-		case MULTI_EXECUTOR_TASK_TRACKER:
+		case MULTI_EXECUTOR_NON_PUSHABLE_INSERT_SELECT:
 		{
-			customScan->methods = &TaskTrackerCustomScanMethods;
-			break;
-		}
-
-		case MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT:
-		{
-			customScan->methods = &CoordinatorInsertSelectCustomScanMethods;
+			customScan->methods = &NonPushableInsertSelectCustomScanMethods;
 			break;
 		}
 
@@ -1364,7 +1283,7 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 	if (IsMultiTaskPlan(distributedPlan))
 	{
 		/* if it is not a single task executable plan, inform user according to the log level */
-		if (MultiTaskQueryLogLevel != MULTI_TASK_QUERY_INFO_OFF)
+		if (MultiTaskQueryLogLevel != CITUS_LOG_LEVEL_OFF)
 		{
 			ereport(MultiTaskQueryLogLevel, (errmsg(
 												 "multi-task query about to be executed"),
@@ -1375,7 +1294,6 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 		}
 	}
 
-	distributedPlan->relationIdList = localPlan->relationOids;
 	distributedPlan->queryId = localPlan->queryId;
 
 	Node *distributedPlanData = (Node *) distributedPlan;
@@ -1383,7 +1301,23 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 	customScan->custom_private = list_make1(distributedPlanData);
 	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
 
-	if (distributedPlan->masterQuery)
+	/*
+	 * Fast path queries cannot have any subplans by definition, so skip
+	 * expensive traversals.
+	 */
+	if (!distributedPlan->fastPathRouterPlan)
+	{
+		/*
+		 * Record subplans used by distributed plan to make intermediate result
+		 * pruning easier.
+		 *
+		 * We do this before finalizing the plan, because the combineQuery is
+		 * rewritten by standard_planner in FinalizeNonRouterPlan.
+		 */
+		distributedPlan->usedSubPlanNodeList = FindSubPlanUsages(distributedPlan);
+	}
+
+	if (distributedPlan->combineQuery)
 	{
 		finalPlan = FinalizeNonRouterPlan(localPlan, distributedPlan, customScan);
 	}
@@ -1398,14 +1332,13 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 
 /*
  * FinalizeNonRouterPlan gets the distributed custom scan plan, and creates the
- * final master select plan on the top of this distributed plan for adaptive
- * and task-tracker executors.
+ * final master select plan on the top of this distributed plan for adaptive executor.
  */
 static PlannedStmt *
 FinalizeNonRouterPlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan,
 					  CustomScan *customScan)
 {
-	PlannedStmt *finalPlan = MasterNodeSelectPlan(distributedPlan, customScan);
+	PlannedStmt *finalPlan = PlanCombineQuery(distributedPlan, customScan);
 	finalPlan->queryId = localPlan->queryId;
 	finalPlan->utilityStmt = localPlan->utilityStmt;
 
@@ -1425,18 +1358,58 @@ FinalizeNonRouterPlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan,
 static PlannedStmt *
 FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan)
 {
-	ListCell *targetEntryCell = NULL;
-	List *targetList = NIL;
 	List *columnNameList = NIL;
 
+	customScan->custom_scan_tlist =
+		makeCustomScanTargetlistFromExistingTargetList(localPlan->planTree->targetlist);
+	customScan->scan.plan.targetlist =
+		makeTargetListFromCustomScanList(customScan->custom_scan_tlist);
+
+	/* extract the column names from the final targetlist*/
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, customScan->scan.plan.targetlist)
+	{
+		Value *columnName = makeString(targetEntry->resname);
+		columnNameList = lappend(columnNameList, columnName);
+	}
+
+	PlannedStmt *routerPlan = makeNode(PlannedStmt);
+	routerPlan->planTree = (Plan *) customScan;
+
+	RangeTblEntry *remoteScanRangeTableEntry = RemoteScanRangeTableEntry(columnNameList);
+	routerPlan->rtable = list_make1(remoteScanRangeTableEntry);
+
+	/* add original range table list for access permission checks */
+	routerPlan->rtable = list_concat(routerPlan->rtable, localPlan->rtable);
+
+	routerPlan->canSetTag = true;
+	routerPlan->relationOids = NIL;
+
+	routerPlan->queryId = localPlan->queryId;
+	routerPlan->utilityStmt = localPlan->utilityStmt;
+	routerPlan->commandType = localPlan->commandType;
+	routerPlan->hasReturning = localPlan->hasReturning;
+
+	return routerPlan;
+}
+
+
+/*
+ * makeCustomScanTargetlistFromExistingTargetList rebuilds the targetlist from the remote
+ * query into a list that can be used as the custom_scan_tlist for our Citus Custom Scan.
+ */
+static List *
+makeCustomScanTargetlistFromExistingTargetList(List *existingTargetlist)
+{
+	List *custom_scan_tlist = NIL;
+
 	/* we will have custom scan range table entry as the first one in the list */
-	int customScanRangeTableIndex = 1;
+	const int customScanRangeTableIndex = 1;
 
 	/* build a targetlist to read from the custom scan output */
-	foreach(targetEntryCell, localPlan->planTree->targetlist)
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, existingTargetlist)
 	{
-		TargetEntry *targetEntry = lfirst(targetEntryCell);
-
 		Assert(IsA(targetEntry, TargetEntry));
 
 		/*
@@ -1465,32 +1438,40 @@ FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan)
 
 		TargetEntry *newTargetEntry = flatCopyTargetEntry(targetEntry);
 		newTargetEntry->expr = (Expr *) newVar;
-		targetList = lappend(targetList, newTargetEntry);
-
-		Value *columnName = makeString(targetEntry->resname);
-		columnNameList = lappend(columnNameList, columnName);
+		custom_scan_tlist = lappend(custom_scan_tlist, newTargetEntry);
 	}
 
-	customScan->scan.plan.targetlist = targetList;
+	return custom_scan_tlist;
+}
 
-	PlannedStmt *routerPlan = makeNode(PlannedStmt);
-	routerPlan->planTree = (Plan *) customScan;
 
-	RangeTblEntry *remoteScanRangeTableEntry = RemoteScanRangeTableEntry(columnNameList);
-	routerPlan->rtable = list_make1(remoteScanRangeTableEntry);
-
-	/* add original range table list for access permission checks */
-	routerPlan->rtable = list_concat(routerPlan->rtable, localPlan->rtable);
-
-	routerPlan->canSetTag = true;
-	routerPlan->relationOids = NIL;
-
-	routerPlan->queryId = localPlan->queryId;
-	routerPlan->utilityStmt = localPlan->utilityStmt;
-	routerPlan->commandType = localPlan->commandType;
-	routerPlan->hasReturning = localPlan->hasReturning;
-
-	return routerPlan;
+/*
+ * makeTargetListFromCustomScanList based on a custom_scan_tlist create the target list to
+ * use on the Citus Custom Scan Node. The targetlist differs from the custom_scan_tlist in
+ * a way that the expressions in the targetlist all are references to the index (resno) in
+ * the custom_scan_tlist in their varattno while the varno is replaced with INDEX_VAR
+ * instead of the range table entry index.
+ */
+static List *
+makeTargetListFromCustomScanList(List *custom_scan_tlist)
+{
+	List *targetList = NIL;
+	TargetEntry *targetEntry = NULL;
+	int resno = 1;
+	foreach_ptr(targetEntry, custom_scan_tlist)
+	{
+		/*
+		 * INDEX_VAR is used to reference back to the TargetEntry in custom_scan_tlist by
+		 * its resno (index)
+		 */
+		Var *newVar = makeVarFromTargetEntry(INDEX_VAR, targetEntry);
+		TargetEntry *newTargetEntry = makeTargetEntry((Expr *) newVar, resno,
+													  targetEntry->resname,
+													  targetEntry->resjunk);
+		targetList = lappend(targetList, newTargetEntry);
+		resno++;
+	}
+	return targetList;
 }
 
 
@@ -1535,7 +1516,7 @@ BlessRecordExpression(Expr *expr)
 		ListCell *argCell = NULL;
 		int currentResno = 1;
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		rowTupleDesc = CreateTemplateTupleDesc(list_length(rowExpr->args));
 #else
 		rowTupleDesc = CreateTemplateTupleDesc(list_length(rowExpr->args), false);
@@ -1700,8 +1681,7 @@ CheckNodeCopyAndSerialization(Node *node)
 {
 #ifdef USE_ASSERT_CHECKING
 	char *out = nodeToString(node);
-	Node *deserializedNode = (Node *) stringToNode(out);
-	Node *nodeCopy = copyObject(deserializedNode);
+	Node *nodeCopy = copyObject(node);
 	char *outCopy = nodeToString(nodeCopy);
 
 	pfree(out);
@@ -1729,7 +1709,7 @@ multi_join_restriction_hook(PlannerInfo *root,
 {
 	/*
 	 * Use a memory context that's guaranteed to live long enough, could be
-	 * called in a more shorted lived one (e.g. with GEQO).
+	 * called in a more shortly lived one (e.g. with GEQO).
 	 */
 	PlannerRestrictionContext *plannerRestrictionContext =
 		CurrentPlannerRestrictionContext();
@@ -1778,7 +1758,26 @@ void
 multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 								Index restrictionIndex, RangeTblEntry *rte)
 {
-	DistTableCacheEntry *cacheEntry = NULL;
+	CitusTableCacheEntry *cacheEntry = NULL;
+
+	if (ReplaceCitusExtraDataContainer && IsCitusExtraDataContainerRelation(rte))
+	{
+		/*
+		 * We got here by planning the query part that needs to be executed on the query
+		 * coordinator node.
+		 * We have verified the occurrence of the citus_extra_datacontainer function
+		 * encoding the remote scan we plan to execute here. We will replace all paths
+		 * with a path describing our custom scan.
+		 */
+		Path *path = CreateCitusCustomScanPath(root, relOptInfo, restrictionIndex, rte,
+											   ReplaceCitusExtraDataContainerWithCustomScan);
+
+		/* replace all paths with our custom scan and recalculate cheapest */
+		relOptInfo->pathlist = list_make1(path);
+		set_cheapest(relOptInfo);
+
+		return;
+	}
 
 	AdjustReadIntermediateResultCost(rte, relOptInfo);
 	AdjustReadIntermediateResultArrayCost(rte, relOptInfo);
@@ -1790,14 +1789,14 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 
 	/*
 	 * Use a memory context that's guaranteed to live long enough, could be
-	 * called in a more shorted lived one (e.g. with GEQO).
+	 * called in a more shortly lived one (e.g. with GEQO).
 	 */
 	PlannerRestrictionContext *plannerRestrictionContext =
 		CurrentPlannerRestrictionContext();
 	MemoryContext restrictionsMemoryContext = plannerRestrictionContext->memoryContext;
 	MemoryContext oldMemoryContext = MemoryContextSwitchTo(restrictionsMemoryContext);
 
-	bool distributedTable = IsDistributedTable(rte->relid);
+	bool distributedTable = IsCitusTable(rte->relid);
 	bool localTable = !distributedTable;
 
 	RelationRestriction *relationRestriction = palloc0(sizeof(RelationRestriction));
@@ -1823,10 +1822,10 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	 */
 	if (distributedTable)
 	{
-		cacheEntry = DistributedTableCacheEntry(rte->relid);
+		cacheEntry = GetCitusTableCacheEntry(rte->relid);
 
 		relationRestrictionContext->allReferenceTables &=
-			(cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE);
+			IsCitusTableTypeCacheEntry(cacheEntry, REFERENCE_TABLE);
 	}
 
 	relationRestrictionContext->relationRestrictionList =
@@ -1959,7 +1958,7 @@ AdjustReadIntermediateResultsCostInternal(RelOptInfo *relOptInfo, List *columnTy
 	double rowSizeEstimate = 0;
 	double rowCountEstimate = 0.;
 	double ioCost = 0.;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	QualCost funcCost = { 0., 0. };
 #else
 	double funcCost = 0.;
@@ -2022,13 +2021,13 @@ AdjustReadIntermediateResultsCostInternal(RelOptInfo *relOptInfo, List *columnTy
 
 
 		/* add the cost of parsing a column */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		add_function_cost(NULL, inputFunctionId, NULL, &funcCost);
 #else
 		funcCost += get_func_cost(inputFunctionId);
 #endif
 	}
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	rowCost += funcCost.per_tuple;
 #else
 	rowCost += funcCost * cpu_operator_cost;
@@ -2047,7 +2046,7 @@ AdjustReadIntermediateResultsCostInternal(RelOptInfo *relOptInfo, List *columnTy
 	path->rows = rowCountEstimate;
 	path->total_cost = rowCountEstimate * rowCost + ioCost;
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	path->startup_cost = funcCost.startup + relOptInfo->baserestrictcost.startup;
 #endif
 }
@@ -2203,7 +2202,7 @@ ResetPlannerRestrictionContext(PlannerRestrictionContext *plannerRestrictionCont
  * has external parameters that are not contained in boundParams, false
  * otherwise.
  */
-static bool
+bool
 HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams)
 {
 	if (expression == NULL)
@@ -2267,182 +2266,66 @@ HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams)
 
 
 /*
- * IsLocalReferenceTableJoin returns if the given query is a join between
- * reference tables and local tables.
+ * GetRTEListPropertiesForQuery is a wrapper around GetRTEListProperties that
+ * returns RTEListProperties for the rte list retrieved from query.
  */
-static bool
-IsLocalReferenceTableJoin(Query *parse, List *rangeTableList)
+RTEListProperties *
+GetRTEListPropertiesForQuery(Query *query)
 {
-	bool hasReferenceTable = false;
-	bool hasLocalTable = false;
-	ListCell *rangeTableCell = false;
+	List *rteList = ExtractRangeTableEntryList(query);
+	return GetRTEListProperties(rteList);
+}
 
-	bool hasReferenceTableReplica = false;
 
-	/*
-	 * We only allow join between reference tables and local tables in the
-	 * coordinator.
-	 */
-	if (!IsCoordinator())
+/*
+ * GetRTEListProperties returns RTEListProperties struct processing the given
+ * rangeTableList.
+ */
+static RTEListProperties *
+GetRTEListProperties(List *rangeTableList)
+{
+	RTEListProperties *rteListProperties = palloc0(sizeof(RTEListProperties));
+
+	RangeTblEntry *rangeTableEntry = NULL;
+	foreach_ptr(rangeTableEntry, rangeTableList)
 	{
-		return false;
-	}
-
-	/*
-	 * All groups that have pg_dist_node entries, also have reference
-	 * table replicas.
-	 */
-	PrimaryNodeForGroup(COORDINATOR_GROUP_ID, &hasReferenceTableReplica);
-
-	/*
-	 * If reference table doesn't have replicas on the coordinator, we don't
-	 * allow joins with local tables.
-	 */
-	if (!hasReferenceTableReplica)
-	{
-		return false;
-	}
-
-	if (FindNodeCheck((Node *) parse, QueryIsNotSimpleSelect))
-	{
-		return false;
-	}
-
-	foreach(rangeTableCell, rangeTableList)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-
-		/*
-		 * Don't plan joins involving functions locally since we are not sure if
-		 * they do distributed accesses or not, and defaulting to local planning
-		 * might break transactional semantics.
-		 *
-		 * For example, access to the reference table in the function might go
-		 * over a connection, but access to the same reference table outside
-		 * the function will go over the current backend. The snapshot for the
-		 * connection in the function is taken after the statement snapshot,
-		 * so they can see two different views of data.
-		 *
-		 * Looking at gram.y, RTE_TABLEFUNC is used only for XMLTABLE() which
-		 * is okay to be planned locally, so allowing that.
-		 */
-		if (rangeTableEntry->rtekind == RTE_FUNCTION)
-		{
-			return false;
-		}
-
-		if (rangeTableEntry->rtekind != RTE_RELATION)
+		if (!(rangeTableEntry->rtekind == RTE_RELATION &&
+			  rangeTableEntry->relkind == RELKIND_RELATION))
 		{
 			continue;
 		}
 
-		/*
-		 * We only allow local join for the relation kinds for which we can
-		 * determine deterministically that access to them are local or distributed.
-		 * For this reason, we don't allow non-materialized views.
-		 */
-		if (rangeTableEntry->relkind == RELKIND_VIEW)
+		Oid relationId = rangeTableEntry->relid;
+		CitusTableCacheEntry *cacheEntry = LookupCitusTableCacheEntry(relationId);
+		if (!cacheEntry)
 		{
-			return false;
+			rteListProperties->hasPostgresLocalTable = true;
 		}
-
-		if (!IsDistributedTable(rangeTableEntry->relid))
+		else if (IsCitusTableTypeCacheEntry(cacheEntry, REFERENCE_TABLE))
 		{
-			hasLocalTable = true;
-			continue;
+			rteListProperties->hasReferenceTable = true;
 		}
-
-		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(
-			rangeTableEntry->relid);
-		if (cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE)
+		else if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_LOCAL_TABLE))
 		{
-			hasReferenceTable = true;
+			rteListProperties->hasCitusLocalTable = true;
+		}
+		else if (IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE))
+		{
+			rteListProperties->hasDistributedTable = true;
 		}
 		else
 		{
-			return false;
+			/* it's not expected, but let's do a bug catch here */
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("encountered with an unexpected citus "
+								   "table type while processing range table "
+								   "entries of query")));
 		}
 	}
 
-	return hasLocalTable && hasReferenceTable;
-}
+	rteListProperties->hasCitusTable = (rteListProperties->hasDistributedTable ||
+										rteListProperties->hasReferenceTable ||
+										rteListProperties->hasCitusLocalTable);
 
-
-/*
- * QueryIsNotSimpleSelect returns true if node is a query which modifies or
- * marks for modifications.
- */
-static bool
-QueryIsNotSimpleSelect(Node *node)
-{
-	if (!IsA(node, Query))
-	{
-		return false;
-	}
-
-	Query *query = (Query *) node;
-	return (query->commandType != CMD_SELECT) || (query->rowMarks != NIL);
-}
-
-
-/*
- * UpdateReferenceTablesWithShard recursively replaces the reference table names
- * in the given query with the shard table names.
- */
-static bool
-UpdateReferenceTablesWithShard(Node *node, void *context)
-{
-	if (node == NULL)
-	{
-		return false;
-	}
-
-	/* want to look at all RTEs, even in subqueries, CTEs and such */
-	if (IsA(node, Query))
-	{
-		return query_tree_walker((Query *) node, UpdateReferenceTablesWithShard,
-								 NULL, QTW_EXAMINE_RTES_BEFORE);
-	}
-
-	if (!IsA(node, RangeTblEntry))
-	{
-		return expression_tree_walker(node, UpdateReferenceTablesWithShard,
-									  NULL);
-	}
-
-	RangeTblEntry *newRte = (RangeTblEntry *) node;
-
-	if (newRte->rtekind != RTE_RELATION)
-	{
-		return false;
-	}
-
-	Oid relationId = newRte->relid;
-	if (!IsDistributedTable(relationId))
-	{
-		return false;
-	}
-
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(relationId);
-	if (cacheEntry->partitionMethod != DISTRIBUTE_BY_NONE)
-	{
-		return false;
-	}
-
-	ShardInterval *shardInterval = cacheEntry->sortedShardIntervalArray[0];
-	uint64 shardId = shardInterval->shardId;
-
-	char *relationName = get_rel_name(relationId);
-	AppendShardIdToName(&relationName, shardId);
-
-	Oid schemaId = get_rel_namespace(relationId);
-	newRte->relid = get_relname_relid(relationName, schemaId);
-
-	/*
-	 * Parser locks relations in addRangeTableEntry(). So we should lock the
-	 * modified ones too.
-	 */
-	LockRelationOid(newRte->relid, AccessShareLock);
-
-	return false;
+	return rteListProperties;
 }

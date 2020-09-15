@@ -14,7 +14,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/worker_manager.h"
 #include "utils/hsearch.h"
@@ -37,6 +37,7 @@ extern int ReadFromSecondaries;
  */
 #define GROUP_ID_UPGRADING -2
 
+
 /*
  * Representation of a table's metadata that is frequently used for
  * distributed execution. Cached.
@@ -52,7 +53,6 @@ typedef struct
 	 */
 	bool isValid;
 
-	bool isDistributedTable;
 	bool hasUninitializedShardInterval;
 	bool hasUniformHashDistribution; /* valid for hash partitioned tables */
 	bool hasOverlappingShardInterval;
@@ -82,7 +82,7 @@ typedef struct
 	/*
 	 * The following two lists consists of relationIds that this distributed
 	 * relation has a foreign key to (e.g., referencedRelationsViaForeignKey) or
-	 * other relations has a foreign key to to this relation (e.g.,
+	 * other relations has a foreign key to this relation (e.g.,
 	 * referencingRelationsViaForeignKey).
 	 *
 	 * Note that we're keeping all transitive foreign key references as well
@@ -95,7 +95,7 @@ typedef struct
 	/* pg_dist_placement metadata */
 	GroupShardPlacement **arrayOfPlacementArrays;
 	int *arrayOfPlacementArrayLengths;
-} DistTableCacheEntry;
+} CitusTableCacheEntry;
 
 typedef struct DistObjectCacheEntryKey
 {
@@ -116,21 +116,45 @@ typedef struct DistObjectCacheEntry
 	int colocationId;
 } DistObjectCacheEntry;
 
+typedef enum
+{
+	HASH_DISTRIBUTED,
+	APPEND_DISTRIBUTED,
+	RANGE_DISTRIBUTED,
 
-extern bool IsDistributedTable(Oid relationId);
-extern List * DistributedTableList(void);
+	/* hash, range or append distributed table */
+	DISTRIBUTED_TABLE,
+
+	REFERENCE_TABLE,
+	CITUS_LOCAL_TABLE,
+
+	/* table without a dist key such as reference table */
+	CITUS_TABLE_WITH_NO_DIST_KEY
+} CitusTableType;
+
+extern bool IsCitusTableType(Oid relationId, CitusTableType tableType);
+extern bool IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEtnry,
+									   CitusTableType tableType);
+
+extern bool IsCitusTable(Oid relationId);
+extern bool IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel);
+extern bool IsReferenceTableByDistParams(char partitionMethod, char replicationModel);
+extern List * CitusTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
 extern Oid RelationIdForShard(uint64 shardId);
 extern bool ReferenceTableShardId(uint64 shardId);
 extern ShardPlacement * FindShardPlacementOnGroup(int32 groupId, uint64 shardId);
 extern GroupShardPlacement * LoadGroupShardPlacement(uint64 shardId, uint64 placementId);
 extern ShardPlacement * LoadShardPlacement(uint64 shardId, uint64 placementId);
-extern DistTableCacheEntry * DistributedTableCacheEntry(Oid distributedRelationId);
+extern CitusTableCacheEntry * GetCitusTableCacheEntry(Oid distributedRelationId);
+extern CitusTableCacheEntry * LookupCitusTableCacheEntry(Oid relationId);
 extern DistObjectCacheEntry * LookupDistObjectCacheEntry(Oid classid, Oid objid, int32
 														 objsubid);
 extern int32 GetLocalGroupId(void);
 extern List * DistTableOidList(void);
-extern Oid LookupShardRelation(int64 shardId, bool missing_ok);
+extern List * ReferenceTableOidList(void);
+extern void CitusTableCacheFlushInvalidatedEntries(void);
+extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
 extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
@@ -147,18 +171,27 @@ extern bool HasOverlappingShardInterval(ShardInterval **shardIntervalArray,
 										Oid shardIntervalCollation,
 										FmgrInfo *shardIntervalSortCompareFunction);
 
+extern ShardPlacement * ShardPlacementForFunctionColocatedWithReferenceTable(
+	CitusTableCacheEntry *cacheEntry);
+extern ShardPlacement * ShardPlacementForFunctionColocatedWithDistTable(
+	DistObjectCacheEntry *procedure, FuncExpr *funcExpr, Var *partitionColumn,
+	CitusTableCacheEntry
+	*cacheEntry,
+	PlannedStmt *plan);
+
 extern bool CitusHasBeenLoaded(void);
 extern bool CheckCitusVersion(int elevel);
 extern bool CheckAvailableVersion(int elevel);
+extern bool InstalledAndAvailableVersionsSame(void);
 extern bool MajorVersionsCompatible(char *leftVersion, char *rightVersion);
-extern void ErrorIfInconsistentShardIntervals(DistTableCacheEntry *cacheEntry);
+extern void ErrorIfInconsistentShardIntervals(CitusTableCacheEntry *cacheEntry);
 extern void EnsureModificationsCanRun(void);
 extern char LookupDistributionMethod(Oid distributionMethodOid);
 
 /* access WorkerNodeHash */
 extern HTAB * GetWorkerNodeHash(void);
-extern int GetWorkerNodeCount(void);
 extern WorkerNode * LookupNodeByNodeId(uint32 nodeId);
+extern WorkerNode * LookupNodeByNodeIdOrError(uint32 nodeId);
 extern WorkerNode * LookupNodeForGroup(int32 groupId);
 
 /* namespace oids */
@@ -192,6 +225,7 @@ extern Oid DistPlacementGroupidIndexId(void);
 extern Oid DistObjectPrimaryKeyIndexId(void);
 
 /* type oids */
+extern Oid LookupTypeOid(char *schemaNameSting, char *typeNameString);
 extern Oid CitusCopyFormatTypeId(void);
 
 /* function oids */
@@ -203,6 +237,7 @@ extern Oid CitusAnyValueFunctionId(void);
 extern Oid CitusTextSendAsJsonbFunctionId(void);
 extern Oid PgTableVisibleFuncId(void);
 extern Oid CitusTableVisibleFuncId(void);
+extern Oid JsonbExtractPathFuncId(void);
 
 /* enum oids */
 extern Oid PrimaryNodeRoleId(void);
@@ -217,6 +252,5 @@ extern Oid CitusExtensionOwner(void);
 extern char * CitusExtensionOwnerName(void);
 extern char * CurrentUserName(void);
 extern const char * CurrentDatabaseName(void);
-
 
 #endif /* METADATA_CACHE_H */

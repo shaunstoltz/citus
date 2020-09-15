@@ -29,6 +29,11 @@ step "s1-begin-on-worker"
         SELECT run_commands_on_session_level_connection_to_node('BEGIN');
 }
 
+step "s1-disable-binary-protocol-on-worker" {
+	-- Workaround router-select blocking blocking create-index-concurrently
+	SELECT run_commands_on_session_level_connection_to_node('SET citus.enable_binary_protocol TO false');
+}
+
 step "s1-select"
 {
 	SELECT run_commands_on_session_level_connection_to_node('SELECT * FROM select_table');
@@ -67,11 +72,6 @@ step "s2-begin-on-worker"
 step "s2-select"
 {
 	SELECT run_commands_on_session_level_connection_to_node('SELECT * FROM select_table');
-}
-
-step "s2-insert"
-{
-        SELECT run_commands_on_session_level_connection_to_node('INSERT INTO select_table VALUES(6, 60)');
 }
 
 step "s2-insert-select"
@@ -135,4 +135,4 @@ permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-select"
 permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-select" "s2-start-session-level-connection" "s2-begin-on-worker" "s2-copy" "s1-commit-worker" "s2-commit-worker" "s1-stop-connection" "s2-stop-connection" "s3-select-count"
 permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-select" "s2-begin" "s2-index" "s1-commit-worker" "s2-commit" "s1-stop-connection"
 permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-select" "s2-start-session-level-connection" "s2-begin-on-worker" "s2-select-for-update" "s1-commit-worker" "s2-commit-worker" "s1-stop-connection" "s2-stop-connection"
-permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-select" "s2-coordinator-create-index-concurrently" "s1-commit-worker" "s1-stop-connection"
+permutation "s1-start-session-level-connection" "s1-begin-on-worker" "s1-disable-binary-protocol-on-worker" "s1-select" "s2-coordinator-create-index-concurrently" "s1-commit-worker" "s1-stop-connection"

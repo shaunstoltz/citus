@@ -6,6 +6,8 @@
  */
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -15,14 +17,15 @@
 #include "catalog/pg_inherits.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "partitioning/partdesc.h"
 #endif
 #include "utils/builtins.h"
@@ -31,10 +34,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-
 static char * PartitionBound(Oid partitionId);
 static Relation try_relation_open_nolock(Oid relationId);
-
 
 /*
  * Returns true if the given relation is a partitioned table.
@@ -43,7 +44,6 @@ bool
 PartitionedTable(Oid relationId)
 {
 	Relation rel = try_relation_open(relationId, AccessShareLock);
-	bool partitionedTable = false;
 
 	/* don't error out for tables that are dropped */
 	if (rel == NULL)
@@ -51,13 +51,15 @@ PartitionedTable(Oid relationId)
 		return false;
 	}
 
+	bool partitionedTable = false;
+
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
 		partitionedTable = true;
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionedTable;
 }
@@ -86,7 +88,7 @@ PartitionedTableNoLock(Oid relationId)
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionedTable;
 }
@@ -109,7 +111,7 @@ PartitionTable(Oid relationId)
 	bool partitionTable = rel->rd_rel->relispartition;
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionTable;
 }
@@ -134,7 +136,7 @@ PartitionTableNoLock(Oid relationId)
 	bool partitionTable = rel->rd_rel->relispartition;
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionTable;
 }
@@ -184,7 +186,7 @@ IsChildTable(Oid relationId)
 	HeapTuple inheritsTuple = NULL;
 	bool tableInherits = false;
 
-	Relation pgInherits = heap_open(InheritsRelationId, AccessShareLock);
+	Relation pgInherits = table_open(InheritsRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0], Anum_pg_inherits_inhrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -206,7 +208,7 @@ IsChildTable(Oid relationId)
 	}
 
 	systable_endscan(scan);
-	heap_close(pgInherits, AccessShareLock);
+	table_close(pgInherits, AccessShareLock);
 
 	if (tableInherits && PartitionTable(relationId))
 	{
@@ -228,7 +230,7 @@ IsParentTable(Oid relationId)
 	ScanKeyData key[1];
 	bool tableInherited = false;
 
-	Relation pgInherits = heap_open(InheritsRelationId, AccessShareLock);
+	Relation pgInherits = table_open(InheritsRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0], Anum_pg_inherits_inhparent,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -242,7 +244,7 @@ IsParentTable(Oid relationId)
 		tableInherited = true;
 	}
 	systable_endscan(scan);
-	heap_close(pgInherits, AccessShareLock);
+	table_close(pgInherits, AccessShareLock);
 
 	if (tableInherited && PartitionedTable(relationId))
 	{
@@ -276,7 +278,7 @@ PartitionParentOid(Oid partitionOid)
 List *
 PartitionList(Oid parentRelationId)
 {
-	Relation rel = heap_open(parentRelationId, AccessShareLock);
+	Relation rel = table_open(parentRelationId, AccessShareLock);
 	List *partitionList = NIL;
 
 
@@ -286,18 +288,18 @@ PartitionList(Oid parentRelationId)
 
 		ereport(ERROR, (errmsg("\"%s\" is not a parent table", relationName)));
 	}
+	PartitionDesc partDesc = RelationGetPartitionDesc(rel);
+	Assert(partDesc != NULL);
 
-	Assert(rel->rd_partdesc != NULL);
-
-	int partitionCount = rel->rd_partdesc->nparts;
+	int partitionCount = partDesc->nparts;
 	for (int partitionIndex = 0; partitionIndex < partitionCount; ++partitionIndex)
 	{
 		partitionList =
-			lappend_oid(partitionList, rel->rd_partdesc->oids[partitionIndex]);
+			lappend_oid(partitionList, partDesc->oids[partitionIndex]);
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionList;
 }

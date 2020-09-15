@@ -198,14 +198,20 @@ SELECT count(*) FROM priority_orders JOIN air_shipped_lineitems ON (o_custkey = 
    192
 (1 row)
 
-SET citus.task_executor_type to "task-tracker";
 -- single view repartition subqueries are not supported
 SELECT l_suppkey, count(*) FROM
 	(SELECT l_suppkey, l_shipdate, count(*)
 		FROM air_shipped_lineitems GROUP BY l_suppkey, l_shipdate) supps
 	GROUP BY l_suppkey ORDER BY 2 DESC, 1 LIMIT 5;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Subqueries without group by clause are not supported yet
+ l_suppkey | count
+---------------------------------------------------------------------
+      7680 |     4
+       160 |     3
+      1042 |     3
+      1318 |     3
+      5873 |     3
+(5 rows)
+
 -- logically same query without a view works fine
 SELECT l_suppkey, count(*) FROM
 	(SELECT l_suppkey, l_shipdate, count(*)
@@ -226,8 +232,15 @@ SELECT l_suppkey, count(*) FROM
 		FROM (SELECT * FROM lineitem_hash_part WHERE l_shipmode = 'AIR') asi
 		GROUP BY l_suppkey, l_shipdate) supps
 	GROUP BY l_suppkey ORDER BY 2 DESC, 1 LIMIT 5;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Subqueries without group by clause are not supported yet
+ l_suppkey | count
+---------------------------------------------------------------------
+      7680 |     4
+       160 |     3
+      1042 |     3
+      1318 |     3
+      5873 |     3
+(5 rows)
+
 -- repartition query on view with single table subquery
 CREATE VIEW supp_count_view AS SELECT * FROM (SELECT l_suppkey, count(*) FROM lineitem_hash_part GROUP BY 1) s1;
 SELECT * FROM supp_count_view ORDER BY 2 DESC, 1 LIMIT 10;
@@ -707,11 +720,13 @@ SELECT * FROM recent_10_users;
 (6 rows)
 
 SET citus.subquery_pushdown to ON;
+NOTICE:  Setting citus.subquery_pushdown flag is discouraged becuase it forces the planner to pushdown certain queries, skipping relevant correctness checks.
+DETAIL:  When enabled, the planner skips many correctness checks for subqueries and pushes down the queries to shards as-is. It means that the queries are likely to return wrong results unless the user is absolutely sure that pushing down the subquery is safe. This GUC is maintained only for backward compatibility, no new users are supposed to use it. The planner is capable of pushing down as much computation as possible to the shards depending on the query.
 -- still not supported since outer query does not have limit
 -- it shows a different (subquery with single relation) error message
 SELECT * FROM recent_10_users;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Subqueries with limit are not supported yet
+ERROR:  cannot push down this subquery
+DETAIL:  Limit in subquery without limit in the outermost query is unsupported
 -- now it displays more correct error message
 SELECT et.* FROM recent_10_users JOIN events_table et USING(user_id);
 ERROR:  cannot push down this subquery
@@ -843,6 +858,8 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
 (31 rows)
 
 SET citus.subquery_pushdown to ON;
+NOTICE:  Setting citus.subquery_pushdown flag is discouraged becuase it forces the planner to pushdown certain queries, skipping relevant correctness checks.
+DETAIL:  When enabled, the planner skips many correctness checks for subqueries and pushes down the queries to shards as-is. It means that the queries are likely to return wrong results unless the user is absolutely sure that pushing down the subquery is safe. This GUC is maintained only for backward compatibility, no new users are supposed to use it. The planner is capable of pushing down as much computation as possible to the shards depending on the query.
 EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USING(user_id) ORDER BY et.time DESC LIMIT 10;
                                                      QUERY PLAN
 ---------------------------------------------------------------------

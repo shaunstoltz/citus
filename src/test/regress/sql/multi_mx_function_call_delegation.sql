@@ -83,6 +83,7 @@ select create_distributed_function('mx_call_func_bigint(bigint,bigint)');
 select create_distributed_function('mx_call_func_custom_types(mx_call_enum,mx_call_enum)');
 select create_distributed_function('squares(int)');
 
+
 -- We still don't route them to the workers, because they aren't
 -- colocated with any distributed tables.
 SET client_min_messages TO DEBUG1;
@@ -102,6 +103,16 @@ select mx_call_func_custom_types('S', 'A');
 select squares(4);
 select multi_mx_function_call_delegation.mx_call_func(2, 0);
 select multi_mx_function_call_delegation.mx_call_func_custom_types('S', 'A');
+
+
+-- This is currently an undetected failure when using the binary protocol
+-- It should not be enabled by default until this is resolved. The tests above
+-- will fail too, when changing the default to TRUE;
+SET citus.enable_binary_protocol = TRUE;
+select mx_call_func_custom_types('S', 'A');
+select multi_mx_function_call_delegation.mx_call_func_custom_types('S', 'A');
+RESET citus.enable_binary_protocol;
+
 
 -- We don't allow distributing calls inside transactions
 begin;
@@ -258,6 +269,14 @@ EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);
+
+\c - - - :worker_1_port
+SET search_path TO multi_mx_function_call_delegation, public;
+-- create_distributed_function is disallowed from worker nodes
+select create_distributed_function('mx_call_func(int,int)');
+
+\c - - - :master_port
+SET search_path TO multi_mx_function_call_delegation, public;
 
 RESET client_min_messages;
 \set VERBOSITY terse

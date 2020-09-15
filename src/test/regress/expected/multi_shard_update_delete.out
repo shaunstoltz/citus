@@ -227,6 +227,9 @@ CREATE TABLE tt1_1120 partition of tt1 for VALUES FROM (11) to (20);
 INSERT INTO tt1 VALUES (1,11), (3,15), (5,17), (6,19), (8,17), (2,12);
 SELECT create_distributed_table('tt1','id');
 NOTICE:  Copying data from local table...
+NOTICE:  copying the data has completed
+DETAIL:  The local data in the table is no longer visible, but is still on disk.
+HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$public.tt1_1120$$)
  create_distributed_table
 ---------------------------------------------------------------------
 
@@ -341,6 +344,9 @@ INSERT INTO test_table_1 VALUES(2, '2015-02-01 08:31:16', 7);
 INSERT INTO test_table_1 VALUES(3, '2111-01-12 08:35:19', 9);
 SELECT create_distributed_table('test_table_1', 'id');
 NOTICE:  Copying data from local table...
+NOTICE:  copying the data has completed
+DETAIL:  The local data in the table is no longer visible, but is still on disk.
+HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$public.test_table_1$$)
  create_distributed_table
 ---------------------------------------------------------------------
 
@@ -723,12 +729,14 @@ UPDATE users_test_table
 SET    value_2 = 5
 FROM   events_test_table_local
 WHERE  users_test_table.user_id = events_test_table_local.user_id;
-ERROR:  relation events_test_table_local is not distributed
+ERROR:  cannot plan modifications with local tables involving citus tables
+HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 UPDATE events_test_table_local
 SET    value_2 = 5
 FROM   users_test_table
 WHERE  events_test_table_local.user_id = users_test_table.user_id;
-ERROR:  cannot plan modifications of local tables involving distributed tables
+ERROR:  cannot plan modifications with local tables involving citus tables
+HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 -- Local tables in a subquery are supported through recursive planning
 UPDATE users_test_table
 SET    value_2 = 5
@@ -793,6 +801,9 @@ INSERT INTO test_table_2 VALUES(2, random());
 INSERT INTO test_table_2 VALUES(3, random());
 SELECT create_distributed_table('test_table_2', 'id');
 NOTICE:  Copying data from local table...
+NOTICE:  copying the data has completed
+DETAIL:  The local data in the table is no longer visible, but is still on disk.
+HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$public.test_table_2$$)
  create_distributed_table
 ---------------------------------------------------------------------
 

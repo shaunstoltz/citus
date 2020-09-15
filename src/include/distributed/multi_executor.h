@@ -17,6 +17,7 @@
 #include "distributed/citus_custom_scan.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/tuple_destination.h"
 
 
 /* managed via guc.c */
@@ -72,26 +73,63 @@ extern int ExecutorLevel;
 extern void CitusExecutorStart(QueryDesc *queryDesc, int eflags);
 extern void CitusExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 							 bool execute_once);
+extern void AdaptiveExecutorPreExecutorRun(CitusScanState *scanState);
 extern TupleTableSlot * AdaptiveExecutor(CitusScanState *scanState);
-extern uint64 ExecuteTaskListExtended(RowModifyLevel modLevel, List *taskList,
-									  TupleDesc tupleDescriptor,
-									  Tuplestorestate *tupleStore,
-									  bool hasReturning, int targetPoolSize,
-									  TransactionProperties *xactProperties,
-									  List *jobIdList);
-extern uint64 ExecuteTaskListIntoTupleStore(RowModifyLevel modLevel, List *taskList,
-											TupleDesc tupleDescriptor,
-											Tuplestorestate *tupleStore,
-											bool hasReturning);
-extern void ExecuteUtilityTaskListWithoutResults(List *taskList);
-extern uint64 ExecuteTaskList(RowModifyLevel modLevel, List *taskList, int
-							  targetPoolSize);
+
+
+/*
+ * ExecutionParams contains parameters that are used during the execution.
+ * Some of these can be the zero value if it is not needed during the execution.
+ */
+typedef struct ExecutionParams
+{
+	/* modLevel is the access level for rows.*/
+	RowModifyLevel modLevel;
+
+	/* taskList contains the tasks for the execution.*/
+	List *taskList;
+
+	/* where to forward each tuple received */
+	TupleDestination *tupleDestination;
+
+	/* expectResults is true if this execution will return some result. */
+	bool expectResults;
+
+	/* targetPoolSize is the maximum amount of connections per worker */
+	int targetPoolSize;
+
+	/* xactProperties contains properties for transactions, such as if we should use 2pc. */
+	TransactionProperties xactProperties;
+
+	/* jobIdList contains all job ids for the execution */
+	List *jobIdList;
+
+	/* localExecutionSupported is true if we can use local execution, if it is false
+	 * local execution will not be used. */
+	bool localExecutionSupported;
+
+	/* isUtilityCommand is true if the current execution is for a utility
+	 * command such as a DDL command.*/
+	bool isUtilityCommand;
+} ExecutionParams;
+
+ExecutionParams * CreateBasicExecutionParams(RowModifyLevel modLevel,
+											 List *taskList,
+											 int targetPoolSize,
+											 bool localExecutionSupported);
+
+extern uint64 ExecuteTaskListExtended(ExecutionParams *executionParams);
+extern uint64 ExecuteTaskListIntoTupleDest(RowModifyLevel modLevel, List *taskList,
+										   TupleDestination *tupleDest,
+										   bool expectResults);
+extern bool IsCitusCustomState(PlanState *planState);
 extern TupleTableSlot * CitusExecScan(CustomScanState *node);
 extern TupleTableSlot * ReturnTupleFromTuplestore(CitusScanState *scanState);
-extern void LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob);
 extern void ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc
 								   tupleDescriptor, Tuplestorestate *tupstore);
 extern Query * ParseQueryString(const char *queryString, Oid *paramOids, int numParams);
+extern Query * RewriteRawQueryStmt(RawStmt *rawStmt, const char *queryString,
+								   Oid *paramOids, int numParams);
 extern void ExecuteQueryStringIntoDestReceiver(const char *queryString, ParamListInfo
 											   params,
 											   DestReceiver *dest);
@@ -108,6 +146,7 @@ extern void ExtractParametersFromParamList(ParamListInfo paramListInfo,
 										   Oid **parameterTypes,
 										   const char ***parameterValues, bool
 										   useOriginalCustomTypeOids);
+extern ParamListInfo ExecutorBoundParams(void);
 
 
 #endif /* MULTI_EXECUTOR_H */

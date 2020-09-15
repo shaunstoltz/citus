@@ -18,7 +18,20 @@
 #include "nodes/pg_list.h"
 #include "utils/array.h"
 #include "utils/hsearch.h"
+#include "distributed/version_compat.h"
 
+
+/*
+ * ListCellAndListWrapper stores a list and list cell.
+ * This struct is used for functionContext. When iterating a list
+ * in separate function calls, we need both the list and the current cell.
+ * Therefore this wrapper stores both of them.
+ */
+typedef struct ListCellAndListWrapper
+{
+	List *list;
+	ListCell *listCell;
+} ListCellAndListWrapper;
 
 /*
  * foreach_ptr -
@@ -27,8 +40,8 @@
  *	  cell in.
  *
  *   How it works:
- *	  - A ListCell is declared with the name {var}Cell and used throughout the
- *	    for loop using ## to concat.
+ *	  - A ListCell is declared with the name {var}CellDoNotUse and used
+ *	    throughout the for loop using ## to concat.
  *	  - To assign to var it needs to be done in the condition of the for loop,
  *	    because we cannot use the initializer since a ListCell* variable is
  *	    declared there.
@@ -36,9 +49,10 @@
  *	    var is NULL.
  */
 #define foreach_ptr(var, l) \
-	for (ListCell *(var ## Cell) = list_head(l); \
-		 (var ## Cell) != NULL && (((var) = lfirst(var ## Cell)) || true); \
-		 var ## Cell = lnext(var ## Cell))
+	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
+		 (var ## CellDoNotUse) != NULL && \
+		 (((var) = lfirst(var ## CellDoNotUse)) || true); \
+		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
 
 
 /*
@@ -48,9 +62,10 @@
  *	  For explanation of how it works see foreach_ptr.
  */
 #define foreach_int(var, l) \
-	for (ListCell *(var ## Cell) = list_head(l); \
-		 (var ## Cell) != NULL && (((var) = lfirst_int(var ## Cell)) || true); \
-		 var ## Cell = lnext(var ## Cell))
+	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
+		 (var ## CellDoNotUse) != NULL && \
+		 (((var) = lfirst_int(var ## CellDoNotUse)) || true); \
+		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
 
 
 /*
@@ -60,9 +75,10 @@
  *	  For explanation of how it works see foreach_ptr.
  */
 #define foreach_oid(var, l) \
-	for (ListCell *(var ## Cell) = list_head(l); \
-		 (var ## Cell) != NULL && (((var) = lfirst_oid(var ## Cell)) || true); \
-		 var ## Cell = lnext(var ## Cell))
+	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
+		 (var ## CellDoNotUse) != NULL && \
+		 (((var) = lfirst_oid(var ## CellDoNotUse)) || true); \
+		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
 
 
 /* utility functions declaration shared within this module */
@@ -74,5 +90,7 @@ extern ArrayType * DatumArrayToArrayType(Datum *datumArray, int datumCount,
 extern HTAB * ListToHashSet(List *pointerList, Size keySize, bool isStringList);
 extern char * StringJoin(List *stringList, char delimiter);
 extern List * ListTake(List *pointerList, int size);
+extern void * safe_list_nth(const List *list, int index);
+extern List * GenerateListFromElement(void *listElement, int listLength);
 
 #endif /* CITUS_LISTUTILS_H */

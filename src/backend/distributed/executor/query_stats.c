@@ -94,12 +94,7 @@ CitusExecutorName(MultiExecutorType executorType)
 			return "adaptive";
 		}
 
-		case MULTI_EXECUTOR_TASK_TRACKER:
-		{
-			return "task-tracker";
-		}
-
-		case MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT:
+		case MULTI_EXECUTOR_NON_PUSHABLE_INSERT_SELECT:
 		{
 			return "insert-select";
 		}

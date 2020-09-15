@@ -284,10 +284,12 @@ ERROR:  could not run distributed query with subquery outside the FROM, WHERE an
 HINT:  Consider using an equality filter on the distributed table's partition column.
 -- joins are not supported between local and distributed tables
 SELECT title, authors.name FROM authors, articles WHERE authors.id = articles.author_id;
-ERROR:  relation authors is not distributed
+ERROR:  direct joins between distributed and local tables are not supported
+HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 -- inner joins are not supported (I think)
 SELECT * FROM  (articles INNER JOIN authors ON articles.id = authors.id);
-ERROR:  relation authors is not distributed
+ERROR:  direct joins between distributed and local tables are not supported
+HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 -- test use of EXECUTE statements within plpgsql
 DO $sharded_execute$
 	BEGIN
@@ -412,14 +414,12 @@ SELECT o_orderstatus, sum(l_linenumber), avg(l_linenumber) FROM lineitem, orders
 -- now, test the cases where Citus do or do not need to create
 -- the master queries
 SET client_min_messages TO 'DEBUG2';
-SET citus.task_executor_type TO 'adaptive';
 -- start with the simple lookup query
 SELECT *
 	FROM articles
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -434,7 +434,6 @@ SELECT *
 	FROM articles
 	WHERE author_id = 1 OR author_id = 17;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -463,8 +462,7 @@ SELECT id as article_id, word_count * id as random_value
 	FROM articles
 	WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  article_id | random_value
 ---------------------------------------------------------------------
           1 |         9572
@@ -481,8 +479,7 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  first_author | second_word_count
 ---------------------------------------------------------------------
            10 |             17277
@@ -497,8 +494,7 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
+DEBUG:  query has a single distribution column value: 10
  first_author | second_word_count
 ---------------------------------------------------------------------
            10 |             19519
@@ -512,8 +508,7 @@ SELECT *
 	WHERE author_id = 1
 	LIMIT 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |  title   | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
@@ -529,8 +524,7 @@ SELECT id
 	GROUP BY id
 	ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id
 ---------------------------------------------------------------------
   1
@@ -542,15 +536,12 @@ DETAIL:  distribution column value: 1
 
 -- copying from a single shard table does not require the master query
 COPY articles_single_shard TO stdout;
-DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 50	10	anjanette	19519
 SELECT avg(word_count)
 	FROM articles
 	WHERE author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
         avg
 ---------------------------------------------------------------------
  12356.400000000000
@@ -573,8 +564,7 @@ SELECT max(word_count) as max, min(word_count) as min,
 	FROM articles
 	WHERE author_id = 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
+DEBUG:  query has a single distribution column value: 2
   max  | min  |  sum  | cnt
 ---------------------------------------------------------------------
  18185 | 2728 | 61782 |   5
@@ -635,24 +625,21 @@ DEBUG:  Router planner cannot handle multi-shard select queries
 -- tablesample is supported
 SELECT * FROM articles TABLESAMPLE SYSTEM (0) WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
 
 SELECT * FROM articles TABLESAMPLE BERNOULLI (0) WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
 
 SELECT * FROM articles TABLESAMPLE SYSTEM (100) WHERE author_id = 1 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -664,8 +651,7 @@ DETAIL:  distribution column value: 1
 
 SELECT * FROM articles TABLESAMPLE BERNOULLI (100) WHERE author_id = 1 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -680,8 +666,7 @@ SET citus.enable_fast_path_router_planner TO true;
 SELECT * FROM articles TABLESAMPLE SYSTEM (0) WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -689,8 +674,7 @@ DETAIL:  distribution column value: 1
 SELECT * FROM articles TABLESAMPLE BERNOULLI (0) WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id | title | word_count
 ---------------------------------------------------------------------
 (0 rows)
@@ -698,8 +682,7 @@ DETAIL:  distribution column value: 1
 SELECT * FROM articles TABLESAMPLE SYSTEM (100) WHERE author_id = 1 ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -712,8 +695,7 @@ DETAIL:  distribution column value: 1
 SELECT * FROM articles TABLESAMPLE BERNOULLI (100) WHERE author_id = 1 ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
  id | author_id |    title     | word_count
 ---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
@@ -724,3 +706,47 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 SET client_min_messages to 'NOTICE';
+-- we should be able to use nextval in the target list
+CREATE SEQUENCE query_seq;
+SELECT nextval('query_seq') FROM articles WHERE author_id = 1;
+ nextval
+---------------------------------------------------------------------
+       1
+       2
+       3
+       4
+       5
+(5 rows)
+
+SELECT nextval('query_seq') FROM articles LIMIT 3;
+ nextval
+---------------------------------------------------------------------
+       6
+       7
+       8
+(3 rows)
+
+SELECT nextval('query_seq')*2 FROM articles LIMIT 3;
+ ?column?
+---------------------------------------------------------------------
+       18
+       20
+       22
+(3 rows)
+
+SELECT * FROM (SELECT nextval('query_seq') FROM articles LIMIT 3) vals;
+ nextval
+---------------------------------------------------------------------
+      12
+      13
+      14
+(3 rows)
+
+-- but not elsewhere
+SELECT sum(nextval('query_seq')) FROM articles;
+ERROR:  relation "public.query_seq" does not exist
+CONTEXT:  while executing command on localhost:xxxxx
+SELECT n FROM (SELECT nextval('query_seq') n, random() FROM articles) vals;
+ERROR:  relation "public.query_seq" does not exist
+CONTEXT:  while executing command on localhost:xxxxx
+DROP SEQUENCE query_seq;

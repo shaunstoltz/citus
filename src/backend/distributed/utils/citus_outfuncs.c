@@ -18,6 +18,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include <ctype.h>
 
 #include "distributed/citus_nodefuncs.h"
@@ -28,10 +30,10 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_server_executor.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "lib/stringinfo.h"
 #include "nodes/plannodes.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #else
 #include "nodes/relation.h"
@@ -135,7 +137,7 @@
 
 
 #define booltostr(x)  ((x) ? "true" : "false")
-
+static void WriteTaskQuery(OUTFUNC_ARGS);
 
 /*****************************************************************************
  *	Output routines for Citus node types
@@ -182,11 +184,10 @@ OutDistributedPlan(OUTFUNC_ARGS)
 
 	WRITE_UINT64_FIELD(planId);
 	WRITE_ENUM_FIELD(modLevel, RowModifyLevel);
-	WRITE_BOOL_FIELD(hasReturning);
-	WRITE_BOOL_FIELD(routerExecutable);
+	WRITE_BOOL_FIELD(expectResults);
 
 	WRITE_NODE_FIELD(workerJob);
-	WRITE_NODE_FIELD(masterQuery);
+	WRITE_NODE_FIELD(combineQuery);
 	WRITE_UINT64_FIELD(queryId);
 	WRITE_NODE_FIELD(relationIdList);
 	WRITE_OID_FIELD(targetRelationId);
@@ -220,7 +221,7 @@ OutUsedDistributedSubPlan(OUTFUNC_ARGS)
 	WRITE_NODE_TYPE("USEDDISTRIBUTEDSUBPLAN");
 
 	WRITE_STRING_FIELD(subPlanId);
-	WRITE_INT_FIELD(locationMask);
+	WRITE_ENUM_FIELD(accessType, SubPlanAccessType);
 }
 
 
@@ -323,6 +324,9 @@ OutMultiExtendedOp(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(havingQual);
 	WRITE_BOOL_FIELD(hasDistinctOn);
 	WRITE_NODE_FIELD(distinctClause);
+	WRITE_BOOL_FIELD(hasWindowFuncs);
+	WRITE_BOOL_FIELD(onlyPushableWindowFunctions);
+	WRITE_NODE_FIELD(windowClause);
 
 	OutMultiUnaryNodeFields(str, (const MultiUnaryNode *) node);
 }
@@ -335,10 +339,11 @@ OutJobFields(StringInfo str, const Job *node)
 	WRITE_NODE_FIELD(taskList);
 	WRITE_NODE_FIELD(dependentJobList);
 	WRITE_BOOL_FIELD(subqueryPushdown);
-	WRITE_BOOL_FIELD(requiresMasterEvaluation);
+	WRITE_BOOL_FIELD(requiresCoordinatorEvaluation);
 	WRITE_BOOL_FIELD(deferredPruning);
 	WRITE_NODE_FIELD(partitionKeyValue);
 	WRITE_NODE_FIELD(localPlannedStatements);
+	WRITE_BOOL_FIELD(parametersInJobQueryResolved);
 }
 
 
@@ -465,6 +470,37 @@ OutRelationRowLock(OUTFUNC_ARGS)
 	WRITE_ENUM_FIELD(rowLockStrength, LockClauseStrength);
 }
 
+static void WriteTaskQuery(OUTFUNC_ARGS) {
+	WRITE_LOCALS(Task);
+
+	WRITE_ENUM_FIELD(taskQuery.queryType, TaskQueryType);
+
+	switch (node->taskQuery.queryType)
+	{
+		case TASK_QUERY_TEXT:
+		{
+			WRITE_STRING_FIELD(taskQuery.data.queryStringLazy);
+			break;
+		}
+
+		case TASK_QUERY_OBJECT:
+		{
+			WRITE_NODE_FIELD(taskQuery.data.jobQueryReferenceForLazyDeparsing);
+			break;
+		}
+
+		case TASK_QUERY_TEXT_LIST:
+		{
+			WRITE_NODE_FIELD(taskQuery.data.queryStringList);
+			break;
+		}
+
+		default:
+		{
+			break;
+		}
+	}
+}
 
 void
 OutTask(OUTFUNC_ARGS)
@@ -475,8 +511,7 @@ OutTask(OUTFUNC_ARGS)
 	WRITE_ENUM_FIELD(taskType, TaskType);
 	WRITE_UINT64_FIELD(jobId);
 	WRITE_UINT_FIELD(taskId);
-	WRITE_NODE_FIELD(queryForLocalExecution);
-	WRITE_STRING_FIELD(queryStringLazy);
+	WriteTaskQuery(str, raw_node);
 	WRITE_OID_FIELD(anchorDistributedTableId);
 	WRITE_UINT64_FIELD(anchorShardId);
 	WRITE_NODE_FIELD(taskPlacementList);
@@ -485,13 +520,13 @@ OutTask(OUTFUNC_ARGS)
 	WRITE_UINT_FIELD(upstreamTaskId);
 	WRITE_NODE_FIELD(shardInterval);
 	WRITE_BOOL_FIELD(assignmentConstrained);
-	WRITE_NODE_FIELD(taskExecution);
 	WRITE_CHAR_FIELD(replicationModel);
 	WRITE_BOOL_FIELD(modifyWithSubquery);
 	WRITE_NODE_FIELD(relationShardList);
 	WRITE_NODE_FIELD(relationRowLockList);
 	WRITE_NODE_FIELD(rowValuesLists);
 	WRITE_BOOL_FIELD(partiallyLocalOrRemote);
+	WRITE_BOOL_FIELD(parametersInQueryStringResolved);
 }
 
 
@@ -506,28 +541,6 @@ OutLocalPlannedStatement(OUTFUNC_ARGS)
 	WRITE_UINT_FIELD(localGroupId);
 	WRITE_NODE_FIELD(localPlan);
 }
-
-
-void
-OutTaskExecution(OUTFUNC_ARGS)
-{
-	WRITE_LOCALS(TaskExecution);
-	WRITE_NODE_TYPE("TASKEXECUTION");
-
-	WRITE_UINT64_FIELD(jobId);
-	WRITE_UINT_FIELD(taskId);
-	WRITE_UINT_FIELD(nodeCount);
-
-	WRITE_ENUM_ARRAY(taskStatusArray, node->nodeCount);
-	WRITE_ENUM_ARRAY(transmitStatusArray, node->nodeCount);
-	WRITE_INT_ARRAY(connectionIdArray, node->nodeCount);
-	WRITE_INT_ARRAY(fileDescriptorArray, node->nodeCount);
-
-	WRITE_UINT_FIELD(currentNodeIndex);
-	WRITE_UINT_FIELD(querySourceNodeIndex);
-	WRITE_UINT_FIELD(failureCount);
-}
-
 
 void
 OutDeferredErrorMessage(OUTFUNC_ARGS)

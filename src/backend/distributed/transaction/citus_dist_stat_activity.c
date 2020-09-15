@@ -24,7 +24,7 @@
 #include "distributed/connection_management.h"
 #include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/transaction_identifier.h"
@@ -311,10 +311,8 @@ citus_worker_stat_activity(PG_FUNCTION_ARGS)
 static List *
 CitusStatActivity(const char *statQuery)
 {
-	List *workerNodeList = ActivePrimaryWorkerNodeList(NoLock);
-	ListCell *workerNodeCell = NULL;
+	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
 	List *connectionList = NIL;
-	ListCell *connectionCell = NULL;
 
 	/*
 	 * For the local node, we can avoid opening connections. This might be
@@ -331,15 +329,17 @@ CitusStatActivity(const char *statQuery)
 	 */
 	char *nodeUser = CurrentUserName();
 
+	int32 localGroupId = GetLocalGroupId();
+
 	/* open connections in parallel */
-	foreach(workerNodeCell, workerNodeList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-		char *nodeName = workerNode->workerName;
+		const char *nodeName = workerNode->workerName;
 		int nodePort = workerNode->workerPort;
 		int connectionFlags = 0;
 
-		if (workerNode->groupId == GetLocalGroupId())
+		if (workerNode->groupId == localGroupId)
 		{
 			/* we already get these stats via GetLocalNodeCitusDistStat() */
 			continue;
@@ -355,10 +355,9 @@ CitusStatActivity(const char *statQuery)
 	FinishConnectionListEstablishment(connectionList);
 
 	/* send commands in parallel */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
 		int querySent = SendRemoteCommand(connection, statQuery);
 		if (querySent == 0)
 		{
@@ -367,9 +366,8 @@ CitusStatActivity(const char *statQuery)
 	}
 
 	/* receive query results */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		bool raiseInterrupts = true;
 
 		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
@@ -424,8 +422,6 @@ GetLocalNodeCitusDistStat(const char *statQuery)
 {
 	List *citusStatsList = NIL;
 
-	ListCell *workerNodeCell = NULL;
-
 	if (IsCoordinator())
 	{
 		/*
@@ -438,17 +434,16 @@ GetLocalNodeCitusDistStat(const char *statQuery)
 		return citusStatsList;
 	}
 
-	int localGroupId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 
 	/* get the current worker's node stats */
-	List *workerNodeList = ActivePrimaryWorkerNodeList(NoLock);
-	foreach(workerNodeCell, workerNodeList)
+	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-
 		if (workerNode->groupId == localGroupId)
 		{
-			char *nodeName = workerNode->workerName;
+			const char *nodeName = workerNode->workerName;
 			int nodePort = workerNode->workerPort;
 
 			citusStatsList = LocalNodeCitusDistStat(statQuery, nodeName, nodePort);
@@ -543,6 +538,11 @@ ReplaceInitiatorNodeIdentifier(int initiator_node_identifier,
 
 		/* a query should run on an existing node */
 		Assert(nodeExists);
+		if (initiatorWorkerNode == NULL)
+		{
+			ereport(ERROR, (errmsg("no primary node found for group %d",
+								   initiator_node_identifier)));
+		}
 		citusDistStat->master_query_host_name =
 			cstring_to_text(initiatorWorkerNode->workerName);
 		citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
@@ -611,7 +611,7 @@ LocalNodeCitusDistStat(const char *statQuery, const char *hostname, int port)
 	 */
 	oldContext = MemoryContextSwitchTo(upperContext);
 
-	for (uint32 rowIndex = 0; rowIndex < SPI_processed; rowIndex++)
+	for (uint64 rowIndex = 0; rowIndex < SPI_processed; rowIndex++)
 	{
 		TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
 
@@ -903,15 +903,12 @@ ParseXIDField(PGresult *result, int rowIndex, int colIndex)
 static void
 ReturnCitusDistStats(List *citusStatsList, FunctionCallInfo fcinfo)
 {
-	ListCell *citusStatsCell = NULL;
-
 	TupleDesc tupleDesc;
 	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDesc);
 
-	foreach(citusStatsCell, citusStatsList)
+	CitusDistStat *citusDistStat = NULL;
+	foreach_ptr(citusDistStat, citusStatsList)
 	{
-		CitusDistStat *citusDistStat = (CitusDistStat *) lfirst(citusStatsCell);
-
 		Datum values[CITUS_DIST_STAT_ACTIVITY_COLS];
 		bool nulls[CITUS_DIST_STAT_ACTIVITY_COLS];
 

@@ -10,13 +10,17 @@
 
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 120000
+#include "distributed/pg_version_constants.h"
+
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "commands/defrem.h"
 #endif
 #include "commands/vacuum.h"
+#include "distributed/adaptive_executor.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparse_shard_query.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/resource_lock.h"
@@ -25,6 +29,10 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "postmaster/bgworker_internals.h"
+
+
+#define VACUUM_PARALLEL_NOTSET -2
 
 /*
  * Subset of VacuumParams we care about
@@ -32,18 +40,21 @@
 typedef struct CitusVacuumParams
 {
 	int options;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	VacOptTernaryValue truncate;
 	VacOptTernaryValue index_cleanup;
 #endif
-} CitusVacuumParams;
 
+#if PG_VERSION_NUM >= PG_VERSION_13
+	int nworkers;
+#endif
+} CitusVacuumParams;
 
 /* Local functions forward declarations for processing distributed table commands */
 static bool IsDistributedVacuumStmt(int vacuumOptions, List *vacuumRelationIdList);
 static List * VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams,
 							 List *vacuumColumnList);
-static StringInfo DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams);
+static char * DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams);
 static char * DeparseVacuumColumnNames(List *columnNameList);
 static List * VacuumColumnList(VacuumStmt *vacuumStmt, int relationIndex);
 static List * ExtractVacuumTargetRels(VacuumStmt *vacuumStmt);
@@ -64,17 +75,15 @@ PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
 {
 	int relationIndex = 0;
 	List *vacuumRelationList = ExtractVacuumTargetRels(vacuumStmt);
-	ListCell *vacuumRelationCell = NULL;
 	List *relationIdList = NIL;
-	ListCell *relationIdCell = NULL;
 	CitusVacuumParams vacuumParams = VacuumStmtParams(vacuumStmt);
 	LOCKMODE lockMode = (vacuumParams.options & VACOPT_FULL) ? AccessExclusiveLock :
 						ShareUpdateExclusiveLock;
 	int executedVacuumCount = 0;
 
-	foreach(vacuumRelationCell, vacuumRelationList)
+	RangeVar *vacuumRelation = NULL;
+	foreach_ptr(vacuumRelation, vacuumRelationList)
 	{
-		RangeVar *vacuumRelation = (RangeVar *) lfirst(vacuumRelationCell);
 		Oid relationId = RangeVarGetRelid(vacuumRelation, lockMode, false);
 		relationIdList = lappend_oid(relationIdList, relationId);
 	}
@@ -87,10 +96,10 @@ PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
 	}
 
 	/* execute vacuum on distributed tables */
-	foreach(relationIdCell, relationIdList)
+	Oid relationId = InvalidOid;
+	foreach_oid(relationId, relationIdList)
 	{
-		Oid relationId = lfirst_oid(relationIdCell);
-		if (IsDistributedTable(relationId))
+		if (IsCitusTable(relationId))
 		{
 			/*
 			 * VACUUM commands cannot run inside a transaction block, so we use
@@ -109,8 +118,9 @@ PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
 			List *vacuumColumnList = VacuumColumnList(vacuumStmt, relationIndex);
 			List *taskList = VacuumTaskList(relationId, vacuumParams, vacuumColumnList);
 
-			/* use adaptive executor when enabled */
-			ExecuteUtilityTaskListWithoutResults(taskList);
+			/* local execution is not implemented for VACUUM commands */
+			bool localExecutionSupported = false;
+			ExecuteUtilityTaskList(taskList, localExecutionSupported);
 			executedVacuumCount++;
 		}
 		relationIndex++;
@@ -131,7 +141,6 @@ IsDistributedVacuumStmt(int vacuumOptions, List *vacuumRelationIdList)
 {
 	const char *stmtName = (vacuumOptions & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
 	bool distributeStmt = false;
-	ListCell *relationIdCell = NULL;
 	int distributedRelationCount = 0;
 
 	/*
@@ -147,10 +156,10 @@ IsDistributedVacuumStmt(int vacuumOptions, List *vacuumRelationIdList)
 								  "distributed tables.", stmtName)));
 	}
 
-	foreach(relationIdCell, vacuumRelationIdList)
+	Oid relationId = InvalidOid;
+	foreach_oid(relationId, vacuumRelationIdList)
 	{
-		Oid relationId = lfirst_oid(relationIdCell);
-		if (OidIsValid(relationId) && IsDistributedTable(relationId))
+		if (OidIsValid(relationId) && IsCitusTable(relationId))
 		{
 			distributedRelationCount++;
 		}
@@ -184,16 +193,17 @@ IsDistributedVacuumStmt(int vacuumOptions, List *vacuumRelationIdList)
 static List *
 VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams, List *vacuumColumnList)
 {
+	/* resulting task list */
 	List *taskList = NIL;
-	ListCell *shardIntervalCell = NULL;
-	uint64 jobId = INVALID_JOB_ID;
+
+	/* enumerate the tasks when putting them to the taskList */
 	int taskId = 1;
-	StringInfo vacuumString = DeparseVacuumStmtPrefix(vacuumParams);
-	const int vacuumPrefixLen = vacuumString->len;
+
 	Oid schemaId = get_rel_namespace(relationId);
 	char *schemaName = get_namespace_name(schemaId);
-	char *tableName = get_rel_name(relationId);
+	char *relationName = get_rel_name(relationId);
 
+	const char *vacuumStringPrefix = DeparseVacuumStmtPrefix(vacuumParams);
 	const char *columnNames = DeparseVacuumColumnNames(vacuumColumnList);
 
 	/*
@@ -209,24 +219,29 @@ VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams, List *vacuumColum
 	/* grab shard lock before getting placement list */
 	LockShardListMetadata(shardIntervalList, ShareLock);
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
+		char *shardRelationName = pstrdup(relationName);
 
-		char *shardName = pstrdup(tableName);
-		AppendShardIdToName(&shardName, shardInterval->shardId);
-		shardName = quote_qualified_identifier(schemaName, shardName);
+		/* build shard relation name */
+		AppendShardIdToName(&shardRelationName, shardId);
 
-		vacuumString->len = vacuumPrefixLen;
-		appendStringInfoString(vacuumString, shardName);
-		appendStringInfoString(vacuumString, columnNames);
+		char *quotedShardName = quote_qualified_identifier(schemaName, shardRelationName);
+
+		/* copy base vacuum string and build the shard specific command */
+		StringInfo vacuumStringForShard = makeStringInfo();
+		appendStringInfoString(vacuumStringForShard, vacuumStringPrefix);
+
+		appendStringInfoString(vacuumStringForShard, quotedShardName);
+		appendStringInfoString(vacuumStringForShard, columnNames);
 
 		Task *task = CitusMakeNode(Task);
-		task->jobId = jobId;
+		task->jobId = INVALID_JOB_ID;
 		task->taskId = taskId++;
 		task->taskType = VACUUM_ANALYZE_TASK;
-		SetTaskQueryString(task, pstrdup(vacuumString->data));
+		SetTaskQueryString(task, vacuumStringForShard->data);
 		task->dependentTaskList = NULL;
 		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->anchorShardId = shardId;
@@ -245,7 +260,7 @@ VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams, List *vacuumColum
  * reuse this prefix within a loop to generate shard-specific VACUUM or ANALYZE
  * statements.
  */
-static StringInfo
+static char *
 DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 {
 	int vacuumFlags = vacuumParams.options;
@@ -273,13 +288,16 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 
 	/* if no flags remain, exit early */
 	if (vacuumFlags == 0
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		&& vacuumParams.truncate == VACOPT_TERNARY_DEFAULT &&
 		vacuumParams.index_cleanup == VACOPT_TERNARY_DEFAULT
 #endif
+#if PG_VERSION_NUM >= PG_VERSION_13
+		&& vacuumParams.nworkers == VACUUM_PARALLEL_NOTSET
+#endif
 		)
 	{
-		return vacuumPrefix;
+		return vacuumPrefix->data;
 	}
 
 	/* otherwise, handle options */
@@ -310,7 +328,7 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 		appendStringInfoString(vacuumPrefix, "VERBOSE,");
 	}
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	if (vacuumFlags & VACOPT_SKIP_LOCKED)
 	{
 		appendStringInfoString(vacuumPrefix, "SKIP_LOCKED,");
@@ -333,11 +351,18 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 	}
 #endif
 
+#if PG_VERSION_NUM >= PG_VERSION_13
+	if (vacuumParams.nworkers != VACUUM_PARALLEL_NOTSET)
+	{
+		appendStringInfo(vacuumPrefix, "PARALLEL %d,", vacuumParams.nworkers);
+	}
+#endif
+
 	vacuumPrefix->data[vacuumPrefix->len - 1] = ')';
 
 	appendStringInfoChar(vacuumPrefix, ' ');
 
-	return vacuumPrefix;
+	return vacuumPrefix->data;
 }
 
 
@@ -353,7 +378,6 @@ static char *
 DeparseVacuumColumnNames(List *columnNameList)
 {
 	StringInfo columnNames = makeStringInfo();
-	ListCell *columnNameCell = NULL;
 
 	if (columnNameList == NIL)
 	{
@@ -362,11 +386,10 @@ DeparseVacuumColumnNames(List *columnNameList)
 
 	appendStringInfoString(columnNames, " (");
 
-	foreach(columnNameCell, columnNameList)
+	Value *columnName = NULL;
+	foreach_ptr(columnName, columnNameList)
 	{
-		char *columnName = strVal(lfirst(columnNameCell));
-
-		appendStringInfo(columnNames, "%s,", columnName);
+		appendStringInfo(columnNames, "%s,", strVal(columnName));
 	}
 
 	columnNames->data[columnNames->len - 1] = ')';
@@ -398,10 +421,9 @@ ExtractVacuumTargetRels(VacuumStmt *vacuumStmt)
 {
 	List *vacuumList = NIL;
 
-	ListCell *vacuumRelationCell = NULL;
-	foreach(vacuumRelationCell, vacuumStmt->rels)
+	VacuumRelation *vacuumRelation = NULL;
+	foreach_ptr(vacuumRelation, vacuumStmt->rels)
 	{
-		VacuumRelation *vacuumRelation = (VacuumRelation *) lfirst(vacuumRelationCell);
 		vacuumList = lappend(vacuumList, vacuumRelation->relation);
 	}
 
@@ -412,10 +434,12 @@ ExtractVacuumTargetRels(VacuumStmt *vacuumStmt)
 /*
  * VacuumStmtParams returns a CitusVacuumParams based on the supplied VacuumStmt.
  */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 
 /*
  * This is mostly ExecVacuum from Postgres's commands/vacuum.c
+ * Note that ExecVacuum does an actual vacuum as well and we don't want
+ * that to happen in the coordinator hence we copied the rest here.
  */
 static CitusVacuumParams
 VacuumStmtParams(VacuumStmt *vacstmt)
@@ -427,17 +451,18 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 	bool freeze = false;
 	bool full = false;
 	bool disable_page_skipping = false;
-	ListCell *lc;
 
 	/* Set default value */
 	params.index_cleanup = VACOPT_TERNARY_DEFAULT;
 	params.truncate = VACOPT_TERNARY_DEFAULT;
+	#if PG_VERSION_NUM >= PG_VERSION_13
+	params.nworkers = VACUUM_PARALLEL_NOTSET;
+	#endif
 
 	/* Parse options list */
-	foreach(lc, vacstmt->options)
+	DefElem *opt = NULL;
+	foreach_ptr(opt, vacstmt->options)
 	{
-		DefElem *opt = (DefElem *) lfirst(lc);
-
 		/* Parse common options for VACUUM and ANALYZE */
 		if (strcmp(opt->defname, "verbose") == 0)
 		{
@@ -481,6 +506,31 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 			params.truncate = defGetBoolean(opt) ? VACOPT_TERNARY_ENABLED :
 							  VACOPT_TERNARY_DISABLED;
 		}
+		#if PG_VERSION_NUM >= PG_VERSION_13
+		else if (strcmp(opt->defname, "parallel") == 0)
+		{
+			if (opt->arg == NULL)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("parallel option requires a value between 0 and %d",
+								MAX_PARALLEL_WORKER_LIMIT)));
+			}
+			else
+			{
+				int nworkers = defGetInt32(opt);
+				if (nworkers < 0 || nworkers > MAX_PARALLEL_WORKER_LIMIT)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("parallel vacuum degree must be between 0 and %d",
+									MAX_PARALLEL_WORKER_LIMIT)));
+				}
+
+				params.nworkers = nworkers;
+			}
+		}
+		#endif
 		else
 		{
 			ereport(ERROR,

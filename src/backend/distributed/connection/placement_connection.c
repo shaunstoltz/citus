@@ -11,17 +11,24 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/hash.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/multi_executor.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/placement_connection.h"
 #include "distributed/relation_access_tracking.h"
 #include "utils/hsearch.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "common/hashfn.h"
+#endif
 #include "utils/memutils.h"
 
 
@@ -208,6 +215,14 @@ GetPlacementConnection(uint32 flags, ShardPlacement *placement, const char *user
 {
 	MultiConnection *connection = StartPlacementConnection(flags, placement, userName);
 
+	if (connection == NULL)
+	{
+		/* connection can only be NULL for optional connections */
+		Assert((flags & OPTIONAL_CONNECTION));
+
+		return NULL;
+	}
+
 	FinishConnectionEstablishment(connection);
 	return connection;
 }
@@ -292,18 +307,25 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 		 */
 		chosenConnection = StartNodeUserDatabaseConnection(flags, nodeName, nodePort,
 														   userName, NULL);
+		if (chosenConnection == NULL)
+		{
+			/* connection can only be NULL for optional connections */
+			Assert((flags & OPTIONAL_CONNECTION));
 
-		if ((flags & CONNECTION_PER_PLACEMENT) &&
+			return NULL;
+		}
+
+		if ((flags & REQUIRE_CLEAN_CONNECTION) &&
 			ConnectionAccessedDifferentPlacement(chosenConnection, placement))
 		{
 			/*
 			 * Cached connection accessed a non-co-located placement in the same
-			 * table or co-location group, while the caller asked for a connection
-			 * per placement. Open a new connection instead.
+			 * table or co-location group, while the caller asked for a clean
+			 * connection. Open a new connection instead.
 			 *
 			 * We use this for situations in which we want to use a different
 			 * connection for every placement, such as COPY. If we blindly returned
-			 * a cached conection that already modified a different, non-co-located
+			 * a cached connection that already modified a different, non-co-located
 			 * placement B in the same table or in a table with the same co-location
 			 * ID as the current placement, then we'd no longer able to write to
 			 * placement B later in the COPY.
@@ -312,6 +334,14 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 															   FORCE_NEW_CONNECTION,
 															   nodeName, nodePort,
 															   userName, NULL);
+
+			if (chosenConnection == NULL)
+			{
+				/* connection can only be NULL for optional connections */
+				Assert((flags & OPTIONAL_CONNECTION));
+
+				return NULL;
+			}
 
 			Assert(!ConnectionAccessedDifferentPlacement(chosenConnection, placement));
 		}
@@ -338,13 +368,11 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 void
 AssignPlacementListToConnection(List *placementAccessList, MultiConnection *connection)
 {
-	ListCell *placementAccessCell = NULL;
-	char *userName = connection->user;
+	const char *userName = connection->user;
 
-	foreach(placementAccessCell, placementAccessList)
+	ShardPlacementAccess *placementAccess = NULL;
+	foreach_ptr(placementAccess, placementAccessList)
 	{
-		ShardPlacementAccess *placementAccess =
-			(ShardPlacementAccess *) lfirst(placementAccessCell);
 		ShardPlacement *placement = placementAccess->placement;
 		ShardPlacementAccessType accessType = placementAccess->accessType;
 
@@ -438,7 +466,7 @@ AssignPlacementListToConnection(List *placementAccessList, MultiConnection *conn
 
 		/* record the relation access */
 		Oid relationId = RelationIdForShard(placement->shardId);
-		RecordRelationAccessIfReferenceTable(relationId, accessType);
+		RecordRelationAccessIfNonDistTable(relationId, accessType);
 	}
 }
 
@@ -490,7 +518,6 @@ static MultiConnection *
 FindPlacementListConnection(int flags, List *placementAccessList, const char *userName)
 {
 	bool foundModifyingConnection = false;
-	ListCell *placementAccessCell = NULL;
 	MultiConnection *chosenConnection = NULL;
 
 	/*
@@ -506,10 +533,9 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 	 * If placements have only been read in this transaction, then use the last
 	 * suitable connection found for a placement in the placementAccessList.
 	 */
-	foreach(placementAccessCell, placementAccessList)
+	ShardPlacementAccess *placementAccess = NULL;
+	foreach_ptr(placementAccess, placementAccessList)
 	{
-		ShardPlacementAccess *placementAccess =
-			(ShardPlacementAccess *) lfirst(placementAccessCell);
 		ShardPlacement *placement = placementAccess->placement;
 		ShardPlacementAccessType accessType = placementAccess->accessType;
 
@@ -615,6 +641,24 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 				/* this connection performed writes, we must use it */
 				foundModifyingConnection = true;
 			}
+		}
+		else if (placementConnection->hadDDL || placementConnection->hadDML)
+		{
+			if (strcmp(placementConnection->userName, userName) != 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						 errmsg("cannot perform query on placements that were "
+								"modified in this transaction by a different "
+								"user")));
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+					 errmsg("cannot perform query, because modifications were "
+							"made over a connection that cannot be used at "
+							"this time. This is most likely a Citus bug so "
+							"please report it"
+							)));
 		}
 	}
 
@@ -1143,6 +1187,19 @@ InitPlacementConnectionManagement(void)
 
 	/* (relationId) = [relationAccessMode] hash */
 	AllocateRelationAccessHash();
+}
+
+
+/*
+ * UseConnectionPerPlacement returns whether we should use as separate connection
+ * per placement even if another connection is idle. We mostly use this in testing
+ * scenarios.
+ */
+bool
+UseConnectionPerPlacement(void)
+{
+	return ForceMaxQueryParallelization &&
+		   MultiShardConnectionType != SEQUENTIAL_CONNECTION;
 }
 
 

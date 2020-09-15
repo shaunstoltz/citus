@@ -13,6 +13,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include <math.h>
 #include <stdint.h>
 
@@ -37,7 +39,7 @@
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/deparse_shard_query.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_join_order.h"
@@ -50,14 +52,14 @@
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shard_pruning.h"
-#include "distributed/task_tracker.h"
+
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #else
@@ -68,8 +70,10 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -77,6 +81,8 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
+/* RepartitionJoinBucketCountPerNode determines bucket amount during repartitions */
+int RepartitionJoinBucketCountPerNode = 8;
 
 /* Policy to use when assigning tasks to worker nodes */
 int TaskAssignmentPolicy = TASK_ASSIGNMENT_GREEDY;
@@ -91,30 +97,47 @@ bool EnableUniqueJobIds = true;
 static List *OperatorCache = NIL;
 
 
+/* context passed down in AddAnyValueAggregates mutator */
+typedef struct AddAnyValueAggregatesContext
+{
+	/* SortGroupClauses corresponding to the GROUP BY clause */
+	List *groupClauseList;
+
+	/* TargetEntry's to which the GROUP BY clauses refer */
+	List *groupByTargetEntryList;
+
+	/*
+	 * haveNonVarGrouping is true if there are expressions in the
+	 * GROUP BY target entries. We use this as an optimisation to
+	 * skip expensive checks when possible.
+	 */
+	bool haveNonVarGrouping;
+} AddAnyValueAggregatesContext;
+
+
 /* Local functions forward declarations for job creation */
 static Job * BuildJobTree(MultiTreeRoot *multiTree);
 static MultiNode * LeftMostNode(MultiTreeRoot *multiTree);
 static Oid RangePartitionJoinBaseRelationId(MultiJoin *joinNode);
 static MultiTable * FindTableNode(MultiNode *multiNode, int rangeTableId);
 static Query * BuildJobQuery(MultiNode *multiNode, List *dependentJobList);
-static Query * BuildReduceQuery(MultiExtendedOp *extendedOpNode, List *dependentJobList);
 static List * BaseRangeTableList(MultiNode *multiNode);
 static List * QueryTargetList(MultiNode *multiNode);
 static List * TargetEntryList(List *expressionList);
+static Node * AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context);
 static List * QueryGroupClauseList(MultiNode *multiNode);
 static List * QuerySelectClauseList(MultiNode *multiNode);
-static List * QueryJoinClauseList(MultiNode *multiNode);
 static List * QueryFromList(List *rangeTableList);
 static Node * QueryJoinTree(MultiNode *multiNode, List *dependentJobList,
 							List **rangeTableList);
+static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry,
+										List *l_colnames, List *r_colnames,
+										List *leftColVars, List *rightColVars);
 static RangeTblEntry * JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList,
 										   List *rangeTableList);
 static int ExtractRangeTableId(Node *node);
 static void ExtractColumns(RangeTblEntry *rangeTableEntry, int rangeTableId,
 						   List *dependentJobList, List **columnNames, List **columnVars);
-static RangeTblEntry * DerivedRangeTableEntry(MultiNode *multiNode, List *columnNames,
-											  List *tableIdList);
-static List * DerivedColumnNameList(uint32 columnCount, uint64 generatingJobId);
 static Query * BuildSubqueryJobQuery(MultiNode *multiNode);
 static void UpdateAllColumnAttributes(Node *columnContainer, List *rangeTableList,
 									  List *dependentJobList);
@@ -136,15 +159,15 @@ static ArrayType * SplitPointObject(ShardInterval **shardIntervalArray,
 									uint32 shardIntervalCount);
 
 /* Local functions forward declarations for task list creation and helper functions */
-static bool DistributedPlanRouterExecutable(DistributedPlan *distributedPlan);
 static Job * BuildJobTreeTaskList(Job *jobTree,
 								  PlannerRestrictionContext *plannerRestrictionContext);
+static bool IsInnerTableOfOuterJoin(RelationRestriction *relationRestriction);
 static void ErrorIfUnsupportedShardDistribution(Query *query);
 static Task * QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 									  RelationRestrictionContext *restrictionContext,
 									  uint32 taskId,
 									  TaskType taskType,
-									  bool modifyRequiresMasterEvaluation);
+									  bool modifyRequiresCoordinatorEvaluation);
 static bool ShardIntervalsEqual(FmgrInfo *comparisonFunction,
 								Oid collation,
 								ShardInterval *firstInterval,
@@ -186,7 +209,7 @@ static List * GreedyAssignTaskList(List *taskList);
 static Task * GreedyAssignTask(WorkerNode *workerNode, List *taskList,
 							   List *activeShardPlacementLists);
 static List * ReorderAndAssignTaskList(List *taskList,
-									   List * (*reorderFunction)(Task *, List *));
+									   ReorderFunction reorderFunction);
 static int CompareTasksByShardId(const void *leftElement, const void *rightElement);
 static List * ActiveShardPlacementLists(List *taskList);
 static List * ActivePlacementList(List *placementList);
@@ -203,13 +226,8 @@ static List * MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList,
 							uint32 taskIdIndex);
 static StringInfo ColumnNameArrayString(uint32 columnCount, uint64 generatingJobId);
 static StringInfo ColumnTypeArrayString(List *targetEntryList);
-static StringInfo MergeTableQueryString(uint32 taskIdIndex, List *targetEntryList);
-static StringInfo IntermediateTableQueryString(uint64 jobId, uint32 taskIdIndex,
-											   Query *reduceQuery);
-static uint32 FinalTargetEntryCount(List *targetEntryList);
 static bool CoPlacedShardIntervals(ShardInterval *firstInterval,
 								   ShardInterval *secondInterval);
-static Node * AddAnyValueAggregates(Node *node, void *context);
 
 
 /*
@@ -229,74 +247,15 @@ CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
 
 	/* build the final merge query to execute on the master */
 	List *masterDependentJobList = list_make1(workerJob);
-	Query *masterQuery = BuildJobQuery((MultiNode *) multiTree, masterDependentJobList);
+	Query *combineQuery = BuildJobQuery((MultiNode *) multiTree, masterDependentJobList);
 
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
 	distributedPlan->workerJob = workerJob;
-	distributedPlan->masterQuery = masterQuery;
-	distributedPlan->routerExecutable = DistributedPlanRouterExecutable(distributedPlan);
+	distributedPlan->combineQuery = combineQuery;
 	distributedPlan->modLevel = ROW_MODIFY_READONLY;
+	distributedPlan->expectResults = true;
 
 	return distributedPlan;
-}
-
-
-/*
- * DistributedPlanRouterExecutable returns true if the input distributedPlan is
- * router executable.
- *
- * Note that all the multi plans that are created by router planner are
- * already router executable. Thus, this function should only be called
- * for multi plans that are not generated by router planner.
- */
-static bool
-DistributedPlanRouterExecutable(DistributedPlan *distributedPlan)
-{
-	Query *masterQuery = distributedPlan->masterQuery;
-	Job *job = distributedPlan->workerJob;
-	List *workerTaskList = job->taskList;
-	int taskCount = list_length(workerTaskList);
-	int dependentJobCount = list_length(job->dependentJobList);
-
-	if (!EnableRouterExecution)
-	{
-		return false;
-	}
-
-	/* router executor cannot execute SELECT queries that hit more than one shard */
-	if (taskCount != 1)
-	{
-		return false;
-	}
-
-	/* router executor cannot execute repartition jobs */
-	if (dependentJobCount > 0)
-	{
-		return false;
-	}
-
-	/*
-	 * Router executor does not run master query. This means that aggregation and
-	 * sorting on the master query wouldn't be executed. Thus, such plans shouldn't be
-	 * qualified as router executable.
-	 */
-	if (masterQuery != NULL && list_length(masterQuery->sortClause) > 0)
-	{
-		return false;
-	}
-
-	/*
-	 * Note that worker query having an aggregate means that the master query should
-	 * have either an aggregate or a function expression which has to be executed for
-	 * the correct results.
-	 */
-	bool masterQueryHasAggregates = job->jobQuery->hasAggs;
-	if (masterQueryHasAggregates)
-	{
-		return false;
-	}
-
-	return true;
 }
 
 
@@ -411,30 +370,6 @@ BuildJobTree(MultiTreeRoot *multiTree)
 				/* append to the dependent job list for on-going dependencies */
 				loopDependentJobList = lappend(loopDependentJobList, mapMergeJob);
 			}
-		}
-		else if (boundaryNodeJobType == SUBQUERY_MAP_MERGE_JOB)
-		{
-			MultiPartition *partitionNode = (MultiPartition *) currentNode;
-			MultiNode *queryNode = GrandChildNode((MultiUnaryNode *) partitionNode);
-			Var *partitionKey = partitionNode->partitionColumn;
-
-			/* build query and partition job */
-			List *dependentJobList = list_copy(loopDependentJobList);
-			Query *jobQuery = BuildJobQuery(queryNode, dependentJobList);
-
-			MapMergeJob *mapMergeJob = BuildMapMergeJob(jobQuery, dependentJobList,
-														partitionKey,
-														DUAL_HASH_PARTITION_TYPE,
-														InvalidOid,
-														SUBQUERY_MAP_MERGE_JOB);
-
-			Query *reduceQuery = BuildReduceQuery((MultiExtendedOp *) parentNode,
-												  list_make1(mapMergeJob));
-			mapMergeJob->reduceQuery = reduceQuery;
-
-			/* reset dependent job list */
-			loopDependentJobList = NIL;
-			loopDependentJobList = list_make1(mapMergeJob);
 		}
 		else if (boundaryNodeJobType == TOP_LEVEL_WORKER_JOB)
 		{
@@ -584,6 +519,8 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	bool hasDistinctOn = false;
 	List *distinctClause = NIL;
 	bool isRepartitionJoin = false;
+	bool hasWindowFuncs = false;
+	List *windowClause = NIL;
 
 	/* we start building jobs from below the collect node */
 	Assert(!CitusIsA(multiNode, MultiCollect));
@@ -634,6 +571,8 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 		targetList = copyObject(extendedOp->targetList);
 		distinctClause = extendedOp->distinctClause;
 		hasDistinctOn = extendedOp->hasDistinctOn;
+		hasWindowFuncs = extendedOp->hasWindowFuncs;
+		windowClause = extendedOp->windowClause;
 	}
 	else
 	{
@@ -684,13 +623,11 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	 */
 	if (groupClauseList != NIL && isRepartitionJoin)
 	{
-		targetList = (List *) expression_tree_mutator((Node *) targetList,
-													  AddAnyValueAggregates,
-													  groupClauseList);
+		targetList = (List *) WrapUngroupedVarsInAnyValueAggregate(
+			(Node *) targetList, groupClauseList, targetList, true);
 
-		havingQual = expression_tree_mutator((Node *) havingQual,
-											 AddAnyValueAggregates,
-											 groupClauseList);
+		havingQual = WrapUngroupedVarsInAnyValueAggregate(
+			(Node *) havingQual, groupClauseList, targetList, false);
 	}
 
 	/*
@@ -715,93 +652,17 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	jobQuery->limitOffset = limitOffset;
 	jobQuery->limitCount = limitCount;
 	jobQuery->havingQual = havingQual;
-	jobQuery->hasAggs = contain_agg_clause((Node *) targetList);
+	jobQuery->hasAggs = contain_aggs_of_level((Node *) targetList, 0) ||
+						contain_aggs_of_level((Node *) havingQual, 0);
 	jobQuery->distinctClause = distinctClause;
 	jobQuery->hasDistinctOn = hasDistinctOn;
+	jobQuery->windowClause = windowClause;
+	jobQuery->hasWindowFuncs = hasWindowFuncs;
+	jobQuery->hasSubLinks = checkExprHasSubLink((Node *) jobQuery);
+
+	Assert(jobQuery->hasWindowFuncs == contain_window_function((Node *) jobQuery));
 
 	return jobQuery;
-}
-
-
-/*
- * BuildReduceQuery traverses the given logical plan tree, determines the job that
- * corresponds to this part of the tree, and builds the query structure for that
- * particular job. The function assumes that jobs this particular job depends on
- * have already been built, as their output is needed to build the query.
- */
-static Query *
-BuildReduceQuery(MultiExtendedOp *extendedOpNode, List *dependentJobList)
-{
-	MultiNode *multiNode = (MultiNode *) extendedOpNode;
-	List *derivedRangeTableList = NIL;
-	List *targetList = NIL;
-	ListCell *columnCell = NULL;
-	List *columnNameList = NIL;
-
-	Job *dependentJob = linitial(dependentJobList);
-	List *dependentTargetList = dependentJob->jobQuery->targetList;
-	uint32 columnCount = (uint32) list_length(dependentTargetList);
-
-	for (uint32 columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		StringInfo columnNameString = makeStringInfo();
-
-		appendStringInfo(columnNameString, MERGE_COLUMN_FORMAT, columnIndex);
-
-		Value *columnValue = makeString(columnNameString->data);
-		columnNameList = lappend(columnNameList, columnValue);
-	}
-
-	/* create a derived range table for the subtree below the collect */
-	RangeTblEntry *rangeTableEntry = DerivedRangeTableEntry(multiNode, columnNameList,
-															OutputTableIdList(multiNode));
-	rangeTableEntry->eref->colnames = columnNameList;
-	ModifyRangeTblExtraData(rangeTableEntry, CITUS_RTE_SHARD, NULL, NULL, NULL);
-	derivedRangeTableList = lappend(derivedRangeTableList, rangeTableEntry);
-
-	targetList = copyObject(extendedOpNode->targetList);
-	List *columnList = pull_var_clause_default((Node *) targetList);
-
-	foreach(columnCell, columnList)
-	{
-		Var *column = (Var *) lfirst(columnCell);
-		Index originalTableId = column->varnoold;
-
-		/* find the new table identifier */
-		Index newTableId = NewTableId(originalTableId, derivedRangeTableList);
-		column->varno = newTableId;
-	}
-
-	/* build the where clause list using select and join predicates */
-	List *selectClauseList = QuerySelectClauseList((MultiNode *) extendedOpNode);
-	List *joinClauseList = QueryJoinClauseList((MultiNode *) extendedOpNode);
-	List *whereClauseList = list_concat(selectClauseList, joinClauseList);
-
-	/*
-	 * Build the From/Where construct. We keep the where-clause list implicitly
-	 * AND'd, since both partition and join pruning depends on the clauses being
-	 * expressed as a list.
-	 */
-	FromExpr *joinTree = makeNode(FromExpr);
-	joinTree->quals = (Node *) whereClauseList;
-	joinTree->fromlist = QueryFromList(derivedRangeTableList);
-
-	/* build the query structure for this job */
-	Query *reduceQuery = makeNode(Query);
-	reduceQuery->commandType = CMD_SELECT;
-	reduceQuery->querySource = QSRC_ORIGINAL;
-	reduceQuery->canSetTag = true;
-	reduceQuery->rtable = derivedRangeTableList;
-	reduceQuery->targetList = targetList;
-	reduceQuery->jointree = joinTree;
-	reduceQuery->sortClause = extendedOpNode->sortClauseList;
-	reduceQuery->groupClause = extendedOpNode->groupClauseList;
-	reduceQuery->limitOffset = extendedOpNode->limitOffset;
-	reduceQuery->limitCount = extendedOpNode->limitCount;
-	reduceQuery->havingQual = extendedOpNode->havingQual;
-	reduceQuery->hasAggs = contain_agg_clause((Node *) targetList);
-
-	return reduceQuery;
 }
 
 
@@ -839,7 +700,8 @@ BaseRangeTableList(MultiNode *multiNode)
 				rangeTableEntry->alias = multiTable->alias;
 				rangeTableEntry->relid = multiTable->relationId;
 				SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_RELATION, NULL, NULL,
-									 list_make1_int(multiTable->rangeTableId));
+									 list_make1_int(multiTable->rangeTableId),
+									 NIL, NIL, NIL, NIL);
 
 				baseRangeTableList = lappend(baseRangeTableList, rangeTableEntry);
 			}
@@ -862,16 +724,19 @@ BaseRangeTableList(MultiNode *multiNode)
  * derived table either represents the output of a repartition job; or the data
  * on worker nodes in case of the master node query.
  */
-static RangeTblEntry *
-DerivedRangeTableEntry(MultiNode *multiNode, List *columnList, List *tableIdList)
+RangeTblEntry *
+DerivedRangeTableEntry(MultiNode *multiNode, List *columnList, List *tableIdList,
+					   List *funcColumnNames, List *funcColumnTypes,
+					   List *funcColumnTypeMods, List *funcCollations)
 {
 	RangeTblEntry *rangeTableEntry = makeNode(RangeTblEntry);
 	rangeTableEntry->inFromCl = true;
 	rangeTableEntry->eref = makeNode(Alias);
 	rangeTableEntry->eref->colnames = columnList;
 
-	SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_REMOTE_QUERY, NULL, NULL,
-						 tableIdList);
+	SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_REMOTE_QUERY, NULL, NULL, tableIdList,
+						 funcColumnNames, funcColumnTypes, funcColumnTypeMods,
+						 funcCollations);
 
 	return rangeTableEntry;
 }
@@ -882,7 +747,7 @@ DerivedRangeTableEntry(MultiNode *multiNode, List *columnList, List *tableIdList
  * tables. These column names are then used when building the create stament
  * query string for derived tables.
  */
-static List *
+List *
 DerivedColumnNameList(uint32 columnCount, uint64 generatingJobId)
 {
 	List *columnNameList = NIL;
@@ -951,23 +816,116 @@ TargetEntryList(List *expressionList)
 
 
 /*
- * AddAnyValueAggregates wraps all vars that do not apear in the GROUP BY
+ * WrapUngroupedVarsInAnyValueAggregate finds Var nodes in the expression
+ * that do not refer to any GROUP BY column and wraps them in an any_value
+ * aggregate. These columns are allowed when the GROUP BY is on a primary
+ * key of a relation, but not if we wrap the relation in a subquery.
+ * However, since we still know the value is unique, any_value gives the
+ * right result.
+ */
+Node *
+WrapUngroupedVarsInAnyValueAggregate(Node *expression, List *groupClauseList,
+									 List *targetList, bool checkExpressionEquality)
+{
+	if (expression == NULL)
+	{
+		return NULL;
+	}
+
+	AddAnyValueAggregatesContext context;
+	context.groupClauseList = groupClauseList;
+	context.groupByTargetEntryList = GroupTargetEntryList(groupClauseList, targetList);
+	context.haveNonVarGrouping = false;
+
+	if (checkExpressionEquality)
+	{
+		/*
+		 * If the GROUP BY contains non-Var expressions, we need to do an expensive
+		 * subexpression equality check.
+		 */
+		TargetEntry *targetEntry = NULL;
+		foreach_ptr(targetEntry, context.groupByTargetEntryList)
+		{
+			if (!IsA(targetEntry->expr, Var))
+			{
+				context.haveNonVarGrouping = true;
+				break;
+			}
+		}
+	}
+
+	/* put the result in the same memory context */
+	MemoryContext nodeContext = GetMemoryChunkContext(expression);
+	MemoryContext oldContext = MemoryContextSwitchTo(nodeContext);
+
+	Node *result = expression_tree_mutator(expression, AddAnyValueAggregates,
+										   &context);
+
+	MemoryContextSwitchTo(oldContext);
+
+	return result;
+}
+
+
+/*
+ * AddAnyValueAggregates wraps all vars that do not appear in the GROUP BY
  * clause or are inside an aggregate function in an any_value aggregate
- * function. This is needed for repartition joins because primary keys are not
- * present on intermediate tables.
+ * function. This is needed because postgres allows columns that are not
+ * in the GROUP BY to appear on the target list as long as the primary key
+ * of the table is in the GROUP BY, but we sometimes wrap the join tree
+ * in a subquery in which case the primary key information is lost.
+ *
+ * This function copies parts of the node tree, but may contain references
+ * to the original node tree.
+ *
+ * The implementation is derived from / inspired by
+ * check_ungrouped_columns_walker.
  */
 static Node *
-AddAnyValueAggregates(Node *node, void *context)
+AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context)
 {
-	List *groupClauseList = context;
 	if (node == NULL)
 	{
 		return node;
 	}
 
-	if (IsA(node, Var))
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+	{
+		/* any column is allowed to appear in an aggregate or grouping */
+		return node;
+	}
+	else if (IsA(node, Var))
 	{
 		Var *var = (Var *) node;
+
+		/*
+		 * Check whether this Var appears in the GROUP BY.
+		 */
+		TargetEntry *groupByTargetEntry = NULL;
+		foreach_ptr(groupByTargetEntry, context->groupByTargetEntryList)
+		{
+			if (!IsA(groupByTargetEntry->expr, Var))
+			{
+				continue;
+			}
+
+			Var *groupByVar = (Var *) groupByTargetEntry->expr;
+
+			/* we should only be doing this at the top level of the query */
+			Assert(groupByVar->varlevelsup == 0);
+
+			if (var->varno == groupByVar->varno &&
+				var->varattno == groupByVar->varattno)
+			{
+				/* this Var is in the GROUP BY, do not wrap it */
+				return node;
+			}
+		}
+
+		/*
+		 * We have found a Var that does not appear in the GROUP BY.
+		 * Wrap it in an any_value aggregate.
+		 */
 		Aggref *agg = makeNode(Aggref);
 		agg->aggfnoid = CitusAnyValueFunctionId();
 		agg->aggtype = var->vartype;
@@ -976,33 +934,27 @@ AddAnyValueAggregates(Node *node, void *context)
 		agg->aggtranstype = InvalidOid;
 		agg->aggargtypes = list_make1_oid(var->vartype);
 		agg->aggsplit = AGGSPLIT_SIMPLE;
+		agg->aggcollid = exprCollation((Node *) var);
 		return (Node *) agg;
 	}
-	if (IsA(node, TargetEntry))
+	else if (context->haveNonVarGrouping)
 	{
-		TargetEntry *targetEntry = (TargetEntry *) node;
-
-
 		/*
-		 * Stop searching this part of the tree if the targetEntry is part of
-		 * the group by clause.
+		 * The GROUP BY contains at least one expression. Check whether the
+		 * current expression is equal to one of the GROUP BY expressions.
+		 * Otherwise, continue to descend into subexpressions.
 		 */
-		if (targetEntry->ressortgroupref != 0)
+		TargetEntry *groupByTargetEntry = NULL;
+		foreach_ptr(groupByTargetEntry, context->groupByTargetEntryList)
 		{
-			SortGroupClause *sortGroupClause = NULL;
-			foreach_ptr(sortGroupClause, groupClauseList)
+			if (equal(node, groupByTargetEntry->expr))
 			{
-				if (sortGroupClause->tleSortGroupRef == targetEntry->ressortgroupref)
-				{
-					return node;
-				}
+				/* do not descend into mutator, all Vars are safe */
+				return node;
 			}
 		}
 	}
-	if (IsA(node, Aggref))
-	{
-		return node;
-	}
+
 	return expression_tree_mutator(node, AddAnyValueAggregates, context);
 }
 
@@ -1081,44 +1033,6 @@ QuerySelectClauseList(MultiNode *multiNode)
 
 
 /*
- * QueryJoinClauseList traverses the given logical plan tree, and extracts all
- * join clauses from the join nodes. Note that this function does not walk below
- * a collect node; the clauses below the collect node apply to another query,
- * and they would have been captured by the remote job we depend upon.
- */
-static List *
-QueryJoinClauseList(MultiNode *multiNode)
-{
-	List *joinClauseList = NIL;
-	List *pendingNodeList = list_make1(multiNode);
-
-	while (pendingNodeList != NIL)
-	{
-		MultiNode *currMultiNode = (MultiNode *) linitial(pendingNodeList);
-		CitusNodeTag nodeType = CitusNodeTag(currMultiNode);
-		pendingNodeList = list_delete_first(pendingNodeList);
-
-		/* extract join clauses from the multi join node */
-		if (nodeType == T_MultiJoin)
-		{
-			MultiJoin *joinNode = (MultiJoin *) currMultiNode;
-			List *clauseList = copyObject(joinNode->joinClauseList);
-			joinClauseList = list_concat(joinClauseList, clauseList);
-		}
-
-		/* add this node's children only if the node isn't a multi collect */
-		if (nodeType != T_MultiCollect)
-		{
-			List *childNodeList = ChildNodeList(currMultiNode);
-			pendingNodeList = list_concat(pendingNodeList, childNodeList);
-		}
-	}
-
-	return joinClauseList;
-}
-
-
-/*
  * Create a tree of JoinExpr and RangeTblRef nodes for the job query from
  * a given multiNode. If the tree contains MultiCollect or MultiJoin nodes,
  * add corresponding entries to the range table list. We need to construct
@@ -1164,11 +1078,6 @@ QueryJoinTree(MultiNode *multiNode, List *dependentJobList, List **rangeTableLis
 				joinExpr->jointype = JOIN_LEFT;
 			}
 
-			RangeTblEntry *rangeTableEntry = JoinRangeTableEntry(joinExpr,
-																 dependentJobList,
-																 *rangeTableList);
-			*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
-
 			/* fix the column attributes in ON (...) clauses */
 			List *columnList = pull_var_clause_default((Node *) joinNode->joinClauseList);
 			foreach(columnCell, columnList)
@@ -1177,12 +1086,17 @@ QueryJoinTree(MultiNode *multiNode, List *dependentJobList, List **rangeTableLis
 				UpdateColumnAttributes(column, *rangeTableList, dependentJobList);
 
 				/* adjust our column old attributes for partition pruning to work */
-				column->varnoold = column->varno;
-				column->varoattno = column->varattno;
+				column->varnosyn = column->varno;
+				column->varattnosyn = column->varattno;
 			}
 
 			/* make AND clauses explicit after fixing them */
 			joinExpr->quals = (Node *) make_ands_explicit(joinNode->joinClauseList);
+
+			RangeTblEntry *rangeTableEntry = JoinRangeTableEntry(joinExpr,
+																 dependentJobList,
+																 *rangeTableList);
+			*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
 
 			return (Node *) joinExpr;
 		}
@@ -1221,9 +1135,37 @@ QueryJoinTree(MultiNode *multiNode, List *dependentJobList, List **rangeTableLis
 			List *columnNameList = DerivedColumnNameList(columnCount,
 														 dependentJob->jobId);
 
+			List *funcColumnNames = NIL;
+			List *funcColumnTypes = NIL;
+			List *funcColumnTypeMods = NIL;
+			List *funcCollations = NIL;
+
+			TargetEntry *targetEntry = NULL;
+			foreach_ptr(targetEntry, dependentTargetList)
+			{
+				Node *expr = (Node *) targetEntry->expr;
+
+				char *name = targetEntry->resname;
+				if (name == NULL)
+				{
+					name = pstrdup("unnamed");
+				}
+
+				funcColumnNames = lappend(funcColumnNames, makeString(name));
+
+				funcColumnTypes = lappend_oid(funcColumnTypes, exprType(expr));
+				funcColumnTypeMods = lappend_int(funcColumnTypeMods, exprTypmod(expr));
+				funcCollations = lappend_oid(funcCollations, exprCollation(expr));
+			}
+
 			RangeTblEntry *rangeTableEntry = DerivedRangeTableEntry(multiNode,
 																	columnNameList,
-																	tableIdList);
+																	tableIdList,
+																	funcColumnNames,
+																	funcColumnTypes,
+																	funcColumnTypeMods,
+																	funcCollations);
+
 			RangeTblRef *rangeTableRef = makeNode(RangeTblRef);
 
 			rangeTableRef->rtindex = list_length(*rangeTableList) + 1;
@@ -1289,10 +1231,10 @@ static RangeTblEntry *
 JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTableList)
 {
 	RangeTblEntry *rangeTableEntry = makeNode(RangeTblEntry);
-	List *joinedColumnNames = NIL;
-	List *joinedColumnVars = NIL;
 	List *leftColumnNames = NIL;
 	List *leftColumnVars = NIL;
+	List *joinedColumnNames = NIL;
+	List *joinedColumnVars = NIL;
 	int leftRangeTableId = ExtractRangeTableId(joinExpr->larg);
 	RangeTblEntry *leftRTE = rt_fetch(leftRangeTableId, rangeTableList);
 	List *rightColumnNames = NIL;
@@ -1312,16 +1254,43 @@ JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTable
 				   &leftColumnNames, &leftColumnVars);
 	ExtractColumns(rightRTE, rightRangeTableId, dependentJobList,
 				   &rightColumnNames, &rightColumnVars);
-
 	joinedColumnNames = list_concat(joinedColumnNames, leftColumnNames);
-	joinedColumnVars = list_concat(joinedColumnVars, leftColumnVars);
 	joinedColumnNames = list_concat(joinedColumnNames, rightColumnNames);
+	joinedColumnVars = list_concat(joinedColumnVars, leftColumnVars);
 	joinedColumnVars = list_concat(joinedColumnVars, rightColumnVars);
 
 	rangeTableEntry->eref->colnames = joinedColumnNames;
 	rangeTableEntry->joinaliasvars = joinedColumnVars;
 
+	SetJoinRelatedColumnsCompat(rangeTableEntry,
+								leftColumnNames, rightColumnNames, leftColumnVars,
+								rightColumnVars);
+
 	return rangeTableEntry;
+}
+
+
+static void
+SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry,
+							List *leftColumnNames, List *rightColumnNames,
+							List *leftColumnVars, List *rightColumnVars)
+{
+	#if PG_VERSION_NUM >= PG_VERSION_13
+
+	/* We don't have any merged columns so set it to 0 */
+	rangeTableEntry->joinmergedcols = 0;
+	int numvars = list_length(leftColumnVars);
+	for (int varId = 1; varId <= numvars; varId++)
+	{
+		rangeTableEntry->joinleftcols = lappend_int(rangeTableEntry->joinleftcols, varId);
+	}
+	numvars = list_length(rightColumnVars);
+	for (int varId = 1; varId <= numvars; varId++)
+	{
+		rangeTableEntry->joinrightcols = lappend_int(rangeTableEntry->joinrightcols,
+													 varId);
+	}
+	#endif
 }
 
 
@@ -1516,13 +1485,13 @@ BuildSubqueryJobQuery(MultiNode *multiNode)
 	/* build the where clause list using select predicates */
 	List *whereClauseList = QuerySelectClauseList(multiNode);
 
-	if (contain_agg_clause((Node *) targetList) ||
-		contain_agg_clause((Node *) havingQual))
+	if (contain_aggs_of_level((Node *) targetList, 0) ||
+		contain_aggs_of_level((Node *) havingQual, 0))
 	{
 		hasAggregates = true;
 	}
 
-	/* distinct is not send to worker query if there are top level aggregates */
+	/* distinct is not sent to worker query if there are top level aggregates */
 	if (hasAggregates)
 	{
 		hasDistinctOn = false;
@@ -1557,6 +1526,9 @@ BuildSubqueryJobQuery(MultiNode *multiNode)
 	jobQuery->distinctClause = distinctClause;
 	jobQuery->hasWindowFuncs = hasWindowFuncs;
 	jobQuery->windowClause = windowClause;
+	jobQuery->hasSubLinks = checkExprHasSubLink((Node *) jobQuery);
+
+	Assert(jobQuery->hasWindowFuncs == contain_window_function((Node *) jobQuery));
 
 	return jobQuery;
 }
@@ -1589,8 +1561,8 @@ UpdateAllColumnAttributes(Node *columnContainer, List *rangeTableList,
 static void
 UpdateColumnAttributes(Var *column, List *rangeTableList, List *dependentJobList)
 {
-	Index originalTableId = column->varnoold;
-	AttrNumber originalColumnId = column->varoattno;
+	Index originalTableId = column->varnosyn;
+	AttrNumber originalColumnId = column->varattnosyn;
 
 	/* find the new table identifier */
 	Index newTableId = NewTableId(originalTableId, rangeTableList);
@@ -1674,8 +1646,8 @@ NewColumnId(Index originalTableId, AttrNumber originalColumnId,
 		 * Check against the *old* values for this column, as the new values
 		 * would have been updated already.
 		 */
-		if (column->varnoold == originalTableId &&
-			column->varoattno == originalColumnId)
+		if (column->varnosyn == originalTableId &&
+			column->varattnosyn == originalColumnId)
 		{
 			newColumnId = columnIndex;
 			break;
@@ -1863,7 +1835,7 @@ BuildJob(Query *jobQuery, List *dependentJobList)
 	job->jobId = UniqueJobId();
 	job->jobQuery = jobQuery;
 	job->dependentJobList = dependentJobList;
-	job->requiresMasterEvaluation = false;
+	job->requiresCoordinatorEvaluation = false;
 
 	return job;
 }
@@ -1913,11 +1885,22 @@ BuildMapMergeJob(Query *jobQuery, List *dependentJobList, Var *partitionKey,
 	else if (partitionType == SINGLE_HASH_PARTITION_TYPE || partitionType ==
 			 RANGE_PARTITION_TYPE)
 	{
-		DistTableCacheEntry *cache = DistributedTableCacheEntry(baseRelationId);
-		uint32 shardCount = cache->shardIntervalArrayLength;
-		ShardInterval **sortedShardIntervalArray = cache->sortedShardIntervalArray;
+		CitusTableCacheEntry *cache = GetCitusTableCacheEntry(baseRelationId);
+		int shardCount = cache->shardIntervalArrayLength;
+		ShardInterval **cachedSortedShardIntervalArray =
+			cache->sortedShardIntervalArray;
+		bool hasUninitializedShardInterval =
+			cache->hasUninitializedShardInterval;
 
-		bool hasUninitializedShardInterval = cache->hasUninitializedShardInterval;
+		ShardInterval **sortedShardIntervalArray =
+			palloc0(sizeof(ShardInterval) * shardCount);
+
+		for (int shardIndex = 0; shardIndex < shardCount; shardIndex++)
+		{
+			sortedShardIntervalArray[shardIndex] =
+				CopyShardInterval(cachedSortedShardIntervalArray[shardIndex]);
+		}
+
 		if (hasUninitializedShardInterval)
 		{
 			ereport(ERROR, (errmsg("cannot range repartition shard with "
@@ -1925,7 +1908,7 @@ BuildMapMergeJob(Query *jobQuery, List *dependentJobList, Var *partitionKey,
 		}
 
 		mapMergeJob->partitionType = partitionType;
-		mapMergeJob->partitionCount = shardCount;
+		mapMergeJob->partitionCount = (uint32) shardCount;
 		mapMergeJob->sortedShardIntervalArray = sortedShardIntervalArray;
 		mapMergeJob->sortedShardIntervalArrayLength = shardCount;
 	}
@@ -1944,8 +1927,8 @@ BuildMapMergeJob(Query *jobQuery, List *dependentJobList, Var *partitionKey,
 static uint32
 HashPartitionCount(void)
 {
-	uint32 groupCount = ActiveReadableWorkerNodeCount();
-	double maxReduceTasksPerNode = MaxRunningTasksPerNode / 2.0;
+	uint32 groupCount = list_length(ActiveReadableNodeList());
+	double maxReduceTasksPerNode = RepartitionJoinBucketCountPerNode;
 
 	uint32 partitionCount = (uint32) rint(groupCount * maxReduceTasksPerNode);
 	return partitionCount;
@@ -2047,7 +2030,7 @@ BuildJobTreeTaskList(Job *jobTree, PlannerRestrictionContext *plannerRestriction
 			sqlTaskList = QueryPushdownSqlTaskList(job->jobQuery, job->jobId,
 												   plannerRestrictionContext->
 												   relationRestrictionContext,
-												   prunedRelationShardList, SELECT_TASK,
+												   prunedRelationShardList, READ_TASK,
 												   false);
 		}
 		else
@@ -2064,12 +2047,29 @@ BuildJobTreeTaskList(Job *jobTree, PlannerRestrictionContext *plannerRestriction
 		List *assignedSqlTaskList = AssignTaskList(sqlTaskList);
 		AssignDataFetchDependencies(assignedSqlTaskList);
 
-		/* now assign merge task's data fetch dependencies */
+		/* if the parameters has not been resolved, record it */
+		job->parametersInJobQueryResolved =
+			!HasUnresolvedExternParamsWalker((Node *) job->jobQuery, NULL);
+
+		/*
+		 * Make final adjustments for the assigned tasks.
+		 *
+		 * First, update SELECT tasks' parameters resolved field.
+		 *
+		 * Second, assign merge task's data fetch dependencies.
+		 */
 		foreach(assignedSqlTaskCell, assignedSqlTaskList)
 		{
 			Task *assignedSqlTask = (Task *) lfirst(assignedSqlTaskCell);
-			List *assignedMergeTaskList = FindDependentMergeTaskList(assignedSqlTask);
 
+			/* we don't support parameters in the physical planner */
+			if (assignedSqlTask->taskType == READ_TASK)
+			{
+				assignedSqlTask->parametersInQueryStringResolved =
+					job->parametersInJobQueryResolved;
+			}
+
+			List *assignedMergeTaskList = FindDependentMergeTaskList(assignedSqlTask);
 			AssignDataFetchDependencies(assignedMergeTaskList);
 		}
 
@@ -2109,7 +2109,7 @@ List *
 QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 						 RelationRestrictionContext *relationRestrictionContext,
 						 List *prunedRelationShardList, TaskType taskType, bool
-						 modifyRequiresMasterEvaluation)
+						 modifyRequiresCoordinatorEvaluation)
 {
 	List *sqlTaskList = NIL;
 	ListCell *restrictionCell = NULL;
@@ -2140,8 +2140,8 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 		List *prunedShardList = (List *) lfirst(prunedRelationShardCell);
 		ListCell *shardIntervalCell = NULL;
 
-		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(relationId);
-		if (cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE)
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
 			continue;
 		}
@@ -2163,6 +2163,21 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 			maxShardOffset = -1;
 		}
 
+		/*
+		 * For left joins we don't care about the shards pruned for the right hand side.
+		 * If the right hand side would prune to a smaller set we should still send it to
+		 * all tables of the left hand side. However if the right hand side is bigger than
+		 * the left hand side we don't have to send the query to any shard that is not
+		 * matching anything on the left hand side.
+		 *
+		 * Instead we will simply skip any RelationRestriction if it is an OUTER join and
+		 * the table is part of the non-outer side of the join.
+		 */
+		if (IsInnerTableOfOuterJoin(relationRestriction))
+		{
+			continue;
+		}
+
 		foreach(shardIntervalCell, prunedShardList)
 		{
 			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
@@ -2170,15 +2185,8 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 
 			taskRequiredForShardIndex[shardIndex] = true;
 
-			if (shardIndex < minShardOffset)
-			{
-				minShardOffset = shardIndex;
-			}
-
-			if (shardIndex > maxShardOffset)
-			{
-				maxShardOffset = shardIndex;
-			}
+			minShardOffset = Min(minShardOffset, shardIndex);
+			maxShardOffset = Max(maxShardOffset, shardIndex);
 		}
 	}
 
@@ -2205,7 +2213,7 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 													 relationRestrictionContext,
 													 taskIdIndex,
 													 taskType,
-													 modifyRequiresMasterEvaluation);
+													 modifyRequiresCoordinatorEvaluation);
 		subqueryTask->jobId = jobId;
 		sqlTaskList = lappend(sqlTaskList, subqueryTask);
 
@@ -2225,6 +2233,45 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 	}
 
 	return sqlTaskList;
+}
+
+
+/*
+ * IsInnerTableOfOuterJoin tests based on the join information envoded in a
+ * RelationRestriction if the table accessed for this relation is
+ *   a) in an outer join
+ *   b) on the inner part of said join
+ *
+ * The function returns true only if both conditions above hold true
+ */
+static bool
+IsInnerTableOfOuterJoin(RelationRestriction *relationRestriction)
+{
+	RestrictInfo *joinInfo = NULL;
+	foreach_ptr(joinInfo, relationRestriction->relOptInfo->joininfo)
+	{
+		if (joinInfo->outer_relids == NULL)
+		{
+			/* not an outer join */
+			continue;
+		}
+
+		/*
+		 * This join restriction info describes an outer join, we need to figure out if
+		 * our table is in the non outer part of this join. If that is the case this is a
+		 * non outer table of an outer join.
+		 */
+		bool isInOuter = bms_is_member(relationRestriction->relOptInfo->relid,
+									   joinInfo->outer_relids);
+		if (!isInOuter)
+		{
+			/* this table is joined in the inner part of an outer join */
+			return true;
+		}
+	}
+
+	/* we have not found any join clause that satisfies both requirements */
+	return false;
 }
 
 
@@ -2252,27 +2299,26 @@ ErrorIfUnsupportedShardDistribution(Query *query)
 	foreach(relationIdCell, relationIdList)
 	{
 		Oid relationId = lfirst_oid(relationIdCell);
-		char partitionMethod = PartitionMethod(relationId);
-		if (partitionMethod == DISTRIBUTE_BY_RANGE)
+		if (IsCitusTableType(relationId, RANGE_DISTRIBUTED))
 		{
 			rangeDistributedRelationCount++;
 			nonReferenceRelations = lappend_oid(nonReferenceRelations,
 												relationId);
 		}
-		else if (partitionMethod == DISTRIBUTE_BY_HASH)
+		else if (IsCitusTableType(relationId, HASH_DISTRIBUTED))
 		{
 			hashDistributedRelationCount++;
 			nonReferenceRelations = lappend_oid(nonReferenceRelations,
 												relationId);
 		}
-		else if (partitionMethod == DISTRIBUTE_BY_NONE)
+		else if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
-			/* do not need to handle reference tables */
+			/* do not need to handle non-distributed tables */
 			continue;
 		}
 		else
 		{
-			DistTableCacheEntry *distTableEntry = DistributedTableCacheEntry(relationId);
+			CitusTableCacheEntry *distTableEntry = GetCitusTableCacheEntry(relationId);
 			if (distTableEntry->hasOverlappingShardInterval)
 			{
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2343,7 +2389,7 @@ ErrorIfUnsupportedShardDistribution(Query *query)
 static Task *
 QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 						RelationRestrictionContext *restrictionContext, uint32 taskId,
-						TaskType taskType, bool modifyRequiresMasterEvaluation)
+						TaskType taskType, bool modifyRequiresCoordinatorEvaluation)
 {
 	Query *taskQuery = copyObject(originalQuery);
 
@@ -2378,10 +2424,10 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 		Oid relationId = relationRestriction->relationId;
 		ShardInterval *shardInterval = NULL;
 
-		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(relationId);
-		if (cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE)
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
-			/* reference table only has one shard */
+			/* non-distributed tables have only one shard */
 			shardInterval = cacheEntry->sortedShardIntervalArray[0];
 
 			/* only use reference table as anchor shard if none exists yet */
@@ -2406,19 +2452,21 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 			anchorShardId = shardInterval->shardId;
 		}
 
-		taskShardList = lappend(taskShardList, list_make1(shardInterval));
+		ShardInterval *copiedShardInterval = CopyShardInterval(shardInterval);
+
+		taskShardList = lappend(taskShardList, list_make1(copiedShardInterval));
 
 		RelationShard *relationShard = CitusMakeNode(RelationShard);
-		relationShard->relationId = shardInterval->relationId;
-		relationShard->shardId = shardInterval->shardId;
+		relationShard->relationId = copiedShardInterval->relationId;
+		relationShard->shardId = copiedShardInterval->shardId;
 
 		relationShardList = lappend(relationShardList, relationShard);
 	}
 
 	Assert(anchorShardId != INVALID_SHARD_ID);
 
-	List *selectPlacementList = WorkersContainingAllShards(taskShardList);
-	if (list_length(selectPlacementList) == 0)
+	List *taskPlacementList = PlacementsForWorkersContainingAllShards(taskShardList);
+	if (list_length(taskPlacementList) == 0)
 	{
 		ereport(ERROR, (errmsg("cannot find a worker that has active placements for all "
 							   "shards in the query")));
@@ -2443,8 +2491,8 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 
 	Task *subqueryTask = CreateBasicTask(jobId, taskId, taskType, NULL);
 
-	if ((taskType == MODIFY_TASK && !modifyRequiresMasterEvaluation) ||
-		taskType == SELECT_TASK)
+	if ((taskType == MODIFY_TASK && !modifyRequiresCoordinatorEvaluation) ||
+		taskType == READ_TASK)
 	{
 		pg_get_query_def(taskQuery, queryString);
 		ereport(DEBUG4, (errmsg("distributed statement: %s",
@@ -2454,7 +2502,7 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 
 	subqueryTask->dependentTaskList = NULL;
 	subqueryTask->anchorShardId = anchorShardId;
-	subqueryTask->taskPlacementList = selectPlacementList;
+	subqueryTask->taskPlacementList = taskPlacementList;
 	subqueryTask->relationShardList = relationShardList;
 
 	return subqueryTask;
@@ -2472,8 +2520,13 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 bool
 CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 {
-	DistTableCacheEntry *firstTableCache = DistributedTableCacheEntry(firstRelationId);
-	DistTableCacheEntry *secondTableCache = DistributedTableCacheEntry(secondRelationId);
+	if (firstRelationId == secondRelationId)
+	{
+		return true;
+	}
+
+	CitusTableCacheEntry *firstTableCache = GetCitusTableCacheEntry(firstRelationId);
+	CitusTableCacheEntry *secondTableCache = GetCitusTableCacheEntry(secondRelationId);
 
 	ShardInterval **sortedFirstIntervalArray = firstTableCache->sortedShardIntervalArray;
 	ShardInterval **sortedSecondIntervalArray =
@@ -2483,13 +2536,13 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 	FmgrInfo *comparisonFunction = firstTableCache->shardIntervalCompareFunction;
 
 	/* reference tables are always & only copartitioned with reference tables */
-	if (firstTableCache->partitionMethod == DISTRIBUTE_BY_NONE &&
-		secondTableCache->partitionMethod == DISTRIBUTE_BY_NONE)
+	if (IsCitusTableTypeCacheEntry(firstTableCache, CITUS_TABLE_WITH_NO_DIST_KEY) &&
+		IsCitusTableTypeCacheEntry(secondTableCache, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		return true;
 	}
-	else if (firstTableCache->partitionMethod == DISTRIBUTE_BY_NONE ||
-			 secondTableCache->partitionMethod == DISTRIBUTE_BY_NONE)
+	else if (IsCitusTableTypeCacheEntry(firstTableCache, CITUS_TABLE_WITH_NO_DIST_KEY) ||
+			 IsCitusTableTypeCacheEntry(secondTableCache, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		return false;
 	}
@@ -2524,8 +2577,8 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 	 * different values for the same value. int vs bigint can be given as an
 	 * example.
 	 */
-	if (firstTableCache->partitionMethod == DISTRIBUTE_BY_HASH ||
-		secondTableCache->partitionMethod == DISTRIBUTE_BY_HASH)
+	if (IsCitusTableTypeCacheEntry(firstTableCache, HASH_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(secondTableCache, HASH_DISTRIBUTED))
 	{
 		return false;
 	}
@@ -2733,7 +2786,7 @@ SqlTaskList(Job *job)
 		StringInfo sqlQueryString = makeStringInfo();
 		pg_get_query_def(taskQuery, sqlQueryString);
 
-		Task *sqlTask = CreateBasicTask(jobId, taskIdIndex, SELECT_TASK,
+		Task *sqlTask = CreateBasicTask(jobId, taskIdIndex, READ_TASK,
 										sqlQueryString->data);
 		sqlTask->dependentTaskList = dataFetchTaskList;
 		sqlTask->relationShardList = BuildRelationShardList(fragmentRangeTableList,
@@ -2923,8 +2976,8 @@ AnchorRangeTableIdList(List *rangeTableList, List *baseRangeTableIdList)
 
 
 /*
- * AdjustColumnOldAttributes adjust the old tableId (varnoold) and old columnId
- * (varoattno), and sets them equal to the new values. We need this adjustment
+ * AdjustColumnOldAttributes adjust the old tableId (varnosyn) and old columnId
+ * (varattnosyn), and sets them equal to the new values. We need this adjustment
  * for partition pruning where we compare these columns with partition columns
  * loaded from system catalogs. Since columns loaded from system catalogs always
  * have the same old and new values, we also need to adjust column values here.
@@ -2938,8 +2991,8 @@ AdjustColumnOldAttributes(List *expressionList)
 	foreach(columnCell, columnList)
 	{
 		Var *column = (Var *) lfirst(columnCell);
-		column->varnoold = column->varno;
-		column->varoattno = column->varattno;
+		column->varnosyn = column->varno;
+		column->varattnosyn = column->varattno;
 	}
 }
 
@@ -3203,6 +3256,43 @@ GetOperatorByType(Oid typeId, Oid accessMethodId, int16 strategyNumber)
 
 
 /*
+ * BinaryOpExpression checks that a given expression is a binary operator. If
+ * this is the case it returns true and sets leftOperand and rightOperand to
+ * the left and right hand side of the operator. left/rightOperand will be
+ * stripped of implicit coercions by strip_implicit_coercions.
+ */
+bool
+BinaryOpExpression(Expr *clause, Node **leftOperand, Node **rightOperand)
+{
+	if (!is_opclause(clause) || list_length(((OpExpr *) clause)->args) != 2)
+	{
+		if (leftOperand != NULL)
+		{
+			*leftOperand = NULL;
+		}
+		if (rightOperand != NULL)
+		{
+			*leftOperand = NULL;
+		}
+		return false;
+	}
+	if (leftOperand != NULL)
+	{
+		*leftOperand = get_leftop(clause);
+		Assert(*leftOperand != NULL);
+		*leftOperand = strip_implicit_coercions(*leftOperand);
+	}
+	if (rightOperand != NULL)
+	{
+		*rightOperand = get_rightop(clause);
+		Assert(*rightOperand != NULL);
+		*rightOperand = strip_implicit_coercions(*rightOperand);
+	}
+	return true;
+}
+
+
+/*
  * SimpleOpExpression checks that given expression is a simple operator
  * expression. A simple operator expression is a binary operator expression with
  * operands of a var and a non-null constant.
@@ -3210,23 +3300,14 @@ GetOperatorByType(Oid typeId, Oid accessMethodId, int16 strategyNumber)
 bool
 SimpleOpExpression(Expr *clause)
 {
-	Node *leftOperand = NULL;
-	Node *rightOperand = NULL;
 	Const *constantClause = NULL;
 
-	if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
+	Node *leftOperand;
+	Node *rightOperand;
+	if (!BinaryOpExpression(clause, &leftOperand, &rightOperand))
 	{
-		leftOperand = get_leftop(clause);
-		rightOperand = get_rightop(clause);
+		return false;
 	}
-	else
-	{
-		return false; /* not a binary opclause */
-	}
-
-	/* strip coercions before doing check */
-	leftOperand = strip_implicit_coercions(leftOperand);
-	rightOperand = strip_implicit_coercions(rightOperand);
 
 	if (IsA(rightOperand, Const) && IsA(leftOperand, Var))
 	{
@@ -3259,13 +3340,13 @@ SimpleOpExpression(Expr *clause)
 bool
 OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn)
 {
-	Node *leftOperand = get_leftop((Expr *) operatorExpression);
-	Node *rightOperand = get_rightop((Expr *) operatorExpression);
+	Node *leftOperand;
+	Node *rightOperand;
+	if (!BinaryOpExpression((Expr *) operatorExpression, &leftOperand, &rightOperand))
+	{
+		return false;
+	}
 	Var *column = NULL;
-
-	/* strip coercions before doing check */
-	leftOperand = strip_implicit_coercions(leftOperand);
-	rightOperand = strip_implicit_coercions(rightOperand);
 
 	if (IsA(leftOperand, Var))
 	{
@@ -3335,14 +3416,20 @@ UpdateConstraint(Node *baseConstraint, ShardInterval *shardInterval)
 	Assert(shardInterval != NULL);
 	Assert(shardInterval->minValueExists);
 	Assert(shardInterval->maxValueExists);
+	Assert(minNode != NULL);
+	Assert(maxNode != NULL);
 	Assert(IsA(minNode, Const));
 	Assert(IsA(maxNode, Const));
 
 	Const *minConstant = (Const *) minNode;
 	Const *maxConstant = (Const *) maxNode;
 
-	minConstant->constvalue = shardInterval->minValue;
-	maxConstant->constvalue = shardInterval->maxValue;
+	minConstant->constvalue = datumCopy(shardInterval->minValue,
+										shardInterval->valueByVal,
+										shardInterval->valueTypeLen);
+	maxConstant->constvalue = datumCopy(shardInterval->maxValue,
+										shardInterval->valueByVal,
+										shardInterval->valueTypeLen);
 
 	minConstant->constisnull = false;
 	maxConstant->constisnull = false;
@@ -3474,7 +3561,7 @@ NodeIsRangeTblRefReferenceTable(Node *node, List *rangeTableList)
 	{
 		return false;
 	}
-	return PartitionMethod(rangeTableEntry->relid) == DISTRIBUTE_BY_NONE;
+	return IsCitusTableType(rangeTableEntry->relid, REFERENCE_TABLE);
 }
 
 
@@ -3646,15 +3733,12 @@ PartitionedOnColumn(Var *column, List *rangeTableList, List *dependentJobList)
 	if (rangeTableType == CITUS_RTE_RELATION)
 	{
 		Oid relationId = rangeTableEntry->relid;
-		char partitionMethod = PartitionMethod(relationId);
 		Var *partitionColumn = PartitionColumn(relationId, rangeTableId);
 
-		/* reference tables do not have partition columns */
-		if (partitionMethod == DISTRIBUTE_BY_NONE)
+		/* non-distributed tables do not have partition columns */
+		if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY))
 		{
-			partitionedOnColumn = false;
-
-			return partitionedOnColumn;
+			return false;
 		}
 
 		if (partitionColumn->varattno == column->varattno)
@@ -3836,10 +3920,10 @@ FragmentInterval(RangeTableFragment *fragment)
 bool
 ShardIntervalsOverlap(ShardInterval *firstInterval, ShardInterval *secondInterval)
 {
-	DistTableCacheEntry *intervalRelation =
-		DistributedTableCacheEntry(firstInterval->relationId);
+	CitusTableCacheEntry *intervalRelation =
+		GetCitusTableCacheEntry(firstInterval->relationId);
 
-	Assert(intervalRelation->partitionMethod != DISTRIBUTE_BY_NONE);
+	Assert(IsCitusTableTypeCacheEntry(intervalRelation, DISTRIBUTED_TABLE));
 
 	FmgrInfo *comparisonFunction = intervalRelation->shardIntervalCompareFunction;
 	Oid collation = intervalRelation->partitionColumn->varcollid;
@@ -4331,7 +4415,7 @@ GenerateSyntheticShardIntervalArray(int partitionCount)
 		ShardInterval *shardInterval = CitusMakeNode(ShardInterval);
 
 		/* calculate the split of the hash space */
-		int32 shardMinHashToken = INT32_MIN + (shardIndex * hashTokenIncrement);
+		int32 shardMinHashToken = PG_INT32_MIN + (shardIndex * hashTokenIncrement);
 		int32 shardMaxHashToken = shardMinHashToken + (hashTokenIncrement - 1);
 
 		shardInterval->relationId = InvalidOid;
@@ -4361,6 +4445,22 @@ RowModifyLevelForQuery(Query *query)
 
 	if (commandType == CMD_SELECT)
 	{
+		if (query->hasModifyingCTE)
+		{
+			/* skip checking for INSERT as those CTEs are recursively planned */
+			CommonTableExpr *cte = NULL;
+			foreach_ptr(cte, query->cteList)
+			{
+				Query *cteQuery = (Query *) cte->ctequery;
+
+				if (cteQuery->commandType == CMD_UPDATE ||
+					cteQuery->commandType == CMD_DELETE)
+				{
+					return ROW_MODIFY_NONCOMMUTATIVE;
+				}
+			}
+		}
+
 		return ROW_MODIFY_READONLY;
 	}
 
@@ -4520,25 +4620,6 @@ MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList, uint32 taskIdIndex)
 			mergeTask = CreateBasicTask(jobId, mergeTaskId, MERGE_TASK,
 										mergeQueryString->data);
 		}
-		else
-		{
-			StringInfo mergeTableQueryString =
-				MergeTableQueryString(taskIdIndex, targetEntryList);
-			char *escapedMergeTableQueryString =
-				quote_literal_cstr(mergeTableQueryString->data);
-			StringInfo intermediateTableQueryString =
-				IntermediateTableQueryString(jobId, taskIdIndex, reduceQuery);
-			char *escapedIntermediateTableQueryString =
-				quote_literal_cstr(intermediateTableQueryString->data);
-			StringInfo mergeAndRunQueryString = makeStringInfo();
-			appendStringInfo(mergeAndRunQueryString, MERGE_FILES_AND_RUN_QUERY_COMMAND,
-							 jobId, taskIdIndex, escapedMergeTableQueryString,
-							 escapedIntermediateTableQueryString);
-
-			mergeTask = CreateBasicTask(jobId, mergeTaskId, MERGE_TASK,
-										mergeAndRunQueryString->data);
-		}
-
 		mergeTask->partitionId = partitionId;
 		taskIdIndex++;
 
@@ -4555,10 +4636,10 @@ MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList, uint32 taskIdIndex)
 			uint32 mapTaskNodePort = mapTaskPlacement->nodePort;
 
 			/*
-			 * If replication factor is 1, then we know that we will use the first and
-			 * the only placement. If task tracker is used, then it will regenerate the
-			 * query string because if there are multiple placements then it does not
-			 * know in which placement the parent map task was successful.
+			 * We will use the first node even if replication factor is greater than 1
+			 * When replication factor is greater than 1 and there
+			 * is a connection problem to the node that has done the map task, we will get
+			 * an error in fetch task execution.
 			 */
 			StringInfo mapFetchQueryString = makeStringInfo();
 			appendStringInfo(mapFetchQueryString, MAP_OUTPUT_FETCH_COMMAND,
@@ -4871,7 +4952,7 @@ TaskListAppendUnique(List *list, Task *task)
 
 
 /*
- * TaskListConcatUnique append to list1 each member of list2  that isn't
+ * TaskListConcatUnique append to list1 each member of list2 that isn't
  * already in list1. Whether an element is already a member of the list
  * is determined via TaskListMember().
  */
@@ -5086,7 +5167,7 @@ GreedyAssignTask(WorkerNode *workerNode, List *taskList, List *activeShardPlacem
 				rotatePlacementListBy = replicaIndex;
 
 				/* overwrite task list to signal that this task is assigned */
-				taskCell->data.ptr_value = NULL;
+				SetListCellPtr(taskCell, NULL);
 				break;
 			}
 		}
@@ -5125,7 +5206,7 @@ List *
 FirstReplicaAssignTaskList(List *taskList)
 {
 	/* No additional reordering need take place for this algorithm */
-	List *(*reorderFunction)(Task *, List *) = NULL;
+	ReorderFunction reorderFunction = NULL;
 
 	taskList = ReorderAndAssignTaskList(taskList, reorderFunction);
 
@@ -5152,8 +5233,8 @@ RoundRobinAssignTaskList(List *taskList)
 
 /*
  * RoundRobinReorder implements the core of the round-robin assignment policy.
- * It takes a task and placement list and rotates a copy of the placement list
- * based on the latest stable transaction id provided by PostgreSQL.
+ * It takes a placement list and rotates a copy of it based on the latest stable
+ * transaction id provided by PostgreSQL.
  *
  * We prefer to use transactionId as the seed for the rotation to use the replicas
  * in the same worker node within the same transaction. This becomes more important
@@ -5166,7 +5247,7 @@ RoundRobinAssignTaskList(List *taskList)
  * where as task-assignment happens duing the planning.
  */
 List *
-RoundRobinReorder(Task *task, List *placementList)
+RoundRobinReorder(List *placementList)
 {
 	TransactionId transactionId = GetMyProcLocalTransactionId();
 	uint32 activePlacementCount = list_length(placementList);
@@ -5185,7 +5266,7 @@ RoundRobinReorder(Task *task, List *placementList)
  * by rotation or shuffling). Returns the task list with placements assigned.
  */
 static List *
-ReorderAndAssignTaskList(List *taskList, List * (*reorderFunction)(Task *, List *))
+ReorderAndAssignTaskList(List *taskList, ReorderFunction reorderFunction)
 {
 	List *assignedTaskList = NIL;
 	ListCell *taskCell = NULL;
@@ -5216,7 +5297,7 @@ ReorderAndAssignTaskList(List *taskList, List * (*reorderFunction)(Task *, List 
 		{
 			if (reorderFunction != NULL)
 			{
-				placementList = reorderFunction(task, placementList);
+				placementList = reorderFunction(placementList);
 			}
 			task->taskPlacementList = placementList;
 
@@ -5433,7 +5514,7 @@ AssignDualHashTaskList(List *taskList)
 	 * if subsequent jobs have a small number of tasks, we won't allocate the
 	 * tasks to the same worker repeatedly.
 	 */
-	List *workerNodeList = ActiveReadableWorkerNodeList();
+	List *workerNodeList = ActiveReadableNodeList();
 	uint32 workerNodeCount = (uint32) list_length(workerNodeList);
 	uint32 beginningNodeIndex = jobId % workerNodeCount;
 
@@ -5455,9 +5536,7 @@ AssignDualHashTaskList(List *taskList)
 			WorkerNode *workerNode = list_nth(workerNodeList, assignmentIndex);
 
 			ShardPlacement *taskPlacement = CitusMakeNode(ShardPlacement);
-			taskPlacement->nodeName = pstrdup(workerNode->workerName);
-			taskPlacement->nodePort = workerNode->workerPort;
-			taskPlacement->nodeId = workerNode->nodeId;
+			SetPlacementNodeMetadata(taskPlacement, workerNode);
 
 			taskPlacementList = lappend(taskPlacementList, taskPlacement);
 		}
@@ -5475,6 +5554,19 @@ AssignDualHashTaskList(List *taskList)
 	}
 
 	return assignedTaskList;
+}
+
+
+/*
+ * SetPlacementNodeMetadata sets nodename, nodeport, nodeid and groupid for the placement.
+ */
+void
+SetPlacementNodeMetadata(ShardPlacement *placement, WorkerNode *workerNode)
+{
+	placement->nodeName = pstrdup(workerNode->workerName);
+	placement->nodePort = workerNode->workerPort;
+	placement->nodeId = workerNode->nodeId;
+	placement->groupId = workerNode->groupId;
 }
 
 
@@ -5509,7 +5601,7 @@ AssignDataFetchDependencies(List *taskList)
 		ListCell *dependentTaskCell = NULL;
 
 		Assert(task->taskPlacementList != NIL);
-		Assert(task->taskType == SELECT_TASK || task->taskType == MERGE_TASK);
+		Assert(task->taskType == READ_TASK || task->taskType == MERGE_TASK);
 
 		foreach(dependentTaskCell, dependentTaskList)
 		{
@@ -5546,130 +5638,4 @@ TaskListHighestTaskId(List *taskList)
 	}
 
 	return highestTaskId;
-}
-
-
-/*
- * MergeTableQueryString builds a query string which creates a merge task table
- * within the job's schema, which should have already been created by the task
- * tracker protocol.
- */
-static StringInfo
-MergeTableQueryString(uint32 taskIdIndex, List *targetEntryList)
-{
-	StringInfo taskTableName = TaskTableName(taskIdIndex);
-	StringInfo mergeTableQueryString = makeStringInfo();
-	StringInfo mergeTableName = makeStringInfo();
-	StringInfo columnsString = makeStringInfo();
-	ListCell *targetEntryCell = NULL;
-	uint32 columnIndex = 0;
-
-	appendStringInfo(mergeTableName, "%s%s", taskTableName->data, MERGE_TABLE_SUFFIX);
-
-	uint32 columnCount = (uint32) list_length(targetEntryList);
-
-	foreach(targetEntryCell, targetEntryList)
-	{
-		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-		Node *columnExpression = (Node *) targetEntry->expr;
-		Oid columnTypeId = exprType(columnExpression);
-		int32 columnTypeMod = exprTypmod(columnExpression);
-
-		StringInfo columnNameString = makeStringInfo();
-		appendStringInfo(columnNameString, MERGE_COLUMN_FORMAT, columnIndex);
-
-		char *columnName = columnNameString->data;
-		char *columnType = format_type_with_typemod(columnTypeId, columnTypeMod);
-
-		appendStringInfo(columnsString, "%s %s", columnName, columnType);
-
-		columnIndex++;
-		if (columnIndex != columnCount)
-		{
-			appendStringInfo(columnsString, ", ");
-		}
-	}
-
-	appendStringInfo(mergeTableQueryString, CREATE_TABLE_COMMAND, mergeTableName->data,
-					 columnsString->data);
-
-	return mergeTableQueryString;
-}
-
-
-/*
- * IntermediateTableQueryString builds a query string which creates a task table
- * by running reduce query on already created merge table.
- */
-static StringInfo
-IntermediateTableQueryString(uint64 jobId, uint32 taskIdIndex, Query *reduceQuery)
-{
-	StringInfo taskTableName = TaskTableName(taskIdIndex);
-	StringInfo intermediateTableQueryString = makeStringInfo();
-	StringInfo mergeTableName = makeStringInfo();
-	StringInfo columnsString = makeStringInfo();
-	StringInfo taskReduceQueryString = makeStringInfo();
-	Query *taskReduceQuery = copyObject(reduceQuery);
-	ListCell *columnNameCell = NULL;
-	uint32 columnIndex = 0;
-
-	uint32 columnCount = FinalTargetEntryCount(reduceQuery->targetList);
-	List *columnNames = DerivedColumnNameList(columnCount, jobId);
-
-	foreach(columnNameCell, columnNames)
-	{
-		Value *columnNameValue = (Value *) lfirst(columnNameCell);
-		char *columnName = strVal(columnNameValue);
-
-		appendStringInfo(columnsString, "%s", columnName);
-
-		columnIndex++;
-		if (columnIndex != columnCount)
-		{
-			appendStringInfo(columnsString, ", ");
-		}
-	}
-
-	appendStringInfo(mergeTableName, "%s%s", taskTableName->data, MERGE_TABLE_SUFFIX);
-
-	List *rangeTableList = taskReduceQuery->rtable;
-	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) linitial(rangeTableList);
-	Alias *referenceNames = rangeTableEntry->eref;
-	referenceNames->aliasname = mergeTableName->data;
-
-	rangeTableEntry->alias = rangeTableEntry->eref;
-
-	ModifyRangeTblExtraData(rangeTableEntry, GetRangeTblKind(rangeTableEntry),
-							NULL, mergeTableName->data, NIL);
-
-	pg_get_query_def(taskReduceQuery, taskReduceQueryString);
-
-	appendStringInfo(intermediateTableQueryString, CREATE_TABLE_AS_COMMAND,
-					 taskTableName->data, columnsString->data,
-					 taskReduceQueryString->data);
-
-	return intermediateTableQueryString;
-}
-
-
-/*
- * FinalTargetEntryCount returns count of target entries in the final target
- * entry list.
- */
-static uint32
-FinalTargetEntryCount(List *targetEntryList)
-{
-	uint32 finalTargetEntryCount = 0;
-	ListCell *targetEntryCell = NULL;
-
-	foreach(targetEntryCell, targetEntryList)
-	{
-		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-		if (!targetEntry->resjunk)
-		{
-			finalTargetEntryCount++;
-		}
-	}
-
-	return finalTargetEntryCount;
 }

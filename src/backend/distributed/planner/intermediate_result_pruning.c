@@ -13,6 +13,7 @@
  */
 
 #include "distributed/citus_custom_scan.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/intermediate_result_pruning.h"
 #include "distributed/listutils.h"
 #include "distributed/log_utils.h"
@@ -20,29 +21,81 @@
 #include "distributed/query_utils.h"
 #include "distributed/worker_manager.h"
 #include "utils/builtins.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "common/hashfn.h"
+#endif
 
 /* controlled via GUC, used mostly for testing */
 bool LogIntermediateResults = false;
 
+
+static List * FindSubPlansUsedInNode(Node *node, SubPlanAccessType accessType);
 static void AppendAllAccessedWorkerNodes(IntermediateResultsHashEntry *entry,
 										 DistributedPlan *distributedPlan,
 										 int workerNodeCount);
+static void AppendAllWorkerNodes(IntermediateResultsHashEntry *entry);
 static List * FindAllRemoteWorkerNodesUsingSubplan(IntermediateResultsHashEntry *entry);
 static List * RemoveLocalNodeFromWorkerList(List *workerNodeList);
 static void LogIntermediateResultMulticastSummary(IntermediateResultsHashEntry *entry,
 												  List *workerNodeList);
-static bool UsedSubPlansEqual(UsedDistributedSubPlan *left,
-							  UsedDistributedSubPlan *right);
-static UsedDistributedSubPlan * UsedSubPlanListMember(List *list,
-													  UsedDistributedSubPlan *usedPlan);
+
+
+/*
+ * FindSubPlanUsages finds the subplans used in the master query and the
+ * job query and returns them as a combined list of UsedDistributedSubPlan
+ * structs.
+ *
+ * The list may contain duplicates if the subplan is referenced multiple
+ * times.
+ */
+List *
+FindSubPlanUsages(DistributedPlan *plan)
+{
+	List *localSubPlans = NIL;
+	List *remoteSubPlans = NIL;
+
+	if (plan->combineQuery != NULL)
+	{
+		localSubPlans = FindSubPlansUsedInNode((Node *) plan->combineQuery,
+											   SUBPLAN_ACCESS_LOCAL);
+	}
+
+	if (plan->workerJob != NULL)
+	{
+		/*
+		 * Mark the subplans as needed on remote side. Note that this decision is
+		 * revisited on execution, when the query only consists of intermediate
+		 * results.
+		 */
+		remoteSubPlans = FindSubPlansUsedInNode((Node *) plan->workerJob->jobQuery,
+												SUBPLAN_ACCESS_REMOTE);
+	}
+
+	if (plan->insertSelectQuery != NULL)
+	{
+		/* INSERT..SELECT plans currently do not have a workerJob */
+		Assert(plan->workerJob == NULL);
+
+		/*
+		 * The SELECT in an INSERT..SELECT is not fully planned yet and we cannot
+		 * perform pruning. We therefore require all subplans used in the
+		 * INSERT..SELECT to be available all nodes.
+		 */
+		remoteSubPlans = FindSubPlansUsedInNode((Node *) plan->insertSelectQuery,
+												SUBPLAN_ACCESS_ANYWHERE);
+	}
+
+	/* merge the used subplans */
+	return list_concat(localSubPlans, remoteSubPlans);
+}
 
 
 /*
  * FindSubPlansUsedInPlan finds all the subplans used by the plan by traversing
  * the input node.
  */
-List *
-FindSubPlansUsedInNode(Node *node)
+static List *
+FindSubPlansUsedInNode(Node *node, SubPlanAccessType accessType)
 {
 	List *rangeTableList = NIL;
 	ListCell *rangeTableCell = NULL;
@@ -71,14 +124,9 @@ FindSubPlansUsedInNode(Node *node)
 			UsedDistributedSubPlan *usedPlan = CitusMakeNode(UsedDistributedSubPlan);
 
 			usedPlan->subPlanId = pstrdup(resultId);
+			usedPlan->accessType = accessType;
 
-			/* the callers are responsible for setting the accurate location */
-			usedPlan->locationMask = SUBPLAN_ACCESS_NONE;
-
-			if (!UsedSubPlanListMember(usedSubPlanList, usedPlan))
-			{
-				usedSubPlanList = lappend(usedSubPlanList, usedPlan);
-			}
+			usedSubPlanList = lappend(usedSubPlanList, usedPlan);
 		}
 	}
 
@@ -106,7 +154,7 @@ RecordSubplanExecutionsOnNodes(HTAB *intermediateResultsHash,
 	List *usedSubPlanNodeList = distributedPlan->usedSubPlanNodeList;
 	List *subPlanList = distributedPlan->subPlanList;
 	ListCell *subPlanCell = NULL;
-	int workerNodeCount = GetWorkerNodeCount();
+	int workerNodeCount = ActiveReadableNonCoordinatorNodeCount();
 
 	foreach(subPlanCell, usedSubPlanNodeList)
 	{
@@ -117,33 +165,40 @@ RecordSubplanExecutionsOnNodes(HTAB *intermediateResultsHash,
 		IntermediateResultsHashEntry *entry = SearchIntermediateResult(
 			intermediateResultsHash, resultId);
 
-		if (usedPlan->locationMask & SUBPLAN_ACCESS_LOCAL)
-		{
-			/* subPlan needs to be written locally as the planner decided */
-			entry->writeLocalFile = true;
-		}
-
 		/*
-		 * There is no need to traverse the whole plan if the intermediate result
-		 * will be written to a local file and send to all nodes
+		 * There is no need to traverse the subplan if the intermediate result
+		 * will be written to a local file and sent to all nodes. Note that the
+		 * remaining subplans in the distributed plan should still be traversed.
 		 */
 		if (list_length(entry->nodeIdList) == workerNodeCount && entry->writeLocalFile)
 		{
 			elog(DEBUG4, "Subplan %s is used in all workers", resultId);
-			break;
+			continue;
 		}
-		else if (usedPlan->locationMask & SUBPLAN_ACCESS_REMOTE)
+
+		if (usedPlan->accessType == SUBPLAN_ACCESS_LOCAL)
+		{
+			/* subPlan needs to be written locally as the planner decided */
+			entry->writeLocalFile = true;
+		}
+		else if (usedPlan->accessType == SUBPLAN_ACCESS_REMOTE)
 		{
 			/*
 			 * traverse the plan and add find all worker nodes
 			 *
 			 * If we have reference tables in the distributed plan, all the
 			 * workers will be in the node list. We can improve intermediate result
-			 * pruning by deciding which reference table shard will be accessed earlier
+			 * pruning by deciding which reference table shard will be accessed earlier.
 			 */
 			AppendAllAccessedWorkerNodes(entry, distributedPlan, workerNodeCount);
 
 			elog(DEBUG4, "Subplan %s is used in %lu", resultId, distributedPlan->planId);
+		}
+		else if (usedPlan->accessType == SUBPLAN_ACCESS_ANYWHERE)
+		{
+			/* subplan is needed on all nodes */
+			entry->writeLocalFile = true;
+			AppendAllWorkerNodes(entry);
 		}
 	}
 
@@ -205,6 +260,25 @@ AppendAllAccessedWorkerNodes(IntermediateResultsHashEntry *entry,
 				return;
 			}
 		}
+	}
+}
+
+
+/*
+ * AppendAllWorkerNodes appends all node IDs of readable worker nodes to the
+ * nodeIdList, meaning the corresponding intermediate result should be sent
+ * to all readable nodes.
+ */
+static void
+AppendAllWorkerNodes(IntermediateResultsHashEntry *entry)
+{
+	List *workerNodeList = ActiveReadableNonCoordinatorNodeList();
+
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
+	{
+		entry->nodeIdList =
+			list_append_unique_int(entry->nodeIdList, workerNode->nodeId);
 	}
 }
 
@@ -299,18 +373,20 @@ RemoveLocalNodeFromWorkerList(List *workerNodeList)
 	int32 localGroupId = GetLocalGroupId();
 
 	ListCell *workerNodeCell = NULL;
+	#if PG_VERSION_NUM < PG_VERSION_13
 	ListCell *prev = NULL;
+	#endif
 	foreach(workerNodeCell, workerNodeList)
 	{
 		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
 		if (workerNode->groupId == localGroupId)
 		{
-			return list_delete_cell(workerNodeList, workerNodeCell, prev);
+			return list_delete_cell_compat(workerNodeList, workerNodeCell, prev);
 		}
-
-		prev = workerNodeCell;
 	}
-
+	#if PG_VERSION_NUM < PG_VERSION_13
+	prev = workerNodeCell;
+	#endif
 	return workerNodeList;
 }
 
@@ -379,98 +455,4 @@ SearchIntermediateResult(HTAB *intermediateResultsHash, char *resultId)
 	}
 
 	return entry;
-}
-
-
-/*
- * MergeUsedSubPlanLists is a utility function that merges the two input
- * UsedSubPlan lists. Existence of the items of the rightSubPlanList
- * checked in leftSubPlanList. If not found, items are added to
- * leftSubPlanList. If found, the locationMask fields are merged.
- *
- * Finally, the in-place modified leftSubPlanList is returned.
- */
-List *
-MergeUsedSubPlanLists(List *leftSubPlanList, List *rightSubPlanList)
-{
-	ListCell *rightListCell;
-
-	foreach(rightListCell, rightSubPlanList)
-	{
-		UsedDistributedSubPlan *memberOnRightList = lfirst(rightListCell);
-		UsedDistributedSubPlan *memberOnLeftList =
-			UsedSubPlanListMember(leftSubPlanList, memberOnRightList);
-
-		if (memberOnLeftList == NULL)
-		{
-			leftSubPlanList = lappend(leftSubPlanList, memberOnRightList);
-		}
-		else
-		{
-			memberOnLeftList->locationMask |= memberOnRightList->locationMask;
-		}
-	}
-
-	return leftSubPlanList;
-}
-
-
-/*
- * UsedSubPlanListMember is a utility function inspired from list_member(),
- * but operating on UsedDistributedSubPlan struct, which doesn't have equal()
- * function defined (similar to all Citus node types).
- */
-static UsedDistributedSubPlan *
-UsedSubPlanListMember(List *usedSubPlanList, UsedDistributedSubPlan *usedPlan)
-{
-	const ListCell *usedSubPlanCell;
-
-	foreach(usedSubPlanCell, usedSubPlanList)
-	{
-		if (UsedSubPlansEqual(lfirst(usedSubPlanCell), usedPlan))
-		{
-			return lfirst(usedSubPlanCell);
-		}
-	}
-
-	return NULL;
-}
-
-
-/*
- * UpdateUsedPlanListLocation is a utility function which iterates over the list
- * and updates the subPlanLocation to the input location.
- */
-void
-UpdateUsedPlanListLocation(List *subPlanList, int locationMask)
-{
-	ListCell *subPlanCell = NULL;
-	foreach(subPlanCell, subPlanList)
-	{
-		UsedDistributedSubPlan *subPlan = lfirst(subPlanCell);
-
-		subPlan->locationMask |= locationMask;
-	}
-}
-
-
-/*
- * UsedSubPlansEqual is a utility function inspired from equal(),
- * but operating on UsedDistributedSubPlan struct, which doesn't have equal()
- * function defined (similar to all Citus node types).
- */
-static bool
-UsedSubPlansEqual(UsedDistributedSubPlan *left, UsedDistributedSubPlan *right)
-{
-	if (left == NULL || right == NULL)
-	{
-		return false;
-	}
-
-	if (strncmp(left->subPlanId, right->subPlanId, NAMEDATALEN) == 0)
-	{
-		return true;
-	}
-
-	return false;
 }

@@ -357,7 +357,7 @@ ORDER BY nodeport;
 (2 rows)
 
 -- register after insert trigger
-SELECT * FROM run_command_on_placements('researchers', 'CREATE CONSTRAINT TRIGGER reject_large_researcher_id AFTER INSERT ON %s DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE  reject_large_id()')
+SELECT * FROM run_command_on_placements('researchers', 'CREATE CONSTRAINT TRIGGER reject_large_researcher_id AFTER INSERT ON %s DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION  reject_large_id()')
 ORDER BY nodeport, shardid;
  nodename  | nodeport | shardid | success |     result
 ---------------------------------------------------------------------
@@ -519,7 +519,7 @@ $rb$ LANGUAGE plpgsql;
 CREATE CONSTRAINT TRIGGER reject_bad
 AFTER INSERT ON objects_1200003
 DEFERRABLE INITIALLY IMMEDIATE
-FOR EACH ROW EXECUTE PROCEDURE reject_bad();
+FOR EACH ROW EXECUTE FUNCTION reject_bad();
 \c - - - :master_port
 -- test partial failure; worker_1 succeeds, 2 fails
 -- in this case, we expect the transaction to abort
@@ -570,7 +570,7 @@ $rb$ LANGUAGE plpgsql;
 CREATE CONSTRAINT TRIGGER reject_bad
 AFTER INSERT ON labs_1200002
 DEFERRABLE INITIALLY IMMEDIATE
-FOR EACH ROW EXECUTE PROCEDURE reject_bad();
+FOR EACH ROW EXECUTE FUNCTION reject_bad();
 \c - - - :master_port
 BEGIN;
 INSERT INTO objects VALUES (1, 'apple');
@@ -611,7 +611,7 @@ DROP TRIGGER reject_bad ON objects_1200003;
 CREATE CONSTRAINT TRIGGER reject_bad
 AFTER INSERT ON objects_1200003
 DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE PROCEDURE reject_bad();
+FOR EACH ROW EXECUTE FUNCTION reject_bad();
 \c - - - :master_port
 -- should be the same story as before, just at COMMIT time
 BEGIN;
@@ -654,7 +654,7 @@ DROP TRIGGER reject_bad ON labs_1200002;
 CREATE CONSTRAINT TRIGGER reject_bad
 AFTER INSERT ON labs_1200002
 DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE PROCEDURE reject_bad();
+FOR EACH ROW EXECUTE FUNCTION reject_bad();
 \c - - - :master_port
 BEGIN;
 INSERT INTO objects VALUES (1, 'apple');
@@ -856,7 +856,7 @@ $rb$ LANGUAGE plpgsql;
 CREATE CONSTRAINT TRIGGER reject_bad_reference
 AFTER INSERT ON reference_modifying_xacts_1200006
 DEFERRABLE INITIALLY IMMEDIATE
-FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+FOR EACH ROW EXECUTE FUNCTION reject_bad_reference();
 \c - - - :master_port
 \set VERBOSITY terse
 -- try without wrapping inside a transaction
@@ -873,7 +873,7 @@ DROP TRIGGER reject_bad_reference ON reference_modifying_xacts_1200006;
 CREATE CONSTRAINT TRIGGER reject_bad_reference
 AFTER INSERT ON reference_modifying_xacts_1200006
 DEFERRABLE INITIALLY  DEFERRED
-FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+FOR EACH ROW EXECUTE FUNCTION reject_bad_reference();
 \c - - - :master_port
 \set VERBOSITY terse
 -- try without wrapping inside a transaction
@@ -944,7 +944,7 @@ $rb$ LANGUAGE plpgsql;
 CREATE CONSTRAINT TRIGGER reject_bad_hash
 AFTER INSERT ON hash_modifying_xacts_1200007
 DEFERRABLE INITIALLY IMMEDIATE
-FOR EACH ROW EXECUTE PROCEDURE reject_bad_hash();
+FOR EACH ROW EXECUTE FUNCTION reject_bad_hash();
 \c - - - :master_port
 \set VERBOSITY terse
 -- the transaction as a whole should fail
@@ -967,7 +967,7 @@ DROP TRIGGER reject_bad_hash ON hash_modifying_xacts_1200007;
 CREATE CONSTRAINT TRIGGER reject_bad_hash
 AFTER INSERT ON hash_modifying_xacts_1200007
 DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE PROCEDURE reject_bad_hash();
+FOR EACH ROW EXECUTE FUNCTION reject_bad_hash();
 \c - - - :master_port
 \set VERBOSITY terse
 -- the transaction as a whole should fail
@@ -988,7 +988,7 @@ FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
 AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR
-		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
        logicalrelid        | shardstate | count
@@ -1004,7 +1004,7 @@ ORDER BY s.logicalrelid, sp.shardstate;
 CREATE CONSTRAINT TRIGGER reject_bad_reference
 AFTER INSERT ON reference_modifying_xacts_1200006
 DEFERRABLE INITIALLY IMMEDIATE
-FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+FOR EACH ROW EXECUTE FUNCTION reject_bad_reference();
 \c - - - :master_port
 \set VERBOSITY terse
 BEGIN;
@@ -1035,7 +1035,7 @@ FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
 AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR
-		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
        logicalrelid        | shardstate | count
@@ -1173,19 +1173,20 @@ SELECT create_distributed_table('numbers_hash_failure_test', 'key');
 -- and rename the existing user
 \c - :default_user - :worker_1_port
 ALTER USER test_user RENAME TO test_user_new;
+NOTICE:  not propagating ALTER ROLE ... RENAME TO commands to worker nodes
 -- connect back to master and query the reference table
  \c - test_user - :master_port
 -- should fail since the worker doesn't have test_user anymore
 INSERT INTO reference_failure_test VALUES (1, '1');
-ERROR:  connection error: localhost:xxxxx
+ERROR:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 -- the same as the above, but wrapped within a transaction
 BEGIN;
 INSERT INTO reference_failure_test VALUES (1, '1');
-ERROR:  connection error: localhost:xxxxx
+ERROR:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 COMMIT;
 BEGIN;
 COPY reference_failure_test FROM STDIN WITH (FORMAT 'csv');
-ERROR:  connection error: localhost:xxxxx
+ERROR:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 COMMIT;
 -- show that no data go through the table and shard states are good
 SET client_min_messages to 'ERROR';
@@ -1200,7 +1201,7 @@ SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
 FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
-AND      s.logicalrelid = 'reference_failure_test'::regclass	
+AND      s.logicalrelid = 'reference_failure_test'::regclass
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
       logicalrelid      | shardstate | count
@@ -1210,8 +1211,8 @@ ORDER BY s.logicalrelid, sp.shardstate;
 
 BEGIN;
 COPY numbers_hash_failure_test FROM STDIN WITH (FORMAT 'csv');
-WARNING:  connection error: localhost:xxxxx
-WARNING:  connection error: localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 -- some placements are invalid before abort
 SELECT shardid, shardstate, nodename, nodeport
 FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
@@ -1232,8 +1233,8 @@ ORDER BY shardid, nodeport;
 ABORT;
 -- verify nothing is inserted
 SELECT count(*) FROM numbers_hash_failure_test;
-WARNING:  connection error: localhost:xxxxx
-WARNING:  connection error: localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
  count
 ---------------------------------------------------------------------
      0
@@ -1258,8 +1259,8 @@ ORDER BY shardid, nodeport;
 
 BEGIN;
 COPY numbers_hash_failure_test FROM STDIN WITH (FORMAT 'csv');
-WARNING:  connection error: localhost:xxxxx
-WARNING:  connection error: localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 -- check shard states before commit
 SELECT shardid, shardstate, nodename, nodeport
 FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
@@ -1297,8 +1298,8 @@ ORDER BY shardid, nodeport;
 
 -- verify data is inserted
 SELECT count(*) FROM numbers_hash_failure_test;
-WARNING:  connection error: localhost:xxxxx
-WARNING:  connection error: localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
  count
 ---------------------------------------------------------------------
      2
@@ -1307,10 +1308,11 @@ WARNING:  connection error: localhost:xxxxx
 -- break the other node as well
 \c - :default_user - :worker_2_port
 ALTER USER test_user RENAME TO test_user_new;
+NOTICE:  not propagating ALTER ROLE ... RENAME TO commands to worker nodes
 \c - test_user - :master_port
 -- fails on all shard placements
 INSERT INTO numbers_hash_failure_test VALUES (2,2);
-ERROR:  connection error: localhost:xxxxx
+ERROR:  connection to the remote node localhost:xxxxx failed with the following error: FATAL:  role "test_user" does not exist
 -- connect back to the master with the proper user to continue the tests
 \c - :default_user - :master_port
 SET citus.next_shard_id TO 1200020;

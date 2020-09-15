@@ -1,6 +1,5 @@
 SET citus.enable_repartition_joins to ON;
 
-SET citus.task_executor_type to 'task-tracker';
 -- prevent PG 11 - PG 12 outputs to diverge
 SET citus.enable_cte_inlining TO false;
 
@@ -17,7 +16,6 @@ SELECT cte.user_id, cte.value_2 FROM cte,cte2 ORDER BY 1,2 LIMIT 10;
 
 
 SET citus.max_intermediate_result_size TO 9;
--- regular task-tracker CTE should fail
 WITH cte AS
 (
 	SELECT
@@ -100,7 +98,7 @@ WITH cte AS (
 	SELECT * FROM cte2, cte3 WHERE cte2.user_id = cte3.user_id AND cte2.user_id = 1
 	AND EXISTS (select * from cte2, cte3)
 )
-SELECT * FROM cte WHERE EXISTS (select * from cte);
+SELECT count(*) FROM cte WHERE EXISTS (select * from cte);
 
 
 SET citus.max_intermediate_result_size TO 3;
@@ -115,7 +113,7 @@ WITH cte AS (
 	)
 	SELECT * FROM cte2, cte3 WHERE cte2.value_1 IN (SELECT value_2 FROM cte3)
 )
-SELECT * FROM cte;
+SELECT count(*) FROM cte;
 
 
 -- this will fail in real_time_executor
@@ -173,7 +171,7 @@ cte4 AS (
 SELECT * FROM cte UNION ALL
 SELECT * FROM cte4 ORDER BY 1,2,3,4,5 LIMIT 5;
 
--- regular task-tracker CTE, should work since -1 disables the limit
+-- regular adaptive executor CTE, should work since -1 disables the limit
 WITH cte AS
 (
 	SELECT

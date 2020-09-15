@@ -10,6 +10,8 @@
 #include "postgres.h"
 #include "miscadmin.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include <stddef.h>
 
 #include "access/attnum.h"
@@ -35,9 +37,10 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/listutils.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/relay_utility.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/version_compat.h"
 #include "foreign/foreign.h"
@@ -126,10 +129,10 @@ get_extension_schema(Oid ext_oid)
 	HeapTuple	tuple;
 	ScanKeyData entry[1];
 
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	rel = table_open(ExtensionRelationId, AccessShareLock);
 
 	ScanKeyInit(&entry[0],
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 				Anum_pg_extension_oid,
 #else
 				ObjectIdAttributeNumber,
@@ -150,7 +153,7 @@ get_extension_schema(Oid ext_oid)
 
 	systable_endscan(scandesc);
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return result;
 	/* *INDENT-ON* */
@@ -171,7 +174,8 @@ pg_get_serverdef_string(Oid tableRelationId)
 	StringInfoData buffer = { NULL, 0, 0, 0 };
 	initStringInfo(&buffer);
 
-	appendStringInfo(&buffer, "CREATE SERVER %s", quote_identifier(server->servername));
+	appendStringInfo(&buffer, "CREATE SERVER IF NOT EXISTS %s",
+					 quote_identifier(server->servername));
 	if (server->servertype != NULL)
 	{
 		appendStringInfo(&buffer, " TYPE %s",
@@ -356,7 +360,7 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 					defaultString = deparse_expression(defaultNode, defaultContext,
 													   false, false);
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 					if (attributeForm->attgenerated == ATTRIBUTE_GENERATED_STORED)
 					{
 						appendStringInfo(&buffer, " GENERATED ALWAYS AS (%s) STORED",
@@ -419,7 +423,9 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 		/* deparse check constraint string */
 		char *checkString = deparse_expression(checkNode, checkContext, false, false);
 
+		appendStringInfoString(&buffer, "(");
 		appendStringInfoString(&buffer, checkString);
+		appendStringInfoString(&buffer, ")");
 	}
 
 	/* close create table's outer parentheses */
@@ -524,7 +530,14 @@ pg_get_tablecolumnoptionsdef_string(Oid tableRelationId)
 	 */
 	TupleDesc tupleDescriptor = RelationGetDescr(relation);
 
-	for (AttrNumber attributeIndex = 0; attributeIndex < tupleDescriptor->natts;
+	if (tupleDescriptor->natts > MaxAttrNumber)
+	{
+		ereport(ERROR, (errmsg("bad number of tuple descriptor attributes")));
+	}
+
+	AttrNumber natts = tupleDescriptor->natts;
+	for (AttrNumber attributeIndex = 0;
+		 attributeIndex < natts;
 		 attributeIndex++)
 	{
 		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
@@ -699,7 +712,7 @@ deparse_shard_reindex_statement(ReindexStmt *origStmt, Oid distrelid, int64 shar
 {
 	ReindexStmt *reindexStmt = copyObject(origStmt); /* copy to avoid modifications */
 	char *relationName = NULL;
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	const char *concurrentlyString = reindexStmt->concurrent ? "CONCURRENTLY " : "";
 #else
 	const char *concurrentlyString = "";
@@ -801,6 +814,15 @@ deparse_index_columns(StringInfo buffer, List *indexParameterList, List *deparse
 			appendStringInfo(buffer, "%s ",
 							 NameListToQuotedString(indexElement->opclass));
 		}
+#if PG_VERSION_NUM >= PG_VERSION_13
+
+		/* Commit on postgres: 911e70207703799605f5a0e8aad9f06cff067c63*/
+		if (indexElement->opclassopts != NIL)
+		{
+			ereport(ERROR, errmsg(
+						"citus currently doesn't support operator class parameters in indexes"));
+		}
+#endif
 
 		if (indexElement->ordering != SORTBY_DEFAULT)
 		{
@@ -1162,7 +1184,7 @@ pg_get_replica_identity_command(Oid tableRelationId)
 {
 	StringInfo buf = makeStringInfo();
 
-	Relation relation = heap_open(tableRelationId, AccessShareLock);
+	Relation relation = table_open(tableRelationId, AccessShareLock);
 
 	char replicaIdentity = relation->rd_rel->relreplident;
 
@@ -1190,7 +1212,7 @@ pg_get_replica_identity_command(Oid tableRelationId)
 						 relationName);
 	}
 
-	heap_close(relation, AccessShareLock);
+	table_close(relation, AccessShareLock);
 
 	return (buf->len > 0) ? buf->data : NULL;
 }

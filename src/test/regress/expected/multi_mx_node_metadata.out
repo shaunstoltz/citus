@@ -8,6 +8,8 @@ SELECT nextval('pg_catalog.pg_dist_shardid_seq') AS last_shard_id \gset
 SET citus.replication_model TO streaming;
 SET citus.shard_count TO 8;
 SET citus.shard_replication_factor TO 1;
+SET citus.replicate_reference_tables_on_activate TO off;
+\set VERBOSITY terse
 -- Simulates a readonly node by setting default_transaction_read_only.
 CREATE FUNCTION mark_node_readonly(hostname TEXT, port INTEGER, isreadonly BOOLEAN)
     RETURNS TEXT
@@ -97,7 +99,7 @@ SELECT nodeid, nodename, nodeport, hasmetadata, metadatasynced FROM pg_dist_node
 END;
 -- wait until maintenance daemon does the next metadata sync, and then
 -- check if metadata is synced again
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -138,7 +140,7 @@ SELECT nodeid, nodename, nodeport, hasmetadata, metadatasynced FROM pg_dist_node
 
 END;
 -- maintenace daemon metadata sync should fail, because node is still unwriteable.
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -157,7 +159,7 @@ SELECT 1 FROM master_update_node(:nodeid_1, 'localhost', :worker_1_port);
         1
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -173,7 +175,6 @@ SELECT nodeid, hasmetadata, metadatasynced FROM pg_dist_node;
 -- Test updating a node when another node is in readonly-mode
 ---------------------------------------------------------------------
 SELECT master_add_node('localhost', :worker_2_port) AS nodeid_2 \gset
-NOTICE:  Replicating reference table "ref_table" to the node localhost:xxxxx
 SELECT 1 FROM start_metadata_sync_to_node('localhost', :worker_2_port);
  ?column?
 ---------------------------------------------------------------------
@@ -233,7 +234,7 @@ SELECT mark_node_readonly('localhost', :worker_2_port, FALSE);
  t
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -261,7 +262,7 @@ SELECT count(*) FROM dist_table_2;
 (1 row)
 
 END;
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -274,7 +275,7 @@ SELECT mark_node_readonly('localhost', :worker_2_port, FALSE);
  t
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -312,6 +313,83 @@ SELECT verify_metadata('localhost', :worker_1_port),
 (1 row)
 
 ---------------------------------------------------------------------
+-- Test that master_update_node invalidates the plan cache
+---------------------------------------------------------------------
+PREPARE foo AS SELECT COUNT(*) FROM dist_table_1 WHERE a = 1;
+SET citus.log_remote_commands = ON;
+-- trigger caching for prepared statements
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+SELECT master_update_node(:nodeid_1, '127.0.0.1', :worker_1_port);
+ master_update_node
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT wait_until_metadata_sync(30000);
+NOTICE:  issuing LISTEN metadata_sync
+ wait_until_metadata_sync
+---------------------------------------------------------------------
+
+(1 row)
+
+-- make sure the nodename changed.
+EXECUTE foo;
+NOTICE:  issuing SELECT count(*) AS count FROM public.dist_table_1_102010 dist_table_1 WHERE (a OPERATOR(pg_catalog.=) 1)
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+SET citus.log_remote_commands TO OFF;
+---------------------------------------------------------------------
 -- Test that master_update_node can appear in a prepared transaction.
 ---------------------------------------------------------------------
 BEGIN;
@@ -323,7 +401,7 @@ SELECT 1 FROM master_update_node(:nodeid_1, 'localhost', 12345);
 
 PREPARE TRANSACTION 'tx01';
 COMMIT PREPARED 'tx01';
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -345,7 +423,7 @@ SELECT 1 FROM master_update_node(:nodeid_1, 'localhost', :worker_1_port);
 
 PREPARE TRANSACTION 'tx01';
 COMMIT PREPARED 'tx01';
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -383,7 +461,6 @@ SELECT verify_metadata('localhost', :worker_1_port);
 (1 row)
 
 SELECT 1 FROM master_activate_node('localhost', :worker_2_port);
-NOTICE:  Replicating reference table "ref_table" to the node localhost:xxxxx
  ?column?
 ---------------------------------------------------------------------
         1
@@ -404,7 +481,7 @@ SELECT master_update_node(:nodeid_2, 'localhost', 1);
 
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -415,8 +492,6 @@ UPDATE pg_dist_node SET metadatasynced = TRUE WHERE nodeid IN (:nodeid_1, :nodei
 -- should error out
 SELECT 1 FROM master_disable_node('localhost', 1);
 ERROR:  Disabling localhost:xxxxx failed
-DETAIL:  connection error: localhost:xxxxx
-HINT:  If you are using MX, try stop_metadata_sync_to_node(hostname, port) for nodes that are down before disabling them.
 -- try again after stopping metadata sync
 SELECT stop_metadata_sync_to_node('localhost', 1);
  stop_metadata_sync_to_node
@@ -442,14 +517,13 @@ SELECT master_update_node(:nodeid_2, 'localhost', :worker_2_port);
 
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
 (1 row)
 
 SELECT 1 FROM master_activate_node('localhost', :worker_2_port);
-NOTICE:  Replicating reference table "ref_table" to the node localhost:xxxxx
  ?column?
 ---------------------------------------------------------------------
         1
@@ -471,7 +545,7 @@ SELECT master_update_node(:nodeid_1, 'localhost', 1);
 
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -482,8 +556,6 @@ UPDATE pg_dist_node SET metadatasynced = TRUE WHERE nodeid IN (:nodeid_1, :nodei
 -- should error out
 SELECT 1 FROM master_disable_node('localhost', :worker_2_port);
 ERROR:  Disabling localhost:xxxxx failed
-DETAIL:  connection error: localhost:xxxxx
-HINT:  If you are using MX, try stop_metadata_sync_to_node(hostname, port) for nodes that are down before disabling them.
 -- try again after stopping metadata sync
 SELECT stop_metadata_sync_to_node('localhost', 1);
  stop_metadata_sync_to_node
@@ -504,14 +576,13 @@ SELECT master_update_node(:nodeid_1, 'localhost', :worker_1_port);
 
 (1 row)
 
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
 (1 row)
 
 SELECT 1 FROM master_activate_node('localhost', :worker_2_port);
-NOTICE:  Replicating reference table "ref_table" to the node localhost:xxxxx
  ?column?
 ---------------------------------------------------------------------
         1

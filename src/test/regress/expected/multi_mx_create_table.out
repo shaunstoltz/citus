@@ -58,6 +58,11 @@ CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
 CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
 -- now create required stuff in the worker 1
 \c - - - :worker_1_port
+-- show that we do not support creating citus local tables from mx workers for now
+CREATE TABLE citus_local_table(a int);
+SELECT create_citus_local_table('citus_local_table');
+ERROR:  operation is not allowed on this node
+HINT:  Connect to the coordinator and run it again.
 -- create schema to test schema support
 CREATE SCHEMA citus_mx_test_schema_join_1;
 CREATE SCHEMA citus_mx_test_schema_join_2;
@@ -454,18 +459,18 @@ FROM pg_dist_partition NATURAL JOIN shard_counts
 ORDER BY colocationid, logicalrelid;
                       logicalrelid                      | colocationid | shard_count | partmethod | repmodel
 ---------------------------------------------------------------------
- citus_mx_test_schema_join_1.nation_hash                |      1390002 |           4 | h          | s
- citus_mx_test_schema_join_1.nation_hash_2              |      1390002 |           4 | h          | s
- citus_mx_test_schema_join_2.nation_hash                |      1390002 |           4 | h          | s
- citus_mx_test_schema.nation_hash_collation_search_path |      1390002 |           4 | h          | s
- citus_mx_test_schema.nation_hash_composite_types       |      1390002 |           4 | h          | s
- mx_ddl_table                                           |      1390002 |           4 | h          | s
- app_analytics_events_mx                                |      1390002 |           4 | h          | s
- company_employees_mx                                   |      1390002 |           4 | h          | s
- customer_mx                                            |      1390004 |           1 | n          | t
- nation_mx                                              |      1390004 |           1 | n          | t
- part_mx                                                |      1390004 |           1 | n          | t
- supplier_mx                                            |      1390004 |           1 | n          | t
+ customer_mx                                            |      1390001 |           1 | n          | t
+ nation_mx                                              |      1390001 |           1 | n          | t
+ part_mx                                                |      1390001 |           1 | n          | t
+ supplier_mx                                            |      1390001 |           1 | n          | t
+ citus_mx_test_schema_join_1.nation_hash                |      1390003 |           4 | h          | s
+ citus_mx_test_schema_join_1.nation_hash_2              |      1390003 |           4 | h          | s
+ citus_mx_test_schema_join_2.nation_hash                |      1390003 |           4 | h          | s
+ citus_mx_test_schema.nation_hash_collation_search_path |      1390003 |           4 | h          | s
+ citus_mx_test_schema.nation_hash_composite_types       |      1390003 |           4 | h          | s
+ mx_ddl_table                                           |      1390003 |           4 | h          | s
+ app_analytics_events_mx                                |      1390003 |           4 | h          | s
+ company_employees_mx                                   |      1390003 |           4 | h          | s
  nation_hash                                            |      1390006 |          16 | h          | s
  citus_mx_test_schema.nation_hash                       |      1390006 |          16 | h          | s
  lineitem_mx                                            |      1390007 |          16 | h          | s

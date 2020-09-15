@@ -10,17 +10,18 @@ SET client_min_messages TO WARNING;
 CREATE USER reprefuser WITH LOGIN;
 SELECT run_command_on_workers('CREATE USER reprefuser WITH LOGIN');
 SET citus.enable_alter_role_propagation TO ON;
+-- alter role for other than the extension owner works in enterprise, output differs accordingly
 ALTER ROLE reprefuser WITH CREATEDB;
 
 SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
 
 -- test that coordinator pg_dist_node entry is synced to the workers
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
 
 SELECT verify_metadata('localhost', :worker_1_port),
        verify_metadata('localhost', :worker_2_port);
 
-CREATE TABLE ref(a int);
+CREATE TABLE ref(groupid int);
 SELECT create_reference_table('ref');
 
 -- alter role from mx worker isn't propagated
@@ -43,17 +44,44 @@ SET client_min_messages TO DEBUG;
 SELECT count(*) FROM ref;
 SELECT count(*) FROM ref;
 
+-- test that distributed functions also use local execution
+CREATE OR REPLACE FUNCTION my_group_id()
+RETURNS void
+LANGUAGE plpgsql
+SET search_path FROM CURRENT
+AS $$
+DECLARE
+    gid int;
+BEGIN
+    SELECT groupid INTO gid
+    FROM pg_dist_local_group;
+
+    INSERT INTO mx_add_coordinator.ref(groupid) VALUES (gid);
+END;
+$$;
+SELECT create_distributed_function('my_group_id()', colocate_with := 'ref');
+SELECT my_group_id();
+SELECT my_group_id();
+SELECT DISTINCT(groupid) FROM ref ORDER BY 1;
+TRUNCATE TABLE ref;
 -- for round-robin policy, always go to workers
 SET citus.task_assignment_policy TO "round-robin";
 SELECT count(*) FROM ref;
 SELECT count(*) FROM ref;
 SELECT count(*) FROM ref;
 
+SELECT my_group_id();
+SELECT my_group_id();
+SELECT my_group_id();
+SELECT DISTINCT(groupid) FROM ref ORDER BY 1;
+TRUNCATE TABLE ref;
+
 -- modifications always go through local shard as well as remote ones
 INSERT INTO ref VALUES (1);
 
 -- get it ready for the next executions
 TRUNCATE ref;
+ALTER TABLE ref RENAME COLUMN groupid TO a;
 
 -- test that changes from a metadata node is reflected in the coordinator placement
 \c - - - :worker_1_port
@@ -62,7 +90,7 @@ INSERT INTO ref VALUES (1), (2), (3);
 UPDATE ref SET a = a + 1;
 DELETE FROM ref WHERE a > 3;
 
--- Test we don't allow reference/local joins on mx workers
+-- Test we allow reference/local joins on mx workers
 CREATE TABLE local_table (a int);
 INSERT INTO local_table VALUES (2), (4);
 
@@ -81,10 +109,11 @@ SELECT count(*) FROM run_command_on_workers('SELECT recover_prepared_transaction
 SELECT master_remove_node('localhost', :master_port);
 
 -- test that coordinator pg_dist_node entry was removed from the workers
-SELECT wait_until_metadata_sync();
+SELECT wait_until_metadata_sync(30000);
 SELECT verify_metadata('localhost', :worker_1_port),
        verify_metadata('localhost', :worker_2_port);
 
+SET client_min_messages TO error;
 DROP SCHEMA mx_add_coordinator CASCADE;
 SET search_path TO DEFAULT;
 RESET client_min_messages;

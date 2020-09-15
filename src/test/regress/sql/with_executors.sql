@@ -1,4 +1,4 @@
--- Confirm we can use local, router, real-time, and task-tracker execution
+-- Confirm we can use local, and adaptive execution
 
 CREATE SCHEMA with_executors;
 SET search_path TO with_executors, public;
@@ -6,6 +6,10 @@ SET citus.enable_repartition_joins TO on;
 
 CREATE TABLE with_executors.local_table (id int);
 INSERT INTO local_table VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+
+CREATE TABLE ref_table (id int);
+SELECT create_reference_table('ref_table');
+INSERT INTO ref_table VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
 
 -- CTEs should be able to use local queries
 WITH cte AS (
@@ -101,7 +105,7 @@ WITH cte AS (
 SELECT * FROM cte WHERE uid=1 ORDER BY 2 LIMIT 5;
 
 
--- CTEs should be able to use task-tracker queries
+-- CTEs should be able to use adaptive executor
 WITH cte AS (
 	WITH task_tracker_1 AS (
 		SELECT
@@ -221,11 +225,31 @@ WITH cte AS (
 SELECT DISTINCT uid_1, val_3 FROM cte join events_table on cte.val_3=events_table.event_type ORDER BY 1, 2;
 
 
--- CTEs should not be able to terminate (the last SELECT) in a local query
+-- CTEs should be able to terminate (the last SELECT) in a local query
 WITH cte AS (
-	SELECT * FROM users_table
+	SELECT user_id FROM users_table
 )
-SELECT count(*) FROM cte JOIN local_table ON (user_id = id);
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id);
+
+-- not if there are no distributed tables
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id) JOIN events_table USING (user_id);
+
+-- unless the distributed table is part of a recursively planned subquery
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id) JOIN (SELECT * FROM events_table OFFSET 0) e USING (user_id);
+
+-- joins between local and reference tables not allowed
+-- since the coordinator is not in the metadata at this stage
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT count(*) FROM local_table JOIN ref_table USING (id)
+WHERE id IN (SELECT * FROM cte);
 
 -- CTEs should be able to terminate a router query
 WITH cte AS (
@@ -270,8 +294,6 @@ WITH cte AS (
 SELECT count(*) FROM cte, users_table where cte.count=user_id;
 
 
-SET citus.task_executor_type='task-tracker';
--- CTEs shouldn't be able to terminate a task-tracker query
 WITH cte_1 AS (
 	SELECT
 		u_table.user_id as u_id, e_table.event_type

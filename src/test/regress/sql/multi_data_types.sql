@@ -80,11 +80,64 @@ INSERT INTO composite_type_partitioned_table VALUES  (3, '(5, 6)'::test_composit
 INSERT INTO composite_type_partitioned_table VALUES  (4, '(7, 8)'::test_composite_type);
 INSERT INTO composite_type_partitioned_table VALUES  (5, '(9, 10)'::test_composite_type);
 
+PREPARE do_insert(int,test_composite_type) AS INSERT INTO composite_type_partitioned_table VALUES ($1,$2);
+EXECUTE do_insert(5, '(9,10)');
+EXECUTE do_insert(5, '(9,10)');
+EXECUTE do_insert(5, '(9,10)');
+EXECUTE do_insert(5, '(9,10)');
+EXECUTE do_insert(5, '(9,10)');
+EXECUTE do_insert(5, '(9,10)');
+
+PREPARE get_id(test_composite_type) AS SELECT min(id) FROM composite_type_partitioned_table WHERE col = $1;
+EXECUTE get_id('(9,10)');
+EXECUTE get_id('(9,10)');
+EXECUTE get_id('(9,10)');
+EXECUTE get_id('(9,10)');
+EXECUTE get_id('(9,10)');
+EXECUTE get_id('(9,10)');
+
+
 SELECT * FROM composite_type_partitioned_table WHERE col =  '(7, 8)'::test_composite_type;
 
 UPDATE composite_type_partitioned_table SET id = 6 WHERE col =  '(7, 8)'::test_composite_type;
 
 SELECT * FROM composite_type_partitioned_table WHERE col =  '(7, 8)'::test_composite_type;
+
+CREATE TYPE other_composite_type AS (
+    i integer,
+    i2 integer
+);
+
+-- Check that casts are correctly done on partition columns
+SELECT run_command_on_coordinator_and_workers($cf$
+    CREATE CAST (other_composite_type AS test_composite_type) WITH INOUT AS IMPLICIT;
+$cf$);
+
+INSERT INTO composite_type_partitioned_table VALUES (123, '(123, 456)'::other_composite_type);
+SELECT * FROM composite_type_partitioned_table WHERE id = 123;
+
+EXPLAIN (ANALYZE TRUE, COSTS FALSE, VERBOSE TRUE, TIMING FALSE, SUMMARY FALSE)
+INSERT INTO composite_type_partitioned_table VALUES (123, '(123, 456)'::other_composite_type);
+
+SELECT run_command_on_coordinator_and_workers($cf$
+    DROP CAST (other_composite_type as test_composite_type);
+$cf$);
+SELECT run_command_on_coordinator_and_workers($cf$
+    CREATE FUNCTION to_test_composite_type(arg other_composite_type) RETURNS test_composite_type
+        AS 'select arg::text::test_composite_type;'
+        LANGUAGE SQL
+        IMMUTABLE
+        RETURNS NULL ON NULL INPUT;
+$cf$);
+
+SELECT run_command_on_coordinator_and_workers($cf$
+    CREATE CAST (other_composite_type AS test_composite_type) WITH FUNCTION to_test_composite_type(other_composite_type) AS IMPLICIT;
+$cf$);
+INSERT INTO composite_type_partitioned_table VALUES (456, '(456, 678)'::other_composite_type);
+
+EXPLAIN (ANALYZE TRUE, COSTS FALSE, VERBOSE TRUE, TIMING FALSE, SUMMARY FALSE)
+INSERT INTO composite_type_partitioned_table VALUES (123, '(456, 678)'::other_composite_type);
+
 
 
 -- create and distribute a table on enum type column

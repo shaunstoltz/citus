@@ -12,12 +12,16 @@
 
 #include "citus_version.h"
 #include "catalog/pg_extension_d.h"
+#include "commands/defrem.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/multi_executor.h"
 #include "distributed/relation_access_tracking.h"
@@ -32,9 +36,9 @@ static char * ExtractNewExtensionVersion(Node *parseTree);
 static void AddSchemaFieldIfMissing(CreateExtensionStmt *stmt);
 static List * FilterDistributedExtensions(List *extensionObjectList);
 static List * ExtensionNameListToObjectAddressList(List *extensionObjectList);
+static void MarkExistingObjectDependenciesDistributedIfSupported(void);
 static void EnsureSequentialModeForExtensionDDL(void);
 static bool ShouldPropagateExtensionCommand(Node *parseTree);
-static bool IsDropCitusStmt(Node *parseTree);
 static bool IsAlterExtensionSetSchemaCitus(Node *parseTree);
 static Node * RecreateExtensionStmt(Oid extensionOid);
 
@@ -98,13 +102,12 @@ ExtractNewExtensionVersion(Node *parseTree)
 		Assert(false);
 	}
 
-	Value *newVersionValue = GetExtensionOption(optionsList, "new_version");
+	DefElem *newVersionValue = GetExtensionOption(optionsList, "new_version");
 
 	/* return target string safely */
 	if (newVersionValue)
 	{
-		const char *newVersion = strVal(newVersionValue);
-
+		const char *newVersion = defGetString(newVersionValue);
 		return pstrdup(newVersion);
 	}
 	else
@@ -168,6 +171,9 @@ PostprocessCreateExtensionStmt(Node *node, const char *queryString)
 	 */
 	AddSchemaFieldIfMissing(stmt);
 
+	/* always send commands with IF NOT EXISTS */
+	stmt->if_not_exists = true;
+
 	const char *createExtensionStmtSql = DeparseTreeNode(node);
 
 	/*
@@ -184,7 +190,7 @@ PostprocessCreateExtensionStmt(Node *node, const char *queryString)
 
 	MarkObjectDistributed(&extensionAddress);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -198,7 +204,7 @@ AddSchemaFieldIfMissing(CreateExtensionStmt *createExtensionStmt)
 {
 	List *optionsList = createExtensionStmt->options;
 
-	Value *schemaNameValue = GetExtensionOption(optionsList, "schema");
+	DefElem *schemaNameValue = GetExtensionOption(optionsList, "schema");
 
 	if (!schemaNameValue)
 	{
@@ -206,7 +212,7 @@ AddSchemaFieldIfMissing(CreateExtensionStmt *createExtensionStmt)
 		 * As we already created the extension by standard_ProcessUtility,
 		 * we actually know the schema it belongs to
 		 */
-		bool missingOk = false;
+		const bool missingOk = false;
 		Oid extensionOid = get_extension_oid(createExtensionStmt->extname, missingOk);
 		Oid extensionSchemaOid = get_extension_schema(extensionOid);
 		char *extensionSchemaName = get_namespace_name(extensionSchemaOid);
@@ -236,7 +242,6 @@ List *
 PreprocessDropExtensionStmt(Node *node, const char *queryString)
 {
 	DropStmt *stmt = castNode(DropStmt, node);
-	ListCell *addressCell = NULL;
 
 	if (!ShouldPropagateExtensionCommand(node))
 	{
@@ -276,9 +281,9 @@ PreprocessDropExtensionStmt(Node *node, const char *queryString)
 		distributedExtensions);
 
 	/* unmark each distributed extension */
-	foreach(addressCell, distributedExtensionAddresses)
+	ObjectAddress *address = NULL;
+	foreach_ptr(address, distributedExtensionAddresses)
 	{
-		ObjectAddress *address = (ObjectAddress *) lfirst(addressCell);
 		UnmarkObjectDistributed(address);
 	}
 
@@ -291,7 +296,6 @@ PreprocessDropExtensionStmt(Node *node, const char *queryString)
 	 */
 	stmt->objects = distributedExtensions;
 	const char *deparsedStmt = DeparseTreeNode((Node *) stmt);
-
 	stmt->objects = allDroppedExtensions;
 
 	/*
@@ -302,7 +306,7 @@ PreprocessDropExtensionStmt(Node *node, const char *queryString)
 								(void *) deparsedStmt,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -316,12 +320,11 @@ FilterDistributedExtensions(List *extensionObjectList)
 {
 	List *extensionNameList = NIL;
 
-	bool missingOk = true;
-	ListCell *objectCell = NULL;
-
-	foreach(objectCell, extensionObjectList)
+	Value *objectName = NULL;
+	foreach_ptr(objectName, extensionObjectList)
 	{
-		char *extensionName = strVal(lfirst(objectCell));
+		const char *extensionName = strVal(objectName);
+		const bool missingOk = true;
 
 		Oid extensionOid = get_extension_oid(extensionName, missingOk);
 
@@ -338,7 +341,7 @@ FilterDistributedExtensions(List *extensionObjectList)
 			continue;
 		}
 
-		extensionNameList = lappend(extensionNameList, makeString(extensionName));
+		extensionNameList = lappend(extensionNameList, objectName);
 	}
 
 	return extensionNameList;
@@ -356,17 +359,15 @@ ExtensionNameListToObjectAddressList(List *extensionObjectList)
 {
 	List *extensionObjectAddressList = NIL;
 
-	ListCell *objectCell = NULL;
-
-	foreach(objectCell, extensionObjectList)
+	Value *objectName;
+	foreach_ptr(objectName, extensionObjectList)
 	{
 		/*
 		 * We set missingOk to false as we assume all the objects in
 		 * extensionObjectList list are valid and distributed.
 		 */
-		bool missingOk = false;
-
-		const char *extensionName = strVal(lfirst(objectCell));
+		const char *extensionName = strVal(objectName);
+		const bool missingOk = false;
 
 		ObjectAddress *address = palloc0(sizeof(ObjectAddress));
 
@@ -420,7 +421,7 @@ PreprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
 								(void *) alterExtensionStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
 
@@ -453,6 +454,7 @@ List *
 PreprocessAlterExtensionUpdateStmt(Node *node, const char *queryString)
 {
 	AlterExtensionStmt *alterExtensionStmt = castNode(AlterExtensionStmt, node);
+
 	if (!ShouldPropagateExtensionCommand((Node *) alterExtensionStmt))
 	{
 		return NIL;
@@ -487,7 +489,109 @@ PreprocessAlterExtensionUpdateStmt(Node *node, const char *queryString)
 								(void *) alterExtensionStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	return NodeDDLTaskList(ALL_WORKERS, commands);
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
+}
+
+
+/*
+ * PostprocessAlterExtensionCitusUpdateStmt is called after ALTER EXTENSION
+ * citus UPDATE command is executed by standard utility hook.
+ *
+ * Actually, we do not need such a post process function for ALTER EXTENSION
+ * UPDATE commands unless the extension is Citus itself. This is because we
+ * need to mark existing objects that are not included in distributed object
+ * infrastructure in older versions of Citus (but now should be) as distributed
+ * if we really updated Citus to the available version successfully via standard
+ * utility hook.
+ */
+void
+PostprocessAlterExtensionCitusUpdateStmt(Node *node)
+{
+	/*
+	 * We should not postprocess this command in workers as they do not keep track
+	 * of citus.pg_dist_object.
+	 */
+	if (!IsCoordinator())
+	{
+		return;
+	}
+
+	bool citusIsUpdatedToLatestVersion = InstalledAndAvailableVersionsSame();
+
+	/*
+	 * Knowing that Citus version was different than the available version before
+	 * standard process utility runs ALTER EXTENSION command, we perform post
+	 * process operations if Citus is updated to that available version
+	 */
+	if (!citusIsUpdatedToLatestVersion)
+	{
+		return;
+	}
+
+	/*
+	 * Finally, mark existing objects that are not included in distributed object
+	 * infrastructure in older versions of Citus (but now should be) as distributed
+	 */
+	MarkExistingObjectDependenciesDistributedIfSupported();
+}
+
+
+/*
+ * MarkAllExistingObjectsDistributed marks all objects that could be distributed by
+ * resolving dependencies of "existing distributed tables" and "already distributed
+ * objects" to introduce the objects created in older versions of Citus to distributed
+ * object infrastructure as well.
+ *
+ * Note that this function is not responsible for ensuring if dependencies exist on
+ * nodes and satisfying these dependendencies if not exists, which is already done by
+ * EnsureDependenciesExistOnAllNodes on demand. Hence, this function is just designed
+ * to be used when "ALTER EXTENSION citus UPDATE" is executed.
+ * This is because we want to add existing objects that would have already been in
+ * pg_dist_object if we had created them in new version of Citus to pg_dist_object.
+ */
+static void
+MarkExistingObjectDependenciesDistributedIfSupported()
+{
+	/* resulting object addresses to be marked as distributed */
+	List *resultingObjectAddresses = NIL;
+
+	/* resolve dependencies of distributed tables */
+	List *distributedTableOidList = DistTableOidList();
+
+	Oid distributedTableOid = InvalidOid;
+	foreach_oid(distributedTableOid, distributedTableOidList)
+	{
+		ObjectAddress tableAddress = { 0 };
+		ObjectAddressSet(tableAddress, RelationRelationId, distributedTableOid);
+
+		List *distributableDependencyObjectAddresses =
+			GetDistributableDependenciesForObject(&tableAddress);
+
+		resultingObjectAddresses = list_concat(resultingObjectAddresses,
+											   distributableDependencyObjectAddresses);
+	}
+
+	/* resolve dependencies of the objects in pg_dist_object*/
+	List *distributedObjectAddressList = GetDistributedObjectAddressList();
+
+	ObjectAddress *distributedObjectAddress = NULL;
+	foreach_ptr(distributedObjectAddress, distributedObjectAddressList)
+	{
+		List *distributableDependencyObjectAddresses =
+			GetDistributableDependenciesForObject(distributedObjectAddress);
+
+		resultingObjectAddresses = list_concat(resultingObjectAddresses,
+											   distributableDependencyObjectAddresses);
+	}
+
+	/* remove duplicates from object addresses list for efficiency */
+	List *uniqueObjectAddresses = GetUniqueDependenciesList(resultingObjectAddresses);
+
+	ObjectAddress *objectAddress = NULL;
+	foreach_ptr(objectAddress, uniqueObjectAddresses)
+	{
+		MarkObjectDistributed(objectAddress);
+	}
 }
 
 
@@ -565,7 +669,7 @@ ShouldPropagateExtensionCommand(Node *parseTree)
 	{
 		return false;
 	}
-	else if (IsDropCitusStmt(parseTree))
+	else if (IsDropCitusExtensionStmt(parseTree))
 	{
 		return false;
 	}
@@ -614,24 +718,30 @@ IsCreateAlterExtensionUpdateCitusStmt(Node *parseTree)
 
 
 /*
- * IsDropCitusStmt iterates the objects to be dropped in a drop statement
- * and try to find citus there.
+ * IsDropCitusExtensionStmt iterates the objects to be dropped in a drop statement
+ * and try to find citus extension there.
  */
-static bool
-IsDropCitusStmt(Node *parseTree)
+bool
+IsDropCitusExtensionStmt(Node *parseTree)
 {
-	ListCell *objectCell = NULL;
-
 	/* if it is not a DropStmt, it is needless to search for citus */
 	if (!IsA(parseTree, DropStmt))
 	{
 		return false;
 	}
+	DropStmt *dropStmt = (DropStmt *) parseTree;
 
-	/* now that we have a DropStmt, check if citus is among the objects to dropped */
-	foreach(objectCell, ((DropStmt *) parseTree)->objects)
+	/* check if the drop command is a DROP EXTENSION command */
+	if (dropStmt->removeType != OBJECT_EXTENSION)
 	{
-		const char *extensionName = strVal(lfirst(objectCell));
+		return false;
+	}
+
+	/* now that we have a DropStmt, check if citus extension is among the objects to dropped */
+	Value *objectName;
+	foreach_ptr(objectName, dropStmt->objects)
+	{
+		const char *extensionName = strVal(objectName);
 
 		if (strncasecmp(extensionName, "citus", NAMEDATALEN) == 0)
 		{

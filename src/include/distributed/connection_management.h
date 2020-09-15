@@ -11,9 +11,12 @@
 #ifndef CONNECTION_MANAGMENT_H
 #define CONNECTION_MANAGMENT_H
 
+#include "postgres.h"
+
 #include "distributed/transaction_management.h"
 #include "distributed/remote_transaction.h"
 #include "lib/ilist.h"
+#include "portability/instr_time.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
@@ -23,9 +26,6 @@
 
 /* used for libpq commands that get an error buffer. Postgres docs recommend 256. */
 #define ERROR_BUFFER_SIZE 256
-
-/* default notice level */
-#define DEFAULT_CITUS_NOTICE_LEVEL DEBUG1
 
 /* application name used for internal connections in Citus */
 #define CITUS_APPLICATION_NAME "citus"
@@ -46,32 +46,36 @@ enum MultiConnectionMode
 
 	FOR_DML = 1 << 2,
 
-	/* open a connection per (co-located set of) placement(s) */
-	CONNECTION_PER_PLACEMENT = 1 << 3,
+	/*
+	 * During COPY we do not want to use a connection that accessed non-co-located
+	 * placements. If there is a connection that did not access another placement,
+	 * then use it. Otherwise open a new clean connection.
+	 */
+	REQUIRE_CLEAN_CONNECTION = 1 << 3,
 
 	OUTSIDE_TRANSACTION = 1 << 4,
 
-	/* connection has not been used to access data */
-	REQUIRE_SIDECHANNEL = 1 << 5
+	/*
+	 * Some connections are optional such as when adaptive executor is executing
+	 * a multi-shard command and requires the second (or further) connections
+	 * per node. In that case, the connection manager may decide not to allow the
+	 * connection.
+	 */
+	OPTIONAL_CONNECTION = 1 << 5,
+
+	/*
+	 * When this flag is passed, via connection throttling, the connection
+	 * establishments may be suspended until a connection slot is available to
+	 * the remote host.
+	 */
+	WAIT_FOR_CONNECTION = 1 << 6
 };
 
+
 /*
- * ConnectionPurpose defines what a connection is used for during the
- * current transaction. This is primarily to not allocate connections
- * that are needed for data access to other purposes.
+ * This state is used for keeping track of the initilization
+ * of the underlying pg_conn struct.
  */
-typedef enum ConnectionPurpose
-{
-	/* connection can be used for any purpose */
-	CONNECTION_PURPOSE_ANY,
-
-	/* connection can be used to access placements */
-	CONNECTION_PURPOSE_DATA_ACCESS,
-
-	/* connection can be used for auxiliary functions, but not data access */
-	CONNECTION_PURPOSE_SIDECHANNEL
-} ConnectionPurpose;
-
 typedef enum MultiConnectionState
 {
 	MULTI_CONNECTION_INITIAL,
@@ -81,7 +85,22 @@ typedef enum MultiConnectionState
 	MULTI_CONNECTION_LOST
 } MultiConnectionState;
 
-/* declaring this directly above makes uncrustify go crazy */
+
+/*
+ * This state is used for keeping track of the initilization
+ * of MultiConnection struct, not specifically the underlying
+ * pg_conn. The state is useful to determine the action during
+ * clean-up of connections.
+ */
+typedef enum MultiConnectionStructInitializationState
+{
+	POOL_STATE_NOT_INITIALIZED,
+	POOL_STATE_COUNTER_INCREMENTED,
+	POOL_STATE_INITIALIZED
+} MultiConnectionStructInitializationState;
+
+
+/* declaring this directly above causes uncrustify to format it badly */
 typedef enum MultiConnectionMode MultiConnectionMode;
 
 typedef struct MultiConnection
@@ -113,9 +132,6 @@ typedef struct MultiConnection
 	/* is the connection currently in use, and shouldn't be used by anything else */
 	bool claimedExclusively;
 
-	/* defines the purpose of the connection */
-	ConnectionPurpose purpose;
-
 	/* time connection establishment was started, for timeout */
 	TimestampTz connectionStart;
 
@@ -133,6 +149,8 @@ typedef struct MultiConnection
 
 	/* number of bytes sent to PQputCopyData() since last flush */
 	uint64 copyBytesWrittenSinceLastFlush;
+
+	MultiConnectionStructInitializationState initilizationState;
 } MultiConnection;
 
 
@@ -181,7 +199,7 @@ extern int MaxCachedConnectionsPerWorker;
 /* parameters used for outbound connections */
 extern char *NodeConninfo;
 
-/* the hash table */
+/* the hash tables are externally accessiable */
 extern HTAB *ConnectionHash;
 extern HTAB *ConnParamsHash;
 
@@ -199,8 +217,8 @@ extern void AddConnParam(const char *keyword, const char *value);
 extern void GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 						  Index *runtimeParamStart, MemoryContext context);
 extern const char * GetConnParam(const char *keyword);
-extern bool CheckConninfo(const char *conninfo, const char **whitelist,
-						  Size whitelistLength, char **errmsg);
+extern bool CheckConninfo(const char *conninfo, const char **allowedConninfoKeywords,
+						  Size allowedConninfoKeywordsLength, char **errmsg);
 
 
 /* Low-level connection establishment APIs */
@@ -218,8 +236,13 @@ extern MultiConnection * StartNodeUserDatabaseConnection(uint32 flags,
 														 int32 port,
 														 const char *user,
 														 const char *database);
+extern void CloseAllConnectionsAfterTransaction(void);
 extern void CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort);
+extern MultiConnection * ConnectionAvailableToNode(char *hostName, int nodePort,
+												   const char *userName,
+												   const char *database);
 extern void CloseConnection(MultiConnection *connection);
+extern void ShutdownAllConnections(void);
 extern void ShutdownConnection(MultiConnection *connection);
 
 /* dealing with a connection */
@@ -227,12 +250,9 @@ extern void FinishConnectionListEstablishment(List *multiConnectionList);
 extern void FinishConnectionEstablishment(MultiConnection *connection);
 extern void ClaimConnectionExclusively(MultiConnection *connection);
 extern void UnclaimConnection(MultiConnection *connection);
-extern long DeadlineTimestampTzToTimeout(TimestampTz deadline);
 
-/* dealing with notice handler */
-extern void SetCitusNoticeProcessor(MultiConnection *connection);
-extern char * TrimLogLevel(const char *message);
-extern void UnsetCitusNoticeLevel(void);
-
+/* time utilities */
+extern double MillisecondsPassedSince(instr_time moment);
+extern long MillisecondsToTimeout(instr_time start, long msAfterStart);
 
 #endif /* CONNECTION_MANAGMENT_H */

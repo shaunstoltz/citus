@@ -61,6 +61,7 @@ typedef struct WorkerNode
 extern int MaxWorkerNodesTracked;
 extern char *WorkerListFileName;
 extern char *CurrentCluster;
+extern bool ReplicateReferenceTablesOnActivate;
 
 
 /* Function declarations for finding worker nodes to place shards on */
@@ -69,16 +70,20 @@ extern WorkerNode * WorkerGetRoundRobinCandidateNode(List *workerNodeList,
 													 uint64 shardId,
 													 uint32 placementIndex);
 extern WorkerNode * WorkerGetLocalFirstCandidateNode(List *currentNodeList);
-extern uint32 ActivePrimaryWorkerNodeCount(void);
-extern List * ActivePrimaryWorkerNodeList(LOCKMODE lockMode);
+extern uint32 ActivePrimaryNonCoordinatorNodeCount(void);
+extern List * ActivePrimaryNonCoordinatorNodeList(LOCKMODE lockMode);
 extern List * ActivePrimaryNodeList(LOCKMODE lockMode);
+extern bool CoordinatorAddedAsWorkerNode(void);
 extern List * ReferenceTablePlacementNodeList(LOCKMODE lockMode);
+extern WorkerNode * CoordinatorNodeIfAddedAsWorkerOrError(void);
+extern void ErrorIfCoordinatorNotAddedAsWorkerNode(void);
 extern List * DistributedTablePlacementNodeList(LOCKMODE lockMode);
 extern bool NodeCanHaveDistTablePlacements(WorkerNode *node);
-extern uint32 ActiveReadableWorkerNodeCount(void);
-extern List * ActiveReadableWorkerNodeList(void);
+extern uint32 ActiveReadableNonCoordinatorNodeCount(void);
+extern List * ActiveReadableNonCoordinatorNodeList(void);
 extern List * ActiveReadableNodeList(void);
-extern WorkerNode * FindWorkerNode(char *nodeName, int32 nodePort);
+extern WorkerNode * FindWorkerNode(const char *nodeName, int32 nodePort);
+extern WorkerNode * FindWorkerNodeOrError(const char *nodeName, int32 nodePort);
 extern WorkerNode * FindWorkerNodeAnyCluster(const char *nodeName, int32 nodePort);
 extern List * ReadDistNode(bool includeNodesFromOtherClusters);
 extern void EnsureCoordinator(void);
@@ -94,5 +99,7 @@ extern WorkerNode * GetFirstPrimaryWorkerNode(void);
 /* Function declarations for worker node utilities */
 extern int CompareWorkerNodes(const void *leftElement, const void *rightElement);
 extern int WorkerNodeCompare(const void *lhsKey, const void *rhsKey, Size keySize);
+extern int NodeNamePortCompare(const char *workerLhsName, const char *workerRhsName,
+							   int workerLhsPort, int workerRhsPort);
 
 #endif   /* WORKER_MANAGER_H */

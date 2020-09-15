@@ -36,6 +36,26 @@ CREATE TABLE collections_list_0
 	PARTITION OF collections_list (key, ser, ts, collection_id, value)
 	FOR VALUES IN ( 0 );
 
+-- create a volatile function that returns the local node id
+CREATE OR REPLACE FUNCTION get_local_node_id_volatile()
+RETURNS INT AS $$
+DECLARE localGroupId int;
+BEGIN
+        SELECT groupid INTO localGroupId FROM pg_dist_local_group;
+  RETURN localGroupId;
+END; $$ language plpgsql VOLATILE;
+SELECT create_distributed_function('get_local_node_id_volatile()');
+
+-- test case for issue #3556
+CREATE TABLE accounts (id text PRIMARY KEY);
+CREATE TABLE stats (account_id text PRIMARY KEY, spent int);
+
+SELECT create_distributed_table('accounts', 'id', colocate_with => 'none');
+SELECT create_distributed_table('stats', 'account_id', colocate_with => 'accounts');
+
+INSERT INTO accounts (id) VALUES ('foo');
+INSERT INTO stats (account_id, spent) VALUES ('foo', 100);
+
 -- connection worker and get ready for the tests
 \c - - - :worker_1_port
 SET search_path TO local_shard_execution;
@@ -65,6 +85,35 @@ CREATE OR REPLACE FUNCTION shard_of_distribution_column_is_local(dist_key int) R
 		RETURN shard_is_local;
         END;
 $$ LANGUAGE plpgsql;
+
+-- test case for issue #3556
+SET citus.log_intermediate_results TO TRUE;
+SET client_min_messages TO DEBUG1;
+
+SELECT *
+FROM
+(
+    WITH accounts_cte AS (
+        SELECT id AS account_id
+        FROM accounts
+    ),
+    joined_stats_cte_1 AS (
+        SELECT spent, account_id
+        FROM stats
+        INNER JOIN accounts_cte USING (account_id)
+    ),
+    joined_stats_cte_2 AS (
+        SELECT spent, account_id
+        FROM joined_stats_cte_1
+        INNER JOIN accounts_cte USING (account_id)
+    )
+    SELECT SUM(spent) OVER (PARTITION BY coalesce(account_id, NULL))
+    FROM accounts_cte
+    INNER JOIN joined_stats_cte_2 USING (account_id)
+) inner_query;
+
+SET citus.log_intermediate_results TO DEFAULT;
+SET client_min_messages TO DEFAULT;
 
 -- pick some example values that reside on the shards locally and remote
 
@@ -154,6 +203,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM distributed_table WHERE key = 1 AND age = 20;
 
 EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF)   SELECT * FROM distributed_table WHERE key = 1 AND age = 20;
 
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF)
+WITH r AS ( SELECT GREATEST(random(), 2) z,* FROM distributed_table)
+SELECT 1 FROM r WHERE z < 3;
+
 EXPLAIN (COSTS OFF) DELETE FROM distributed_table WHERE key = 1 AND age = 20;
 
 EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF) DELETE FROM distributed_table WHERE key = 1 AND age = 20;
@@ -185,8 +238,7 @@ COPY second_distributed_table FROM STDIN WITH CSV;
 	-- (a) Unless the first query is a local query, always use distributed execution.
 	-- (b) If the executor has used local execution, it has to use local execution
 	--     for the remaining of the transaction block. If that's not possible, the
-	-- 	   executor has to error out (e.g., TRUNCATE is a utility command and we
-	--	   currently do not support local execution of utility commands)
+	-- 	   executor has to error out
 
 -- rollback should be able to rollback local execution
 BEGIN;
@@ -257,22 +309,6 @@ ROLLBACK;
 -- load some data so that foreign keys won't complain with the next tests
 INSERT INTO reference_table SELECT i FROM generate_series(500, 600) i;
 
--- a very similar set of operation, but this time use
--- COPY as the first command
-BEGIN;
-	INSERT INTO distributed_table SELECT i, i::text, i % 10 + 25 FROM generate_series(500, 600) i;
-
-	-- this could go through local execution, but doesn't because we've already
-	-- done distributed execution
-	SELECT * FROM distributed_table WHERE key = 500 ORDER BY 1,2,3;
-
-	-- utility commands could still use distributed execution
-	TRUNCATE distributed_table CASCADE;
-
-	-- ensure that TRUNCATE made it
-	SELECT * FROM distributed_table WHERE key = 500 ORDER BY 1,2,3;
-ROLLBACK;
-
 -- show that cascading foreign keys just works fine with local execution
 BEGIN;
 	INSERT INTO reference_table VALUES (701);
@@ -298,7 +334,7 @@ BEGIN;
 	SELECT count(*) FROM distributed_table WHERE key = 500;
 ROLLBACK;
 
--- a local query is followed by a command that cannot be executed locally
+-- a local query followed by TRUNCATE command can be executed locally
 BEGIN;
 	SELECT count(*) FROM distributed_table WHERE key = 1;
 	TRUNCATE distributed_table CASCADE;
@@ -308,15 +344,13 @@ ROLLBACK;
 BEGIN;
 	SELECT count(*) FROM distributed_table WHERE key = 1;
 
-	-- even no need to supply any data
-	COPY distributed_table FROM STDIN WITH CSV;
+	INSERT INTO distributed_table (key) SELECT i FROM generate_series(1,1) i;
 ROLLBACK;
 
--- a local query is followed by a command that cannot be executed locally
 BEGIN;
-	SELECT count(*) FROM distributed_table WHERE key = 1;
-
-	INSERT INTO distributed_table (key) SELECT i FROM generate_series(1,10)i;
+SET citus.enable_repartition_joins TO ON;
+SELECT count(*) FROM distributed_table;
+SELECT count(*) FROM distributed_table d1 join distributed_table d2 using(age);
 ROLLBACK;
 
 -- a local query is followed by a command that cannot be executed locally
@@ -361,6 +395,29 @@ $$ LANGUAGE plpgsql;
 
 CALL only_local_execution();
 
+-- insert a row that we need in the next tests
+INSERT INTO distributed_table VALUES (1, '11',21) ON CONFLICT(key) DO UPDATE SET value = '29';
+
+-- make sure that functions can use local execution
+CREATE OR REPLACE PROCEDURE only_local_execution_with_function_evaluation() AS $$
+		DECLARE nodeId INT;
+		BEGIN
+			-- fast path router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table WHERE key = 1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+
+			-- regular router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = 1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+		END;
+$$ LANGUAGE plpgsql;
+
+CALL only_local_execution_with_function_evaluation();
+
 CREATE OR REPLACE PROCEDURE only_local_execution_with_params(int) AS $$
 		DECLARE cnt INT;
 		BEGIN
@@ -371,6 +428,25 @@ CREATE OR REPLACE PROCEDURE only_local_execution_with_params(int) AS $$
 $$ LANGUAGE plpgsql;
 
 CALL only_local_execution_with_params(1);
+
+CREATE OR REPLACE PROCEDURE only_local_execution_with_function_evaluation_param(int) AS $$
+		DECLARE nodeId INT;
+		BEGIN
+			-- fast path router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table WHERE key = $1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+
+			-- regular router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = $1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+		END;
+$$ LANGUAGE plpgsql;
+
+CALL only_local_execution_with_function_evaluation_param(1);
 
 CREATE OR REPLACE PROCEDURE local_execution_followed_by_dist() AS $$
 		DECLARE cnt INT;
@@ -619,19 +695,13 @@ BEGIN;
 ROLLBACK;
 
 
--- task-tracker select execution
 BEGIN;
 	DELETE FROM distributed_table WHERE key = 500;
-
-	SET LOCAL citus.task_executor_type = 'task-tracker';
 
 	SELECT count(*) FROM distributed_table;
 ROLLBACK;
 
--- local execution should not be executed locally
--- becase a task-tracker query has already been executed
 BEGIN;
-	SET LOCAL citus.task_executor_type = 'task-tracker';
 	SET LOCAL client_min_messages TO INFO;
 	SELECT count(*) FROM distributed_table;
 	SET LOCAL client_min_messages TO LOG;
@@ -774,7 +844,7 @@ RESET citus.log_local_commands;
 
 \c - - - :master_port
 SET citus.next_shard_id TO 1480000;
--- local execution with custom type
+-- test both local and remote execution with custom type
 SET citus.replication_model TO "streaming";
 SET citus.shard_replication_factor TO 1;
 CREATE TYPE invite_resp AS ENUM ('yes', 'no', 'maybe');
@@ -787,6 +857,105 @@ CREATE TABLE event_responses (
 );
 
 SELECT create_distributed_table('event_responses', 'event_id');
+
+INSERT INTO event_responses VALUES (1, 1, 'yes'), (2, 2, 'yes'), (3, 3, 'no'), (4, 4, 'no');
+
+CREATE OR REPLACE FUNCTION regular_func(p invite_resp)
+RETURNS int AS $$
+DECLARE
+	q1Result INT;
+	q2Result INT;
+	q3Result INT;
+BEGIN
+SELECT count(*) INTO q1Result FROM event_responses WHERE response = $1;
+SELECT count(*) INTO q2Result FROM event_responses e1 LEFT JOIN event_responses e2 USING (event_id) WHERE e2.response = $1;
+SELECT count(*) INTO q3Result FROM (SELECT * FROM event_responses WHERE response = $1 LIMIT 5) as foo;
+RETURN  q3Result+q2Result+q1Result;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+SELECT regular_func('yes');
+
+CREATE OR REPLACE PROCEDURE regular_procedure(p invite_resp)
+AS $$
+BEGIN
+PERFORM * FROM event_responses WHERE response = $1 ORDER BY 1 DESC, 2 DESC, 3 DESC;
+PERFORM * FROM event_responses e1 LEFT JOIN event_responses e2 USING (event_id) WHERE e2.response = $1 ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC;
+PERFORM  * FROM (SELECT * FROM event_responses WHERE response = $1 LIMIT 5) as foo ORDER BY 1 DESC, 2 DESC, 3 DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+
+PREPARE multi_shard_no_dist_key(invite_resp) AS select * from event_responses where response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+EXECUTE multi_shard_no_dist_key('yes');
+
+PREPARE multi_shard_with_dist_key(int, invite_resp) AS select * from event_responses where event_id > $1 AND response = $2::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+
+PREPARE query_pushdown_no_dist_key(invite_resp) AS select * from event_responses e1 LEFT JOIN event_responses e2 USING(event_id) where e1.response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC LIMIT 1;
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+EXECUTE query_pushdown_no_dist_key('yes');
+
+PREPARE insert_select_via_coord(invite_resp) AS INSERT INTO event_responses SELECT * FROM event_responses where response = $1::invite_resp LIMIT 1 ON CONFLICT (event_id, user_id) DO NOTHING ;
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+
+PREPARE insert_select_pushdown(invite_resp) AS INSERT INTO event_responses SELECT * FROM event_responses where response = $1::invite_resp ON CONFLICT (event_id, user_id) DO NOTHING;
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+
+PREPARE router_select_with_no_dist_key_filter(invite_resp) AS select * from event_responses where event_id = 1 AND response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+EXECUTE router_select_with_no_dist_key_filter('yes');
+
+-- rest of the tests assume the table is empty
+TRUNCATE event_responses;
 
 CREATE OR REPLACE PROCEDURE register_for_event(p_event_id int, p_user_id int, p_choice invite_resp)
 LANGUAGE plpgsql AS $fn$

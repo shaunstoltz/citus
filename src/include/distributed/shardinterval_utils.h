@@ -12,7 +12,7 @@
 #ifndef SHARDINTERVAL_UTILS_H_
 #define SHARDINTERVAL_UTILS_H_
 
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "nodes/primnodes.h"
 
@@ -47,9 +47,10 @@ extern int CompareShardPlacementsByShardId(const void *leftElement,
 extern int CompareRelationShards(const void *leftElement,
 								 const void *rightElement);
 extern int ShardIndex(ShardInterval *shardInterval);
+extern int CalculateUniformHashRangeIndex(int hashedValue, int shardCount);
 extern ShardInterval * FindShardInterval(Datum partitionColumnValue,
-										 DistTableCacheEntry *cacheEntry);
-extern int FindShardIntervalIndex(Datum searchedValue, DistTableCacheEntry *cacheEntry);
+										 CitusTableCacheEntry *cacheEntry);
+extern int FindShardIntervalIndex(Datum searchedValue, CitusTableCacheEntry *cacheEntry);
 extern int SearchCachedShardInterval(Datum partitionColumnValue,
 									 ShardInterval **shardIntervalCache,
 									 int shardCount, Oid shardIntervalCollation,

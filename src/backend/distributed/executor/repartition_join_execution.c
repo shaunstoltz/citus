@@ -29,21 +29,19 @@
 #include "utils/builtins.h"
 #include "distributed/hash_helpers.h"
 
-#include "distributed/directed_acyclic_graph_execution.h"
-#include "distributed/multi_physical_planner.h"
 #include "distributed/adaptive_executor.h"
-#include "distributed/worker_manager.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_server_executor.h"
-#include "distributed/repartition_join_execution.h"
-#include "distributed/worker_transaction.h"
-#include "distributed/worker_manager.h"
-#include "distributed/transaction_management.h"
-#include "distributed/multi_task_tracker_executor.h"
-#include "distributed/worker_transaction.h"
-#include "distributed/metadata_cache.h"
+#include "distributed/directed_acyclic_graph_execution.h"
 #include "distributed/listutils.h"
+#include "distributed/local_executor.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_server_executor.h"
+#include "distributed/task_execution_utils.h"
+#include "distributed/repartition_join_execution.h"
+#include "distributed/transaction_management.h"
 #include "distributed/transmit.h"
+#include "distributed/worker_manager.h"
+#include "distributed/worker_transaction.h"
 
 
 static List * CreateTemporarySchemasForMergeTasks(Job *topLevelJob);
@@ -52,6 +50,7 @@ static void TraverseJobTree(Job *curJob, List **jobs);
 static char * GenerateCreateSchemasCommand(List *jobIds, char *schemaOwner);
 static char * GenerateJobCommands(List *jobIds, char *templateCommand);
 static char * GenerateDeleteJobsCommand(List *jobIds);
+static void EnsureCompatibleLocalExecutionState(List *taskList);
 
 
 /*
@@ -64,13 +63,34 @@ ExecuteDependentTasks(List *topLevelTasks, Job *topLevelJob)
 {
 	EnsureNoModificationsHaveBeenDone();
 
-	List *allTasks = TaskAndExecutionList(topLevelTasks);
+	List *allTasks = CreateTaskListForJobTree(topLevelTasks);
+
+	EnsureCompatibleLocalExecutionState(allTasks);
 
 	List *jobIds = CreateTemporarySchemasForMergeTasks(topLevelJob);
 
 	ExecuteTasksInDependencyOrder(allTasks, topLevelTasks, jobIds);
 
 	return jobIds;
+}
+
+
+/*
+ * EnsureCompatibleLocalExecutionState makes sure that the tasks won't have
+ * any visibility problems because of local execution.
+ */
+static void
+EnsureCompatibleLocalExecutionState(List *taskList)
+{
+	/*
+	 * We have LOCAL_EXECUTION_REQUIRED check here to avoid unnecessarily
+	 * iterating the task list in AnyTaskAccessesLocalNode.
+	 */
+	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_REQUIRED &&
+		AnyTaskAccessesLocalNode(taskList))
+	{
+		ErrorIfTransactionAccessedPlacementsLocally();
+	}
 }
 
 
@@ -83,7 +103,8 @@ CreateTemporarySchemasForMergeTasks(Job *topLeveLJob)
 {
 	List *jobIds = ExtractJobsInJobTree(topLeveLJob);
 	char *createSchemasCommand = GenerateCreateSchemasCommand(jobIds, CurrentUserName());
-	SendCommandToAllWorkers(createSchemasCommand, CitusExtensionOwnerName());
+	SendCommandToWorkersInParallel(ALL_SHARD_NODES, createSchemasCommand,
+								   CitusExtensionOwnerName());
 	return jobIds;
 }
 
@@ -108,12 +129,14 @@ ExtractJobsInJobTree(Job *job)
 static void
 TraverseJobTree(Job *curJob, List **jobIds)
 {
-	ListCell *jobCell = NULL;
-	*jobIds = lappend(*jobIds, (void *) curJob->jobId);
+	uint64 *jobIdPointer = palloc(sizeof(uint64));
+	*jobIdPointer = curJob->jobId;
 
-	foreach(jobCell, curJob->dependentJobList)
+	*jobIds = lappend(*jobIds, jobIdPointer);
+
+	Job *childJob = NULL;
+	foreach_ptr(childJob, curJob->dependentJobList)
 	{
-		Job *childJob = (Job *) lfirst(jobCell);
 		TraverseJobTree(childJob, jobIds);
 	}
 }
@@ -126,11 +149,11 @@ static char *
 GenerateCreateSchemasCommand(List *jobIds, char *ownerName)
 {
 	StringInfo createSchemaCommand = makeStringInfo();
-	ListCell *jobIdCell = NULL;
 
-	foreach(jobIdCell, jobIds)
+	uint64 *jobIdPointer = NULL;
+	foreach_ptr(jobIdPointer, jobIds)
 	{
-		uint64 jobId = (uint64) lfirst(jobIdCell);
+		uint64 jobId = *jobIdPointer;
 		appendStringInfo(createSchemaCommand, WORKER_CREATE_SCHEMA_QUERY,
 						 jobId, quote_literal_cstr(ownerName));
 	}
@@ -149,11 +172,11 @@ static char *
 GenerateJobCommands(List *jobIds, char *templateCommand)
 {
 	StringInfo createSchemaCommand = makeStringInfo();
-	ListCell *jobIdCell = NULL;
 
-	foreach(jobIdCell, jobIds)
+	uint64 *jobIdPointer = NULL;
+	foreach_ptr(jobIdPointer, jobIds)
 	{
-		uint64 jobId = (uint64) lfirst(jobIdCell);
+		uint64 jobId = *jobIdPointer;
 		appendStringInfo(createSchemaCommand, templateCommand, jobId);
 	}
 	return createSchemaCommand->data;
@@ -167,9 +190,9 @@ GenerateJobCommands(List *jobIds, char *templateCommand)
 void
 DoRepartitionCleanup(List *jobIds)
 {
-	SendOptionalCommandListToAllWorkers(list_make1(GenerateDeleteJobsCommand(
-													   jobIds)),
-										CitusExtensionOwnerName());
+	SendCommandToWorkersOptionalInParallel(ALL_SHARD_NODES, GenerateDeleteJobsCommand(
+											   jobIds),
+										   CitusExtensionOwnerName());
 }
 
 

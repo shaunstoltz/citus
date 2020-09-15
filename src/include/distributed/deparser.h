@@ -18,6 +18,7 @@
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "catalog/objectaddress.h"
+#include "lib/stringinfo.h"
 
 /* forward declarations for format_collate.c */
 /* Control flags for FormatCollateExtended, compatible with format_type_extended */
@@ -87,6 +88,8 @@ extern char * DeparseAlterFunctionSchemaStmt(Node *stmt);
 extern char * DeparseAlterFunctionOwnerStmt(Node *stmt);
 extern char * DeparseAlterFunctionDependsStmt(Node *stmt);
 
+extern void AppendVariableSet(StringInfo buf, VariableSetStmt *setStmt);
+
 extern void QualifyAlterFunctionStmt(Node *stmt);
 extern void QualifyRenameFunctionStmt(Node *stmt);
 extern void QualifyAlterFunctionSchemaStmt(Node *stmt);
@@ -95,10 +98,15 @@ extern void QualifyAlterFunctionDependsStmt(Node *stmt);
 
 /* forward declarations for deparse_role_stmts.c */
 extern char * DeparseAlterRoleStmt(Node *stmt);
+extern char * DeparseAlterRoleSetStmt(Node *stmt);
+
+extern List * MakeSetStatementArguments(char *configurationName,
+										char *configurationValue);
+extern void QualifyAlterRoleSetStmt(Node *stmt);
 
 /* forward declarations for deparse_extension_stmts.c */
-extern Value * GetExtensionOption(List *extensionOptions,
-								  const char *defname);
+extern DefElem * GetExtensionOption(List *extensionOptions,
+									const char *defname);
 extern char * DeparseCreateExtensionStmt(Node *stmt);
 extern char * DeparseDropExtensionStmt(Node *stmt);
 extern char * DeparseAlterExtensionSchemaStmt(Node *stmt);

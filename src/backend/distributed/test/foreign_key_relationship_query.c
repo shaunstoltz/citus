@@ -14,8 +14,9 @@
 #include "fmgr.h"
 #include "funcapi.h"
 
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-
+#include "distributed/version_compat.h"
 
 /* these functions are only exported in the regression tests */
 PG_FUNCTION_INFO_V1(get_referencing_relation_id_list);
@@ -38,14 +39,21 @@ get_referencing_relation_id_list(PG_FUNCTION_ARGS)
 	if (SRF_IS_FIRSTCALL())
 	{
 		Oid relationId = PG_GETARG_OID(0);
-		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(relationId);
-		List *refList = cacheEntry->referencingRelationsViaForeignKey;
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
 		/* create a function context for cross-call persistence */
 		functionContext = SRF_FIRSTCALL_INIT();
 
+		MemoryContext oldContext =
+			MemoryContextSwitchTo(functionContext->multi_call_memory_ctx);
+		List *refList = list_copy(
+			cacheEntry->referencingRelationsViaForeignKey);
+		ListCellAndListWrapper *wrapper = palloc0(sizeof(ListCellAndListWrapper));
 		foreignRelationCell = list_head(refList);
-		functionContext->user_fctx = foreignRelationCell;
+		wrapper->list = refList;
+		wrapper->listCell = foreignRelationCell;
+		functionContext->user_fctx = wrapper;
+		MemoryContextSwitchTo(oldContext);
 	}
 
 	/*
@@ -56,12 +64,13 @@ get_referencing_relation_id_list(PG_FUNCTION_ARGS)
 	 */
 	functionContext = SRF_PERCALL_SETUP();
 
-	foreignRelationCell = (ListCell *) functionContext->user_fctx;
-	if (foreignRelationCell != NULL)
+	ListCellAndListWrapper *wrapper =
+		(ListCellAndListWrapper *) functionContext->user_fctx;
+	if (wrapper->listCell != NULL)
 	{
-		Oid refId = lfirst_oid(foreignRelationCell);
+		Oid refId = lfirst_oid(wrapper->listCell);
 
-		functionContext->user_fctx = lnext(foreignRelationCell);
+		wrapper->listCell = lnext_compat(wrapper->list, wrapper->listCell);
 
 		SRF_RETURN_NEXT(functionContext, PointerGetDatum(refId));
 	}
@@ -89,14 +98,20 @@ get_referenced_relation_id_list(PG_FUNCTION_ARGS)
 	if (SRF_IS_FIRSTCALL())
 	{
 		Oid relationId = PG_GETARG_OID(0);
-		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(relationId);
-		List *refList = cacheEntry->referencedRelationsViaForeignKey;
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
 		/* create a function context for cross-call persistence */
 		functionContext = SRF_FIRSTCALL_INIT();
 
+		MemoryContext oldContext =
+			MemoryContextSwitchTo(functionContext->multi_call_memory_ctx);
+		List *refList = list_copy(cacheEntry->referencedRelationsViaForeignKey);
 		foreignRelationCell = list_head(refList);
-		functionContext->user_fctx = foreignRelationCell;
+		ListCellAndListWrapper *wrapper = palloc0(sizeof(ListCellAndListWrapper));
+		wrapper->list = refList;
+		wrapper->listCell = foreignRelationCell;
+		functionContext->user_fctx = wrapper;
+		MemoryContextSwitchTo(oldContext);
 	}
 
 	/*
@@ -107,12 +122,14 @@ get_referenced_relation_id_list(PG_FUNCTION_ARGS)
 	 */
 	functionContext = SRF_PERCALL_SETUP();
 
-	foreignRelationCell = (ListCell *) functionContext->user_fctx;
-	if (foreignRelationCell != NULL)
-	{
-		Oid refId = lfirst_oid(foreignRelationCell);
+	ListCellAndListWrapper *wrapper =
+		(ListCellAndListWrapper *) functionContext->user_fctx;
 
-		functionContext->user_fctx = lnext(foreignRelationCell);
+	if (wrapper->listCell != NULL)
+	{
+		Oid refId = lfirst_oid(wrapper->listCell);
+
+		wrapper->listCell = lnext_compat(wrapper->list, wrapper->listCell);
 
 		SRF_RETURN_NEXT(functionContext, PointerGetDatum(refId));
 	}

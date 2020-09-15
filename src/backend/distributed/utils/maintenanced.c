@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include <time.h>
 
 #include "miscadmin.h"
@@ -30,9 +32,10 @@
 #include "commands/extension.h"
 #include "libpq/pqsignal.h"
 #include "catalog/namespace.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/maintenanced.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/statistics_collection.h"
@@ -48,6 +51,9 @@
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "tcop/tcopprot.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "common/hashfn.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 
@@ -77,8 +83,8 @@ typedef struct MaintenanceDaemonDBData
 
 	/* information: which user to use */
 	Oid userOid;
-	bool daemonStarted;
 	pid_t workerPid;
+	bool daemonStarted;
 	bool triggerMetadataSync;
 	Latch *latch; /* pointer to the background worker's latch */
 } MaintenanceDaemonDBData;
@@ -101,13 +107,17 @@ static MaintenanceDaemonControlData *MaintenanceDaemonControl = NULL;
 static HTAB *MaintenanceDaemonDBHash;
 
 static volatile sig_atomic_t got_SIGHUP = false;
+static volatile sig_atomic_t got_SIGTERM = false;
 
+static void MaintenanceDaemonSigTermHandler(SIGNAL_ARGS);
 static void MaintenanceDaemonSigHupHandler(SIGNAL_ARGS);
 static size_t MaintenanceDaemonShmemSize(void);
 static void MaintenanceDaemonShmemInit(void);
+static void MaintenanceDaemonShmemExit(int code, Datum arg);
 static void MaintenanceDaemonErrorContext(void *arg);
 static bool LockCitusExtension(void);
 static bool MetadataSyncTriggeredCheckAndReset(MaintenanceDaemonDBData *dbData);
+static void WarnMaintenanceDaemonNotStarted(void);
 
 
 /*
@@ -143,62 +153,76 @@ InitializeMaintenanceDaemonBackend(void)
 
 	MaintenanceDaemonDBData *dbData = (MaintenanceDaemonDBData *) hash_search(
 		MaintenanceDaemonDBHash,
-		&
-		MyDatabaseId,
+		&MyDatabaseId,
 		HASH_ENTER_NULL,
 		&found);
 
 	if (dbData == NULL)
 	{
-		/* FIXME: better message, reference relevant guc in hint */
-		ereport(ERROR, (errmsg("ran out of database slots")));
+		WarnMaintenanceDaemonNotStarted();
+		LWLockRelease(&MaintenanceDaemonControl->lock);
+
+		return;
+	}
+
+	/* maintenance daemon can ignore itself */
+	if (dbData->workerPid == MyProcPid)
+	{
+		LWLockRelease(&MaintenanceDaemonControl->lock);
+		return;
 	}
 
 	if (!found || !dbData->daemonStarted)
 	{
 		BackgroundWorker worker;
 		BackgroundWorkerHandle *handle = NULL;
-		int pid = 0;
-
-		dbData->userOid = extensionOwner;
 
 		memset(&worker, 0, sizeof(worker));
 
-		snprintf(worker.bgw_name, BGW_MAXLEN,
-				 "Citus Maintenance Daemon: %u/%u",
-				 MyDatabaseId, extensionOwner);
+		SafeSnprintf(worker.bgw_name, sizeof(worker.bgw_name),
+					 "Citus Maintenance Daemon: %u/%u",
+					 MyDatabaseId, extensionOwner);
 
 		/* request ability to connect to target database */
 		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 
 		/*
 		 * No point in getting started before able to run query, but we do
-		 * want to get started on Hot-Stanby standbys.
+		 * want to get started on Hot-Standby.
 		 */
 		worker.bgw_start_time = BgWorkerStart_ConsistentState;
 
-		/*
-		 * Restart after a bit after errors, but don't bog the system.
-		 */
+		/* Restart after a bit after errors, but don't bog the system. */
 		worker.bgw_restart_time = 5;
-		sprintf(worker.bgw_library_name, "citus");
-		sprintf(worker.bgw_function_name, "CitusMaintenanceDaemonMain");
+		strcpy_s(worker.bgw_library_name,
+				 sizeof(worker.bgw_library_name), "citus");
+		strcpy_s(worker.bgw_function_name, sizeof(worker.bgw_library_name),
+				 "CitusMaintenanceDaemonMain");
+
 		worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
-		memcpy(worker.bgw_extra, &extensionOwner, sizeof(Oid));
+		memcpy_s(worker.bgw_extra, sizeof(worker.bgw_extra), &extensionOwner,
+				 sizeof(Oid));
 		worker.bgw_notify_pid = MyProcPid;
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		{
-			ereport(ERROR, (errmsg("could not start maintenance background worker"),
-							errhint("Increasing max_worker_processes might help.")));
+			WarnMaintenanceDaemonNotStarted();
+			dbData->daemonStarted = false;
+			LWLockRelease(&MaintenanceDaemonControl->lock);
+
+			return;
 		}
 
 		dbData->daemonStarted = true;
+		dbData->userOid = extensionOwner;
 		dbData->workerPid = 0;
 		dbData->triggerMetadataSync = false;
 		LWLockRelease(&MaintenanceDaemonControl->lock);
 
+		pid_t pid;
 		WaitForBackgroundWorkerStartup(handle, &pid);
+
+		pfree(handle);
 	}
 	else
 	{
@@ -222,6 +246,17 @@ InitializeMaintenanceDaemonBackend(void)
 
 
 /*
+ * WarnMaintenanceDaemonNotStarted warns that maintenanced couldn't be started.
+ */
+static void
+WarnMaintenanceDaemonNotStarted(void)
+{
+	ereport(WARNING, (errmsg("could not start maintenance background worker"),
+					  errhint("Increasing max_worker_processes might help.")));
+}
+
+
+/*
  * CitusMaintenanceDaemonMain is the maintenance daemon's main routine, it'll
  * be started by the background worker infrastructure.  If it errors out,
  * it'll be restarted after a few seconds.
@@ -240,7 +275,7 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	/*
 	 * Look up this worker's configuration.
 	 */
-	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_SHARED);
+	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
 
 	MaintenanceDaemonDBData *myDbData = (MaintenanceDaemonDBData *)
 										hash_search(MaintenanceDaemonDBHash, &databaseOid,
@@ -253,14 +288,19 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		 * wait for a session to call InitializeMaintenanceDaemonBackend
 		 * to properly add it to the hash.
 		 */
+
 		proc_exit(0);
 	}
+
+	before_shmem_exit(MaintenanceDaemonShmemExit, main_arg);
+
+	Assert(myDbData->workerPid == 0);
 
 	/* from this point, DROP DATABASE will attempt to kill the worker */
 	myDbData->workerPid = MyProcPid;
 
 	/* wire up signals */
-	pqsignal(SIGTERM, die);
+	pqsignal(SIGTERM, MaintenanceDaemonSigTermHandler);
 	pqsignal(SIGHUP, MaintenanceDaemonSigHupHandler);
 	BackgroundWorkerUnblockSignals();
 
@@ -291,14 +331,17 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	pgstat_report_appname("Citus Maintenance Daemon");
 
 	/* enter main loop */
-	for (;;)
+	while (!got_SIGTERM)
 	{
-		int rc;
 		int latchFlags = WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH;
 		double timeout = 10000.0; /* use this if the deadlock detection is disabled */
 		bool foundDeadlock = false;
 
 		CHECK_FOR_INTERRUPTS();
+
+		Assert(myDbData->workerPid == MyProcPid);
+
+		CitusTableCacheFlushInvalidatedEntries();
 
 		/*
 		 * XXX: Each task should clear the metadata cache before every iteration
@@ -310,8 +353,8 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		 */
 
 		/*
-		 * Perform Work.  If a specific task needs to be called sooner than
-		 * timeout indicates, it's ok to lower it to that value.  Expensive
+		 * Perform Work. If a specific task needs to be called sooner than
+		 * timeout indicates, it's ok to lower it to that value. Expensive
 		 * tasks should do their own time math about whether to re-run checks.
 		 */
 
@@ -508,7 +551,7 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		 * Wait until timeout, or until somebody wakes us up. Also cast the timeout to
 		 * integer where we've calculated it using double for not losing the precision.
 		 */
-		rc = WaitLatch(MyLatch, latchFlags, (long) timeout, PG_WAIT_EXTENSION);
+		int rc = WaitLatch(MyLatch, latchFlags, (long) timeout, PG_WAIT_EXTENSION);
 
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -530,6 +573,7 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 				 */
 				LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
 				myDbData->daemonStarted = false;
+				myDbData->workerPid = 0;
 				LWLockRelease(&MaintenanceDaemonControl->lock);
 
 				/* return code of 1 requests worker restart */
@@ -631,6 +675,45 @@ MaintenanceDaemonShmemInit(void)
 
 
 /*
+ * MaintenaceDaemonShmemExit is the before_shmem_exit handler for cleaning up MaintenanceDaemonDBHash
+ */
+static void
+MaintenanceDaemonShmemExit(int code, Datum arg)
+{
+	Oid databaseOid = DatumGetObjectId(arg);
+
+	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
+
+	MaintenanceDaemonDBData *myDbData = (MaintenanceDaemonDBData *)
+										hash_search(MaintenanceDaemonDBHash, &databaseOid,
+													HASH_FIND, NULL);
+	if (myDbData && myDbData->workerPid == MyProcPid)
+	{
+		myDbData->daemonStarted = false;
+		myDbData->workerPid = 0;
+	}
+
+	LWLockRelease(&MaintenanceDaemonControl->lock);
+}
+
+
+/* MaintenanceDaemonSigTermHandler calls proc_exit(0) */
+static void
+MaintenanceDaemonSigTermHandler(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+
+	got_SIGTERM = true;
+	if (MyProc != NULL)
+	{
+		SetLatch(&MyProc->procLatch);
+	}
+
+	errno = save_errno;
+}
+
+
+/*
  * MaintenanceDaemonSigHupHandler set a flag to re-read config file at next
  * convenient time.
  */
@@ -709,6 +792,7 @@ StopMaintenanceDaemon(Oid databaseId)
 		MaintenanceDaemonDBHash,
 		&databaseId,
 		HASH_REMOVE, &found);
+
 	if (found)
 	{
 		workerPid = dbData->workerPid;

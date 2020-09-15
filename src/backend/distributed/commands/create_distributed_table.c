@@ -11,6 +11,9 @@
 #include "postgres.h"
 #include "miscadmin.h"
 
+#include "distributed/pg_version_constants.h"
+#include "distributed/commands/utility_hook.h"
+
 #include "access/genam.h"
 #include "access/hash.h"
 #include "access/heapam.h"
@@ -24,6 +27,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #if PG_VERSION_NUM >= 12000
 #include "catalog/pg_proc.h"
@@ -31,14 +35,19 @@
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
+#include "distributed/deparser.h"
 #include "distributed/distribution_column.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/metadata/dependency.h"
+#include "distributed/metadata/distobject.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
@@ -72,13 +81,17 @@
 #include "utils/syscache.h"
 #include "utils/inval.h"
 
+/*
+ * once every LOG_PER_TUPLE_AMOUNT, the copy will be logged.
+ */
+#define LOG_PER_TUPLE_AMOUNT 1000000
 
 /* Replication model to use when creating distributed tables */
 int ReplicationModel = REPLICATION_MODEL_COORDINATOR;
 
 
 /* local function forward declarations */
-static char AppropriateReplicationModel(char distributionMethod, bool viaDeprecatedAPI);
+static char DecideReplicationModel(char distributionMethod, bool viaDeprecatedAPI);
 static void CreateHashDistributedTableShards(Oid relationId, Oid colocatedTableId,
 											 bool localTableEmpty);
 static uint32 ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
@@ -91,11 +104,14 @@ static void EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 										  Oid distributionColumnType,
 										  Oid sourceRelationId);
 static void EnsureLocalTableEmpty(Oid relationId);
-static void EnsureTableNotDistributed(Oid relationId);
+static void EnsureRelationHasNoTriggers(Oid relationId);
 static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
 									int16 supportFunctionNumber);
 static void EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod,
-											 bool viaDepracatedAPI);
+											 bool viaDeprecatedAPI);
+static bool ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod, bool
+									viaDeprecatedAPI);
+static void EnsureCitusTableCanBeCreated(Oid relationOid);
 static bool LocalTableEmpty(Oid tableId);
 static void CopyLocalDataIntoShards(Oid relationId);
 static List * TupleDescColumnNameList(TupleDesc tupleDescriptor);
@@ -104,11 +120,19 @@ static bool DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 														Var *distributionColumn);
 static bool RelationUsesHeapAccessMethodOrNone(Relation relation);
 static bool CanUseExclusiveConnections(Oid relationId, bool localTableEmpty);
+static void DoCopyFromLocalTableIntoShards(Relation distributedRelation,
+										   DestReceiver *copyDest,
+										   TupleTableSlot *slot,
+										   EState *estate);
+static void UndistributeTable(Oid relationId);
+static List * GetViewCreationCommandsOfTable(Oid relationId);
+static void ReplaceTable(Oid sourceId, Oid targetId);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
 PG_FUNCTION_INFO_V1(create_distributed_table);
 PG_FUNCTION_INFO_V1(create_reference_table);
+PG_FUNCTION_INFO_V1(undistribute_table);
 
 
 /*
@@ -125,14 +149,13 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	text *distributionColumnText = PG_GETARG_TEXT_P(1);
 	Oid distributionMethodOid = PG_GETARG_OID(2);
 
+	CheckCitusVersion(ERROR);
+
+	EnsureCitusTableCanBeCreated(relationId);
+
 	char *colocateWithTableName = NULL;
 	bool viaDeprecatedAPI = true;
 	ObjectAddress tableAddress = { 0 };
-
-
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
-	EnsureTableOwner(relationId);
 
 	/*
 	 * distributed tables might have dependencies on different objects, since we create
@@ -156,16 +179,10 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 							   "relation does not exist")));
 	}
 
-	/*
-	 * We should do this check here since the codes in the following lines rely
-	 * on this relation to have a supported relation kind. More extensive checks
-	 * will be performed in CreateDistributedTable.
-	 */
-	EnsureRelationKindSupported(relationId);
-
 	char *distributionColumnName = text_to_cstring(distributionColumnText);
 	Var *distributionColumn = BuildDistributionKeyFromColumnName(relation,
 																 distributionColumnName);
+	Assert(distributionColumn != NULL);
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
 	CreateDistributedTable(relationId, distributionColumn, distributionMethod,
@@ -187,18 +204,16 @@ create_distributed_table(PG_FUNCTION_ARGS)
 {
 	ObjectAddress tableAddress = { 0 };
 
-
 	bool viaDeprecatedAPI = false;
-
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
 
 	Oid relationId = PG_GETARG_OID(0);
 	text *distributionColumnText = PG_GETARG_TEXT_P(1);
 	Oid distributionMethodOid = PG_GETARG_OID(2);
 	text *colocateWithTableNameText = PG_GETARG_TEXT_P(3);
 
-	EnsureTableOwner(relationId);
+	CheckCitusVersion(ERROR);
+
+	EnsureCitusTableCanBeCreated(relationId);
 
 	/*
 	 * distributed tables might have dependencies on different objects, since we create
@@ -222,16 +237,10 @@ create_distributed_table(PG_FUNCTION_ARGS)
 							   "relation does not exist")));
 	}
 
-	/*
-	 * We should do this check here since the codes in the following lines rely
-	 * on this relation to have a supported relation kind. More extensive checks
-	 * will be performed in CreateDistributedTable.
-	 */
-	EnsureRelationKindSupported(relationId);
-
 	char *distributionColumnName = text_to_cstring(distributionColumnText);
 	Var *distributionColumn = BuildDistributionKeyFromColumnName(relation,
 																 distributionColumnName);
+	Assert(distributionColumn != NULL);
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
 	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
@@ -261,9 +270,9 @@ create_reference_table(PG_FUNCTION_ARGS)
 
 	bool viaDeprecatedAPI = false;
 
-	EnsureCoordinator();
 	CheckCitusVersion(ERROR);
-	EnsureTableOwner(relationId);
+
+	EnsureCitusTableCanBeCreated(relationId);
 
 	/*
 	 * distributed tables might have dependencies on different objects, since we create
@@ -280,13 +289,6 @@ create_reference_table(PG_FUNCTION_ARGS)
 	 * backends manipulating this relation.
 	 */
 	Relation relation = relation_open(relationId, ExclusiveLock);
-
-	/*
-	 * We should do this check here since the codes in the following lines rely
-	 * on this relation to have a supported relation kind. More extensive checks
-	 * will be performed in CreateDistributedTable.
-	 */
-	EnsureRelationKindSupported(relationId);
 
 	List *workerNodeList = ActivePrimaryNodeList(ShareLock);
 	int workerCount = list_length(workerNodeList);
@@ -311,6 +313,46 @@ create_reference_table(PG_FUNCTION_ARGS)
 
 
 /*
+ * undistribute_table gets a distributed table name and
+ * udistributes it.
+ */
+Datum
+undistribute_table(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+	EnsureTableOwner(relationId);
+
+	UndistributeTable(relationId);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * EnsureCitusTableCanBeCreated checks if
+ * - we are on the coordinator
+ * - the current user is the owner of the table
+ * - relation kind is supported
+ */
+static void
+EnsureCitusTableCanBeCreated(Oid relationOid)
+{
+	EnsureCoordinator();
+	EnsureTableOwner(relationOid);
+
+	/*
+	 * We should do this check here since the codes in the following lines rely
+	 * on this relation to have a supported relation kind. More extensive checks
+	 * will be performed in CreateDistributedTable.
+	 */
+	EnsureRelationKindSupported(relationOid);
+}
+
+
+/*
  * CreateDistributedTable creates distributed table in the given configuration.
  * This functions contains all necessary logic to create distributed tables. It
  * performs necessary checks to ensure distributing the table is safe. If it is
@@ -326,8 +368,8 @@ void
 CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributionMethod,
 					   char *colocateWithTableName, bool viaDeprecatedAPI)
 {
-	char replicationModel = AppropriateReplicationModel(distributionMethod,
-														viaDeprecatedAPI);
+	char replicationModel = DecideReplicationModel(distributionMethod,
+												   viaDeprecatedAPI);
 
 	/*
 	 * ColocationIdForNewTable assumes caller acquires lock on relationId. In our case,
@@ -341,6 +383,12 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	EnsureRelationCanBeDistributed(relationId, distributionColumn, distributionMethod,
 								   colocationId, replicationModel, viaDeprecatedAPI);
 
+	/*
+	 * Make sure that existing reference tables have been replicated to all the nodes
+	 * such that we can create foreign keys and joins work immediately after creation.
+	 */
+	EnsureReferenceTablesExistOnAllNodes();
+
 	/* we need to calculate these variables before creating distributed metadata */
 	bool localTableEmpty = LocalTableEmpty(relationId);
 	Oid colocatedTableId = ColocatedTableId(colocationId);
@@ -349,7 +397,7 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	InsertIntoPgDistPartition(relationId, distributionMethod, distributionColumn,
 							  colocationId, replicationModel);
 
-	/* foreign tables does not support TRUNCATE trigger */
+	/* foreign tables do not support TRUNCATE trigger */
 	if (RegularTable(relationId))
 	{
 		CreateTruncateTrigger(relationId);
@@ -375,7 +423,6 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 		CreateReferenceTableShard(relationId);
 	}
 
-
 	if (ShouldSyncTableMetadata(relationId))
 	{
 		CreateTableMetadataOnWorkers(relationId);
@@ -394,11 +441,9 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	if (PartitionedTable(relationId))
 	{
 		List *partitionList = PartitionList(relationId);
-		ListCell *partitionCell = NULL;
-
-		foreach(partitionCell, partitionList)
+		Oid partitionRelationId = InvalidOid;
+		foreach_oid(partitionRelationId, partitionList)
 		{
-			Oid partitionRelationId = lfirst_oid(partitionCell);
 			CreateDistributedTable(partitionRelationId, distributionColumn,
 								   distributionMethod, colocateWithTableName,
 								   viaDeprecatedAPI);
@@ -418,13 +463,13 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 
 
 /*
- * AppropriateReplicationModel function decides which replication model should be
+ * DecideReplicationModel function decides which replication model should be
  * used depending on given distribution configuration and global ReplicationModel
  * variable. If ReplicationModel conflicts with distribution configuration, this
  * function errors out.
  */
 static char
-AppropriateReplicationModel(char distributionMethod, bool viaDeprecatedAPI)
+DecideReplicationModel(char distributionMethod, bool viaDeprecatedAPI)
 {
 	if (viaDeprecatedAPI)
 	{
@@ -552,7 +597,7 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 		 */
 		Assert(distributionMethod == DISTRIBUTE_BY_HASH);
 
-		Relation pgDistColocation = heap_open(DistColocationRelationId(), ExclusiveLock);
+		Relation pgDistColocation = table_open(DistColocationRelationId(), ExclusiveLock);
 
 		Oid distributionColumnType = distributionColumn->vartype;
 		Oid distributionColumnCollation = get_typcollation(distributionColumnType);
@@ -573,7 +618,7 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 				createdColocationGroup = true;
 			}
 		}
-		else if (pg_strncasecmp(colocateWithTableName, "none", NAMEDATALEN) == 0)
+		else if (IsColocateWithNone(colocateWithTableName))
 		{
 			colocationId = GetNextColocationId();
 
@@ -599,12 +644,12 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 		if (createdColocationGroup)
 		{
 			/* keep the exclusive lock */
-			heap_close(pgDistColocation, NoLock);
+			table_close(pgDistColocation, NoLock);
 		}
 		else
 		{
 			/* release the exclusive lock */
-			heap_close(pgDistColocation, ExclusiveLock);
+			table_close(pgDistColocation, ExclusiveLock);
 		}
 	}
 
@@ -618,7 +663,7 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
  * distributing table here. If there is an unsatisfied requirement, we error out
  * and do not distribute the table.
  *
- * This function assumes, callers have already acquried necessary locks to ensure
+ * This function assumes, callers have already acquired necessary locks to ensure
  * there will not be any change in the given relation.
  */
 static void
@@ -631,11 +676,14 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 	EnsureTableNotDistributed(relationId);
 	EnsureLocalTableEmptyIfNecessary(relationId, distributionMethod, viaDeprecatedAPI);
 	EnsureReplicationSettings(InvalidOid, replicationModel);
+	EnsureRelationHasNoTriggers(relationId);
 
 	/* we assume callers took necessary locks */
 	Relation relation = relation_open(relationId, NoLock);
 	TupleDesc relationDesc = RelationGetDescr(relation);
 	char *relationName = RelationGetRelationName(relation);
+
+	ErrorIfTableIsACatalogTable(relation);
 
 	if (!RelationUsesHeapAccessMethodOrNone(relation))
 	{
@@ -643,7 +691,7 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 							"cannot distribute relations using non-heap access methods")));
 	}
 
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 
 	/* verify target relation does not use WITH (OIDS) PostgreSQL feature */
 	if (relationDesc->tdhasoid)
@@ -690,7 +738,7 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 									  "defined to use hash partitioning.")));
 		}
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		if (distributionColumn->varcollid != InvalidOid &&
 			!get_collation_isdeterministic(distributionColumn->varcollid))
 		{
@@ -722,7 +770,7 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 	}
 
 	/* partitions cannot be distributed if their parent is not distributed */
-	if (PartitionTable(relationId) && !IsDistributedTable(parentRelationId))
+	if (PartitionTable(relationId) && !IsCitusTable(parentRelationId))
 	{
 		char *parentRelationName = get_rel_name(parentRelationId);
 
@@ -772,12 +820,29 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 		}
 	}
 
-	ErrorIfUnsupportedConstraint(relation, distributionMethod, distributionColumn,
-								 colocationId);
+	ErrorIfUnsupportedConstraint(relation, distributionMethod, replicationModel,
+								 distributionColumn, colocationId);
 
 
 	ErrorIfUnsupportedPolicy(relation);
 	relation_close(relation, NoLock);
+}
+
+
+/*
+ * ErrorIfTableIsACatalogTable is a helper function to error out for citus
+ * table creation from a catalog table.
+ */
+void
+ErrorIfTableIsACatalogTable(Relation relation)
+{
+	if (relation->rd_rel->relnamespace != PG_CATALOG_NAMESPACE)
+	{
+		return;
+	}
+
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot create a citus table from a catalog table")));
 }
 
 
@@ -792,12 +857,11 @@ static void
 EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 							  Oid distributionColumnType, Oid sourceRelationId)
 {
-	DistTableCacheEntry *sourceTableEntry = DistributedTableCacheEntry(sourceRelationId);
-	char sourceDistributionMethod = sourceTableEntry->partitionMethod;
+	CitusTableCacheEntry *sourceTableEntry = GetCitusTableCacheEntry(sourceRelationId);
 	char sourceReplicationModel = sourceTableEntry->replicationModel;
-	Var *sourceDistributionColumn = DistPartitionKey(sourceRelationId);
+	Var *sourceDistributionColumn = DistPartitionKeyOrError(sourceRelationId);
 
-	if (sourceDistributionMethod != DISTRIBUTE_BY_HASH)
+	if (!IsCitusTableTypeCacheEntry(sourceTableEntry, HASH_DISTRIBUTED))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot distribute relation"),
@@ -832,33 +896,57 @@ EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 
 
 /*
- * EnsureLocalTableEmptyIfNecessary only checks for emptiness if only an empty
- * relation can be distributed in given configuration.
- *
- * In some cases, it is possible and safe to send local data to shards while
- * distributing the table. In those cases, we can distribute non-empty local
- * tables. This function checks the distributionMethod and relation kind to
- * see whether we need to be ensure emptiness of local table. If we need to
- * be sure, this function calls EnsureLocalTableEmpty function to ensure
- * that local table does not contain any data.
+ * EnsureLocalTableEmptyIfNecessary errors out if the function should be empty
+ * according to ShouldLocalTableBeEmpty but it is not.
  */
 static void
 EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod,
-								 bool viaDepracatedAPI)
+								 bool viaDeprecatedAPI)
 {
-	if (viaDepracatedAPI)
+	if (ShouldLocalTableBeEmpty(relationId, distributionMethod, viaDeprecatedAPI))
 	{
 		EnsureLocalTableEmpty(relationId);
+	}
+}
+
+
+/*
+ * ShouldLocalTableBeEmpty returns true if the local table should be empty
+ * before creating a citus table.
+ * In some cases, it is possible and safe to send local data to shards while
+ * distributing the table. In those cases, we can distribute non-empty local
+ * tables. This function checks the distributionMethod and relation kind to
+ * see whether we need to be ensure emptiness of local table.
+ */
+static bool
+ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod,
+						bool viaDeprecatedAPI)
+{
+	bool shouldLocalTableBeEmpty = false;
+	if (viaDeprecatedAPI)
+	{
+		/* we don't support copying local data via deprecated API */
+		shouldLocalTableBeEmpty = true;
 	}
 	else if (distributionMethod != DISTRIBUTE_BY_HASH &&
 			 distributionMethod != DISTRIBUTE_BY_NONE)
 	{
-		EnsureLocalTableEmpty(relationId);
+		/*
+		 * We only support hash distributed tables and reference tables
+		 * for initial data loading
+		 */
+		shouldLocalTableBeEmpty = true;
 	}
 	else if (!RegularTable(relationId))
 	{
-		EnsureLocalTableEmpty(relationId);
+		/*
+		 * We only support tables and partitioned tables for initial
+		 * data loading
+		 */
+		shouldLocalTableBeEmpty = true;
 	}
+
+	return shouldLocalTableBeEmpty;
 }
 
 
@@ -884,14 +972,14 @@ EnsureLocalTableEmpty(Oid relationId)
 /*
  * EnsureTableNotDistributed errors out if the table is distributed.
  */
-static void
+void
 EnsureTableNotDistributed(Oid relationId)
 {
 	char *relationName = get_rel_name(relationId);
 
-	bool isDistributedTable = IsDistributedTable(relationId);
+	bool isCitusTable = IsCitusTable(relationId);
 
-	if (isDistributedTable)
+	if (isCitusTable)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 						errmsg("table \"%s\" is already distributed",
@@ -918,13 +1006,39 @@ EnsureReplicationSettings(Oid relationId, char replicationModel)
 		extraHint = "";
 	}
 
-	if (replicationModel == REPLICATION_MODEL_STREAMING && ShardReplicationFactor != 1)
+	if (replicationModel == REPLICATION_MODEL_STREAMING &&
+		DistributedTableReplicationIsEnabled())
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("replication factors above one are incompatible with %s",
 							   msgSuffix),
 						errhint("Try again after reducing \"citus.shard_replication_"
 								"factor\" to one%s.", extraHint)));
+	}
+}
+
+
+/*
+ * EnsureRelationHasNoTriggers errors out if the given table has triggers on
+ * it. See also GetExplicitTriggerIdList function's comment for the triggers this
+ * function errors out.
+ */
+static void
+EnsureRelationHasNoTriggers(Oid relationId)
+{
+	List *explicitTriggerIds = GetExplicitTriggerIdList(relationId);
+
+	if (list_length(explicitTriggerIds) > 0)
+	{
+		char *relationName = get_rel_name(relationId);
+
+		Assert(relationName != NULL);
+		ereport(ERROR, (errmsg("cannot distribute relation \"%s\" because it has "
+							   "triggers ", relationName),
+						errdetail("Citus does not support distributing tables with "
+								  "triggers."),
+						errhint("Drop all the triggers on \"%s\" and retry.",
+								relationName)));
 	}
 }
 
@@ -1029,7 +1143,7 @@ LocalTableEmpty(Oid tableId)
 	int rowId = 0;
 	int attributeId = 1;
 
-	AssertArg(!IsDistributedTable(tableId));
+	AssertArg(!IsCitusTable(tableId));
 
 	int spiConnectionResult = SPI_connect();
 	if (spiConnectionResult != SPI_OK_CONNECT)
@@ -1087,23 +1201,43 @@ CanUseExclusiveConnections(Oid relationId, bool localTableEmpty)
 	}
 	else if (shouldRunSequential && ParallelQueryExecutedInTransaction())
 	{
+		/*
+		 * We decided to use sequential execution. It's either because relation
+		 * has a pre-existing foreign key to a reference table or because we
+		 * decided to use sequential execution due to a query executed in the
+		 * current xact beforehand.
+		 * We have specific error messages for either cases.
+		 */
+
 		char *relationName = get_rel_name(relationId);
 
-		/*
-		 * If there has already been a parallel query executed, the sequential mode
-		 * would still use the already opened parallel connections to the workers,
-		 * thus contradicting our purpose of using sequential mode.
-		 */
-		ereport(ERROR, (errmsg("cannot distribute relation \"%s\" in this "
-							   "transaction because it has a foreign key to "
-							   "a reference table", relationName),
-						errdetail("If a hash distributed table has a foreign key "
-								  "to a reference table, it has to be created "
-								  "in sequential mode before any parallel commands "
-								  "have been executed in the same transaction"),
-						errhint("Try re-running the transaction with "
-								"\"SET LOCAL citus.multi_shard_modify_mode TO "
-								"\'sequential\';\"")));
+		if (hasForeignKeyToReferenceTable)
+		{
+			/*
+			 * If there has already been a parallel query executed, the sequential mode
+			 * would still use the already opened parallel connections to the workers,
+			 * thus contradicting our purpose of using sequential mode.
+			 */
+			ereport(ERROR, (errmsg("cannot distribute relation \"%s\" in this "
+								   "transaction because it has a foreign key to "
+								   "a reference table", relationName),
+							errdetail("If a hash distributed table has a foreign key "
+									  "to a reference table, it has to be created "
+									  "in sequential mode before any parallel commands "
+									  "have been executed in the same transaction"),
+							errhint("Try re-running the transaction with "
+									"\"SET LOCAL citus.multi_shard_modify_mode TO "
+									"\'sequential\';\"")));
+		}
+		else if (MultiShardConnectionType == SEQUENTIAL_CONNECTION)
+		{
+			ereport(ERROR, (errmsg("cannot distribute \"%s\" in sequential mode because "
+								   "a parallel query was executed in this transaction",
+								   relationName),
+							errhint("If you have manually set "
+									"citus.multi_shard_modify_mode to 'sequential', "
+									"try with 'parallel' option. ")));
+		}
 	}
 	else if (shouldRunSequential)
 	{
@@ -1133,7 +1267,7 @@ CreateTruncateTrigger(Oid relationId)
 	CreateTrigStmt *trigger = makeNode(CreateTrigStmt);
 	trigger->trigname = triggerName->data;
 	trigger->relation = NULL;
-	trigger->funcname = SystemFuncName("citus_truncate_trigger");
+	trigger->funcname = SystemFuncName(CITUS_TRUNCATE_TRIGGER_NAME);
 	trigger->args = NIL;
 	trigger->row = false;
 	trigger->timing = TRIGGER_TYPE_AFTER;
@@ -1196,26 +1330,8 @@ RegularTable(Oid relationId)
 static void
 CopyLocalDataIntoShards(Oid distributedRelationId)
 {
-	DestReceiver *copyDest = NULL;
-	List *columnNameList = NIL;
-	Relation distributedRelation = NULL;
-	TupleDesc tupleDescriptor = NULL;
-	Var *partitionColumn = NULL;
-	int partitionColumnIndex = INVALID_PARTITION_COLUMN_INDEX;
-	bool stopOnFailure = true;
-
-	EState *estate = NULL;
-#if PG_VERSION_NUM >= 120000
-	TableScanDesc scan = NULL;
-#else
-	HeapScanDesc scan = NULL;
-#endif
-	HeapTuple tuple = NULL;
-	MemoryContext oldContext = NULL;
-	uint64 rowsCopied = 0;
-
 	/* take an ExclusiveLock to block all operations except SELECT */
-	distributedRelation = heap_open(distributedRelationId, ExclusiveLock);
+	Relation distributedRelation = table_open(distributedRelationId, ExclusiveLock);
 
 	/*
 	 * Skip copying from partitioned tables, we will copy the data from
@@ -1223,7 +1339,7 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 	 */
 	if (PartitionedTable(distributedRelationId))
 	{
-		heap_close(distributedRelation, NoLock);
+		table_close(distributedRelation, NoLock);
 
 		return;
 	}
@@ -1240,24 +1356,27 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/* get the table columns */
-	tupleDescriptor = RelationGetDescr(distributedRelation);
+	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
 	TupleTableSlot *slot = MakeSingleTupleTableSlotCompat(tupleDescriptor,
 														  &TTSOpsHeapTuple);
-	columnNameList = TupleDescColumnNameList(tupleDescriptor);
+	List *columnNameList = TupleDescColumnNameList(tupleDescriptor);
+
+	int partitionColumnIndex = INVALID_PARTITION_COLUMN_INDEX;
 
 	/* determine the partition column in the tuple descriptor */
-	partitionColumn = PartitionColumn(distributedRelationId, 0);
+	Var *partitionColumn = PartitionColumn(distributedRelationId, 0);
 	if (partitionColumn != NULL)
 	{
 		partitionColumnIndex = partitionColumn->varattno - 1;
 	}
 
 	/* initialise per-tuple memory context */
-	estate = CreateExecutorState();
+	EState *estate = CreateExecutorState();
 	ExprContext *econtext = GetPerTupleExprContext(estate);
 	econtext->ecxt_scantuple = slot;
 
-	copyDest =
+	bool stopOnFailure = true;
+	DestReceiver *copyDest =
 		(DestReceiver *) CreateCitusCopyDestReceiver(distributedRelationId,
 													 columnNameList,
 													 partitionColumnIndex,
@@ -1267,19 +1386,47 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 	/* initialise state for writing to shards, we'll open connections on demand */
 	copyDest->rStartup(copyDest, 0, tupleDescriptor);
 
+	DoCopyFromLocalTableIntoShards(distributedRelation, copyDest, slot, estate);
+
+	/* finish writing into the shards */
+	copyDest->rShutdown(copyDest);
+	copyDest->rDestroy(copyDest);
+
+	/* free memory and close the relation */
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	table_close(distributedRelation, NoLock);
+
+	PopActiveSnapshot();
+}
+
+
+/*
+ * DoCopyFromLocalTableIntoShards performs a copy operation
+ * from local tables into shards.
+ */
+static void
+DoCopyFromLocalTableIntoShards(Relation distributedRelation,
+							   DestReceiver *copyDest,
+							   TupleTableSlot *slot,
+							   EState *estate)
+{
 	/* begin reading from local table */
-#if PG_VERSION_NUM >= 120000
-	scan = table_beginscan(distributedRelation, GetActiveSnapshot(), 0, NULL);
+#if PG_VERSION_NUM >= PG_VERSION_12
+	TableScanDesc scan = table_beginscan(distributedRelation, GetActiveSnapshot(), 0,
+										 NULL);
 #else
-	scan = heap_beginscan(distributedRelation, GetActiveSnapshot(), 0, NULL);
+	HeapScanDesc scan = heap_beginscan(distributedRelation, GetActiveSnapshot(), 0, NULL);
 #endif
 
-	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+	MemoryContext oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
+	uint64 rowsCopied = 0;
+	HeapTuple tuple = NULL;
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		/* materialize tuple and send it to a shard */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 		ExecStoreHeapTuple(tuple, slot, false);
 #else
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
@@ -1299,36 +1446,37 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 
 		rowsCopied++;
 
-		if (rowsCopied % 1000000 == 0)
+		if (rowsCopied % LOG_PER_TUPLE_AMOUNT == 0)
 		{
 			ereport(DEBUG1, (errmsg("Copied " UINT64_FORMAT " rows", rowsCopied)));
 		}
 	}
 
-	if (rowsCopied % 1000000 != 0)
+	if (rowsCopied % LOG_PER_TUPLE_AMOUNT != 0)
 	{
 		ereport(DEBUG1, (errmsg("Copied " UINT64_FORMAT " rows", rowsCopied)));
+	}
+
+	if (rowsCopied > 0)
+	{
+		char *qualifiedRelationName =
+			generate_qualified_relation_name(RelationGetRelid(distributedRelation));
+		ereport(NOTICE, (errmsg("copying the data has completed"),
+						 errdetail("The local data in the table is no longer visible, "
+								   "but is still on disk."),
+						 errhint("To remove the local data, run: SELECT "
+								 "truncate_local_data_after_distributing_table($$%s$$)",
+								 qualifiedRelationName)));
 	}
 
 	MemoryContextSwitchTo(oldContext);
 
 	/* finish reading from the local table */
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	table_endscan(scan);
 #else
 	heap_endscan(scan);
 #endif
-
-	/* finish writing into the shards */
-	copyDest->rShutdown(copyDest);
-	copyDest->rDestroy(copyDest);
-
-	/* free memory and close the relation */
-	ExecDropSingleTupleTableSlot(slot);
-	FreeExecutorState(estate);
-	heap_close(distributedRelation, NoLock);
-
-	PopActiveSnapshot();
 }
 
 
@@ -1347,7 +1495,7 @@ TupleDescColumnNameList(TupleDesc tupleDescriptor)
 		char *columnName = NameStr(currentColumn->attname);
 
 		if (currentColumn->attisdropped
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			|| currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
 #endif
 			)
@@ -1391,7 +1539,7 @@ static bool
 DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 											Var *distributionColumn)
 {
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 	Form_pg_attribute attributeForm = TupleDescAttr(relationDesc,
 													distributionColumn->varattno - 1);
 
@@ -1411,11 +1559,239 @@ DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 static bool
 RelationUsesHeapAccessMethodOrNone(Relation relation)
 {
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 
 	return relation->rd_rel->relkind != RELKIND_RELATION ||
 		   relation->rd_amhandler == HEAP_TABLE_AM_HANDLER_OID;
 #else
 	return true;
+#endif
+}
+
+
+/*
+ * UndistributeTable undistributes the given table. The undistribution is done by
+ * creating a new table, moving everything to the new table and dropping the old one.
+ * So the oid of the table is not preserved.
+ *
+ * The undistributed table will have the same name, columns and rows. It will also have
+ * partitions, views, sequences of the old table. Finally it will have everything created
+ * by GetTableConstructionCommands function, which include indexes. These will be
+ * re-created during undistribution, so their oids are not preserved either (except for
+ * sequences). However, their names are preserved.
+ *
+ * The tables with references are not supported. The function gives an error if there are
+ * any references to or from the table.
+ *
+ * The dropping of old table is done with CASCADE. Anything not mentioned here will
+ * be dropped.
+ */
+void
+UndistributeTable(Oid relationId)
+{
+	Relation relation = try_relation_open(relationId, ExclusiveLock);
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errmsg("Cannot undistribute table"),
+						errdetail("No such distributed table exists. "
+								  "Might have already been undistributed.")));
+	}
+
+	relation_close(relation, NoLock);
+
+	if (!IsCitusTable(relationId))
+	{
+		ereport(ERROR, (errmsg("Cannot undistribute table."),
+						errdetail("The table is not distributed.")));
+	}
+
+	if (TableReferencing(relationId))
+	{
+		ereport(ERROR, (errmsg("Cannot undistribute table "
+							   "because it has a foreign key.")));
+	}
+
+	if (TableReferenced(relationId))
+	{
+		ereport(ERROR, (errmsg("Cannot undistribute table "
+							   "because a foreign key references to it.")));
+	}
+
+
+	List *tableBuildingCommands = GetTableBuildingCommands(relationId, true);
+	List *tableConstructionCommands = GetTableConstructionCommands(relationId);
+
+	tableConstructionCommands = list_concat(tableConstructionCommands,
+											GetViewCreationCommandsOfTable(relationId));
+
+	int spiResult = SPI_connect();
+	if (spiResult != SPI_OK_CONNECT)
+	{
+		ereport(ERROR, (errmsg("could not connect to SPI manager")));
+	}
+
+	char *relationName = get_rel_name(relationId);
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+
+	if (PartitionedTable(relationId))
+	{
+		ereport(NOTICE, (errmsg("Undistributing the partitions of %s",
+								quote_qualified_identifier(schemaName, relationName))));
+		List *partitionList = PartitionList(relationId);
+		Oid partitionRelationId = InvalidOid;
+		foreach_oid(partitionRelationId, partitionList)
+		{
+			char *detachPartitionCommand = GenerateDetachPartitionCommand(
+				partitionRelationId);
+			char *attachPartitionCommand = GenerateAlterTableAttachPartitionCommand(
+				partitionRelationId);
+
+			/*
+			 * We first detach the partitions to be able to undistribute them separately.
+			 */
+			spiResult = SPI_execute(detachPartitionCommand, false, 0);
+			if (spiResult != SPI_OK_UTILITY)
+			{
+				ereport(ERROR, (errmsg("could not run SPI query")));
+			}
+			tableBuildingCommands = lappend(tableBuildingCommands,
+											attachPartitionCommand);
+			UndistributeTable(partitionRelationId);
+		}
+	}
+
+	char *tempName = pstrdup(relationName);
+	uint32 hashOfName = hash_any((unsigned char *) tempName, strlen(tempName));
+	AppendShardIdToName(&tempName, hashOfName);
+
+	char *tableCreationCommand = NULL;
+
+	ereport(NOTICE, (errmsg("Creating a new local table for %s",
+							quote_qualified_identifier(schemaName, relationName))));
+
+	foreach_ptr(tableCreationCommand, tableBuildingCommands)
+	{
+		Node *parseTree = ParseTreeNode(tableCreationCommand);
+
+		RelayEventExtendNames(parseTree, schemaName, hashOfName);
+		CitusProcessUtility(parseTree, tableCreationCommand, PROCESS_UTILITY_TOPLEVEL,
+							NULL, None_Receiver, NULL);
+	}
+
+	ReplaceTable(relationId, get_relname_relid(tempName, schemaId));
+
+	char *tableConstructionCommand = NULL;
+	foreach_ptr(tableConstructionCommand, tableConstructionCommands)
+	{
+		spiResult = SPI_execute(tableConstructionCommand, false, 0);
+		if (spiResult != SPI_OK_UTILITY)
+		{
+			ereport(ERROR, (errmsg("could not run SPI query")));
+		}
+	}
+
+	spiResult = SPI_finish();
+	if (spiResult != SPI_OK_FINISH)
+	{
+		ereport(ERROR, (errmsg("could not finish SPI connection")));
+	}
+}
+
+
+/*
+ * GetViewCreationCommandsOfTable takes a table oid generates the CREATE VIEW
+ * commands for views that depend to the given table. This includes the views
+ * that recursively depend on the table too.
+ */
+List *
+GetViewCreationCommandsOfTable(Oid relationId)
+{
+	List *views = GetDependingViews(relationId);
+	List *commands = NIL;
+
+	Oid viewOid = InvalidOid;
+	foreach_oid(viewOid, views)
+	{
+		Datum viewDefinitionDatum = DirectFunctionCall1(pg_get_viewdef,
+														ObjectIdGetDatum(viewOid));
+		char *viewDefinition = TextDatumGetCString(viewDefinitionDatum);
+		StringInfo query = makeStringInfo();
+		char *viewName = get_rel_name(viewOid);
+		char *schemaName = get_namespace_name(get_rel_namespace(viewOid));
+		char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
+		appendStringInfo(query,
+						 "CREATE VIEW %s AS %s",
+						 qualifiedViewName,
+						 viewDefinition);
+		commands = lappend(commands, query->data);
+	}
+	return commands;
+}
+
+
+/*
+ * ReplaceTable replaces the source table with the target table.
+ * It moves all the rows of the source table to target table with INSERT SELECT.
+ * Changes the dependencies of the sequences owned by source table to target table.
+ * Then drops the source table and renames the target table to source tables name.
+ *
+ * Source and target tables need to be in the same schema and have the same columns.
+ */
+void
+ReplaceTable(Oid sourceId, Oid targetId)
+{
+	char *sourceName = get_rel_name(sourceId);
+	char *targetName = get_rel_name(targetId);
+	Oid schemaId = get_rel_namespace(sourceId);
+	char *schemaName = get_namespace_name(schemaId);
+
+	StringInfo query = makeStringInfo();
+
+	ereport(NOTICE, (errmsg("Moving the data of %s",
+							quote_qualified_identifier(schemaName, sourceName))));
+
+	appendStringInfo(query, "INSERT INTO %s SELECT * FROM %s",
+					 quote_qualified_identifier(schemaName, targetName),
+					 quote_qualified_identifier(schemaName, sourceName));
+	int spiResult = SPI_execute(query->data, false, 0);
+	if (spiResult != SPI_OK_INSERT)
+	{
+		ereport(ERROR, (errmsg("could not run SPI query")));
+	}
+
+#if PG_VERSION_NUM >= PG_VERSION_13
+	List *ownedSequences = getOwnedSequences(sourceId);
+#else
+	List *ownedSequences = getOwnedSequences(sourceId, InvalidAttrNumber);
+#endif
+	Oid sequenceOid = InvalidOid;
+	foreach_oid(sequenceOid, ownedSequences)
+	{
+		changeDependencyFor(RelationRelationId, sequenceOid,
+							RelationRelationId, sourceId, targetId);
+	}
+
+	ereport(NOTICE, (errmsg("Dropping the old %s",
+							quote_qualified_identifier(schemaName, sourceName))));
+
+	resetStringInfo(query);
+	appendStringInfo(query, "DROP TABLE %s CASCADE",
+					 quote_qualified_identifier(schemaName, sourceName));
+	spiResult = SPI_execute(query->data, false, 0);
+	if (spiResult != SPI_OK_UTILITY)
+	{
+		ereport(ERROR, (errmsg("could not run SPI query")));
+	}
+
+	ereport(NOTICE, (errmsg("Renaming the new table to %s",
+							quote_qualified_identifier(schemaName, sourceName))));
+
+#if PG_VERSION_NUM >= PG_VERSION_12
+	RenameRelationInternal(targetId,
+						   sourceName, false, false);
+#else
+	RenameRelationInternal(targetId,
+						   sourceName, false);
 #endif
 }

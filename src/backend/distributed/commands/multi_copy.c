@@ -55,6 +55,8 @@
 #include <netinet/in.h> /* for htons */
 #include <string.h>
 
+#include "distributed/pg_version_constants.h"
+
 #include "access/htup_details.h"
 #include "access/htup.h"
 #include "access/sdir.h"
@@ -65,30 +67,40 @@
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/intermediate_results.h"
 #include "distributed/local_executor.h"
 #include "distributed/log_utils.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_executor.h"
+#include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/placement_connection.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/remote_transaction.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_pruning.h"
+#include "distributed/shared_connection_stats.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/local_multi_copy.h"
+#include "distributed/hash_helpers.h"
 #include "executor/executor.h"
 #include "foreign/foreign.h"
+
+#include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
+#include "tcop/cmdtag.h"
+#endif
 #include "tsearch/ts_locale.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -149,6 +161,9 @@ typedef struct CopyConnectionState
 	 * In this case, old activePlacementState isn't NULL, is added to this list.
 	 */
 	dlist_head bufferedPlacementList;
+
+	/* length of bufferedPlacementList, to avoid iterations over the list when needed */
+	int bufferedPlacementCount;
 } CopyConnectionState;
 
 
@@ -159,6 +174,9 @@ struct CopyPlacementState
 
 	/* State of shard to which the placement belongs to. */
 	CopyShardState *shardState;
+
+	/* node group ID of the placement */
+	int32 groupId;
 
 	/*
 	 * Buffered COPY data. When the placement is activePlacementState of
@@ -176,6 +194,12 @@ struct CopyShardState
 	/* Used as hash key. */
 	uint64 shardId;
 
+	/* used for doing local copy */
+	CopyOutState copyOutState;
+
+	/* containsLocalPlacement is true if we have a local placement for the shard id of this state */
+	bool containsLocalPlacement;
+
 	/* List of CopyPlacementStates for all active placements of the shard. */
 	List *placementStateList;
 };
@@ -191,20 +215,22 @@ typedef struct ShardConnections
 
 
 /* Local functions forward declarations */
-static void CopyToExistingShards(CopyStmt *copyStatement, char *completionTag);
-static void CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId);
+static void CopyToExistingShards(CopyStmt *copyStatement,
+								 QueryCompletionCompat *completionTag);
+static void CopyToNewShards(CopyStmt *copyStatement, QueryCompletionCompat *completionTag,
+							Oid relationId);
 static void OpenCopyConnectionsForNewShards(CopyStmt *copyStatement,
 											ShardConnections *shardConnections, bool
 											stopOnFailure,
 											bool useBinaryCopyFormat);
-
+static List * RemoveOptionFromList(List *optionList, char *optionName);
 static bool BinaryOutputFunctionDefined(Oid typeId);
+static bool BinaryInputFunctionDefined(Oid typeId);
 static void SendCopyBinaryHeaders(CopyOutState copyOutState, int64 shardId,
 								  List *connectionList);
 static void SendCopyBinaryFooters(CopyOutState copyOutState, int64 shardId,
 								  List *connectionList);
-static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId,
-										 bool useBinaryCopyFormat);
+static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId);
 static void SendCopyDataToAll(StringInfo dataBuffer, int64 shardId, List *connectionList);
 static void SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId,
 									MultiConnection *connection);
@@ -224,20 +250,30 @@ static FmgrInfo * TypeOutputFunctions(uint32 columnCount, Oid *typeIdArray,
 									  bool binaryFormat);
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
 static bool CopyStatementHasFormat(CopyStmt *copyStatement, char *formatName);
-static void CitusCopyFrom(CopyStmt *copyStatement, char *completionTag);
+static void CitusCopyFrom(CopyStmt *copyStatement, QueryCompletionCompat *completionTag);
 static HTAB * CreateConnectionStateHash(MemoryContext memoryContext);
 static HTAB * CreateShardStateHash(MemoryContext memoryContext);
 static CopyConnectionState * GetConnectionState(HTAB *connectionStateHash,
 												MultiConnection *connection);
 static CopyShardState * GetShardState(uint64 shardId, HTAB *shardStateHash,
 									  HTAB *connectionStateHash, bool stopOnFailure,
-									  bool *found);
-static MultiConnection * CopyGetPlacementConnection(ShardPlacement *placement,
+									  bool *found, bool shouldUseLocalCopy, CopyOutState
+									  copyOutState, bool isCopyToIntermediateFile);
+static MultiConnection * CopyGetPlacementConnection(HTAB *connectionStateHash,
+													ShardPlacement *placement,
 													bool stopOnFailure);
+static bool HasReachedAdaptiveExecutorPoolSize(List *connectionStateHash);
+static MultiConnection * GetLeastUtilisedCopyConnection(List *connectionStateList,
+														char *nodeName, int nodePort);
 static List * ConnectionStateList(HTAB *connectionStateHash);
+static List * ConnectionStateListToNode(HTAB *connectionStateHash,
+										const char *hostname, int32 port);
 static void InitializeCopyShardState(CopyShardState *shardState,
 									 HTAB *connectionStateHash,
-									 uint64 shardId, bool stopOnFailure);
+									 uint64 shardId, bool stopOnFailure, bool
+									 canUseLocalCopy,
+									 CopyOutState copyOutState,
+									 bool isCopyToIntermediateFile);
 static void StartPlacementStateCopyCommand(CopyPlacementState *placementState,
 										   CopyStmt *copyStatement,
 										   CopyOutState copyOutState);
@@ -246,17 +282,32 @@ static void EndPlacementStateCopyCommand(CopyPlacementState *placementState,
 static void UnclaimCopyConnections(List *connectionStateList);
 static void ShutdownCopyConnectionState(CopyConnectionState *connectionState,
 										CitusCopyDestReceiver *copyDest);
+static SelectStmt * CitusCopySelect(CopyStmt *copyStatement);
+static void CitusCopyTo(CopyStmt *copyStatement, QueryCompletionCompat *completionTag);
+static int64 ForwardCopyDataFromConnection(CopyOutState copyOutState,
+										   MultiConnection *connection);
 
 /* Private functions copied and adapted from copy.c in PostgreSQL */
+static void SendCopyBegin(CopyOutState cstate);
+static void SendCopyEnd(CopyOutState cstate);
 static void CopySendData(CopyOutState outputState, const void *databuf, int datasize);
 static void CopySendString(CopyOutState outputState, const char *str);
 static void CopySendChar(CopyOutState outputState, char c);
 static void CopySendInt32(CopyOutState outputState, int32 val);
 static void CopySendInt16(CopyOutState outputState, int16 val);
+static void CopySendEndOfRow(CopyOutState cstate, bool includeEndOfLine);
 static void CopyAttributeOutText(CopyOutState outputState, char *string);
 static inline void CopyFlushOutput(CopyOutState outputState, char *start, char *pointer);
 static bool CitusSendTupleToPlacements(TupleTableSlot *slot,
 									   CitusCopyDestReceiver *copyDest);
+static void AddPlacementStateToCopyConnectionStateBuffer(CopyConnectionState *
+														 connectionState,
+														 CopyPlacementState *
+														 placementState);
+static void RemovePlacementStateFromCopyConnectionStateBuffer(CopyConnectionState *
+															  connectionState,
+															  CopyPlacementState *
+															  placementState);
 static uint64 ShardIdForTuple(CitusCopyDestReceiver *copyDest, Datum *columnValues,
 							  bool *columnNulls);
 
@@ -267,6 +318,13 @@ static bool CitusCopyDestReceiverReceive(TupleTableSlot *slot,
 										 DestReceiver *copyDest);
 static void CitusCopyDestReceiverShutdown(DestReceiver *destReceiver);
 static void CitusCopyDestReceiverDestroy(DestReceiver *destReceiver);
+static bool ContainsLocalPlacement(int64 shardId);
+static void CompleteCopyQueryTagCompat(QueryCompletionCompat *completionTag, uint64
+									   processedRowCount);
+static void FinishLocalCopy(CitusCopyDestReceiver *copyDest);
+static void CloneCopyOutStateForLocalCopy(CopyOutState from, CopyOutState to);
+static bool ShouldExecuteCopyLocally(bool isIntermediateResult);
+static void LogLocalCopyExecution(uint64 shardId);
 
 
 /* exports for SQL callable functions */
@@ -279,7 +337,7 @@ PG_FUNCTION_INFO_V1(citus_text_send_as_jsonb);
  * and the partition method of the distributed table.
  */
 static void
-CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
+CitusCopyFrom(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
 {
 	UseCoordinatedTransaction();
 
@@ -305,17 +363,18 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 	}
 
 	Oid relationId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
-	char partitionMethod = PartitionMethod(relationId);
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
 	/* disallow modifications to a partition table which have rep. factor > 1 */
 	EnsurePartitionTableNotReplicated(relationId);
 
-	if (partitionMethod == DISTRIBUTE_BY_HASH || partitionMethod == DISTRIBUTE_BY_RANGE ||
-		partitionMethod == DISTRIBUTE_BY_NONE)
+	if (IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, RANGE_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		CopyToExistingShards(copyStatement, completionTag);
 	}
-	else if (partitionMethod == DISTRIBUTE_BY_APPEND)
+	else if (IsCitusTableTypeCacheEntry(cacheEntry, APPEND_DISTRIBUTED))
 	{
 		CopyToNewShards(copyStatement, completionTag, relationId);
 	}
@@ -335,7 +394,7 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
  * rows.
  */
 static void
-CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
+CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
 {
 	Oid tableId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
 
@@ -351,7 +410,6 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	MemoryContext executorTupleContext = NULL;
 	ExprContext *executorExpressionContext = NULL;
 
-	char partitionMethod = 0;
 	bool stopOnFailure = false;
 
 	CopyState copyState = NULL;
@@ -360,7 +418,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	ErrorContextCallback errorCallback;
 
 	/* allocate column values and nulls arrays */
-	Relation distributedRelation = heap_open(tableId, RowExclusiveLock);
+	Relation distributedRelation = table_open(tableId, RowExclusiveLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
 	uint32 columnCount = tupleDescriptor->natts;
 	Datum *columnValues = palloc0(columnCount * sizeof(Datum));
@@ -387,7 +445,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 		char *columnName = NameStr(currentColumn->attname);
 
 		if (currentColumn->attisdropped
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			|| currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
 #endif
 			)
@@ -402,8 +460,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	executorTupleContext = GetPerTupleMemoryContext(executorState);
 	executorExpressionContext = GetPerTupleExprContext(executorState);
 
-	partitionMethod = PartitionMethod(tableId);
-	if (partitionMethod == DISTRIBUTE_BY_NONE)
+	if (IsCitusTableType(tableId, REFERENCE_TABLE))
 	{
 		stopOnFailure = true;
 	}
@@ -426,9 +483,8 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	 * There is no need to deep copy everything. We will just deep copy of the fields
 	 * we will change.
 	 */
-	memcpy(copiedDistributedRelation, distributedRelation, sizeof(RelationData));
-	memcpy(copiedDistributedRelationTuple, distributedRelation->rd_rel,
-		   CLASS_TUPLE_SIZE);
+	*copiedDistributedRelation = *distributedRelation;
+	*copiedDistributedRelationTuple = *distributedRelation->rd_rel;
 
 	copiedDistributedRelation->rd_rel = copiedDistributedRelationTuple;
 	copiedDistributedRelation->rd_att = CreateTupleDescCopyConstr(tupleDescriptor);
@@ -496,7 +552,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 
 	ExecDropSingleTupleTableSlot(tupleTableSlot);
 	FreeExecutorState(executorState);
-	heap_close(distributedRelation, NoLock);
+	table_close(distributedRelation, NoLock);
 
 	/* mark failed placements as inactive */
 	MarkFailedShardPlacements();
@@ -505,8 +561,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 
 	if (completionTag != NULL)
 	{
-		snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-				 "COPY " UINT64_FORMAT, processedRowCount);
+		CompleteCopyQueryTagCompat(completionTag, processedRowCount);
 	}
 }
 
@@ -516,10 +571,11 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
  * tables where we create new shards into which to copy rows.
  */
 static void
-CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
+CopyToNewShards(CopyStmt *copyStatement, QueryCompletionCompat *completionTag, Oid
+				relationId)
 {
 	/* allocate column values and nulls arrays */
-	Relation distributedRelation = heap_open(relationId, RowExclusiveLock);
+	Relation distributedRelation = table_open(relationId, RowExclusiveLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
 	uint32 columnCount = tupleDescriptor->natts;
 	Datum *columnValues = palloc0(columnCount * sizeof(Datum));
@@ -571,8 +627,18 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 	 * From here on we use copyStatement as the template for the command
 	 * that we send to workers. This command does not have an attribute
 	 * list since NextCopyFrom will generate a value for all columns.
+	 * We also strip options.
 	 */
 	copyStatement->attlist = NIL;
+	copyStatement->options = NIL;
+
+	if (copyOutState->binary)
+	{
+		DefElem *binaryFormatOption =
+			makeDefElem("format", (Node *) makeString("binary"), -1);
+
+		copyStatement->options = lappend(copyStatement->options, binaryFormatOption);
+	}
 
 	while (true)
 	{
@@ -673,16 +739,55 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 	}
 
 	EndCopyFrom(copyState);
-	heap_close(distributedRelation, NoLock);
+	table_close(distributedRelation, NoLock);
 
 	/* check for cancellation one last time before returning */
 	CHECK_FOR_INTERRUPTS();
 
 	if (completionTag != NULL)
 	{
-		snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-				 "COPY " UINT64_FORMAT, processedRowCount);
+		CompleteCopyQueryTagCompat(completionTag, processedRowCount);
 	}
+}
+
+
+static void
+CompleteCopyQueryTagCompat(QueryCompletionCompat *completionTag, uint64 processedRowCount)
+{
+	#if PG_VERSION_NUM >= PG_VERSION_13
+	SetQueryCompletion(completionTag, CMDTAG_COPY, processedRowCount);
+	#else
+	SafeSnprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+				 "COPY " UINT64_FORMAT, processedRowCount);
+	#endif
+}
+
+
+/*
+ * RemoveOptionFromList removes an option from a list of options in a
+ * COPY .. WITH (..) statement by name and returns the resulting list.
+ */
+static List *
+RemoveOptionFromList(List *optionList, char *optionName)
+{
+	ListCell *optionCell = NULL;
+	#if PG_VERSION_NUM < PG_VERSION_13
+	ListCell *previousCell = NULL;
+	#endif
+	foreach(optionCell, optionList)
+	{
+		DefElem *option = (DefElem *) lfirst(optionCell);
+
+		if (strncmp(option->defname, optionName, NAMEDATALEN) == 0)
+		{
+			return list_delete_cell_compat(optionList, optionCell, previousCell);
+		}
+		#if PG_VERSION_NUM < PG_VERSION_13
+		previousCell = optionCell;
+		#endif
+	}
+
+	return optionList;
 }
 
 
@@ -732,6 +837,12 @@ OpenCopyConnectionsForNewShards(CopyStmt *copyStatement,
 		MultiConnection *connection = GetPlacementConnection(connectionFlags, placement,
 															 nodeUser);
 
+		/*
+		 * This code-path doesn't support optional connections, so we don't expect
+		 * NULL connections.
+		 */
+		Assert(connection != NULL);
+
 		if (PQstatus(connection->pgConn) != CONNECTION_OK)
 		{
 			if (stopOnFailure)
@@ -759,8 +870,7 @@ OpenCopyConnectionsForNewShards(CopyStmt *copyStatement,
 		RemoteTransactionBeginIfNecessary(connection);
 
 		StringInfo copyCommand = ConstructCopyStatement(copyStatement,
-														shardConnections->shardId,
-														useBinaryCopyFormat);
+														shardConnections->shardId);
 
 		if (!SendRemoteCommand(connection, copyCommand->data))
 		{
@@ -813,7 +923,7 @@ CanUseBinaryCopyFormat(TupleDesc tupleDescription)
 		Oid typeId = InvalidOid;
 
 		if (currentColumn->attisdropped
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			|| currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
 #endif
 			)
@@ -871,6 +981,11 @@ CanUseBinaryCopyFormatForType(Oid typeId)
 		return false;
 	}
 
+	if (!BinaryInputFunctionDefined(typeId))
+	{
+		return false;
+	}
+
 	if (typeId >= FirstNormalObjectId)
 	{
 		char typeCategory = '\0';
@@ -905,12 +1020,28 @@ BinaryOutputFunctionDefined(Oid typeId)
 	get_type_io_data(typeId, IOFunc_send, &typeLength, &typeByVal,
 					 &typeAlign, &typeDelim, &typeIoParam, &typeFunctionId);
 
-	if (OidIsValid(typeFunctionId))
-	{
-		return true;
-	}
+	return OidIsValid(typeFunctionId);
+}
 
-	return false;
+
+/*
+ * BinaryInputFunctionDefined checks whether binary output function is defined
+ * for the given type.
+ */
+static bool
+BinaryInputFunctionDefined(Oid typeId)
+{
+	Oid typeFunctionId = InvalidOid;
+	Oid typeIoParam = InvalidOid;
+	int16 typeLength = 0;
+	bool typeByVal = false;
+	char typeAlign = 0;
+	char typeDelim = 0;
+
+	get_type_io_data(typeId, IOFunc_receive, &typeLength, &typeByVal,
+					 &typeAlign, &typeDelim, &typeIoParam, &typeFunctionId);
+
+	return OidIsValid(typeFunctionId);
 }
 
 
@@ -939,7 +1070,7 @@ SendCopyBinaryFooters(CopyOutState copyOutState, int64 shardId, List *connection
  * shard.
  */
 static StringInfo
-ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId, bool useBinaryCopyFormat)
+ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
 {
 	StringInfo command = makeStringInfo();
 
@@ -961,35 +1092,76 @@ ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId, bool useBinaryCop
 
 		foreach(columnNameCell, copyStatement->attlist)
 		{
-			char *columnName = (char *) lfirst(columnNameCell);
+			char *columnName = strVal(lfirst(columnNameCell));
+			const char *quotedColumnName = quote_identifier(columnName);
 
 			if (!appendedFirstName)
 			{
-				appendStringInfo(command, "(%s", columnName);
+				appendStringInfo(command, "(%s", quotedColumnName);
 				appendedFirstName = true;
 			}
 			else
 			{
-				appendStringInfo(command, ", %s", columnName);
+				appendStringInfo(command, ", %s", quotedColumnName);
 			}
 		}
 
 		appendStringInfoString(command, ") ");
 	}
 
-	appendStringInfo(command, "FROM STDIN WITH ");
-
-	if (IsCopyResultStmt(copyStatement))
+	if (copyStatement->is_from)
 	{
-		appendStringInfoString(command, "(FORMAT RESULT)");
-	}
-	else if (useBinaryCopyFormat)
-	{
-		appendStringInfoString(command, "(FORMAT BINARY)");
+		appendStringInfoString(command, "FROM STDIN");
 	}
 	else
 	{
-		appendStringInfoString(command, "(FORMAT TEXT)");
+		appendStringInfoString(command, "TO STDOUT");
+	}
+
+	if (copyStatement->options != NIL)
+	{
+		ListCell *optionCell = NULL;
+
+		appendStringInfoString(command, " WITH (");
+
+		foreach(optionCell, copyStatement->options)
+		{
+			DefElem *defel = (DefElem *) lfirst(optionCell);
+
+			if (optionCell != list_head(copyStatement->options))
+			{
+				appendStringInfoString(command, ", ");
+			}
+
+			appendStringInfo(command, "%s", defel->defname);
+
+			if (defel->arg == NULL)
+			{
+				/* option without value */
+			}
+			else if (IsA(defel->arg, String))
+			{
+				char *value = defGetString(defel);
+
+				/* make sure strings are quoted (may contain reserved characters) */
+				appendStringInfo(command, " %s", quote_literal_cstr(value));
+			}
+			else if (IsA(defel->arg, List))
+			{
+				List *nameList = defGetStringList(defel);
+
+				appendStringInfo(command, " (%s)", NameListToQuotedString(nameList));
+			}
+			else
+			{
+				char *value = defGetString(defel);
+
+				/* numeric options or * should not have quotes */
+				appendStringInfo(command, " %s", value);
+			}
+		}
+
+		appendStringInfoString(command, ")");
 	}
 
 	return command;
@@ -1208,8 +1380,8 @@ TypeForColumnName(Oid relationId, TupleDesc tupleDescriptor, char *columnName)
 
 
 /*
- * Walks a TupleDesc and returns an array of the types of each attribute. Will return
- * InvalidOid in the place of dropped attributes.
+ * Walks a TupleDesc and returns an array of the types of each attribute.
+ * Returns InvalidOid in the place of dropped or generated attributes.
  */
 static Oid *
 TypeArrayFromTupleDescriptor(TupleDesc tupleDescriptor)
@@ -1220,7 +1392,11 @@ TypeArrayFromTupleDescriptor(TupleDesc tupleDescriptor)
 	for (int columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupleDescriptor, columnIndex);
-		if (attr->attisdropped)
+		if (attr->attisdropped
+#if PG_VERSION_NUM >= PG_VERSION_12
+			|| attr->attgenerated == ATTRIBUTE_GENERATED_STORED
+#endif
+			)
 		{
 			typeArray[columnIndex] = InvalidOid;
 		}
@@ -1256,7 +1432,7 @@ ColumnCoercionPaths(TupleDesc destTupleDescriptor, TupleDesc inputTupleDescripto
 
 		if (inputTupleType == InvalidOid)
 		{
-			/* this was a dropped column and will not be in the incoming tuples */
+			/* TypeArrayFromTupleDescriptor decided to skip this column */
 			continue;
 		}
 
@@ -1267,7 +1443,7 @@ ColumnCoercionPaths(TupleDesc destTupleDescriptor, TupleDesc inputTupleDescripto
 		ConversionPathForTypes(inputTupleType, destTupleType,
 							   &coercePaths[columnIndex]);
 
-		currentColumnName = lnext(currentColumnName);
+		currentColumnName = lnext_compat(columnNameList, currentColumnName);
 
 		if (currentColumnName == NULL)
 		{
@@ -1296,9 +1472,9 @@ TypeOutputFunctions(uint32 columnCount, Oid *typeIdArray, bool binaryFormat)
 		bool typeVariableLength = false;
 		Oid outputFunctionId = InvalidOid;
 
-		/* If there are any dropped columns it'll show up as a NULL */
 		if (columnTypeId == InvalidOid)
 		{
+			/* TypeArrayFromTupleDescriptor decided to skip this column */
 			continue;
 		}
 		else if (binaryFormat)
@@ -1389,7 +1565,7 @@ AppendCopyRowData(Datum *valueArray, bool *isNullArray, TupleDesc rowDescriptor,
 		}
 
 		if (currentColumn->attisdropped
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			|| currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
 #endif
 			)
@@ -1512,7 +1688,7 @@ AvailableColumnCount(TupleDesc tupleDescriptor)
 		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
 
 		if (!currentColumn->attisdropped
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 			&& currentColumn->attgenerated != ATTRIBUTE_GENERATED_STORED
 #endif
 			)
@@ -1608,6 +1784,67 @@ CreateEmptyShard(char *relationName)
 
 
 /* *INDENT-OFF* */
+
+
+/*
+ * Send copy start/stop messages for frontend copies.  These have changed
+ * in past protocol redesigns.
+ */
+static void
+SendCopyBegin(CopyOutState cstate)
+{
+	if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
+	{
+		/* new way */
+		StringInfoData buf;
+		int			natts = list_length(cstate->attnumlist);
+		int16		format = (cstate->binary ? 1 : 0);
+		int			i;
+
+		pq_beginmessage(&buf, 'H');
+		pq_sendbyte(&buf, format);	/* overall format */
+		pq_sendint16(&buf, natts);
+		for (i = 0; i < natts; i++)
+			pq_sendint16(&buf, format); /* per-column formats */
+		pq_endmessage(&buf);
+		cstate->copy_dest = COPY_NEW_FE;
+	}
+	else
+	{
+		/* old way */
+		if (cstate->binary)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY BINARY is not supported to stdout or from stdin")));
+		pq_putemptymessage('H');
+		/* grottiness needed for old COPY OUT protocol */
+		pq_startcopyout();
+		cstate->copy_dest = COPY_OLD_FE;
+	}
+}
+
+
+/* End a copy stream sent to the client */
+static void
+SendCopyEnd(CopyOutState cstate)
+{
+	if (cstate->copy_dest == COPY_NEW_FE)
+	{
+		/* Shouldn't have any unsent data */
+		Assert(cstate->fe_msgbuf->len == 0);
+		/* Send Copy Done message */
+		pq_putemptymessage('c');
+	}
+	else
+	{
+		CopySendData(cstate, "\\.", 2);
+		/* Need to flush out the trailer (this also appends a newline) */
+		CopySendEndOfRow(cstate, true);
+		pq_endcopyout(false);
+	}
+}
+
+
 /* Append data to the copy buffer in outputState */
 static void
 CopySendData(CopyOutState outputState, const void *databuf, int datasize)
@@ -1647,6 +1884,45 @@ CopySendInt16(CopyOutState outputState, int16 val)
 {
 	uint16 buf = htons((uint16) val);
 	CopySendData(outputState, &buf, sizeof(buf));
+}
+
+
+/* Send the row to the appropriate destination */
+static void
+CopySendEndOfRow(CopyOutState cstate, bool includeEndOfLine)
+{
+	StringInfo	fe_msgbuf = cstate->fe_msgbuf;
+
+	switch (cstate->copy_dest)
+	{
+		case COPY_OLD_FE:
+			/* The FE/BE protocol uses \n as newline for all platforms */
+			if (!cstate->binary && includeEndOfLine)
+				CopySendChar(cstate, '\n');
+
+			if (pq_putbytes(fe_msgbuf->data, fe_msgbuf->len))
+			{
+				/* no hope of recovering connection sync, so FATAL */
+				ereport(FATAL,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("connection lost during COPY to stdout")));
+			}
+			break;
+		case COPY_NEW_FE:
+			/* The FE/BE protocol uses \n as newline for all platforms */
+			if (!cstate->binary && includeEndOfLine)
+				CopySendChar(cstate, '\n');
+
+			/* Dump the accumulated row as one CopyData message */
+			(void) pq_putmessage('d', fe_msgbuf->data, fe_msgbuf->len);
+			break;
+		case COPY_FILE:
+		case COPY_CALLBACK:
+			Assert(false);		/* Not yet supported. */
+			break;
+	}
+
+	resetStringInfo(fe_msgbuf);
 }
 
 
@@ -1800,6 +2076,56 @@ CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, int partitionColu
 
 
 /*
+ * ShouldExecuteCopyLocally returns true if the current copy
+ * operation should be done locally for local placements.
+ */
+static bool
+ShouldExecuteCopyLocally(bool isIntermediateResult)
+{
+	if (!EnableLocalExecution)
+	{
+		return false;
+	}
+
+	/*
+	 * Intermediate files are written to a file, and files are visible to all
+	 * transactions, and we use a custom copy format for copy therefore we will
+	 * use the existing logic for that.
+	 */
+	if (isIntermediateResult)
+	{
+		return false;
+	}
+
+	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_REQUIRED)
+	{
+		/*
+		 * For various reasons, including the transaction visibility
+		 * rules (e.g., read-your-own-writes), we have to use local
+		 * execution again if it has already happened within this
+		 * transaction block.
+		 *
+		 * We might error out later in the execution if it is not suitable
+		 * to execute the tasks locally.
+		 */
+		Assert(IsMultiStatementTransaction() || InCoordinatedTransaction());
+
+		/*
+		 * TODO: A future improvement could be to keep track of which placements
+		 * have been locally executed. At this point, only use local execution for
+		 * those placements. That'd help to benefit more from parallelism.
+		 */
+
+		return true;
+	}
+
+	/* if we connected to the localhost via a connection, we might not be able to see some previous changes that are done via the connection */
+	return CurrentLocalExecutionStatus != LOCAL_EXECUTION_DISABLED &&
+		   IsMultiStatementTransaction();
+}
+
+
+/*
  * CitusCopyDestReceiverStartup implements the rStartup interface of
  * CitusCopyDestReceiver. It opens the relation, acquires necessary
  * locks, and initializes the state required for doing the copy.
@@ -1810,6 +2136,8 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 {
 	CitusCopyDestReceiver *copyDest = (CitusCopyDestReceiver *) dest;
 
+	bool isIntermediateResult = copyDest->intermediateResultIdPrefix != NULL;
+	copyDest->shouldUseLocalCopy = ShouldExecuteCopyLocally(isIntermediateResult);
 	Oid tableId = copyDest->distributedRelationId;
 
 	char *relationName = get_rel_name(tableId);
@@ -1817,23 +2145,16 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	char *schemaName = get_namespace_name(schemaOid);
 
 	List *columnNameList = copyDest->columnNameList;
-	List *quotedColumnNameList = NIL;
+	List *attributeList = NIL;
 
 	ListCell *columnNameCell = NULL;
-
-	char partitionMethod = '\0';
-
 
 	const char *delimiterCharacter = "\t";
 	const char *nullPrintCharacter = "\\N";
 
-	/* Citus currently doesn't know how to handle COPY command locally */
-	ErrorIfTransactionAccessedPlacementsLocally();
-
 	/* look up table properties */
-	Relation distributedRelation = heap_open(tableId, RowExclusiveLock);
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(tableId);
-	partitionMethod = cacheEntry->partitionMethod;
+	Relation distributedRelation = table_open(tableId, RowExclusiveLock);
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(tableId);
 
 	copyDest->distributedRelation = distributedRelation;
 	copyDest->tupleDescriptor = inputTupleDescriptor;
@@ -1842,7 +2163,7 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	List *shardIntervalList = LoadShardIntervalList(tableId);
 	if (shardIntervalList == NIL)
 	{
-		if (partitionMethod == DISTRIBUTE_BY_HASH)
+		if (IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED))
 		{
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("could not find any shards into which to copy"),
@@ -1861,7 +2182,7 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	}
 
 	/* error if any shard missing min/max values */
-	if (partitionMethod != DISTRIBUTE_BY_NONE &&
+	if (IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) &&
 		cacheEntry->hasUninitializedShardInterval)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1879,9 +2200,6 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	 * (see AcquireExecutorMultiShardLocks() at multi_router_executor.c)
 	 */
 	SerializeNonCommutativeWrites(shardIntervalList, RowExclusiveLock);
-
-	/* keep the table metadata to avoid looking it up for every tuple */
-	copyDest->tableMetadata = cacheEntry;
 
 	UseCoordinatedTransaction();
 
@@ -1916,16 +2234,16 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 			TypeOutputFunctions(columnCount, finalTypeArray, copyOutState->binary);
 	}
 
-	/* ensure the column names are properly quoted in the COPY statement */
+	/* wrap the column names as Values */
 	foreach(columnNameCell, columnNameList)
 	{
 		char *columnName = (char *) lfirst(columnNameCell);
-		char *quotedColumnName = (char *) quote_identifier(columnName);
+		Value *columnNameValue = makeString(columnName);
 
-		quotedColumnNameList = lappend(quotedColumnNameList, quotedColumnName);
+		attributeList = lappend(attributeList, columnNameValue);
 	}
 
-	if (partitionMethod != DISTRIBUTE_BY_NONE &&
+	if (IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) &&
 		copyDest->partitionColumnIndex == INVALID_PARTITION_COLUMN_INDEX)
 	{
 		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -1949,10 +2267,19 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	{
 		copyStatement->relation = makeRangeVar(schemaName, relationName, -1);
 		copyStatement->options = NIL;
+
+		if (copyOutState->binary)
+		{
+			DefElem *binaryFormatOption =
+				makeDefElem("format", (Node *) makeString("binary"), -1);
+
+			copyStatement->options = lappend(copyStatement->options, binaryFormatOption);
+		}
 	}
 
+
 	copyStatement->query = NULL;
-	copyStatement->attlist = quotedColumnNameList;
+	copyStatement->attlist = attributeList;
 	copyStatement->is_from = true;
 	copyStatement->is_program = false;
 	copyStatement->filename = NULL;
@@ -1961,7 +2288,16 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	copyDest->shardStateHash = CreateShardStateHash(TopTransactionContext);
 	copyDest->connectionStateHash = CreateConnectionStateHash(TopTransactionContext);
 
-	RecordRelationAccessIfReferenceTable(tableId, PLACEMENT_ACCESS_DML);
+	RecordRelationAccessIfNonDistTable(tableId, PLACEMENT_ACCESS_DML);
+
+	/*
+	 * For all the primary (e.g., writable) nodes, reserve a shared connection.
+	 * We do this upfront because we cannot know which nodes are going to be
+	 * accessed. Since the order of the reservation is important, we need to
+	 * do it right here. For the details on why the order important, see
+	 * the function.
+	 */
+	EnsureConnectionPossibilityForPrimaryNodes();
 }
 
 
@@ -2031,10 +2367,14 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 	/* connections hash is kept in memory context */
 	MemoryContextSwitchTo(copyDest->memoryContext);
 
+	bool isIntermediateResult = copyDest->intermediateResultIdPrefix != NULL;
 	CopyShardState *shardState = GetShardState(shardId, copyDest->shardStateHash,
 											   copyDest->connectionStateHash,
 											   stopOnFailure,
-											   &cachedShardStateFound);
+											   &cachedShardStateFound,
+											   copyDest->shouldUseLocalCopy,
+											   copyDest->copyOutState,
+											   isIntermediateResult);
 	if (!cachedShardStateFound)
 	{
 		firstTupleInShard = true;
@@ -2055,6 +2395,12 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 		}
 	}
 
+	if (copyDest->shouldUseLocalCopy && shardState->containsLocalPlacement)
+	{
+		WriteTupleToLocalShard(slot, copyDest, shardId, shardState->copyOutState);
+	}
+
+
 	foreach(placementStateCell, shardState->placementStateList)
 	{
 		CopyPlacementState *currentPlacementState = lfirst(placementStateCell);
@@ -2074,15 +2420,18 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 
 			/* before switching, make sure to finish the copy */
 			EndPlacementStateCopyCommand(activePlacementState, copyOutState);
-			dlist_push_head(&connectionState->bufferedPlacementList,
-							&activePlacementState->bufferedPlacementNode);
+			AddPlacementStateToCopyConnectionStateBuffer(connectionState,
+														 activePlacementState);
 		}
 
 		if (switchToCurrentPlacement)
 		{
 			StartPlacementStateCopyCommand(currentPlacementState, copyStatement,
 										   copyOutState);
-			dlist_delete(&currentPlacementState->bufferedPlacementNode);
+
+			RemovePlacementStateFromCopyConnectionStateBuffer(connectionState,
+															  currentPlacementState);
+
 			connectionState->activePlacementState = currentPlacementState;
 
 			/* send previously buffered tuples */
@@ -2137,6 +2486,59 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 
 
 /*
+ * AddPlacementStateToCopyConnectionStateBuffer is a helper function to add a placement
+ * state to connection state's placement buffer. In addition to that, keep the counter
+ * up to date.
+ */
+static void
+AddPlacementStateToCopyConnectionStateBuffer(CopyConnectionState *connectionState,
+											 CopyPlacementState *placementState)
+{
+	dlist_push_head(&connectionState->bufferedPlacementList,
+					&placementState->bufferedPlacementNode);
+	connectionState->bufferedPlacementCount++;
+}
+
+
+/*
+ * RemovePlacementStateFromCopyConnectionStateBuffer is a helper function to removes a placement
+ * state from connection state's placement buffer. In addition to that, keep the counter
+ * up to date.
+ */
+static void
+RemovePlacementStateFromCopyConnectionStateBuffer(CopyConnectionState *connectionState,
+												  CopyPlacementState *placementState)
+{
+	dlist_delete(&placementState->bufferedPlacementNode);
+	connectionState->bufferedPlacementCount--;
+}
+
+
+/*
+ * ContainsLocalPlacement returns true if the current node has
+ * a local placement for the given shard id.
+ */
+static bool
+ContainsLocalPlacement(int64 shardId)
+{
+	ListCell *placementCell = NULL;
+	List *activePlacementList = ActiveShardPlacementList(shardId);
+	int32 localGroupId = GetLocalGroupId();
+
+	foreach(placementCell, activePlacementList)
+	{
+		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
+
+		if (placement->groupId == localGroupId)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+
+/*
  * ShardIdForTuple returns id of the shard to which the given tuple belongs to.
  */
 static uint64
@@ -2185,8 +2587,9 @@ ShardIdForTuple(CitusCopyDestReceiver *copyDest, Datum *columnValues, bool *colu
 	 * For reference table, this function blindly returns the tables single
 	 * shard.
 	 */
-	ShardInterval *shardInterval = FindShardInterval(partitionColumnValue,
-													 copyDest->tableMetadata);
+	CitusTableCacheEntry *cacheEntry =
+		GetCitusTableCacheEntry(copyDest->distributedRelationId);
+	ShardInterval *shardInterval = FindShardInterval(partitionColumnValue, cacheEntry);
 	if (shardInterval == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2213,6 +2616,7 @@ CitusCopyDestReceiverShutdown(DestReceiver *destReceiver)
 	Relation distributedRelation = copyDest->distributedRelation;
 
 	List *connectionStateList = ConnectionStateList(connectionStateHash);
+	FinishLocalCopy(copyDest);
 
 	PG_TRY();
 	{
@@ -2236,7 +2640,29 @@ CitusCopyDestReceiverShutdown(DestReceiver *destReceiver)
 	}
 	PG_END_TRY();
 
-	heap_close(distributedRelation, NoLock);
+	table_close(distributedRelation, NoLock);
+}
+
+
+/*
+ * FinishLocalCopy sends the remaining copies for local placements.
+ */
+static void
+FinishLocalCopy(CitusCopyDestReceiver *copyDest)
+{
+	HTAB *shardStateHash = copyDest->shardStateHash;
+	HASH_SEQ_STATUS status;
+	CopyShardState *copyShardState;
+
+	foreach_htab(copyShardState, &status, shardStateHash)
+	{
+		if (copyShardState->copyOutState != NULL &&
+			copyShardState->copyOutState->fe_msgbuf->len > 0)
+		{
+			FinishLocalCopyToShard(copyDest, copyShardState->shardId,
+								   copyShardState->copyOutState);
+		}
+	}
 }
 
 
@@ -2357,7 +2783,8 @@ CopyStatementHasFormat(CopyStmt *copyStatement, char *formatName)
  * further processing is needed.
  */
 Node *
-ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, const char *queryString)
+ProcessCopyStmt(CopyStmt *copyStatement, QueryCompletionCompat *completionTag, const
+				char *queryString)
 {
 	/*
 	 * Handle special COPY "resultid" FROM STDIN WITH (format result) commands
@@ -2389,11 +2816,11 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, const char *queryS
 		bool isFrom = copyStatement->is_from;
 
 		/* consider using RangeVarGetRelidExtended to check perms before locking */
-		Relation copiedRelation = heap_openrv(copyStatement->relation,
-											  isFrom ? RowExclusiveLock :
-											  AccessShareLock);
+		Relation copiedRelation = table_openrv(copyStatement->relation,
+											   isFrom ? RowExclusiveLock :
+											   AccessShareLock);
 
-		bool isDistributedRelation = IsDistributedTable(RelationGetRelid(copiedRelation));
+		bool isCitusRelation = IsCitusTable(RelationGetRelid(copiedRelation));
 
 		/* ensure future lookups hit the same relation */
 		char *schemaName = get_namespace_name(RelationGetNamespace(copiedRelation));
@@ -2404,13 +2831,13 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, const char *queryS
 		schemaName = MemoryContextStrdup(relationContext, schemaName);
 		copyStatement->relation->schemaname = schemaName;
 
-		heap_close(copiedRelation, NoLock);
+		table_close(copiedRelation, NoLock);
 
-		if (isDistributedRelation)
+		if (isCitusRelation)
 		{
 			if (copyStatement->is_from)
 			{
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= PG_VERSION_12
 				if (copyStatement->whereClause)
 				{
 					ereport(ERROR, (errmsg(
@@ -2423,27 +2850,24 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, const char *queryS
 				CitusCopyFrom(copyStatement, completionTag);
 				return NULL;
 			}
+			else if (copyStatement->filename == NULL && !copyStatement->is_program &&
+					 !CopyStatementHasFormat(copyStatement, "binary"))
+			{
+				/*
+				 * COPY table TO STDOUT is handled by specialized logic to
+				 * avoid buffering the table on the coordinator. This enables
+				 * pg_dump of large tables.
+				 */
+				CitusCopyTo(copyStatement, completionTag);
+				return NULL;
+			}
 			else
 			{
 				/*
-				 * The copy code only handles SELECTs in COPY ... TO on master tables,
-				 * as that can be done non-invasively. To handle COPY master_rel TO
-				 * the copy statement is replaced by a generated select statement.
+				 * COPY table TO PROGRAM / file is handled by wrapping the table
+				 * in a SELECT and going through the resulting COPY logic.
 				 */
-				ColumnRef *allColumns = makeNode(ColumnRef);
-				SelectStmt *selectStmt = makeNode(SelectStmt);
-				ResTarget *selectTarget = makeNode(ResTarget);
-
-				allColumns->fields = list_make1(makeNode(A_Star));
-				allColumns->location = -1;
-
-				selectTarget->name = NULL;
-				selectTarget->indirection = NIL;
-				selectTarget->val = (Node *) allColumns;
-				selectTarget->location = -1;
-
-				selectStmt->targetList = list_make1(selectTarget);
-				selectStmt->fromClause = list_make1(copyObject(copyStatement->relation));
+				SelectStmt *selectStmt = CitusCopySelect(copyStatement);
 
 				/* replace original statement */
 				copyStatement = copyObject(copyStatement);
@@ -2452,56 +2876,200 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, const char *queryS
 			}
 		}
 	}
+	return (Node *) copyStatement;
+}
 
 
-	if (copyStatement->filename != NULL && !copyStatement->is_program)
+/*
+ * CitusCopySelect generates a SelectStmt such that table may be replaced in
+ * "COPY table FROM" for an equivalent result.
+ */
+static SelectStmt *
+CitusCopySelect(CopyStmt *copyStatement)
+{
+	SelectStmt *selectStmt = makeNode(SelectStmt);
+	selectStmt->fromClause = list_make1(copyObject(copyStatement->relation));
+
+	Relation distributedRelation = table_openrv(copyStatement->relation, AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
+	List *targetList = NIL;
+
+	for (int i = 0; i < tupleDescriptor->natts; i++)
 	{
-		char *filename = copyStatement->filename;
+		Form_pg_attribute attr = &tupleDescriptor->attrs[i];
 
-		/*
-		 * We execute COPY commands issued by the task-tracker executor here
-		 * because we're not normally allowed to write to a file as a regular
-		 * user and we don't want to execute the query as superuser.
-		 */
-		if (CacheDirectoryElement(filename) && copyStatement->query != NULL &&
-			!copyStatement->is_from && !is_absolute_path(filename))
+		if (attr->attisdropped
+#if PG_VERSION_NUM >= PG_VERSION_12
+			|| attr->attgenerated
+#endif
+			)
 		{
-			bool binaryCopyFormat = CopyStatementHasFormat(copyStatement, "binary");
-			Query *query = NULL;
-			Node *queryNode = copyStatement->query;
-			StringInfo userFilePath = makeStringInfo();
+			continue;
+		}
 
-			RawStmt *rawStmt = makeNode(RawStmt);
-			rawStmt->stmt = queryNode;
+		ColumnRef *column = makeNode(ColumnRef);
+		column->fields = list_make1(makeString(pstrdup(attr->attname.data)));
+		column->location = -1;
 
-			List *queryTreeList = pg_analyze_and_rewrite(rawStmt, queryString, NULL, 0,
-														 NULL);
+		ResTarget *selectTarget = makeNode(ResTarget);
+		selectTarget->name = NULL;
+		selectTarget->indirection = NIL;
+		selectTarget->val = (Node *) column;
+		selectTarget->location = -1;
 
-			if (list_length(queryTreeList) != 1)
-			{
-				ereport(ERROR, (errmsg("can only execute a single query")));
-			}
+		targetList = lappend(targetList, selectTarget);
+	}
 
-			query = (Query *) linitial(queryTreeList);
+	table_close(distributedRelation, NoLock);
+
+	selectStmt->targetList = targetList;
+	return selectStmt;
+}
+
+
+/*
+ * CitusCopyTo runs a COPY .. TO STDOUT command on each shard to do a full
+ * table dump.
+ */
+static void
+CitusCopyTo(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
+{
+	ListCell *shardIntervalCell = NULL;
+	int64 tuplesSent = 0;
+
+	Relation distributedRelation = table_openrv(copyStatement->relation, AccessShareLock);
+	Oid relationId = RelationGetRelid(distributedRelation);
+	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
+
+	CopyOutState copyOutState = (CopyOutState) palloc0(sizeof(CopyOutStateData));
+	copyOutState->fe_msgbuf = makeStringInfo();
+	copyOutState->binary = false;
+	copyOutState->attnumlist = CopyGetAttnums(tupleDescriptor, distributedRelation,
+											  copyStatement->attlist);
+
+	SendCopyBegin(copyOutState);
+
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = lfirst(shardIntervalCell);
+		List *shardPlacementList = ActiveShardPlacementList(shardInterval->shardId);
+		ListCell *shardPlacementCell = NULL;
+		int placementIndex = 0;
+
+		StringInfo copyCommand = ConstructCopyStatement(copyStatement,
+														shardInterval->shardId);
+
+		foreach(shardPlacementCell, shardPlacementList)
+		{
+			ShardPlacement *shardPlacement = lfirst(shardPlacementCell);
+			int connectionFlags = 0;
+			char *userName = NULL;
+			const bool raiseErrors = true;
+
+			MultiConnection *connection = GetPlacementConnection(connectionFlags,
+																 shardPlacement,
+																 userName);
 
 			/*
-			 * Add a user ID suffix to prevent other users from reading/writing
-			 * the same file. We do this consistently in all functions that interact
-			 * with task files.
+			 * This code-path doesn't support optional connections, so we don't expect
+			 * NULL connections.
 			 */
-			appendStringInfo(userFilePath, "%s.%u", filename, GetUserId());
+			Assert(connection != NULL);
 
-			int64 tuplesSent = WorkerExecuteSqlTask(query, filename, binaryCopyFormat);
+			if (placementIndex == list_length(shardPlacementList) - 1)
+			{
+				/* last chance for this shard */
+				MarkRemoteTransactionCritical(connection);
+			}
 
-			snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-					 "COPY " UINT64_FORMAT, tuplesSent);
+			if (PQstatus(connection->pgConn) != CONNECTION_OK)
+			{
+				HandleRemoteTransactionConnectionError(connection, raiseErrors);
+				continue;
+			}
 
-			return NULL;
+			RemoteTransactionBeginIfNecessary(connection);
+
+			if (!SendRemoteCommand(connection, copyCommand->data))
+			{
+				HandleRemoteTransactionConnectionError(connection, raiseErrors);
+				continue;
+			}
+
+			PGresult *result = GetRemoteCommandResult(connection, raiseErrors);
+			if (PQresultStatus(result) != PGRES_COPY_OUT)
+			{
+				ReportResultError(connection, result, ERROR);
+			}
+
+			PQclear(result);
+
+			tuplesSent += ForwardCopyDataFromConnection(copyOutState, connection);
+			break;
+		}
+
+		if (shardIntervalCell == list_head(shardIntervalList))
+		{
+			/* remove header after the first shard */
+			RemoveOptionFromList(copyStatement->options, "header");
 		}
 	}
 
+	SendCopyEnd(copyOutState);
 
-	return (Node *) copyStatement;
+	table_close(distributedRelation, AccessShareLock);
+
+	if (completionTag != NULL)
+	{
+		CompleteCopyQueryTagCompat(completionTag, tuplesSent);
+	}
+}
+
+
+/*
+ * ForwardCopyDataFromConnection forwards copy data received over the given connection
+ * to the client or file descriptor.
+ */
+static int64
+ForwardCopyDataFromConnection(CopyOutState copyOutState, MultiConnection *connection)
+{
+	char *receiveBuffer = NULL;
+	const int useAsync = 0;
+	bool raiseErrors = true;
+	int64 tuplesSent = 0;
+
+	/* receive copy data message in a synchronous manner */
+	int receiveLength = PQgetCopyData(connection->pgConn, &receiveBuffer, useAsync);
+	while (receiveLength > 0)
+	{
+		bool includeEndOfLine = false;
+
+		CopySendData(copyOutState, receiveBuffer, receiveLength);
+		CopySendEndOfRow(copyOutState, includeEndOfLine);
+		tuplesSent++;
+
+		PQfreemem(receiveBuffer);
+
+		receiveLength = PQgetCopyData(connection->pgConn, &receiveBuffer, useAsync);
+	}
+
+	if (receiveLength != -1)
+	{
+		ReportConnectionError(connection, ERROR);
+	}
+
+	PGresult *result = GetRemoteCommandResult(connection, raiseErrors);
+	if (!IsResponseOK(result))
+	{
+		ReportResultError(connection, result, ERROR);
+	}
+
+	PQclear(result);
+	ClearResults(connection, raiseErrors);
+
+	return tuplesSent;
 }
 
 
@@ -2519,25 +3087,17 @@ CheckCopyPermissions(CopyStmt *copyStatement)
 	/* *INDENT-OFF* */
 	bool		is_from = copyStatement->is_from;
 	Relation	rel;
-	Oid			relid;
 	List	   *range_table = NIL;
 	TupleDesc	tupDesc;
 	AclMode		required_access = (is_from ? ACL_INSERT : ACL_SELECT);
 	List	   *attnums;
 	ListCell   *cur;
 
-	rel = heap_openrv(copyStatement->relation,
+	rel = table_openrv(copyStatement->relation,
 	                  is_from ? RowExclusiveLock : AccessShareLock);
 
-	relid = RelationGetRelid(rel);
-
-	RangeTblEntry *rte = makeNode(RangeTblEntry);
-	rte->rtekind = RTE_RELATION;
-	rte->relid = relid;
-	rte->relkind = rel->rd_rel->relkind;
-	rte->requiredPerms = required_access;
-	range_table = list_make1(rte);
-
+	range_table = CreateRangeTable(rel, required_access);
+	RangeTblEntry *rte = (RangeTblEntry*) linitial(range_table);
 	tupDesc = RelationGetDescr(rel);
 
 	attnums = CopyGetAttnums(tupDesc, rel, copyStatement->attlist);
@@ -2559,8 +3119,23 @@ CheckCopyPermissions(CopyStmt *copyStatement)
 
 	/* TODO: Perform RLS checks once supported */
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 	/* *INDENT-ON* */
+}
+
+
+/*
+ * CreateRangeTable creates a range table with the given relation.
+ */
+List *
+CreateRangeTable(Relation rel, AclMode requiredAccess)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = rel->rd_id;
+	rte->relkind = rel->rd_rel->relkind;
+	rte->requiredPerms = requiredAccess;
+	return list_make1(rte);
 }
 
 
@@ -2581,6 +3156,10 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 		{
 			if (TupleDescAttr(tupDesc, i)->attisdropped)
 				continue;
+#if PG_VERSION_NUM >= PG_VERSION_12
+			if (TupleDescAttr(tupDesc, i)->attgenerated)
+				continue;
+#endif
 			attnums = lappend_int(attnums, i + 1);
 		}
 	}
@@ -2605,6 +3184,14 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 					continue;
 				if (namestrcmp(&(att->attname), name) == 0)
 				{
+#if PG_VERSION_NUM >= PG_VERSION_12
+					if (att->attgenerated)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+								 errmsg("column \"%s\" is a generated column",
+										name),
+								 errdetail("Generated columns cannot be used in COPY.")));
+#endif
 					attnum = att->attnum;
 					break;
 				}
@@ -2703,6 +3290,7 @@ GetConnectionState(HTAB *connectionStateHash, MultiConnection *connection)
 		connectionState->socket = sock;
 		connectionState->connection = connection;
 		connectionState->activePlacementState = NULL;
+		connectionState->bufferedPlacementCount = 0;
 		dlist_init(&connectionState->bufferedPlacementList);
 	}
 
@@ -2736,20 +3324,53 @@ ConnectionStateList(HTAB *connectionStateHash)
 
 
 /*
+ * ConnectionStateListToNode returns all CopyConnectionState structures in
+ * the given hash for a given hostname and port values.
+ */
+static List *
+ConnectionStateListToNode(HTAB *connectionStateHash, const char *hostname, int32 port)
+{
+	List *connectionStateList = NIL;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, connectionStateHash);
+
+	CopyConnectionState *connectionState =
+		(CopyConnectionState *) hash_seq_search(&status);
+	while (connectionState != NULL)
+	{
+		char *connectionHostname = connectionState->connection->hostname;
+		if (strncmp(connectionHostname, hostname, MAX_NODE_LENGTH) == 0 &&
+			connectionState->connection->port == port)
+		{
+			connectionStateList = lappend(connectionStateList, connectionState);
+		}
+
+		connectionState = (CopyConnectionState *) hash_seq_search(&status);
+	}
+
+	return connectionStateList;
+}
+
+
+/*
  * GetShardState finds existing CopyShardState for a shard in the provided
  * hash. If not found, then a new shard state is returned with all related
  * CopyPlacementStates initialized.
  */
 static CopyShardState *
 GetShardState(uint64 shardId, HTAB *shardStateHash,
-			  HTAB *connectionStateHash, bool stopOnFailure, bool *found)
+			  HTAB *connectionStateHash, bool stopOnFailure, bool *found, bool
+			  shouldUseLocalCopy, CopyOutState copyOutState, bool
+			  isCopyToIntermediateFile)
 {
 	CopyShardState *shardState = (CopyShardState *) hash_search(shardStateHash, &shardId,
 																HASH_ENTER, found);
 	if (!*found)
 	{
 		InitializeCopyShardState(shardState, connectionStateHash,
-								 shardId, stopOnFailure);
+								 shardId, stopOnFailure, shouldUseLocalCopy,
+								 copyOutState, isCopyToIntermediateFile);
 	}
 
 	return shardState;
@@ -2764,7 +3385,8 @@ GetShardState(uint64 shardId, HTAB *shardStateHash,
 static void
 InitializeCopyShardState(CopyShardState *shardState,
 						 HTAB *connectionStateHash, uint64 shardId,
-						 bool stopOnFailure)
+						 bool stopOnFailure, bool shouldUseLocalCopy, CopyOutState
+						 copyOutState, bool isCopyToIntermediateFile)
 {
 	ListCell *placementCell = NULL;
 	int failedPlacementCount = 0;
@@ -2776,6 +3398,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 									  ALLOCSET_DEFAULT_INITSIZE,
 									  ALLOCSET_DEFAULT_MAXSIZE);
 
+
 	/* release active placement list at the end of this function */
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
@@ -2785,18 +3408,43 @@ InitializeCopyShardState(CopyShardState *shardState,
 
 	shardState->shardId = shardId;
 	shardState->placementStateList = NIL;
+	shardState->copyOutState = NULL;
+	shardState->containsLocalPlacement = ContainsLocalPlacement(shardId);
+
 
 	foreach(placementCell, activePlacementList)
 	{
 		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
 
+		if (shouldUseLocalCopy && placement->groupId == GetLocalGroupId())
+		{
+			shardState->copyOutState = (CopyOutState) palloc0(sizeof(*copyOutState));
+			CloneCopyOutStateForLocalCopy(copyOutState, shardState->copyOutState);
+			LogLocalCopyExecution(shardId);
+			continue;
+		}
+
+		if (placement->groupId == GetLocalGroupId())
+		{
+			/*
+			 * if we are copying into an intermediate file we won't use local copy.
+			 * Files are visible to all transactions so we can still use local execution, therefore
+			 * we shouldn't restrict only using connection in this case.
+			 */
+			if (!isCopyToIntermediateFile)
+			{
+				SetLocalExecutionStatus(LOCAL_EXECUTION_DISABLED);
+			}
+		}
+
 		MultiConnection *connection =
-			CopyGetPlacementConnection(placement, stopOnFailure);
+			CopyGetPlacementConnection(connectionStateHash, placement, stopOnFailure);
 		if (connection == NULL)
 		{
 			failedPlacementCount++;
 			continue;
 		}
+
 
 		CopyConnectionState *connectionState = GetConnectionState(connectionStateHash,
 																  connection);
@@ -2813,6 +3461,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		CopyPlacementState *placementState = palloc0(sizeof(CopyPlacementState));
 		placementState->shardState = shardState;
 		placementState->data = makeStringInfo();
+		placementState->groupId = placement->groupId;
 		placementState->connectionState = connectionState;
 
 		/*
@@ -2821,8 +3470,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		 * same time as calling StartPlacementStateCopyCommand() so we actually
 		 * know the COPY operation for the placement is ongoing.
 		 */
-		dlist_push_head(&connectionState->bufferedPlacementList,
-						&placementState->bufferedPlacementNode);
+		AddPlacementStateToCopyConnectionStateBuffer(connectionState, placementState);
 		shardState->placementStateList = lappend(shardState->placementStateList,
 												 placementState);
 	}
@@ -2844,12 +3492,50 @@ InitializeCopyShardState(CopyShardState *shardState,
 
 
 /*
+ * CloneCopyOutStateForLocalCopy creates a shallow copy of the CopyOutState with a new
+ * fe_msgbuf. We keep a separate CopyOutState for every local shard placement, because
+ * in case of local copy we serialize and buffer incoming tuples into fe_msgbuf for each
+ * placement and the serialization functions take a CopyOutState as a parameter.
+ */
+static void
+CloneCopyOutStateForLocalCopy(CopyOutState from, CopyOutState to)
+{
+	to->attnumlist = from->attnumlist;
+	to->binary = from->binary;
+	to->copy_dest = from->copy_dest;
+	to->delim = from->delim;
+	to->file_encoding = from->file_encoding;
+	to->need_transcoding = from->need_transcoding;
+	to->null_print = from->null_print;
+	to->null_print_client = from->null_print_client;
+	to->rowcontext = from->rowcontext;
+	to->fe_msgbuf = makeStringInfo();
+}
+
+
+/*
+ * LogLocalCopyExecution logs that the copy will be done locally for
+ * the given shard.
+ */
+static void
+LogLocalCopyExecution(uint64 shardId)
+{
+	if (!(LogRemoteCommands || LogLocalCommands))
+	{
+		return;
+	}
+	ereport(NOTICE, (errmsg("executing the copy locally for shard %lu", shardId)));
+}
+
+
+/*
  * CopyGetPlacementConnection assigns a connection to the given placement. If
  * a connection has already been assigned the placement in the current transaction
  * then it reuses the connection. Otherwise, it requests a connection for placement.
  */
 static MultiConnection *
-CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
+CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement, bool
+						   stopOnFailure)
 {
 	uint32 connectionFlags = FOR_DML;
 	char *nodeUser = CurrentUserName();
@@ -2860,14 +3546,62 @@ CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
 	 */
 	ShardPlacementAccess *placementAccess = CreatePlacementAccess(placement,
 																  PLACEMENT_ACCESS_DML);
-	MultiConnection *connection = GetConnectionIfPlacementAccessedInXact(connectionFlags,
-																		 list_make1(
-																			 placementAccess),
-																		 NULL);
+	MultiConnection *connection =
+		GetConnectionIfPlacementAccessedInXact(connectionFlags,
+											   list_make1(placementAccess), NULL);
 	if (connection != NULL)
 	{
+		/*
+		 * Errors are supposed to cause immediate aborts (i.e. we don't
+		 * want to/can't invalidate placements), mark the connection as
+		 * critical so later errors cause failures.
+		 */
+		MarkRemoteTransactionCritical(connection);
+
 		return connection;
 	}
+
+	/*
+	 * If we exceeded citus.max_adaptive_executor_pool_size, we should re-use the
+	 * existing connections to multiplex multiple COPY commands on shards over a
+	 * single connection.
+	 */
+	char *nodeName = placement->nodeName;
+	int nodePort = placement->nodePort;
+	List *copyConnectionStateList =
+		ConnectionStateListToNode(connectionStateHash, nodeName, nodePort);
+	if (HasReachedAdaptiveExecutorPoolSize(copyConnectionStateList))
+	{
+		/*
+		 * If we've already reached the executor pool size, there should be at
+		 * least one connection to any given node.
+		 *
+		 * Note that we don't need to mark the connection as critical, since the
+		 * connection was already returned by this function before.
+		 */
+		connection = GetLeastUtilisedCopyConnection(copyConnectionStateList,
+													nodeName,
+													nodePort);
+
+		return connection;
+	}
+
+	if (IsReservationPossible())
+	{
+		/*
+		 * Enforce the requirements for adaptive connection management
+		 * (a.k.a., throttle connections if citus.max_shared_pool_size
+		 * reached).
+		 *
+		 * Given that we have done reservations per node, we do not ever
+		 * need to pass WAIT_FOR_CONNECTION, we are sure that there is a
+		 * connection either reserved for this backend or already established
+		 * by the previous commands in the same transaction block.
+		 */
+		int adaptiveConnectionManagementFlag = OPTIONAL_CONNECTION;
+		connectionFlags |= adaptiveConnectionManagementFlag;
+	}
+
 
 	/*
 	 * For placements that haven't been assigned a connection by a previous command
@@ -2877,10 +3611,70 @@ CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
 	if (placement->partitionMethod == DISTRIBUTE_BY_HASH &&
 		MultiShardConnectionType != SEQUENTIAL_CONNECTION)
 	{
-		connectionFlags |= CONNECTION_PER_PLACEMENT;
+		/*
+		 * Claiming the connection exclusively (done below) would also have the
+		 * effect of opening multiple connections, but claiming the connection
+		 * exclusively prevents GetConnectionIfPlacementAccessedInXact from returning
+		 * the connection if it is needed for a different shard placement.
+		 *
+		 * By setting the REQUIRE_CLEAN_CONNECTION flag we are guaranteed to get
+		 * connection that will not be returned by GetConnectionIfPlacementAccessedInXact
+		 * for the remainder of the COPY, hence it safe to claim the connection
+		 * exclusively. Claiming a connection exclusively prevents it from being
+		 * used in other distributed queries that happen during the COPY (e.g. if
+		 * the copy logic calls a function to calculate a default value, and the
+		 * function does a distributed query).
+		 */
+		connectionFlags |= REQUIRE_CLEAN_CONNECTION;
 	}
 
 	connection = GetPlacementConnection(connectionFlags, placement, nodeUser);
+	if (connection == NULL)
+	{
+		if (list_length(copyConnectionStateList) > 0)
+		{
+			/*
+			 * The connection manager throttled any new connections, so pick an existing
+			 * connection with least utilization.
+			 *
+			 * Note that we don't need to mark the connection as critical, since the
+			 * connection was already returned by this function before.
+			 */
+			connection =
+				GetLeastUtilisedCopyConnection(copyConnectionStateList, nodeName,
+											   nodePort);
+		}
+		else
+		{
+			/*
+			 * For this COPY command, we have not established any connections
+			 * and adaptive connection management throttled the new connection
+			 * request. This could only happen if this COPY command is the
+			 * second (or later) COPY command in a transaction block as the
+			 * first COPY command always gets a connection per node thanks to
+			 * the connection reservation.
+			 *
+			 * As we know that there has been at least one COPY command happened
+			 * earlier, we need to find the connection to that node, and use it.
+			 */
+			connection =
+				ConnectionAvailableToNode(nodeName, nodePort, CurrentUserName(),
+										  CurrentDatabaseName());
+
+			/*
+			 * We do not expect this to happen, but still instead of an assert,
+			 * we prefer explicit error message.
+			 */
+			if (connection == NULL)
+			{
+				ereport(ERROR, (errmsg("could not find an available connection"),
+								errhint("Set citus.max_shared_pool_size TO -1 to let "
+										"COPY command finish")));
+			}
+		}
+
+		return connection;
+	}
 
 	if (PQstatus(connection->pgConn) != CONNECTION_OK)
 	{
@@ -2910,9 +3704,70 @@ CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
 		ClaimConnectionExclusively(connection);
 	}
 
-	if (!TransactionConnectedToLocalGroup && placement->groupId == GetLocalGroupId())
+	return connection;
+}
+
+
+/*
+ * HasReachedAdaptiveExecutorPoolSize returns true if the number of entries in input
+ * connection list has greater than or equal to citus.max_adaptive_executor_pool_size.
+ */
+static bool
+HasReachedAdaptiveExecutorPoolSize(List *connectionStateList)
+{
+	if (list_length(connectionStateList) >= MaxAdaptiveExecutorPoolSize)
 	{
-		TransactionConnectedToLocalGroup = true;
+		/*
+		 * We've not reached MaxAdaptiveExecutorPoolSize number of
+		 * connections, so we're allowed to establish a new
+		 * connection to the given node.
+		 */
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * GetLeastUtilisedCopyConnection returns a MultiConnection to the given node
+ * with the least number of placements assigned to it.
+ *
+ * It is assumed that there exists at least one connection to the node.
+ */
+static MultiConnection *
+GetLeastUtilisedCopyConnection(List *connectionStateList, char *nodeName,
+							   int nodePort)
+{
+	MultiConnection *connection = NULL;
+	int minPlacementCount = PG_INT32_MAX;
+	ListCell *connectionStateCell = NULL;
+
+	/*
+	 * We only pick the least utilised connection when some connection limits are
+	 * reached such as max_shared_pool_size or max_adaptive_executor_pool_size.
+	 *
+	 * Therefore there should be some connections to choose from.
+	 */
+	Assert(list_length(connectionStateList) > 0);
+
+	foreach(connectionStateCell, connectionStateList)
+	{
+		CopyConnectionState *connectionState = lfirst(connectionStateCell);
+		int currentConnectionPlacementCount = connectionState->bufferedPlacementCount;
+
+		if (connectionState->activePlacementState != NULL)
+		{
+			currentConnectionPlacementCount++;
+		}
+
+		Assert(currentConnectionPlacementCount > 0);
+
+		if (currentConnectionPlacementCount < minPlacementCount)
+		{
+			minPlacementCount = currentConnectionPlacementCount;
+			connection = connectionState->connection;
+		}
 	}
 
 	return connection;
@@ -2932,7 +3787,7 @@ StartPlacementStateCopyCommand(CopyPlacementState *placementState,
 	bool raiseInterrupts = true;
 	bool binaryCopy = copyOutState->binary;
 
-	StringInfo copyCommand = ConstructCopyStatement(copyStatement, shardId, binaryCopy);
+	StringInfo copyCommand = ConstructCopyStatement(copyStatement, shardId);
 
 	if (!SendRemoteCommand(connection, copyCommand->data))
 	{

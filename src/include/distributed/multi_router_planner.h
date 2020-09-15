@@ -45,15 +45,18 @@ extern DeferredErrorMessage * PlanRouterQuery(Query *originalQuery,
 											  Const **partitionValueConst);
 extern List * RelationShardListForShardIntervalList(List *shardIntervalList,
 													bool *shardsPresent);
-extern List * FindRouterWorkerList(List *shardIntervalList, bool shardsPresent,
-								   bool replacePrunedQueryWithDummy);
-extern List * RouterInsertTaskList(Query *query, DeferredErrorMessage **planningError);
+extern List * CreateTaskPlacementListForShardIntervals(List *shardIntervalList,
+													   bool shardsPresent,
+													   bool generateDummyPlacement,
+													   bool hasLocalRelation);
+extern List * RouterInsertTaskList(Query *query, bool parametersInQueryResolved,
+								   DeferredErrorMessage **planningError);
 extern Const * ExtractInsertPartitionKeyValue(Query *query);
 extern List * TargetShardIntervalsForRestrictInfo(RelationRestrictionContext *
 												  restrictionContext,
 												  bool *multiShardQuery,
 												  Const **partitionValueConst);
-extern List * WorkersContainingAllShards(List *prunedShardIntervalsList);
+extern List * PlacementsForWorkersContainingAllShards(List *shardIntervalListList);
 extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree, Query *originalQuery,
 												   bool multiShardQuery,
@@ -64,22 +67,22 @@ extern List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rte
 extern RelationRestrictionContext * CopyRelationRestrictionContext(
 	RelationRestrictionContext *oldContext);
 
-extern Oid ExtractFirstDistributedTableId(Query *query);
+extern Oid ExtractFirstCitusTableId(Query *query);
 extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
 extern Oid ModifyQueryResultRelationId(Query *query);
 extern RangeTblEntry * ExtractResultRelationRTE(Query *query);
+extern RangeTblEntry * ExtractResultRelationRTEOrError(Query *query);
 extern RangeTblEntry * ExtractDistributedInsertValuesRTE(Query *query);
 extern bool IsMultiRowInsert(Query *query);
 extern void AddShardIntervalRestrictionToSelect(Query *subqery,
 												ShardInterval *shardInterval);
 extern bool UpdateOrDeleteQuery(Query *query);
-extern List * WorkersContainingAllShards(List *prunedShardIntervalsList);
 
 extern uint64 GetAnchorShardId(List *relationShardList);
 extern List * TargetShardIntervalForFastPathQuery(Query *query,
-												  Const **partitionValueConst,
 												  bool *isMultiShardQuery,
-												  Const *distributionKeyValue);
+												  Const *inputDistributionKeyValue,
+												  Const **outGoingPartitionValueConst);
 extern void GenerateSingleShardRouterTaskList(Job *job,
 											  List *relationShardList,
 											  List *placementList, uint64 shardId);

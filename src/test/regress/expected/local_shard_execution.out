@@ -47,6 +47,37 @@ SELECT create_distributed_table('collections_list', 'key');
 CREATE TABLE collections_list_0
 	PARTITION OF collections_list (key, ser, ts, collection_id, value)
 	FOR VALUES IN ( 0 );
+-- create a volatile function that returns the local node id
+CREATE OR REPLACE FUNCTION get_local_node_id_volatile()
+RETURNS INT AS $$
+DECLARE localGroupId int;
+BEGIN
+        SELECT groupid INTO localGroupId FROM pg_dist_local_group;
+  RETURN localGroupId;
+END; $$ language plpgsql VOLATILE;
+SELECT create_distributed_function('get_local_node_id_volatile()');
+ create_distributed_function
+---------------------------------------------------------------------
+
+(1 row)
+
+-- test case for issue #3556
+CREATE TABLE accounts (id text PRIMARY KEY);
+CREATE TABLE stats (account_id text PRIMARY KEY, spent int);
+SELECT create_distributed_table('accounts', 'id', colocate_with => 'none');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT create_distributed_table('stats', 'account_id', colocate_with => 'accounts');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+INSERT INTO accounts (id) VALUES ('foo');
+INSERT INTO stats (account_id, spent) VALUES ('foo', 100);
 -- connection worker and get ready for the tests
 \c - - - :worker_1_port
 SET search_path TO local_shard_execution;
@@ -75,6 +106,45 @@ CREATE OR REPLACE FUNCTION shard_of_distribution_column_is_local(dist_key int) R
 		RETURN shard_is_local;
         END;
 $$ LANGUAGE plpgsql;
+-- test case for issue #3556
+SET citus.log_intermediate_results TO TRUE;
+SET client_min_messages TO DEBUG1;
+SELECT *
+FROM
+(
+    WITH accounts_cte AS (
+        SELECT id AS account_id
+        FROM accounts
+    ),
+    joined_stats_cte_1 AS (
+        SELECT spent, account_id
+        FROM stats
+        INNER JOIN accounts_cte USING (account_id)
+    ),
+    joined_stats_cte_2 AS (
+        SELECT spent, account_id
+        FROM joined_stats_cte_1
+        INNER JOIN accounts_cte USING (account_id)
+    )
+    SELECT SUM(spent) OVER (PARTITION BY coalesce(account_id, NULL))
+    FROM accounts_cte
+    INNER JOIN joined_stats_cte_2 USING (account_id)
+) inner_query;
+DEBUG:  CTE joined_stats_cte_1 is going to be inlined via distributed planning
+DEBUG:  CTE joined_stats_cte_2 is going to be inlined via distributed planning
+DEBUG:  generating subplan XXX_1 for CTE accounts_cte: SELECT id AS account_id FROM local_shard_execution.accounts
+DEBUG:  generating subplan XXX_2 for subquery SELECT sum(joined_stats_cte_2.spent) OVER (PARTITION BY COALESCE(accounts_cte.account_id, NULL::text)) AS sum FROM ((SELECT intermediate_result.account_id FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(account_id text)) accounts_cte JOIN (SELECT joined_stats_cte_1.spent, joined_stats_cte_1.account_id FROM ((SELECT stats.spent, stats.account_id FROM (local_shard_execution.stats JOIN (SELECT intermediate_result.account_id FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(account_id text)) accounts_cte_2 USING (account_id))) joined_stats_cte_1 JOIN (SELECT intermediate_result.account_id FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(account_id text)) accounts_cte_1 USING (account_id))) joined_stats_cte_2 USING (account_id))
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT sum FROM (SELECT intermediate_result.sum FROM read_intermediate_result('XXX_2'::text, 'binary'::citus_copy_format) intermediate_result(sum bigint)) inner_query
+DEBUG:  Subplan XXX_1 will be sent to localhost:xxxxx
+DEBUG:  Subplan XXX_1 will be sent to localhost:xxxxx
+DEBUG:  Subplan XXX_2 will be written to local file
+ sum
+---------------------------------------------------------------------
+ 100
+(1 row)
+
+SET citus.log_intermediate_results TO DEFAULT;
+SET client_min_messages TO DEFAULT;
 -- pick some example values that reside on the shards locally and remote
 -- distribution key values of 1,6, 500 and 701 are LOCAL to shards,
 -- we'll use these values in the tests
@@ -201,6 +271,8 @@ RETURNING *;
 -- that's why it is disallowed to use local execution even if the SELECT
 -- can be executed locally
 INSERT INTO distributed_table SELECT * FROM distributed_table WHERE key = 1 OFFSET 0 ON CONFLICT DO NOTHING;
+NOTICE:  executing the command locally: SELECT key, value, age FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1) OFFSET 0
+NOTICE:  executing the command locally: INSERT INTO local_shard_execution.distributed_table_1470001 AS citus_table_alias (key, value, age) SELECT key, value, age FROM read_intermediate_result('insert_select_XXX_1470001'::text, 'binary'::citus_copy_format) intermediate_result(key integer, value text, age bigint) ON CONFLICT DO NOTHING
 INSERT INTO distributed_table SELECT 1, '1',15 FROM distributed_table WHERE key = 2 LIMIT 1 ON CONFLICT DO NOTHING;
 -- sanity check: multi-shard INSERT..SELECT pushdown goes through distributed execution
 INSERT INTO distributed_table SELECT * FROM distributed_table ON CONFLICT DO NOTHING;
@@ -224,13 +296,42 @@ EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF)   SELECT * FROM distribute
 ---------------------------------------------------------------------
  Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
    Task Count: 1
+   Tuple data received from nodes: 5 bytes
    Tasks Shown: All
    ->  Task
+         Tuple data received from node: 5 bytes
          Node: host=localhost port=xxxxx dbname=regression
          ->  Index Scan using distributed_table_pkey_1470001 on distributed_table_1470001 distributed_table (actual rows=1 loops=1)
                Index Cond: (key = 1)
                Filter: (age = 20)
-(8 rows)
+(10 rows)
+
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF)
+WITH r AS ( SELECT GREATEST(random(), 2) z,* FROM distributed_table)
+SELECT 1 FROM r WHERE z < 3;
+                                               QUERY PLAN
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+   ->  Distributed Subplan XXX_1
+         Intermediate Data Size: 40 bytes
+         Result destination: Write locally
+         ->  Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+               Task Count: 4
+               Tuple data received from nodes: 6 bytes
+               Tasks Shown: One of 4
+               ->  Task
+                     Tuple data received from node: 6 bytes
+                     Node: host=localhost port=xxxxx dbname=regression
+                     ->  Seq Scan on distributed_table_1470001 distributed_table (actual rows=1 loops=1)
+   Task Count: 1
+   Tuple data received from nodes: 1 bytes
+   Tasks Shown: All
+   ->  Task
+         Tuple data received from node: 1 bytes
+         Node: host=localhost port=xxxxx dbname=regression
+         ->  Function Scan on read_intermediate_result intermediate_result (actual rows=1 loops=1)
+               Filter: (z < '3'::double precision)
+(20 rows)
 
 EXPLAIN (COSTS OFF) DELETE FROM distributed_table WHERE key = 1 AND age = 20;
                                                     QUERY PLAN
@@ -255,10 +356,11 @@ EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF) DELETE FROM distributed_ta
    ->  Task
          Node: host=localhost port=xxxxx dbname=regression
          ->  Delete on distributed_table_1470001 distributed_table (actual rows=0 loops=1)
-               ->  Index Scan using distributed_table_pkey_1470001 on distributed_table_1470001 distributed_table (actual rows=0 loops=1)
+               ->  Index Scan using distributed_table_pkey_1470001 on distributed_table_1470001 distributed_table (actual rows=1 loops=1)
                      Index Cond: (key = 1)
                      Filter: (age = 20)
-(9 rows)
+             Trigger for constraint second_distributed_table_key_fkey_1470005: calls=1
+(10 rows)
 
 -- show that EXPLAIN ANALYZE deleted the row and cascades deletes
 SELECT * FROM distributed_table WHERE key = 1 AND age = 20 ORDER BY 1,2,3;
@@ -287,8 +389,7 @@ COPY second_distributed_table FROM STDIN WITH CSV;
 	-- (a) Unless the first query is a local query, always use distributed execution.
 	-- (b) If the executor has used local execution, it has to use local execution
 	--     for the remaining of the transaction block. If that's not possible, the
-	-- 	   executor has to error out (e.g., TRUNCATE is a utility command and we
-	--	   currently do not support local execution of utility commands)
+	-- 	   executor has to error out
 -- rollback should be able to rollback local execution
 BEGIN;
 	INSERT INTO distributed_table VALUES (1, '11',21) ON CONFLICT(key) DO UPDATE SET value = '29' RETURNING *;
@@ -412,9 +513,12 @@ NOTICE:  executing the command locally: SELECT key, value, age FROM local_shard_
 -- using that and never switch back to local execution
 BEGIN;
 	DELETE FROM distributed_table WHERE value = '11';
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (value OPERATOR(pg_catalog.=) '11'::text)
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE (value OPERATOR(pg_catalog.=) '11'::text)
 	-- although this command could have been executed
 	-- locally, it is not going to be executed locally
 	SELECT * FROM distributed_table WHERE key = 1 ORDER BY 1,2,3;
+NOTICE:  executing the command locally: SELECT key, value, age FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1) ORDER BY key, value, age
  key | value | age
 ---------------------------------------------------------------------
 (0 rows)
@@ -423,8 +527,16 @@ BEGIN;
 	-- they are utility commands
 	TRUNCATE distributed_table CASCADE;
 NOTICE:  truncate cascades to table "second_distributed_table"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
 	-- TRUNCATE cascaded into second_distributed_table
 	SELECT count(*) FROM second_distributed_table;
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.second_distributed_table_1470005 second_distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.second_distributed_table_1470007 second_distributed_table WHERE true
  count
 ---------------------------------------------------------------------
      0
@@ -433,28 +545,7 @@ NOTICE:  truncate cascades to table "second_distributed_table"
 ROLLBACK;
 -- load some data so that foreign keys won't complain with the next tests
 INSERT INTO reference_table SELECT i FROM generate_series(500, 600) i;
--- a very similar set of operation, but this time use
--- COPY as the first command
-BEGIN;
-	INSERT INTO distributed_table SELECT i, i::text, i % 10 + 25 FROM generate_series(500, 600) i;
-	-- this could go through local execution, but doesn't because we've already
-	-- done distributed execution
-	SELECT * FROM distributed_table WHERE key = 500 ORDER BY 1,2,3;
- key | value | age
----------------------------------------------------------------------
- 500 | 500   |  25
-(1 row)
-
-	-- utility commands could still use distributed execution
-	TRUNCATE distributed_table CASCADE;
-NOTICE:  truncate cascades to table "second_distributed_table"
-	-- ensure that TRUNCATE made it
-	SELECT * FROM distributed_table WHERE key = 500 ORDER BY 1,2,3;
- key | value | age
----------------------------------------------------------------------
-(0 rows)
-
-ROLLBACK;
+NOTICE:  executing the copy locally for shard xxxxx
 -- show that cascading foreign keys just works fine with local execution
 BEGIN;
 	INSERT INTO reference_table VALUES (701);
@@ -517,7 +608,7 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shar
 (1 row)
 
 ROLLBACK;
--- a local query is followed by a command that cannot be executed locally
+-- a local query followed by TRUNCATE command can be executed locally
 BEGIN;
 	SELECT count(*) FROM distributed_table WHERE key = 1;
 NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
@@ -528,9 +619,12 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shar
 
 	TRUNCATE distributed_table CASCADE;
 NOTICE:  truncate cascades to table "second_distributed_table"
-ERROR:  cannot execute command because a local execution has accessed a placement in the transaction
-DETAIL:  Some parallel commands cannot be executed if a previous command has already been executed locally
-HINT:  Try re-running the transaction with "SET LOCAL citus.enable_local_execution TO OFF;"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
 ROLLBACK;
 -- a local query is followed by a command that cannot be executed locally
 BEGIN;
@@ -541,22 +635,20 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shar
      0
 (1 row)
 
-	-- even no need to supply any data
-	COPY distributed_table FROM STDIN WITH CSV;
-ERROR:  cannot execute command because a local execution has accessed a placement in the transaction
-DETAIL:  Some parallel commands cannot be executed if a previous command has already been executed locally
-HINT:  Try re-running the transaction with "SET LOCAL citus.enable_local_execution TO OFF;"
+	INSERT INTO distributed_table (key) SELECT i FROM generate_series(1,1) i;
+NOTICE:  executing the copy locally for shard xxxxx
 ROLLBACK;
--- a local query is followed by a command that cannot be executed locally
 BEGIN;
-	SELECT count(*) FROM distributed_table WHERE key = 1;
-NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
+SET citus.enable_repartition_joins TO ON;
+SELECT count(*) FROM distributed_table;
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
  count
 ---------------------------------------------------------------------
-     0
+     2
 (1 row)
 
-	INSERT INTO distributed_table (key) SELECT i FROM generate_series(1,10)i;
+SELECT count(*) FROM distributed_table d1 join distributed_table d2 using(age);
 ERROR:  cannot execute command because a local execution has accessed a placement in the transaction
 DETAIL:  Some parallel commands cannot be executed if a previous command has already been executed locally
 HINT:  Try re-running the transaction with "SET LOCAL citus.enable_local_execution TO OFF;"
@@ -634,6 +726,33 @@ PL/pgSQL function only_local_execution() line 5 at SQL statement
 NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
 CONTEXT:  SQL statement "DELETE FROM distributed_table WHERE key = 1"
 PL/pgSQL function only_local_execution() line 6 at SQL statement
+-- insert a row that we need in the next tests
+INSERT INTO distributed_table VALUES (1, '11',21) ON CONFLICT(key) DO UPDATE SET value = '29';
+NOTICE:  executing the command locally: INSERT INTO local_shard_execution.distributed_table_1470001 AS citus_table_alias (key, value, age) VALUES (1, '11'::text, 21) ON CONFLICT(key) DO UPDATE SET value = '29'::text
+-- make sure that functions can use local execution
+CREATE OR REPLACE PROCEDURE only_local_execution_with_function_evaluation() AS $$
+		DECLARE nodeId INT;
+		BEGIN
+			-- fast path router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table WHERE key = 1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+
+			-- regular router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = 1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+		END;
+$$ LANGUAGE plpgsql;
+CALL only_local_execution_with_function_evaluation();
+NOTICE:  executing the command locally: SELECT local_shard_execution.get_local_node_id_volatile() AS get_local_node_id_volatile FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
+CONTEXT:  SQL statement "SELECT get_local_node_id_volatile()             FROM distributed_table WHERE key = 1"
+PL/pgSQL function only_local_execution_with_function_evaluation() line 5 at SQL statement
+NOTICE:  executing the command locally: SELECT local_shard_execution.get_local_node_id_volatile() AS get_local_node_id_volatile FROM (local_shard_execution.distributed_table_1470001 d1(key, value, age) JOIN local_shard_execution.distributed_table_1470001 d2(key, value, age) USING (key)) WHERE (d1.key OPERATOR(pg_catalog.=) 1)
+CONTEXT:  SQL statement "SELECT get_local_node_id_volatile()             FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = 1"
+PL/pgSQL function only_local_execution_with_function_evaluation() line 11 at SQL statement
 CREATE OR REPLACE PROCEDURE only_local_execution_with_params(int) AS $$
 		DECLARE cnt INT;
 		BEGIN
@@ -652,6 +771,29 @@ PL/pgSQL function only_local_execution_with_params(integer) line 5 at SQL statem
 NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
 CONTEXT:  SQL statement "DELETE FROM distributed_table WHERE key = $1"
 PL/pgSQL function only_local_execution_with_params(integer) line 6 at SQL statement
+CREATE OR REPLACE PROCEDURE only_local_execution_with_function_evaluation_param(int) AS $$
+		DECLARE nodeId INT;
+		BEGIN
+			-- fast path router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table WHERE key = $1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+
+			-- regular router
+			SELECT get_local_node_id_volatile() INTO nodeId FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = $1;
+			IF nodeId <= 0 THEN
+				RAISE NOTICE 'unexpected node id';
+			END IF;
+		END;
+$$ LANGUAGE plpgsql;
+CALL only_local_execution_with_function_evaluation_param(1);
+NOTICE:  executing the command locally: SELECT local_shard_execution.get_local_node_id_volatile() AS get_local_node_id_volatile FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE (key OPERATOR(pg_catalog.=) 1)
+CONTEXT:  SQL statement "SELECT get_local_node_id_volatile()             FROM distributed_table WHERE key = $1"
+PL/pgSQL function only_local_execution_with_function_evaluation_param(integer) line 5 at SQL statement
+NOTICE:  executing the command locally: SELECT local_shard_execution.get_local_node_id_volatile() AS get_local_node_id_volatile FROM (local_shard_execution.distributed_table_1470001 d1(key, value, age) JOIN local_shard_execution.distributed_table_1470001 d2(key, value, age) USING (key)) WHERE (d1.key OPERATOR(pg_catalog.=) $1)
+CONTEXT:  SQL statement "SELECT get_local_node_id_volatile()             FROM distributed_table d1 JOIN distributed_table d2 USING (key) WHERE d1.key = $1"
+PL/pgSQL function only_local_execution_with_function_evaluation_param(integer) line 11 at SQL statement
 CREATE OR REPLACE PROCEDURE local_execution_followed_by_dist() AS $$
 		DECLARE cnt INT;
 		BEGIN
@@ -752,6 +894,9 @@ FROM
 WHERE
 	distributed_table.key = all_data.key AND distributed_table.key = 1
 	AND EXISTS (SELECT * FROM all_data);
+NOTICE:  executing the command locally: SELECT key, value, age FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT key, value, age FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table, (SELECT intermediate_result.key, intermediate_result.value, intermediate_result.age FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(key integer, value text, age bigint)) all_data WHERE ((distributed_table.key OPERATOR(pg_catalog.=) all_data.key) AND (distributed_table.key OPERATOR(pg_catalog.=) 1) AND (EXISTS (SELECT all_data_1.key, all_data_1.value, all_data_1.age FROM (SELECT intermediate_result.key, intermediate_result.value, intermediate_result.age FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(key integer, value text, age bigint)) all_data_1)))
  count
 ---------------------------------------------------------------------
      1
@@ -767,6 +912,9 @@ FROM
 	distributed_table, all_data
 WHERE
 	distributed_table.key = all_data.age AND distributed_table.key = 1;
+NOTICE:  executing the command locally: SELECT age FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT age FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table, (SELECT intermediate_result.age FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(age bigint)) all_data WHERE ((distributed_table.key OPERATOR(pg_catalog.=) all_data.age) AND (distributed_table.key OPERATOR(pg_catalog.=) 1))
  count
 ---------------------------------------------------------------------
      0
@@ -774,6 +922,17 @@ WHERE
 
 -- get ready for the next commands
 TRUNCATE reference_table, distributed_table, second_distributed_table;
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.reference_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
 -- local execution of returning of reference tables
 INSERT INTO reference_table VALUES (1),(2),(3),(4),(5),(6) RETURNING *;
 NOTICE:  executing the command locally: INSERT INTO local_shard_execution.reference_table_1470000 AS citus_table_alias (key) VALUES (1), (2), (3), (4), (5), (6) RETURNING citus_table_alias.key
@@ -1174,7 +1333,10 @@ NOTICE:  executing the command locally: DELETE FROM local_shard_execution.refere
 BEGIN;
 	SET LOCAL citus.multi_shard_modify_mode TO sequential ;
 	DELETE FROM distributed_table;
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470001 distributed_table
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table
 	INSERT INTO distributed_table VALUES (1, '11',21) ON CONFLICT(key) DO UPDATE SET value = '100' RETURNING *;
+NOTICE:  executing the command locally: INSERT INTO local_shard_execution.distributed_table_1470001 AS citus_table_alias (key, value, age) VALUES (1, '11'::text, 21) ON CONFLICT(key) DO UPDATE SET value = '100'::text RETURNING citus_table_alias.key, citus_table_alias.value, citus_table_alias.age
  key | value | age
 ---------------------------------------------------------------------
    1 | 11    |  21
@@ -1199,8 +1361,22 @@ ROLLBACK;
 TRUNCATE reference_table CASCADE;
 NOTICE:  truncate cascades to table "distributed_table"
 NOTICE:  truncate cascades to table "second_distributed_table"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.reference_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
 INSERT INTO reference_table SELECT i FROM generate_series(500, 600) i;
+NOTICE:  executing the copy locally for shard xxxxx
 INSERT INTO distributed_table SELECT i, i::text, i % 10 + 25 FROM generate_series(500, 600) i;
+NOTICE:  executing the copy locally for shard xxxxx
+NOTICE:  executing the copy locally for shard xxxxx
 -- show that both local, and mixed local-distributed executions
 -- calculate rows processed correctly
 BEGIN;
@@ -1221,22 +1397,23 @@ NOTICE:  executing the command locally: DELETE FROM local_shard_execution.refere
 	DELETE FROM reference_table;
 NOTICE:  executing the command locally: DELETE FROM local_shard_execution.reference_table_1470000 reference_table
 ROLLBACK;
--- task-tracker select execution
 BEGIN;
 	DELETE FROM distributed_table WHERE key = 500;
 NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE (key OPERATOR(pg_catalog.=) 500)
-	SET LOCAL citus.task_executor_type = 'task-tracker';
 	SELECT count(*) FROM distributed_table;
-ERROR:  cannot execute command because a local execution has accessed a placement in the transaction
-DETAIL:  Some parallel commands cannot be executed if a previous command has already been executed locally
-HINT:  Try re-running the transaction with "SET LOCAL citus.enable_local_execution TO OFF;"
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
+ count
+---------------------------------------------------------------------
+   100
+(1 row)
+
 ROLLBACK;
--- local execution should not be executed locally
--- becase a task-tracker query has already been executed
 BEGIN;
-	SET LOCAL citus.task_executor_type = 'task-tracker';
 	SET LOCAL client_min_messages TO INFO;
 	SELECT count(*) FROM distributed_table;
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
  count
 ---------------------------------------------------------------------
    101
@@ -1244,6 +1421,7 @@ BEGIN;
 
 	SET LOCAL client_min_messages TO LOG;
 	DELETE FROM distributed_table WHERE key = 500;
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE (key OPERATOR(pg_catalog.=) 500)
 ROLLBACK;
 -- probably not a realistic case since views are not very
 -- well supported with MX
@@ -1272,14 +1450,18 @@ NOTICE:  executing the command locally: SELECT key, value, age FROM (SELECT dist
 BEGIN;
 	SAVEPOINT my_savepoint;
 	SELECT count(*) FROM distributed_table;
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470001 distributed_table WHERE true
+NOTICE:  executing the command locally: SELECT count(*) AS count FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE true
  count
 ---------------------------------------------------------------------
    101
 (1 row)
 
     DELETE FROM distributed_table WHERE key = 500;
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE (key OPERATOR(pg_catalog.=) 500)
     ROLLBACK TO SAVEPOINT my_savepoint;
 	DELETE FROM distributed_table WHERE key = 500;
+NOTICE:  executing the command locally: DELETE FROM local_shard_execution.distributed_table_1470003 distributed_table WHERE (key OPERATOR(pg_catalog.=) 500)
 COMMIT;
 -- even if we switch from local execution -> remote execution,
 -- we are able to use local execution after rollback
@@ -1468,6 +1650,17 @@ COMMIT;
 TRUNCATE reference_table CASCADE;
 NOTICE:  truncate cascades to table "distributed_table"
 NOTICE:  truncate cascades to table "second_distributed_table"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.reference_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.distributed_table_xxxxx CASCADE
+NOTICE:  truncate cascades to table "second_distributed_table_xxxxx"
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
+NOTICE:  executing the command locally: TRUNCATE TABLE local_shard_execution.second_distributed_table_xxxxx CASCADE
 -- load some data on a remote shard
 INSERT INTO reference_table (key) VALUES (2);
 NOTICE:  executing the command locally: INSERT INTO local_shard_execution.reference_table_1470000 (key) VALUES (2)
@@ -1513,7 +1706,7 @@ RESET client_min_messages;
 RESET citus.log_local_commands;
 \c - - - :master_port
 SET citus.next_shard_id TO 1480000;
--- local execution with custom type
+-- test both local and remote execution with custom type
 SET citus.replication_model TO "streaming";
 SET citus.shard_replication_factor TO 1;
 CREATE TYPE invite_resp AS ENUM ('yes', 'no', 'maybe');
@@ -1529,6 +1722,273 @@ SELECT create_distributed_table('event_responses', 'event_id');
 
 (1 row)
 
+INSERT INTO event_responses VALUES (1, 1, 'yes'), (2, 2, 'yes'), (3, 3, 'no'), (4, 4, 'no');
+CREATE OR REPLACE FUNCTION regular_func(p invite_resp)
+RETURNS int AS $$
+DECLARE
+	q1Result INT;
+	q2Result INT;
+	q3Result INT;
+BEGIN
+SELECT count(*) INTO q1Result FROM event_responses WHERE response = $1;
+SELECT count(*) INTO q2Result FROM event_responses e1 LEFT JOIN event_responses e2 USING (event_id) WHERE e2.response = $1;
+SELECT count(*) INTO q3Result FROM (SELECT * FROM event_responses WHERE response = $1 LIMIT 5) as foo;
+RETURN  q3Result+q2Result+q1Result;
+END;
+$$ LANGUAGE plpgsql;
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+SELECT regular_func('yes');
+ regular_func
+---------------------------------------------------------------------
+            6
+(1 row)
+
+CREATE OR REPLACE PROCEDURE regular_procedure(p invite_resp)
+AS $$
+BEGIN
+PERFORM * FROM event_responses WHERE response = $1 ORDER BY 1 DESC, 2 DESC, 3 DESC;
+PERFORM * FROM event_responses e1 LEFT JOIN event_responses e2 USING (event_id) WHERE e2.response = $1 ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC;
+PERFORM  * FROM (SELECT * FROM event_responses WHERE response = $1 LIMIT 5) as foo ORDER BY 1 DESC, 2 DESC, 3 DESC;
+END;
+$$ LANGUAGE plpgsql;
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+CALL regular_procedure('no');
+PREPARE multi_shard_no_dist_key(invite_resp) AS select * from event_responses where response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_no_dist_key('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+PREPARE multi_shard_with_dist_key(int, invite_resp) AS select * from event_responses where event_id > $1 AND response = $2::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+EXECUTE multi_shard_with_dist_key(1, 'yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes
+(1 row)
+
+PREPARE query_pushdown_no_dist_key(invite_resp) AS select * from event_responses e1 LEFT JOIN event_responses e2 USING(event_id) where e1.response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC LIMIT 1;
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+EXECUTE query_pushdown_no_dist_key('yes');
+ event_id | user_id | response | user_id | response
+---------------------------------------------------------------------
+        2 |       2 | yes      |       2 | yes
+(1 row)
+
+PREPARE insert_select_via_coord(invite_resp) AS INSERT INTO event_responses SELECT * FROM event_responses where response = $1::invite_resp LIMIT 1 ON CONFLICT (event_id, user_id) DO NOTHING ;
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+EXECUTE insert_select_via_coord('yes');
+PREPARE insert_select_pushdown(invite_resp) AS INSERT INTO event_responses SELECT * FROM event_responses where response = $1::invite_resp ON CONFLICT (event_id, user_id) DO NOTHING;
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+EXECUTE insert_select_pushdown('yes');
+PREPARE router_select_with_no_dist_key_filter(invite_resp) AS select * from event_responses where event_id = 1 AND response = $1::invite_resp ORDER BY 1 DESC, 2 DESC, 3 DESC LIMIT 1;
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+EXECUTE router_select_with_no_dist_key_filter('yes');
+ event_id | user_id | response
+---------------------------------------------------------------------
+        1 |       1 | yes
+(1 row)
+
+-- rest of the tests assume the table is empty
+TRUNCATE event_responses;
 CREATE OR REPLACE PROCEDURE register_for_event(p_event_id int, p_user_id int, p_choice invite_resp)
 LANGUAGE plpgsql AS $fn$
 BEGIN
@@ -1591,7 +2051,7 @@ NOTICE:  executing the command locally: UPDATE public.event_responses_1480001 ev
 SELECT count(*) FROM event_responses WHERE event_id = 16;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
 NOTICE:  executing the command locally: SELECT count(*) AS count FROM public.event_responses_1480001 event_responses WHERE (event_id OPERATOR(pg_catalog.=) 16)
  count
 ---------------------------------------------------------------------
@@ -1601,7 +2061,7 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM public.eve
 SELECT count(*) FROM event_responses WHERE event_id = 16;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
 NOTICE:  executing the command locally: SELECT count(*) AS count FROM public.event_responses_1480001 event_responses WHERE (event_id OPERATOR(pg_catalog.=) 16)
  count
 ---------------------------------------------------------------------
@@ -1611,13 +2071,13 @@ NOTICE:  executing the command locally: SELECT count(*) AS count FROM public.eve
 UPDATE event_responses SET response = 'no' WHERE event_id = 16;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
 NOTICE:  executing the command locally: UPDATE public.event_responses_1480001 event_responses SET response = 'no'::public.invite_resp WHERE (event_id OPERATOR(pg_catalog.=) 16)
 INSERT INTO event_responses VALUES (16, 666, 'maybe')
 ON CONFLICT (event_id, user_id)
 DO UPDATE SET response = EXCLUDED.response RETURNING *;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
 NOTICE:  executing the command locally: INSERT INTO public.event_responses_1480001 AS citus_table_alias (event_id, user_id, response) VALUES (16, 666, 'maybe'::public.invite_resp) ON CONFLICT(event_id, user_id) DO UPDATE SET response = excluded.response RETURNING citus_table_alias.event_id, citus_table_alias.user_id, citus_table_alias.response
  event_id | user_id | response
 ---------------------------------------------------------------------
@@ -1629,7 +2089,6 @@ INSERT INTO event_responses VALUES (16, 666, 'maybe'), (17, 777, 'no')
 ON CONFLICT (event_id, user_id)
 DO UPDATE SET response = EXCLUDED.response RETURNING *;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
 NOTICE:  executing the command locally: INSERT INTO public.event_responses_1480001 AS citus_table_alias (event_id, user_id, response) VALUES (16,666,'maybe'::public.invite_resp), (17,777,'no'::public.invite_resp) ON CONFLICT(event_id, user_id) DO UPDATE SET response = excluded.response RETURNING citus_table_alias.event_id, citus_table_alias.user_id, citus_table_alias.response
  event_id | user_id | response
 ---------------------------------------------------------------------
@@ -1644,7 +2103,7 @@ CALL register_for_event(19, 1, 'yes');
 -- should be fine even if no parameters exists in the query
 SELECT count(*) FROM event_responses WHERE event_id = 16;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
  count
 ---------------------------------------------------------------------
      2
@@ -1652,7 +2111,7 @@ DEBUG:  Plan is router executable
 
 SELECT count(*) FROM event_responses WHERE event_id = 16;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
  count
 ---------------------------------------------------------------------
      2
@@ -1660,12 +2119,12 @@ DEBUG:  Plan is router executable
 
 UPDATE event_responses SET response = 'no' WHERE event_id = 16;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
 INSERT INTO event_responses VALUES (16, 666, 'maybe')
 ON CONFLICT (event_id, user_id)
 DO UPDATE SET response = EXCLUDED.response RETURNING *;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 16
  event_id | user_id | response
 ---------------------------------------------------------------------
        16 |     666 | maybe
@@ -1676,7 +2135,6 @@ INSERT INTO event_responses VALUES (16, 666, 'maybe'), (17, 777, 'no')
 ON CONFLICT (event_id, user_id)
 DO UPDATE SET response = EXCLUDED.response RETURNING *;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
  event_id | user_id | response
 ---------------------------------------------------------------------
        16 |     666 | maybe

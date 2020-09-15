@@ -10,6 +10,8 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "miscadmin.h"
 
 #include "access/xact.h"
@@ -21,19 +23,21 @@
 #include "distributed/commands/utility_hook.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/multi_executor.h"
-#include "distributed/multi_master_planner.h"
+#include "distributed/combine_query_planner.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_router_planner.h"
-#include "distributed/multi_resowner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_protocol.h"
 #include "executor/execdebug.h"
 #include "commands/copy.h"
+#include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
@@ -53,6 +57,12 @@
 int MultiShardConnectionType = PARALLEL_CONNECTION;
 bool WritableStandbyCoordinator = false;
 
+/*
+ * Pointer to bound parameters of the current ongoing call to ExecutorRun.
+ * If executor is not running, then this value is meaningless.
+ */
+ParamListInfo executorBoundParams = NULL;
+
 
 /* sort the returning to get consistent outputs, used only for testing */
 bool SortReturning = false;
@@ -68,7 +78,9 @@ int ExecutorLevel = 0;
 /* local function forward declarations */
 static Relation StubRelation(TupleDesc tupleDescriptor);
 static bool AlterTableConstraintCheck(QueryDesc *queryDesc);
-static bool IsLocalReferenceTableJoinPlan(PlannedStmt *plan);
+static List * FindCitusCustomScanStates(PlanState *planState);
+static bool CitusCustomScanStateWalker(PlanState *planState,
+									   List **citusCustomScanStates);
 
 /*
  * CitusExecutorStart is the ExecutorStart_hook that gets called when
@@ -123,26 +135,31 @@ CitusExecutorRun(QueryDesc *queryDesc,
 {
 	DestReceiver *dest = queryDesc->dest;
 
+	ParamListInfo savedBoundParams = executorBoundParams;
+
+	/*
+	 * Save a pointer to query params so UDFs can access them by calling
+	 * ExecutorBoundParams().
+	 */
+	executorBoundParams = queryDesc->params;
+
+	/*
+	 * We do some potentially time consuming operations our self now before we hand of
+	 * control to postgres' executor. To make sure that time spent is accurately measured
+	 * we remove the totaltime instrumentation from the queryDesc. Instead we will start
+	 * and stop the instrumentation of the total time and put it back on the queryDesc
+	 * before returning (or rethrowing) from this function.
+	 */
+	Instrumentation *volatile totalTime = queryDesc->totaltime;
+	queryDesc->totaltime = NULL;
+
 	PG_TRY();
 	{
 		ExecutorLevel++;
 
-		if (CitusHasBeenLoaded())
+		if (totalTime)
 		{
-			if (IsLocalReferenceTableJoinPlan(queryDesc->plannedstmt) &&
-				IsMultiStatementTransaction())
-			{
-				/*
-				 * Currently we don't support this to avoid problems with tuple
-				 * visibility, locking, etc. For example, change to the reference
-				 * table can go through a MultiConnection, which won't be visible
-				 * to the locally planned queries.
-				 */
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("cannot join local tables and reference tables in "
-									   "a transaction block, udf block, or distributed "
-									   "CTE subquery")));
-			}
+			InstrStartNode(totalTime);
 		}
 
 		/*
@@ -164,7 +181,7 @@ CitusExecutorRun(QueryDesc *queryDesc,
 			EState *estate = queryDesc->estate;
 
 			estate->es_processed = 0;
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < PG_VERSION_12
 			estate->es_lastoid = InvalidOid;
 #endif
 
@@ -174,18 +191,96 @@ CitusExecutorRun(QueryDesc *queryDesc,
 		}
 		else
 		{
+			/* switch into per-query memory context before calling PreExecScan */
+			MemoryContext oldcontext = MemoryContextSwitchTo(
+				queryDesc->estate->es_query_cxt);
+
+			/*
+			 * Call PreExecScan for all citus custom scan nodes prior to starting the
+			 * postgres exec scan to give some citus scan nodes some time to initialize
+			 * state that would be too late if it were to initialize when the first tuple
+			 * would need to return.
+			 */
+			List *citusCustomScanStates = FindCitusCustomScanStates(queryDesc->planstate);
+			CitusScanState *citusScanState = NULL;
+			foreach_ptr(citusScanState, citusCustomScanStates)
+			{
+				if (citusScanState->PreExecScan)
+				{
+					citusScanState->PreExecScan(citusScanState);
+				}
+			}
+
+			/* postgres will switch here again and will restore back on its own */
+			MemoryContextSwitchTo(oldcontext);
+
 			standard_ExecutorRun(queryDesc, direction, count, execute_once);
 		}
 
+		if (totalTime)
+		{
+			InstrStopNode(totalTime, queryDesc->estate->es_processed);
+			queryDesc->totaltime = totalTime;
+		}
+
+		executorBoundParams = savedBoundParams;
 		ExecutorLevel--;
+
+		if (ExecutorLevel == 0 && PlannerLevel == 0)
+		{
+			/*
+			 * We are leaving Citus code so no one should have any references to
+			 * cache entries. Release them now to not hold onto memory in long
+			 * transactions.
+			 */
+			CitusTableCacheFlushInvalidatedEntries();
+		}
 	}
 	PG_CATCH();
 	{
+		if (totalTime)
+		{
+			queryDesc->totaltime = totalTime;
+		}
+
+		executorBoundParams = savedBoundParams;
 		ExecutorLevel--;
 
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+}
+
+
+/*
+ * FindCitusCustomScanStates returns a list of all citus custom scan states in it.
+ */
+static List *
+FindCitusCustomScanStates(PlanState *planState)
+{
+	List *citusCustomScanStates = NIL;
+	CitusCustomScanStateWalker(planState, &citusCustomScanStates);
+	return citusCustomScanStates;
+}
+
+
+/*
+ * CitusCustomScanStateWalker walks a planState tree structure and adds all
+ * CitusCustomState nodes to the list passed by reference as the second argument.
+ */
+static bool
+CitusCustomScanStateWalker(PlanState *planState, List **citusCustomScanStates)
+{
+	if (IsCitusCustomState(planState))
+	{
+		CitusScanState *css = (CitusScanState *) planState;
+		*citusCustomScanStates = lappend(*citusCustomScanStates, css);
+
+		/* breaks the walking of this tree */
+		return true;
+	}
+	return planstate_tree_walker(planState, CitusCustomScanStateWalker,
+								 citusCustomScanStates);
 }
 
 
@@ -214,53 +309,77 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 		forwardScanDirection = false;
 	}
 
-	TupleTableSlot *resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
-	tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, resultSlot);
+	ExprState *qual = scanState->customScanState.ss.ps.qual;
+	ProjectionInfo *projInfo = scanState->customScanState.ss.ps.ps_ProjInfo;
+	ExprContext *econtext = scanState->customScanState.ss.ps.ps_ExprContext;
 
-	return resultSlot;
-}
-
-
-/*
- * Load data collected by task-tracker executor into the tuplestore
- * of CitusScanState. For that, we first create a tuple store, and then copy the
- * files one-by-one into the tuple store.
- *
- * Note that in the long term it'd be a lot better if Multi*Execute() directly
- * filled the tuplestores, but that's a fair bit of work.
- */
-void
-LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
-{
-	List *workerTaskList = workerJob->taskList;
-	ListCell *workerTaskCell = NULL;
-	bool randomAccess = true;
-	bool interTransactions = false;
-	char *copyFormat = "text";
-
-	TupleDesc tupleDescriptor = ScanStateGetTupleDescriptor(citusScanState);
-
-	Assert(citusScanState->tuplestorestate == NULL);
-	citusScanState->tuplestorestate =
-		tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
-
-	if (BinaryMasterCopyFormat)
+	if (!qual && !projInfo)
 	{
-		copyFormat = "binary";
+		/* no quals, nor projections return directly from the tuple store. */
+		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+		return slot;
 	}
 
-	foreach(workerTaskCell, workerTaskList)
+	for (;;)
 	{
-		Task *workerTask = (Task *) lfirst(workerTaskCell);
+		/*
+		 * If there is a very selective qual on the Citus Scan node we might block
+		 * interupts for a longer time if we would not check for interrupts in this loop
+		 */
+		CHECK_FOR_INTERRUPTS();
 
-		StringInfo jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
-		StringInfo taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
+		/*
+		 * Reset per-tuple memory context to free any expression evaluation
+		 * storage allocated in the previous tuple cycle.
+		 */
+		ResetExprContext(econtext);
 
-		ReadFileIntoTupleStore(taskFilename->data, copyFormat, tupleDescriptor,
-							   citusScanState->tuplestorestate);
+		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+
+		if (TupIsNull(slot))
+		{
+			/*
+			 * When the tuple is null we have reached the end of the tuplestore. We will
+			 * return a null tuple, however, depending on the existence of a projection we
+			 * need to either return the scan tuple or the projected tuple.
+			 */
+			if (projInfo)
+			{
+				return ExecClearTuple(projInfo->pi_state.resultslot);
+			}
+			else
+			{
+				return slot;
+			}
+		}
+
+		/* place the current tuple into the expr context */
+		econtext->ecxt_scantuple = slot;
+
+		if (!ExecQual(qual, econtext))
+		{
+			/* skip nodes that do not satisfy the qual (filter) */
+			InstrCountFiltered1(scanState, 1);
+			continue;
+		}
+
+		/* found a satisfactory scan tuple */
+		if (projInfo)
+		{
+			/*
+			 * Form a projection tuple, store it in the result tuple slot and return it.
+			 * ExecProj works on the ecxt_scantuple on the context stored earlier.
+			 */
+			return ExecProject(projInfo);
+		}
+		else
+		{
+			/* Here, we aren't projecting, so just return scan tuple */
+			return slot;
+		}
 	}
-
-	tuplestore_donestoring(citusScanState->tuplestorestate);
 }
 
 
@@ -343,17 +462,15 @@ SortTupleStore(CitusScanState *scanState)
 	Oid *collations = (Oid *) palloc(numberOfSortKeys * sizeof(Oid));
 	bool *nullsFirst = (bool *) palloc(numberOfSortKeys * sizeof(bool));
 
-	ListCell *targetCell = NULL;
 	int sortKeyIndex = 0;
-
 
 	/*
 	 * Iterate on the returning target list and generate the necessary information
 	 * for sorting the tuples.
 	 */
-	foreach(targetCell, targetList)
+	TargetEntry *returningEntry = NULL;
+	foreach_ptr(returningEntry, targetList)
 	{
-		TargetEntry *returningEntry = (TargetEntry *) lfirst(targetCell);
 		Oid sortop = InvalidOid;
 
 		/* determine the sortop, we don't need anything else */
@@ -458,6 +575,22 @@ Query *
 ParseQueryString(const char *queryString, Oid *paramOids, int numParams)
 {
 	RawStmt *rawStmt = (RawStmt *) ParseTreeRawStmt(queryString);
+
+	/* rewrite the parsed RawStmt to produce a Query */
+	Query *query = RewriteRawQueryStmt(rawStmt, queryString, paramOids, numParams);
+
+	return query;
+}
+
+
+/*
+ * RewriteRawQueryStmt rewrites the given parsed RawStmt according to the other
+ * parameters and returns a Query struct.
+ */
+Query *
+RewriteRawQueryStmt(RawStmt *rawStmt, const char *queryString, Oid *paramOids, int
+					numParams)
+{
 	List *queryTreeList =
 		pg_analyze_and_rewrite(rawStmt, queryString, paramOids, numParams, NULL);
 
@@ -488,7 +621,7 @@ ExecuteQueryIntoDestReceiver(Query *query, ParamListInfo params, DestReceiver *d
 	}
 
 	/* plan the subquery, this may be another distributed query */
-	PlannedStmt *queryPlan = pg_plan_query(query, cursorOptions, params);
+	PlannedStmt *queryPlan = pg_plan_query_compat(query, NULL, cursorOptions, params);
 
 	ExecutePlanIntoDestReceiver(queryPlan, params, dest);
 }
@@ -514,7 +647,7 @@ ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 	PortalDefineQuery(portal,
 					  NULL,
 					  "",
-					  "SELECT",
+					  CMDTAG_SELECT_COMPAT,
 					  list_make1(queryPlan),
 					  NULL);
 
@@ -525,8 +658,8 @@ ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 
 
 /*
- * SetLocalMultiShardModifyModeToSequential simply a C interface for
- * setting the following:
+ * SetLocalMultiShardModifyModeToSequential is simply a C interface for setting
+ * the following:
  *      SET LOCAL citus.multi_shard_modify_mode = 'sequential';
  */
 void
@@ -577,108 +710,13 @@ AlterTableConstraintCheck(QueryDesc *queryDesc)
 
 
 /*
- * IsLocalReferenceTableJoinPlan returns true if the given plan joins local tables
- * with reference table shards.
- *
- * This should be consistent with IsLocalReferenceTableJoin() in distributed_planner.c.
+ * ExecutorBoundParams returns the bound parameters of the current ongoing call
+ * to ExecutorRun. This is meant to be used by UDFs which need to access bound
+ * parameters.
  */
-static bool
-IsLocalReferenceTableJoinPlan(PlannedStmt *plan)
+ParamListInfo
+ExecutorBoundParams(void)
 {
-	bool hasReferenceTable = false;
-	bool hasLocalTable = false;
-	ListCell *rangeTableCell = NULL;
-	bool hasReferenceTableReplica = false;
-
-	/*
-	 * We only allow join between reference tables and local tables in the
-	 * coordinator.
-	 */
-	if (!IsCoordinator())
-	{
-		return false;
-	}
-
-	/*
-	 * All groups that have pg_dist_node entries, also have reference
-	 * table replicas.
-	 */
-	PrimaryNodeForGroup(GetLocalGroupId(), &hasReferenceTableReplica);
-
-	/*
-	 * If reference table doesn't have replicas on the coordinator, we don't
-	 * allow joins with local tables.
-	 */
-	if (!hasReferenceTableReplica)
-	{
-		return false;
-	}
-
-	/*
-	 * No need to check FOR UPDATE/SHARE or modifying subqueries, those have
-	 * already errored out in distributed_planner.c if they contain mix of
-	 * local and distributed tables.
-	 */
-	if (plan->commandType != CMD_SELECT)
-	{
-		return false;
-	}
-
-	/*
-	 * plan->rtable contains the flattened RTE lists of the plan tree, which
-	 * includes rtes in subqueries, CTEs, ...
-	 *
-	 * It doesn't contain optimized away table accesses (due to join optimization),
-	 * which is fine for our purpose.
-	 */
-	foreach(rangeTableCell, plan->rtable)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-		bool onlySearchPath = false;
-
-		/*
-		 * Planner's IsLocalReferenceTableJoin() doesn't allow planning functions
-		 * in FROM clause locally. Early exit. We cannot use Assert() here since
-		 * all non-Citus plans might pass through these checks.
-		 */
-		if (rangeTableEntry->rtekind == RTE_FUNCTION)
-		{
-			return false;
-		}
-
-		if (rangeTableEntry->rtekind != RTE_RELATION)
-		{
-			continue;
-		}
-
-		/*
-		 * Planner's IsLocalReferenceTableJoin() doesn't allow planning reference
-		 * table and view join locally. Early exit. We cannot use Assert() here
-		 * since all non-Citus plans might pass through these checks.
-		 */
-		if (rangeTableEntry->relkind == RELKIND_VIEW)
-		{
-			return false;
-		}
-
-		if (RelationIsAKnownShard(rangeTableEntry->relid, onlySearchPath))
-		{
-			/*
-			 * We don't allow joining non-reference distributed tables, so we
-			 * can skip checking that this is a reference table shard or not.
-			 */
-			hasReferenceTable = true;
-		}
-		else
-		{
-			hasLocalTable = true;
-		}
-
-		if (hasReferenceTable && hasLocalTable)
-		{
-			return true;
-		}
-	}
-
-	return false;
+	Assert(ExecutorLevel > 0);
+	return executorBoundParams;
 }

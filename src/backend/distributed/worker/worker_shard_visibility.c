@@ -13,6 +13,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_shard_visibility.h"
 #include "nodes/nodeFuncs.h"
@@ -97,6 +98,25 @@ citus_table_is_visible(PG_FUNCTION_ARGS)
 
 
 /*
+ * ErrorIfRelationIsAKnownShard errors out if the relation with relationId is
+ * a shard relation.
+ */
+void
+ErrorIfRelationIsAKnownShard(Oid relationId)
+{
+	/* search the relation in all schemas */
+	bool onlySearchPath = false;
+	if (!RelationIsAKnownShard(relationId, onlySearchPath))
+	{
+		return;
+	}
+
+	const char *relationName = get_rel_name(relationId);
+	ereport(ERROR, (errmsg("relation \"%s\" is a shard relation ", relationName)));
+}
+
+
+/*
  * RelationIsAKnownShard gets a relationId, check whether it's a shard of
  * any distributed table. If onlySearchPath is true, then it searches
  * the current search path.
@@ -116,8 +136,7 @@ RelationIsAKnownShard(Oid shardRelationId, bool onlySearchPath)
 		return false;
 	}
 
-	int localGroupId = GetLocalGroupId();
-	if (localGroupId == 0)
+	if (IsCoordinator())
 	{
 		bool coordinatorIsKnown = false;
 		PrimaryNodeForGroup(0, &coordinatorIsKnown);
@@ -171,7 +190,7 @@ RelationIsAKnownShard(Oid shardRelationId, bool onlySearchPath)
 	}
 
 	/* try to get the relation id */
-	Oid relationId = LookupShardRelation(shardId, true);
+	Oid relationId = LookupShardRelationFromCatalog(shardId, true);
 	if (!OidIsValid(relationId))
 	{
 		/* there is no such relation */

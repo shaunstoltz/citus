@@ -60,7 +60,6 @@ typedef enum CitusNodeTag
 	T_UsedDistributedSubPlan,
 	T_Task,
 	T_LocalPlannedStatement,
-	T_TaskExecution,
 	T_ShardInterval,
 	T_ShardPlacement,
 	T_RelationShard,
@@ -70,7 +69,7 @@ typedef enum CitusNodeTag
 } CitusNodeTag;
 
 
-const char** CitusNodeTagNames;
+extern const char** CitusNodeTagNames;
 
 
 typedef struct CitusNode

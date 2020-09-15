@@ -1,6 +1,6 @@
 # Rules to normalize test outputs. Our custom diff tool passes test output
-# of tests in normalized_tests.lst through the substitution rules in this file
-# before doing the actual comparison.
+# of tests through the substitution rules in this file before doing the
+# actual comparison.
 #
 # An example of when this is useful is when an error happens on a different
 # port number, or a different worker shard, or a different placement, etc.
@@ -28,8 +28,23 @@ s/\(ref_id\)=\([0-9]+\)/(ref_id)=(X)/g
 # shard table names for multi_subtransactions
 s/"t2_[0-9]+"/"t2_xxxxxxx"/g
 
+# shard table names for multi_subquery
+s/ keyval(1|2|ref)_[0-9]+ / keyval\1_xxxxxxx /g
+
 # shard table names for custom_aggregate_support
 s/ daily_uniques_[0-9]+ / daily_uniques_xxxxxxx /g
+
+# shard table names for isolation_create_citus_local_table
+s/"citus_local_table_([0-9]+)_[0-9]+"/"citus_local_table_\1_xxxxxxx"/g
+
+# normalize relation oid suffix for the truncate triggers created by citus
+s/truncate_trigger_[0-9]+/truncate_trigger_xxxxxxx/g
+
+# (citus_table_triggers.sql)
+# postgres generates create trigger commands for triggers with:
+# "EXECUTE FUNCTION" in pg12
+# "EXECUTE PROCEDURE" in pg11
+s/FOR EACH (ROW|STATEMENT)(.*)EXECUTE PROCEDURE/FOR EACH \1\2EXECUTE FUNCTION/g
 
 # In foreign_key_restriction_enforcement, normalize shard names
 s/"(on_update_fkey_table_|fkey_)[0-9]+"/"\1xxxxxxx"/g
@@ -47,6 +62,9 @@ s/"(raw_events_second_user_id_value_1_key_|agg_events_user_id_value_1_agg_key_)[
 # ignore could not consume warnings
 /WARNING:  could not consume data from worker node/d
 
+# ignore page split with pg13
+/DEBUG:  concurrent ROOT page split/d
+
 # ignore WAL warnings
 /DEBUG: .+creating and filling new WAL file/d
 
@@ -57,9 +75,19 @@ s/(job_[0-9]+\/task_[0-9]+\/p_[0-9]+\.)[0-9]+/\1xxxx/g
 # isolation_ref2ref_foreign_keys
 s/"(ref_table_[0-9]_|ref_table_[0-9]_value_fkey_)[0-9]+"/"\1xxxxxxx"/g
 
+# pg11/pg12 varies in isolation debug output
+s/s1: DEBUG:/DEBUG:/g
+
+# commands cascading to shard relations
+s/(NOTICE:  .*_)[0-9]{5,}( CASCADE)/\1xxxxx\2/g
+s/(NOTICE:  [a-z]+ cascades to table ".*)_[0-9]{5,}"/\1_xxxxx"/g
+
 # Line info varies between versions
 /^LINE [0-9]+:.*$/d
 /^ *\^$/d
+
+# connection id
+s/connectionId: [0-9]+/connectionId: xxxxxxx/g
 
 # Remove trailing whitespace
 s/ *$//g
@@ -73,8 +101,26 @@ s/_ref_id_id_fkey_/_ref_id_fkey_/g
 s/fk_test_2_col1_col2_fkey/fk_test_2_col1_fkey/g
 s/_id_other_column_ref_fkey/_id_fkey/g
 
+# pg13 changes
+s/of relation ".*" violates not-null constraint/violates not-null constraint/g
+s/varnosyn/varnoold/g
+s/varattnosyn/varoattno/g
+/DEBUG:  index ".*" can safely use deduplication.*$/d
+/DEBUG:  index ".*" cannot use deduplication.*$/d
+/DEBUG:  building index ".*" on table ".*" serially.*$/d
+s/partition ".*" would be violated by some row/partition would be violated by some row/g
+/.*Peak Memory Usage:.*$/d
+s/of relation ".*" contains null values/contains null values/g
+s/of relation "t1" is violated by some row/is violated by some row/g
+# can be removed when we remove PG_VERSION_NUM >= 120000
+s/(.*)Output:.*$/\1Output: xxxxxx/g
+
+
 # intermediate_results
 s/(ERROR.*)pgsql_job_cache\/([0-9]+_[0-9]+_[0-9]+)\/(.*).data/\1pgsql_job_cache\/xx_x_xxx\/\3.data/g
+
+# assign_distributed_transaction id params
+s/(NOTICE.*)assign_distributed_transaction_id\([0-9]+, [0-9]+, '.*'\)/\1assign_distributed_transaction_id\(xx, xx, 'xxxxxxx'\)/g
 
 # toast tables
 s/pg_toast_[0-9]+/pg_toast_xxxxx/g
@@ -92,3 +138,24 @@ s/read_intermediate_result\('insert_select_[0-9]+_/read_intermediate_result('ins
 # ignore job id in repartitioned insert/select
 s/repartitioned_results_[0-9]+/repartitioned_results_xxxxx/g
 
+# ignore job id in worker_hash_partition_table
+s/worker_hash_partition_table  \([0-9]+/worker_hash_partition_table  \(xxxxxxx/g
+
+# ignore first parameter for citus_extradata_container due to differences between pg11 and pg12
+# can be removed when we remove PG_VERSION_NUM >= 120000
+s/pg_catalog.citus_extradata_container\([0-9]+/pg_catalog.citus_extradata_container\(XXX/g
+
+# ignore referene table replication messages
+/replicating reference table.*$/d
+
+# ignore memory usage output
+/.*Memory Usage:.*/d
+
+s/Citus.*currently supports/Citus currently supports/g
+
+# Warnings in multi_explain
+s/prepared transaction with identifier .* does not exist/prepared transaction with identifier "citus_x_yyyyyy_zzz_w" does not exist/g
+s/failed to roll back prepared transaction '.*'/failed to roll back prepared transaction 'citus_x_yyyyyy_zzz_w'/g
+
+# Errors with binary decoding where OIDs should be normalized
+s/wrong data type: [0-9]+, expected [0-9]+/wrong data type: XXXX, expected XXXX/g

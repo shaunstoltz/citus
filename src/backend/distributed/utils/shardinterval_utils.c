@@ -15,6 +15,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/distributed_planner.h"
@@ -34,12 +35,10 @@ ShardInterval *
 LowestShardIntervalById(List *shardIntervalList)
 {
 	ShardInterval *lowestShardInterval = NULL;
-	ListCell *shardIntervalCell = NULL;
 
-	foreach(shardIntervalCell, shardIntervalList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
-
 		if (lowestShardInterval == NULL ||
 			lowestShardInterval->shardId > shardInterval->shardId)
 		{
@@ -230,8 +229,8 @@ CompareRelationShards(const void *leftElement, const void *rightElement)
  *
  * For hash partitioned tables, it calculates hash value of a number in its
  * range (e.g. min value) and finds which shard should contain the hashed
- * value. For reference tables, it simply returns 0. For distribution methods
- * other than hash and reference, the function errors out.
+ * value. For reference tables and citus local tables, it simply returns 0.
+ * For the other table types, the function errors out.
  */
 int
 ShardIndex(ShardInterval *shardInterval)
@@ -240,24 +239,29 @@ ShardIndex(ShardInterval *shardInterval)
 	Oid distributedTableId = shardInterval->relationId;
 	Datum shardMinValue = shardInterval->minValue;
 
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
-	char partitionMethod = cacheEntry->partitionMethod;
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
 
 	/*
 	 * Note that, we can also support append and range distributed tables, but
 	 * currently it is not required.
 	 */
-	if (partitionMethod != DISTRIBUTE_BY_HASH && partitionMethod != DISTRIBUTE_BY_NONE)
+	if (!IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED) &&
+		!IsCitusTableTypeCacheEntry(
+			cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("finding index of a given shard is only supported for "
-							   "hash distributed and reference tables")));
+							   "hash distributed tables, reference tables and citus "
+							   "local tables")));
 	}
 
 	/* short-circuit for reference tables */
-	if (partitionMethod == DISTRIBUTE_BY_NONE)
+	if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
-		/* reference tables has only a single shard, so the index is fixed to 0 */
+		/*
+		 * Reference tables and citus local tables have only a single shard,
+		 * so the index is fixed to 0.
+		 */
 		shardIndex = 0;
 
 		return shardIndex;
@@ -276,11 +280,11 @@ ShardIndex(ShardInterval *shardInterval)
  * as NULL for them.
  */
 ShardInterval *
-FindShardInterval(Datum partitionColumnValue, DistTableCacheEntry *cacheEntry)
+FindShardInterval(Datum partitionColumnValue, CitusTableCacheEntry *cacheEntry)
 {
 	Datum searchedValue = partitionColumnValue;
 
-	if (cacheEntry->partitionMethod == DISTRIBUTE_BY_HASH)
+	if (IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED))
 	{
 		searchedValue = FunctionCall1Coll(cacheEntry->hashFunction,
 										  cacheEntry->partitionColumn->varcollid,
@@ -308,16 +312,15 @@ FindShardInterval(Datum partitionColumnValue, DistTableCacheEntry *cacheEntry)
  * INVALID_SHARD_INDEX is returned). This should only happen if something is
  * terribly wrong, either metadata tables are corrupted or we have a bug
  * somewhere. Such as a hash function which returns a value not in the range
- * of [INT32_MIN, INT32_MAX] can fire this.
+ * of [PG_INT32_MIN, PG_INT32_MAX] can fire this.
  */
 int
-FindShardIntervalIndex(Datum searchedValue, DistTableCacheEntry *cacheEntry)
+FindShardIntervalIndex(Datum searchedValue, CitusTableCacheEntry *cacheEntry)
 {
 	ShardInterval **shardIntervalCache = cacheEntry->sortedShardIntervalArray;
 	int shardCount = cacheEntry->shardIntervalArrayLength;
-	char partitionMethod = cacheEntry->partitionMethod;
 	FmgrInfo *compareFunction = cacheEntry->shardIntervalCompareFunction;
-	bool useBinarySearch = (partitionMethod != DISTRIBUTE_BY_HASH ||
+	bool useBinarySearch = (IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED) ||
 							!cacheEntry->hasUniformHashDistribution);
 	int shardIndex = INVALID_SHARD_INDEX;
 
@@ -326,7 +329,7 @@ FindShardIntervalIndex(Datum searchedValue, DistTableCacheEntry *cacheEntry)
 		return INVALID_SHARD_INDEX;
 	}
 
-	if (partitionMethod == DISTRIBUTE_BY_HASH)
+	if (IsCitusTableTypeCacheEntry(cacheEntry, HASH_DISTRIBUTED))
 	{
 		if (useBinarySearch)
 		{
@@ -349,25 +352,13 @@ FindShardIntervalIndex(Datum searchedValue, DistTableCacheEntry *cacheEntry)
 		else
 		{
 			int hashedValue = DatumGetInt32(searchedValue);
-			uint64 hashTokenIncrement = HASH_TOKEN_COUNT / shardCount;
 
-			shardIndex = (uint32) (hashedValue - INT32_MIN) / hashTokenIncrement;
-			Assert(shardIndex <= shardCount);
-
-			/*
-			 * If the shard count is not power of 2, the range of the last
-			 * shard becomes larger than others. For that extra piece of range,
-			 * we still need to use the last shard.
-			 */
-			if (shardIndex == shardCount)
-			{
-				shardIndex = shardCount - 1;
-			}
+			shardIndex = CalculateUniformHashRangeIndex(hashedValue, shardCount);
 		}
 	}
-	else if (partitionMethod == DISTRIBUTE_BY_NONE)
+	else if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
 	{
-		/* reference tables has a single shard, all values mapped to that shard */
+		/* non-distributed tables have a single shard, all values mapped to that shard */
 		Assert(shardCount == 1);
 
 		shardIndex = 0;
@@ -444,6 +435,48 @@ SearchCachedShardInterval(Datum partitionColumnValue, ShardInterval **shardInter
 
 
 /*
+ * CalculateUniformHashRangeIndex returns the index of the hash range in
+ * which hashedValue falls, assuming shardCount uniform hash ranges.
+ *
+ * We use 64-bit integers to avoid overflow issues during arithmetic.
+ *
+ * NOTE: This function is ONLY for hash-distributed tables with uniform
+ * hash ranges.
+ */
+int
+CalculateUniformHashRangeIndex(int hashedValue, int shardCount)
+{
+	int64 hashedValue64 = (int64) hashedValue;
+
+	/* normalize to the 0-UINT32_MAX range */
+	int64 normalizedHashValue = hashedValue64 - PG_INT32_MIN;
+
+	/* size of each hash range */
+	int64 hashRangeSize = HASH_TOKEN_COUNT / shardCount;
+
+	/* index of hash range into which the hash value falls */
+	int shardIndex = (int) (normalizedHashValue / hashRangeSize);
+
+	if (shardIndex < 0 || shardIndex > shardCount)
+	{
+		ereport(ERROR, (errmsg("bug: shard index %d out of bounds", shardIndex)));
+	}
+
+	/*
+	 * If the shard count is not power of 2, the range of the last
+	 * shard becomes larger than others. For that extra piece of range,
+	 * we still need to use the last shard.
+	 */
+	if (shardIndex == shardCount)
+	{
+		shardIndex = shardCount - 1;
+	}
+
+	return shardIndex;
+}
+
+
+/*
  * SingleReplicatedTable checks whether all shards of a distributed table, do not have
  * more than one replica. If even one shard has more than one replica, this function
  * returns false, otherwise it returns true.
@@ -460,12 +493,12 @@ SingleReplicatedTable(Oid relationId)
 		return false;
 	}
 
-	/* checking only for the first shard id should suffice */
-	Oid shardId = (*(uint64 *) linitial(shardList));
-
 	/* for hash distributed tables, it is sufficient to only check one shard */
-	if (PartitionMethod(relationId) == DISTRIBUTE_BY_HASH)
+	if (IsCitusTableType(relationId, HASH_DISTRIBUTED))
 	{
+		/* checking only for the first shard id should suffice */
+		uint64 shardId = *(uint64 *) linitial(shardList);
+
 		shardPlacementList = ShardPlacementList(shardId);
 		if (list_length(shardPlacementList) != 1)
 		{
@@ -475,12 +508,10 @@ SingleReplicatedTable(Oid relationId)
 	else
 	{
 		List *shardIntervalList = LoadShardList(relationId);
-		ListCell *shardIntervalCell = NULL;
-
-		foreach(shardIntervalCell, shardIntervalList)
+		uint64 *shardIdPointer = NULL;
+		foreach_ptr(shardIdPointer, shardIntervalList)
 		{
-			uint64 *shardIdPointer = (uint64 *) lfirst(shardIntervalCell);
-			shardId = (*shardIdPointer);
+			uint64 shardId = *shardIdPointer;
 			shardPlacementList = ShardPlacementList(shardId);
 
 			if (list_length(shardPlacementList) != 1)

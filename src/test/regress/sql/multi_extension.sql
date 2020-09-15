@@ -9,27 +9,66 @@
 
 SET citus.next_shard_id TO 580000;
 
-CREATE SCHEMA test;
-
-CREATE OR REPLACE FUNCTION test.maintenance_worker(p_dbname text DEFAULT current_database())
+SELECT $definition$
+CREATE OR REPLACE FUNCTION test.maintenance_worker()
     RETURNS pg_stat_activity
     LANGUAGE plpgsql
 AS $$
 DECLARE
    activity record;
 BEGIN
-    LOOP
+    DO 'BEGIN END'; -- Force maintenance daemon to start
+    -- we don't want to wait forever; loop will exit after 20 seconds
+    FOR i IN 1 .. 200 LOOP
+        PERFORM pg_stat_clear_snapshot();
         SELECT * INTO activity FROM pg_stat_activity
-	WHERE application_name = 'Citus Maintenance Daemon' AND datname = p_dbname;
+        WHERE application_name = 'Citus Maintenance Daemon' AND datname = current_database();
         IF activity.pid IS NOT NULL THEN
             RETURN activity;
         ELSE
             PERFORM pg_sleep(0.1);
-            PERFORM pg_stat_clear_snapshot();
         END IF ;
     END LOOP;
+    -- fail if we reach the end of this loop
+    raise 'Waited too long for maintenance daemon to start';
 END;
 $$;
+$definition$ create_function_test_maintenance_worker
+\gset
+
+CREATE TABLE prev_objects(description text);
+CREATE TABLE extension_diff(previous_object text COLLATE "C",
+                            current_object text COLLATE "C");
+
+CREATE FUNCTION print_extension_changes()
+RETURNS TABLE(previous_object text, current_object text)
+AS $func$
+BEGIN
+	TRUNCATE TABLE extension_diff;
+
+	CREATE TABLE current_objects AS
+	SELECT pg_catalog.pg_describe_object(classid, objid, 0) AS description
+	FROM pg_catalog.pg_depend, pg_catalog.pg_extension e
+	WHERE refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+		AND refobjid = e.oid
+		AND deptype = 'e'
+		AND e.extname='citus';
+
+	INSERT INTO extension_diff
+	SELECT p.description previous_object, c.description current_object
+	FROM current_objects c FULL JOIN prev_objects p
+	ON p.description = c.description
+	WHERE p.description is null OR c.description is null;
+
+	DROP TABLE prev_objects;
+	ALTER TABLE current_objects RENAME TO prev_objects;
+
+	RETURN QUERY SELECT * FROM extension_diff ORDER BY 1, 2;
+END
+$func$ LANGUAGE plpgsql;
+
+CREATE SCHEMA test;
+:create_function_test_maintenance_worker
 
 -- check maintenance daemon is started
 SELECT datname, current_database(),
@@ -112,6 +151,59 @@ ALTER EXTENSION citus UPDATE TO '9.0-1';
 ALTER EXTENSION citus UPDATE TO '9.0-2';
 ALTER EXTENSION citus UPDATE TO '9.1-1';
 ALTER EXTENSION citus UPDATE TO '9.2-1';
+ALTER EXTENSION citus UPDATE TO '9.2-2';
+-- Snapshot of state at 9.2-2
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 9.2-2 from 9.2-4
+ALTER EXTENSION citus UPDATE TO '9.2-4';
+ALTER EXTENSION citus UPDATE TO '9.2-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+/*
+ * As we mistakenly bumped schema version to 9.3-1 in a bad release, we support
+ * updating citus schema from 9.3-1 to 9.2-4, but we do not support updates to 9.3-1.
+ *
+ * Hence the query below should fail.
+ */
+ALTER EXTENSION citus UPDATE TO '9.3-1';
+
+ALTER EXTENSION citus UPDATE TO '9.2-4';
+-- Snapshot of state at 9.2-4
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 9.2-4 from 9.3-2
+ALTER EXTENSION citus UPDATE TO '9.3-2';
+ALTER EXTENSION citus UPDATE TO '9.2-4';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 9.3-2
+ALTER EXTENSION citus UPDATE TO '9.3-2';
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 9.3-2 from 9.4-1
+ALTER EXTENSION citus UPDATE TO '9.4-1';
+ALTER EXTENSION citus UPDATE TO '9.3-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 9.4-1
+ALTER EXTENSION citus UPDATE TO '9.4-1';
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 9.4-1 from 9.5-1
+ALTER EXTENSION citus UPDATE TO '9.5-1';
+ALTER EXTENSION citus UPDATE TO '9.4-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 9.5-1
+ALTER EXTENSION citus UPDATE TO '9.5-1';
+SELECT * FROM print_extension_changes();
+
+DROP TABLE prev_objects, extension_diff;
 
 -- show running version
 SHOW citus.version;
@@ -206,6 +298,35 @@ ALTER EXTENSION citus UPDATE;
 
 \c - - - :master_port
 
+-- test https://github.com/citusdata/citus/issues/3409
+CREATE USER testuser2 SUPERUSER;
+SET ROLE testuser2;
+DROP EXTENSION Citus;
+-- Loop until we see there's no maintenance daemon running
+DO $$begin
+    for i in 0 .. 100 loop
+        if i = 100 then raise 'Waited too long'; end if;
+        PERFORM pg_stat_clear_snapshot();
+        perform * from pg_stat_activity where application_name = 'Citus Maintenance Daemon';
+        if not found then exit; end if;
+        perform pg_sleep(0.1);
+    end loop;
+end$$;
+SELECT datid, datname, usename FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+CREATE EXTENSION Citus;
+-- Loop until we there's a maintenance daemon running
+DO $$begin
+    for i in 0 .. 100 loop
+        if i = 100 then raise 'Waited too long'; end if;
+        PERFORM pg_stat_clear_snapshot();
+        perform * from pg_stat_activity where application_name = 'Citus Maintenance Daemon';
+        if found then exit; end if;
+        perform pg_sleep(0.1);
+    end loop;
+end$$;
+SELECT datid, datname, usename FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+RESET ROLE;
+
 -- check that maintenance daemon gets (re-)started for the right user
 DROP EXTENSION citus;
 CREATE USER testuser SUPERUSER;
@@ -228,28 +349,9 @@ CREATE DATABASE another;
 CREATE EXTENSION citus;
 
 CREATE SCHEMA test;
+:create_function_test_maintenance_worker
 
-CREATE OR REPLACE FUNCTION test.maintenance_worker(p_dbname text DEFAULT current_database())
-    RETURNS pg_stat_activity
-    LANGUAGE plpgsql
-AS $$
-DECLARE
-   activity record;
-BEGIN
-    LOOP
-        SELECT * INTO activity FROM pg_stat_activity
-	WHERE application_name = 'Citus Maintenance Daemon' AND datname = p_dbname;
-        IF activity.pid IS NOT NULL THEN
-            RETURN activity;
-        ELSE
-            PERFORM pg_sleep(0.1);
-            PERFORM pg_stat_clear_snapshot();
-        END IF ;
-    END LOOP;
-END;
-$$;
-
--- see that the deamon started
+-- see that the daemon started
 SELECT datname, current_database(),
     usename, (SELECT extowner::regrole::text FROM pg_extension WHERE extname = 'citus')
 FROM test.maintenance_worker();
@@ -257,13 +359,13 @@ FROM test.maintenance_worker();
 -- Test that database with active worker can be dropped.
 \c regression
 
-CREATE SCHEMA test_deamon;
+CREATE SCHEMA test_daemon;
 
 -- we create a similar function on the regression database
 -- note that this function checks for the existence of the daemon
 -- when not found, returns true else tries for 5 times and
 -- returns false
-CREATE OR REPLACE FUNCTION test_deamon.maintenance_deamon_died(p_dbname text)
+CREATE OR REPLACE FUNCTION test_daemon.maintenance_daemon_died(p_dbname text)
     RETURNS boolean
     LANGUAGE plpgsql
 AS $$
@@ -271,27 +373,25 @@ DECLARE
    activity record;
 BEGIN
     PERFORM pg_stat_clear_snapshot();
-    LOOP
-        SELECT * INTO activity FROM pg_stat_activity
-        WHERE application_name = 'Citus Maintenance Daemon' AND datname = p_dbname;
-        IF activity.pid IS NULL THEN
-            RETURN true;
-        ELSE
-            RETURN false;
-        END IF;
-    END LOOP;
+    SELECT * INTO activity FROM pg_stat_activity
+    WHERE application_name = 'Citus Maintenance Daemon' AND datname = p_dbname;
+    IF activity.pid IS NULL THEN
+        RETURN true;
+    ELSE
+        RETURN false;
+    END IF;
 END;
 $$;
 
--- drop the database and see that the deamon is dead
+-- drop the database and see that the daemon is dead
 DROP DATABASE another;
 SELECT
     *
 FROM
-    test_deamon.maintenance_deamon_died('another');
+    test_daemon.maintenance_daemon_died('another');
 
 -- we don't need the schema and the function anymore
-DROP SCHEMA test_deamon CASCADE;
+DROP SCHEMA test_daemon CASCADE;
 
 
 -- verify citus does not crash while creating a table when run against an older worker
@@ -306,6 +406,7 @@ CREATE DATABASE another;
 
 \c another
 CREATE EXTENSION citus;
+SET citus.enable_object_propagation TO off; -- prevent distributed transactions during add node
 SELECT FROM master_add_node('localhost', :worker_1_port);
 
 \c - - - :worker_1_port

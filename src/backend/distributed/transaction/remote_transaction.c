@@ -16,7 +16,9 @@
 
 #include "access/xact.h"
 #include "distributed/backend_data.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/connection_management.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/remote_transaction.h"
@@ -58,7 +60,6 @@ void
 StartRemoteTransactionBegin(struct MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
-	ListCell *subIdCell = NULL;
 
 	Assert(transaction->transactionState == REMOTE_TRANS_NOT_STARTED);
 
@@ -74,10 +75,10 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 	List *activeSubXacts = ActiveSubXactContexts();
 	transaction->lastSuccessfulSubXact = TopSubTransactionId;
 	transaction->lastQueuedSubXact = TopSubTransactionId;
-	foreach(subIdCell, activeSubXacts)
-	{
-		SubXactContext *subXactState = lfirst(subIdCell);
 
+	SubXactContext *subXactState = NULL;
+	foreach_ptr(subXactState, activeSubXacts)
+	{
 		/* append SET LOCAL state from when SAVEPOINT was encountered... */
 		if (subXactState->setLocalCmds != NULL)
 		{
@@ -188,21 +189,17 @@ RemoteTransactionBegin(struct MultiConnection *connection)
 void
 RemoteTransactionListBegin(List *connectionList)
 {
-	ListCell *connectionCell = NULL;
+	MultiConnection *connection = NULL;
 
 	/* send BEGIN to all nodes */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
 		StartRemoteTransactionBegin(connection);
 	}
 
 	/* wait for BEGIN to finish on all nodes */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
 		FinishRemoteTransactionBegin(connection);
 	}
 }
@@ -604,7 +601,7 @@ RemoteTransactionBeginIfNecessary(MultiConnection *connection)
 void
 RemoteTransactionsBeginIfNecessary(List *connectionList)
 {
-	ListCell *connectionCell = NULL;
+	MultiConnection *connection = NULL;
 
 	/*
 	 * Don't do anything if not in a coordinated transaction. That allows the
@@ -617,9 +614,8 @@ RemoteTransactionsBeginIfNecessary(List *connectionList)
 	}
 
 	/* issue BEGIN to all connections needing it */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		RemoteTransaction *transaction = &connection->remoteTransaction;
 
 		/* can't send BEGIN if a command already is in progress */
@@ -642,9 +638,8 @@ RemoteTransactionsBeginIfNecessary(List *connectionList)
 	WaitForAllConnections(connectionList, raiseInterrupts);
 
 	/* get result of all the BEGINs */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		RemoteTransaction *transaction = &connection->remoteTransaction;
 
 		/*
@@ -1124,6 +1119,22 @@ CoordinatedRemoteTransactionsSavepointRollback(SubTransactionId subId)
 		}
 
 		FinishRemoteTransactionSavepointRollback(connection, subId);
+
+		/*
+		 * We unclaim the connection now so it can be used again when
+		 * continuing after the ROLLBACK TO SAVEPOINT.
+		 * XXX: We do not undo our hadDML/hadDDL flags. This could result in
+		 * some queries not being allowed on Citus that would actually be fine
+		 * to execute.  Changing this would require us to keep track for each
+		 * savepoint which placement connections had DDL/DML executed at that
+		 * point and if they were already. We also do not call
+		 * ResetShardPlacementAssociation. This might result in suboptimal
+		 * parallelism, because of placement associations that are not really
+		 * necessary anymore because of ROLLBACK TO SAVEPOINT. To change this
+		 * we would need to keep track of when a connection becomes associated
+		 * to a placement.
+		 */
+		UnclaimConnection(connection);
 	}
 }
 
@@ -1330,9 +1341,9 @@ Assign2PCIdentifier(MultiConnection *connection)
 	uint64 transactionNumber = CurrentDistributedTransactionNumber();
 
 	/* print all numbers as unsigned to guarantee no minus symbols appear in the name */
-	snprintf(connection->remoteTransaction.preparedName, NAMEDATALEN,
-			 PREPARED_TRANSACTION_NAME_FORMAT, GetLocalGroupId(), MyProcPid,
-			 transactionNumber, connectionNumber++);
+	SafeSnprintf(connection->remoteTransaction.preparedName, NAMEDATALEN,
+				 PREPARED_TRANSACTION_NAME_FORMAT, GetLocalGroupId(), MyProcPid,
+				 transactionNumber, connectionNumber++);
 }
 
 
@@ -1361,7 +1372,7 @@ ParsePreparedTransactionName(char *preparedTransactionName,
 
 	*groupId = strtol(currentCharPointer, NULL, 10);
 
-	if ((*groupId == 0 && errno == EINVAL) ||
+	if ((*groupId == COORDINATOR_GROUP_ID && errno == EINVAL) ||
 		(*groupId == INT_MAX && errno == ERANGE))
 	{
 		return false;

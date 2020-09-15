@@ -66,7 +66,6 @@ INSERT INTO articles_hash_mx VALUES (48,  8, 'alkylic', 18610);
 INSERT INTO articles_hash_mx VALUES (49,  9, 'anyone', 2681);
 INSERT INTO articles_hash_mx VALUES (50, 10, 'anjanette', 19519);
 
-RESET citus.task_executor_type;
 SET client_min_messages TO 'DEBUG2';
 
 -- insert a single row for the test
@@ -388,7 +387,6 @@ SELECT *
 	WHERE author_id >= 1 AND author_id <= 3
 ORDER BY 1,2,3,4;
 
-RESET citus.task_executor_type;
 
 -- Test various filtering options for router plannable check
 SET client_min_messages to 'DEBUG2';
@@ -501,14 +499,15 @@ SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
 	FROM articles_hash_mx
 	WHERE author_id = 1;
 
--- window functions are not supported for not router plannable queries
 SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash_mx
-	WHERE author_id = 1 or author_id = 2;
+	WHERE author_id = 1 or author_id = 2
+	ORDER BY 1;
 
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash_mx
-	WHERE author_id = 5 or author_id = 2;
+	WHERE author_id = 5 or author_id = 2
+	ORDER BY 2;
 
 -- complex query hitting a single shard
 SELECT
@@ -642,16 +641,6 @@ SET client_min_messages to 'DEBUG2';
 CREATE MATERIALIZED VIEW mv_articles_hash_mx_error AS
 	SELECT * FROM articles_hash_mx WHERE author_id in (1,2);
 
--- router planner/executor is disabled for task-tracker executor
--- following query is router plannable, but router planner is disabled
-
--- TODO: Uncomment once we fix task-tracker issue
---SET citus.task_executor_type to 'task-tracker';
---SELECT id
---	FROM articles_hash_mx
---	WHERE author_id = 1;
-
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash_mx VALUES (51,  1, 'amateus', 1814);
 
 -- verify insert is successfull (not router plannable and executable)

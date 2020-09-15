@@ -13,8 +13,9 @@
 #define MULTI_COPY_H
 
 
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/version_compat.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_coerce.h"
@@ -25,14 +26,28 @@
 
 
 /*
+ * CitusCopyDest indicates the source or destination of a COPY command.
+ */
+typedef enum CitusCopyDest
+{
+	COPY_FILE,                  /* to/from file (or a piped program) */
+	COPY_OLD_FE,                /* to/from frontend (2.0 protocol) */
+	COPY_NEW_FE,                /* to/from frontend (3.0 protocol) */
+	COPY_CALLBACK               /* to/from callback function */
+} CitusCopyDest;
+
+
+/*
  * A smaller version of copy.c's CopyStateData, trimmed to the elements
  * necessary to copy out results. While it'd be a bit nicer to share code,
  * it'd require changing core postgres code.
  */
 typedef struct CopyOutStateData
 {
+	CitusCopyDest copy_dest;    /* type of copy source/destination */
 	StringInfo fe_msgbuf;       /* used for all dests during COPY TO, only for
 	                             * dest == COPY_NEW_FE in COPY FROM */
+	List *attnumlist;           /* integer list of attnums to copy */
 	int file_encoding;          /* file or remote side's character encoding */
 	bool need_transcoding;              /* file encoding diff from server? */
 	bool binary;                /* binary format? */
@@ -74,9 +89,6 @@ typedef struct CitusCopyDestReceiver
 	List *columnNameList;
 	int partitionColumnIndex;
 
-	/* distributed table metadata */
-	DistTableCacheEntry *tableMetadata;
-
 	/* open relation handle */
 	Relation distributedRelation;
 
@@ -116,6 +128,9 @@ typedef struct CitusCopyDestReceiver
 	/* useful for tracking multi shard accesses */
 	bool multiShardCopy;
 
+	/* if true, should copy to local placements in the current session */
+	bool shouldUseLocalCopy;
+
 	/* copy into intermediate result */
 	char *intermediateResultIdPrefix;
 } CitusCopyDestReceiver;
@@ -140,7 +155,9 @@ extern void AppendCopyRowData(Datum *valueArray, bool *isNullArray,
 extern void AppendCopyBinaryHeaders(CopyOutState headerOutputState);
 extern void AppendCopyBinaryFooters(CopyOutState footerOutputState);
 extern void EndRemoteCopy(int64 shardId, List *connectionList);
-extern Node * ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag,
+extern List * CreateRangeTable(Relation rel, AclMode requiredAccess);
+extern Node * ProcessCopyStmt(CopyStmt *copyStatement,
+							  QueryCompletionCompat *completionTag,
 							  const char *queryString);
 extern void CheckCopyPermissions(CopyStmt *copyStatement);
 extern bool IsCopyResultStmt(CopyStmt *copyStatement);

@@ -442,8 +442,9 @@ ROLLBACK;
 -- test with INSERT SELECT via coordinator
 
 -- INSERT .. SELECT via coordinator that doesn't have any intermediate results
+-- We use offset 1 to make sure the result needs to be pulled to the coordinator, offset 0 would be optimized away
 INSERT INTO table_1
-	SELECT * FROM table_2 OFFSET 0;
+	SELECT * FROM table_2 OFFSET 1;
 
 -- INSERT .. SELECT via coordinator which has intermediate result,
 -- and can be pruned to a single worker because the final query is on
@@ -550,7 +551,83 @@ WHERE
 	range_column IN ('A', 'E') AND
 	range_partitioned.data IN (SELECT data FROM some_data);
 
+
+-- test case for issue #3556
+CREATE TABLE accounts (id text PRIMARY KEY);
+CREATE TABLE stats (account_id text PRIMARY KEY, spent int);
+
+SELECT create_distributed_table('accounts', 'id', colocate_with => 'none');
+SELECT create_distributed_table('stats', 'account_id', colocate_with => 'accounts');
+
+INSERT INTO accounts (id) VALUES ('foo');
+INSERT INTO stats (account_id, spent) VALUES ('foo', 100);
+
+SELECT *
+FROM
+(
+    WITH accounts_cte AS (
+        SELECT id AS account_id
+        FROM accounts
+    ),
+    joined_stats_cte_1 AS (
+        SELECT spent, account_id
+        FROM stats
+        INNER JOIN accounts_cte USING (account_id)
+    ),
+    joined_stats_cte_2 AS (
+        SELECT spent, account_id
+        FROM joined_stats_cte_1
+        INNER JOIN accounts_cte USING (account_id)
+    )
+    SELECT SUM(spent) OVER (PARTITION BY coalesce(account_id, NULL))
+    FROM accounts_cte
+    INNER JOIN joined_stats_cte_2 USING (account_id)
+) inner_query;
+
+-- confirm that the pruning works well when using round-robin as well
+SET citus.task_assignment_policy to 'round-robin';
+SELECT *
+FROM
+(
+    WITH accounts_cte AS (
+        SELECT id AS account_id
+        FROM accounts
+    ),
+    joined_stats_cte_1 AS (
+        SELECT spent, account_id
+        FROM stats
+        INNER JOIN accounts_cte USING (account_id)
+    ),
+    joined_stats_cte_2 AS (
+        SELECT spent, account_id
+        FROM joined_stats_cte_1
+        INNER JOIN accounts_cte USING (account_id)
+    )
+    SELECT SUM(spent) OVER (PARTITION BY coalesce(account_id, NULL))
+    FROM accounts_cte
+    INNER JOIN joined_stats_cte_2 USING (account_id)
+) inner_query;
+RESET citus.task_assignment_policy;
+
+-- Insert..select is planned differently, make sure we have results everywhere.
+-- We put the insert..select in a CTE here to prevent the CTE from being moved
+-- into the select, which would follow the regular code path for select.
+WITH stats AS (
+  SELECT count(key) m FROM table_3
+),
+inserts AS (
+  INSERT INTO table_2
+  SELECT key, count(*)
+  FROM table_1
+  WHERE key > (SELECT m FROM stats)
+  GROUP BY key
+  HAVING count(*) < (SELECT m FROM stats)
+  LIMIT 1
+  RETURNING *
+) SELECT count(*) FROM inserts;
+
+SET citus.task_assignment_policy to DEFAULT;
 SET client_min_messages TO DEFAULT;
-DROP TABLE table_1, table_2, table_3, ref_table, range_partitioned;
+DROP TABLE table_1, table_2, table_3, ref_table, accounts, stats, range_partitioned;
 DROP SCHEMA intermediate_result_pruning;
 

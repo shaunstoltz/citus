@@ -15,6 +15,7 @@
 
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/listutils.h"
 #include "distributed/log_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/cancel_utils.h"
@@ -276,10 +277,23 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 		messageDetail = pchomp(PQerrorMessage(pgConn));
 	}
 
-	ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("connection error: %s:%d", nodeName, nodePort),
-					 messageDetail != NULL ?
-					 errdetail("%s", ApplyLogRedaction(messageDetail)) : 0));
+	if (messageDetail)
+	{
+		/*
+		 * We don't use ApplyLogRedaction(messageDetail) as we expect any error
+		 * detail that requires log reduction should have done it locally.
+		 */
+		ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("connection to the remote node %s:%d failed with the "
+								"following error: %s", nodeName, nodePort,
+								messageDetail)));
+	}
+	else
+	{
+		ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("connection to the remote node %s:%d failed",
+								nodeName, nodePort)));
+	}
 }
 
 
@@ -369,12 +383,9 @@ LogRemoteCommand(MultiConnection *connection, const char *command)
 void
 ExecuteCriticalRemoteCommandList(MultiConnection *connection, List *commandList)
 {
-	ListCell *commandCell = NULL;
-
-	foreach(commandCell, commandList)
+	const char *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		char *command = (char *) lfirst(commandCell);
-
 		ExecuteCriticalRemoteCommand(connection, command);
 	}
 }
@@ -463,7 +474,7 @@ ExecuteOptionalRemoteCommand(MultiConnection *connection, const char *command,
 int
 SendRemoteCommandParams(MultiConnection *connection, const char *command,
 						int parameterCount, const Oid *parameterTypes,
-						const char *const *parameterValues)
+						const char *const *parameterValues, bool binaryResults)
 {
 	PGconn *pgConn = connection->pgConn;
 
@@ -481,7 +492,7 @@ SendRemoteCommandParams(MultiConnection *connection, const char *command,
 	Assert(PQisnonblocking(pgConn));
 
 	int rc = PQsendQueryParams(pgConn, command, parameterCount, parameterTypes,
-							   parameterValues, NULL, NULL, 0);
+							   parameterValues, NULL, NULL, binaryResults ? 1 : 0);
 
 	return rc;
 }
@@ -781,7 +792,6 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	int totalConnectionCount = list_length(connectionList);
 	int pendingConnectionsStartIndex = 0;
 	int connectionIndex = 0;
-	ListCell *connectionCell = NULL;
 
 	MultiConnection **allConnections =
 		palloc(totalConnectionCount * sizeof(MultiConnection *));
@@ -790,11 +800,10 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	WaitEventSet *waitEventSet = NULL;
 
 	/* convert connection list to an array such that we can move items around */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connectionItem = NULL;
+	foreach_ptr(connectionItem, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
-		allConnections[connectionIndex] = connection;
+		allConnections[connectionIndex] = connectionItem;
 		connectionReady[connectionIndex] = false;
 		connectionIndex++;
 	}
