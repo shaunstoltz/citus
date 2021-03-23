@@ -239,7 +239,8 @@ AddSchemaFieldIfMissing(CreateExtensionStmt *createExtensionStmt)
  * be made to the workers.
  */
 List *
-PreprocessDropExtensionStmt(Node *node, const char *queryString)
+PreprocessDropExtensionStmt(Node *node, const char *queryString,
+							ProcessUtilityContext processUtilityContext)
 {
 	DropStmt *stmt = castNode(DropStmt, node);
 
@@ -386,7 +387,8 @@ ExtensionNameListToObjectAddressList(List *extensionObjectList)
  * PreprocessAlterExtensionSchemaStmt is invoked for alter extension set schema statements.
  */
 List *
-PreprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
+PreprocessAlterExtensionSchemaStmt(Node *node, const char *queryString,
+								   ProcessUtilityContext processUtilityContext)
 {
 	if (!ShouldPropagateExtensionCommand(node))
 	{
@@ -451,7 +453,8 @@ PostprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
  * PreprocessAlterExtensionUpdateStmt is invoked for alter extension update statements.
  */
 List *
-PreprocessAlterExtensionUpdateStmt(Node *node, const char *queryString)
+PreprocessAlterExtensionUpdateStmt(Node *node, const char *queryString,
+								   ProcessUtilityContext processUtilityContext)
 {
 	AlterExtensionStmt *alterExtensionStmt = castNode(AlterExtensionStmt, node);
 
@@ -555,14 +558,14 @@ MarkExistingObjectDependenciesDistributedIfSupported()
 	/* resulting object addresses to be marked as distributed */
 	List *resultingObjectAddresses = NIL;
 
-	/* resolve dependencies of distributed tables */
-	List *distributedTableOidList = DistTableOidList();
+	/* resolve dependencies of citus tables */
+	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
 
-	Oid distributedTableOid = InvalidOid;
-	foreach_oid(distributedTableOid, distributedTableOidList)
+	Oid citusTableId = InvalidOid;
+	foreach_oid(citusTableId, citusTableIdList)
 	{
 		ObjectAddress tableAddress = { 0 };
-		ObjectAddressSet(tableAddress, RelationRelationId, distributedTableOid);
+		ObjectAddressSet(tableAddress, RelationRelationId, citusTableId);
 
 		List *distributableDependencyObjectAddresses =
 			GetDistributableDependenciesForObject(&tableAddress);
@@ -599,7 +602,8 @@ MarkExistingObjectDependenciesDistributedIfSupported()
  * PreprocessAlterExtensionContentsStmt issues a notice. It does not propagate.
  */
 List *
-PreprocessAlterExtensionContentsStmt(Node *node, const char *queryString)
+PreprocessAlterExtensionContentsStmt(Node *node, const char *queryString,
+									 ProcessUtilityContext processUtilityContext)
 {
 	ereport(NOTICE, (errmsg(
 						 "Citus does not propagate adding/dropping member objects"),

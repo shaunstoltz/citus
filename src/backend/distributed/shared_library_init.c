@@ -37,7 +37,9 @@
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/intermediate_result_pruning.h"
+#include "distributed/local_multi_copy.h"
 #include "distributed/local_executor.h"
+#include "distributed/local_distributed_join_planner.h"
 #include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/maintenanced.h"
 #include "distributed/metadata_utility.h"
@@ -55,9 +57,11 @@
 #include "distributed/multi_server_executor.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/placement_connection.h"
+#include "distributed/recursive_planning.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/run_from_same_connection.h"
+#include "distributed/shard_cleaner.h"
 #include "distributed/shared_connection_stats.h"
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/time_constants.h"
@@ -74,6 +78,7 @@
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_shard_visibility.h"
 #include "distributed/adaptive_executor.h"
+#include "libpq/auth.h"
 #include "port/atomics.h"
 #include "postmaster/postmaster.h"
 #include "storage/ipc.h"
@@ -84,6 +89,8 @@
 #include "utils/guc_tables.h"
 #include "utils/varlena.h"
 
+#include "columnar/mod.h"
+
 /* marks shared object as one loadable by the postgres version compiled against */
 PG_MODULE_MAGIC;
 
@@ -92,12 +99,15 @@ static char *CitusVersion = CITUS_VERSION;
 
 
 void _PG_init(void);
+void _PG_fini(void);
 
 static void DoInitialCleanup(void);
 static void ResizeStackToMaximumDepth(void);
 static void multi_log_hook(ErrorData *edata);
 static void RegisterConnectionCleanup(void);
+static void RegisterClientBackendCounterDecrement(void);
 static void CitusCleanupConnectionsAtExit(int code, Datum arg);
+static void DecrementClientBackendCounterAtExit(int code, Datum arg);
 static void CreateRequiredDirectories(void);
 static void RegisterCitusConfigVariables(void);
 static bool ErrorIfNotASuitableDeadlockFactor(double *newval, void **extra,
@@ -107,12 +117,13 @@ static bool NoticeIfSubqueryPushdownEnabled(bool *newval, void **extra, GucSourc
 static bool NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source);
 static void NodeConninfoGucAssignHook(const char *newval, void *extra);
 static const char * MaxSharedPoolSizeGucShowHook(void);
+static const char * LocalPoolSizeGucShowHook(void);
 static bool StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource
 											 source);
+static void CitusAuthHook(Port *port, int status);
 
-/* static variable to hold value of deprecated GUC variable */
-static bool DeprecatedBool = false;
-static int DeprecatedInt = 0;
+
+static ClientAuthentication_hook_type original_client_auth_hook = NULL;
 
 
 /* *INDENT-OFF* */
@@ -185,9 +196,25 @@ static const struct config_enum_entry log_level_options[] = {
 	{ NULL, 0, false}
 };
 
+
+static const struct config_enum_entry local_table_join_policies[] = {
+	{ "never", LOCAL_JOIN_POLICY_NEVER, false},
+	{ "prefer-local", LOCAL_JOIN_POLICY_PREFER_LOCAL, false},
+	{ "prefer-distributed", LOCAL_JOIN_POLICY_PREFER_DISTRIBUTED, false},
+	{ "auto", LOCAL_JOIN_POLICY_AUTO, false},
+	{ NULL, 0, false}
+};
+
+
 static const struct config_enum_entry multi_shard_modify_connection_options[] = {
 	{ "parallel", PARALLEL_CONNECTION, false },
 	{ "sequential", SEQUENTIAL_CONNECTION, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry explain_analyze_sort_method_options[] = {
+	{ "execution-time", EXPLAIN_ANALYZE_SORT_BY_TIME, false },
+	{ "taskId", EXPLAIN_ANALYZE_SORT_BY_TASK_ID, false },
 	{ NULL, 0, false }
 };
 
@@ -277,6 +304,14 @@ _PG_init(void)
 	/* register hook for error messages */
 	emit_log_hook = multi_log_hook;
 
+
+	/*
+	 * Register hook for counting client backends that
+	 * are successfully authenticated.
+	 */
+	original_client_auth_hook = ClientAuthentication_hook;
+	ClientAuthentication_hook = CitusAuthHook;
+
 	InitializeMaintenanceDaemon();
 
 	/* initialize coordinated transaction management */
@@ -295,7 +330,25 @@ _PG_init(void)
 						PGC_S_OVERRIDE);
 	}
 
-	DoInitialCleanup();
+	/*
+	 * In postmasters execution of _PG_init, IsUnderPostmaster will be false and
+	 * we want to do the cleanup at that time only, otherwise there is a chance that
+	 * there will be parallel queries and we might do a cleanup for things that are
+	 * already in use. This is only needed in Windows.
+	 */
+	if (!IsUnderPostmaster)
+	{
+		DoInitialCleanup();
+	}
+	columnar_init();
+}
+
+
+/* shared library deconstruction function */
+void
+_PG_fini(void)
+{
+	columnar_fini();
 }
 
 
@@ -421,6 +474,23 @@ RegisterConnectionCleanup(void)
 
 
 /*
+ * RegisterClientBackendCounterDecrement is called when the backend terminates.
+ * For all client backends, we register a callback that will undo
+ */
+static void
+RegisterClientBackendCounterDecrement(void)
+{
+	static bool registeredCleanup = false;
+	if (registeredCleanup == false)
+	{
+		before_shmem_exit(DecrementClientBackendCounterAtExit, 0);
+
+		registeredCleanup = true;
+	}
+}
+
+
+/*
  * CitusCleanupConnectionsAtExit is called before_shmem_exit() of the
  * backend for the purposes of any clean-up needed.
  */
@@ -436,6 +506,17 @@ CitusCleanupConnectionsAtExit(int code, Datum arg)
 	 * are already given away.
 	 */
 	DeallocateReservedConnections();
+}
+
+
+/*
+ * DecrementClientBackendCounterAtExit is called before_shmem_exit() of the
+ * backend for the purposes decrementing
+ */
+static void
+DecrementClientBackendCounterAtExit(int code, Datum arg)
+{
+	DecrementClientBackendCounter();
 }
 
 
@@ -482,27 +563,6 @@ RegisterCitusConfigVariables(void)
 		GUC_UNIT_MS | GUC_STANDARD,
 		NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
-		"citus.sslmode",
-		gettext_noop("This variable has been deprecated. Use the citus.node_conninfo "
-					 "GUC instead."),
-		NULL,
-		&DeprecatedInt,
-		0, 0, 32,
-		PGC_POSTMASTER,
-		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.binary_master_copy_format",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedBool,
-		false,
-		PGC_USERSET,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
 	DefineCustomBoolVariable(
 		"citus.binary_worker_copy_format",
 		gettext_noop("Use the binary worker copy format."),
@@ -515,14 +575,20 @@ RegisterCitusConfigVariables(void)
 		GUC_STANDARD,
 		NULL, NULL, NULL);
 
-	DefineCustomBoolVariable(
-		"citus.expire_cached_shards",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedBool,
-		false,
-		PGC_SIGHUP,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
+	DefineCustomIntVariable(
+		"citus.copy_switchover_threshold",
+		gettext_noop("Sets the threshold for copy to be switched "
+					 "over per connection."),
+		gettext_noop("Data size threshold to switch over the active placement for "
+					 "a connection. If this is too low, overhead of starting COPY "
+					 "commands will hurt the performance. If this is too high, "
+					 "buffered data will use lots of memory. 4MB is a good balance "
+					 "between memory usage and performance. Note that this is irrelevant "
+					 "in the common case where we open one connection per placement."),
+		&CopySwitchOverThresholdBytes,
+		4 * 1024 * 1024, 1, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_BYTE | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -535,6 +601,18 @@ RegisterCitusConfigVariables(void)
 		PGC_USERSET,
 		GUC_STANDARD,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_local_reference_table_foreign_keys",
+		gettext_noop("Enables foreign keys from/to local tables"),
+		gettext_noop("When enabled, foreign keys between local tables and reference "
+					 "tables supported."),
+		&EnableLocalReferenceForeignKeys,
+		true,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
 
 	DefineCustomBoolVariable(
 		"citus.enable_single_hash_repartition_joins",
@@ -622,6 +700,62 @@ RegisterCitusConfigVariables(void)
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
 		NoticeIfSubqueryPushdownEnabled, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.remote_copy_flush_threshold",
+		gettext_noop("Sets the threshold for remote copy to be flushed."),
+		gettext_noop("When sending data over remote connections via the COPY protocol, "
+					 "bytes are first buffered internally by libpq. If the number of "
+					 "bytes buffered exceeds the threshold, Citus waits for all the "
+					 "bytes to flush."),
+		&RemoteCopyFlushThreshold,
+		8 * 1024 * 1024, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_BYTE | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.local_copy_flush_threshold",
+		gettext_noop("Sets the threshold for local copy to be flushed."),
+		NULL,
+		&LocalCopyFlushThresholdByte,
+		512 * 1024, 1, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_BYTE | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.local_shared_pool_size",
+		gettext_noop(
+			"Sets the maximum number of connections allowed for the shards on the "
+			"local node across all the backends from this node. Setting to -1 disables "
+			"connections throttling. Setting to 0 makes it auto-adjust, meaning "
+			"equal to the half of max_connections on the coordinator."),
+		gettext_noop("As a rule of thumb, the value should be at most equal to the "
+					 "max_connections on the local node."),
+		&LocalSharedPoolSize,
+		0, -1, INT_MAX,
+		PGC_SIGHUP,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, LocalPoolSizeGucShowHook);
+
+	DefineCustomEnumVariable(
+		"citus.local_table_join_policy",
+		gettext_noop("defines the behaviour when a distributed table "
+					 "is joined with a local table"),
+		gettext_noop(
+			"There are 4 values available. The default, 'auto' will recursively plan"
+			"distributed tables if there is a constant filter on a unique index."
+			"'prefer-local' will choose local tables if possible."
+			"'prefer-distributed' will choose distributed tables if possible"
+			"'never' will basically skip local table joins."
+			),
+		&LocalTableJoinPolicy,
+		LOCAL_JOIN_POLICY_AUTO,
+		local_table_join_policies,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.log_multi_join_order",
@@ -772,6 +906,38 @@ RegisterCitusConfigVariables(void)
 		5 * MS_PER_SECOND, 1, 7 * MS_PER_DAY,
 		PGC_SIGHUP,
 		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.defer_drop_after_shard_move",
+		gettext_noop("When enabled a shard move will mark old shards for deletion"),
+		gettext_noop("The deletion of a shard can sometimes run into a conflict with a "
+					 "long running transactions on a the shard during the drop phase of "
+					 "the shard move. This causes some moves to be rolled back after "
+					 "resources have been spend on moving the shard. To prevent "
+					 "conflicts this feature lets you skip the actual deletion till a "
+					 "later point in time. When used one should set "
+					 "citus.defer_shard_delete_interval to make sure defered deletions "
+					 "will be executed"),
+		&DeferShardDeleteOnMove,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.defer_shard_delete_interval",
+		gettext_noop("Sets the time to wait between background deletion for shards."),
+		gettext_noop("Shards that are marked for deferred deletion need to be deleted in "
+					 "the background at a later time. This is done at a regular interval "
+					 "configured here. The deletion is executed optimistically, it tries "
+					 "to take a lock on a shard to clean, if the lock can't be acquired "
+					 "the background worker moves on. When set to -1 this background "
+					 "process is skipped."),
+		&DeferShardDeleteInterval,
+		-1, -1, 7 * 24 * 3600 * 1000,
+		PGC_SIGHUP,
+		GUC_UNIT_MS,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1072,16 +1238,6 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"citus.task_tracker_delay",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedInt,
-		200 * MS, 1, 100 * MS_PER_SECOND,
-		PGC_SIGHUP,
-		GUC_UNIT_MS | GUC_STANDARD | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
 		"citus.max_cached_conns_per_worker",
 		gettext_noop("Sets the maximum number of connections to cache per worker."),
 		gettext_noop("Each backend opens connections to the workers to query the "
@@ -1096,23 +1252,13 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"citus.max_assign_task_batch_size",
-		gettext_noop("This GUC variable has been deprecated."),
+		"citus.max_cached_connection_lifetime",
+		gettext_noop("Sets the maximum lifetime of cached connections to other nodes."),
 		NULL,
-		&DeprecatedInt,
-		64, 1, INT_MAX,
+		&MaxCachedConnectionLifetime,
+		10 * MS_PER_MINUTE, -1, INT_MAX,
 		PGC_USERSET,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.max_tracked_tasks_per_node",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedInt,
-		1024, 8, INT_MAX,
-		PGC_POSTMASTER,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
+		GUC_UNIT_MS | GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -1122,16 +1268,6 @@ RegisterCitusConfigVariables(void)
 					 "uses those to shuffle data around nodes. "),
 		&RepartitionJoinBucketCountPerNode,
 		4, 1, INT_MAX,
-		PGC_SIGHUP,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.max_running_tasks_per_node",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedInt,
-		8, 1, INT_MAX,
 		PGC_SIGHUP,
 		GUC_STANDARD | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
@@ -1148,16 +1284,6 @@ RegisterCitusConfigVariables(void)
 		8192, 0, (INT_MAX / 1024), /* result stored in int variable */
 		PGC_USERSET,
 		GUC_UNIT_KB | GUC_STANDARD,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.large_table_shard_count",
-		gettext_noop("This variable has been deprecated."),
-		gettext_noop("Consider reference tables instead"),
-		&DeprecatedInt,
-		4, 1, 10000,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -1413,16 +1539,6 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
-		"citus.max_task_string_size",
-		gettext_noop("This GUC variable has been deprecated."),
-		NULL,
-		&DeprecatedInt,
-		12288, 8192, 65536,
-		PGC_POSTMASTER,
-		GUC_STANDARD | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
 	DefineCustomBoolVariable(
 		"citus.enable_statistics_collection",
 		gettext_noop("Enables sending basic usage statistics to Citus."),
@@ -1483,6 +1599,21 @@ RegisterCitusConfigVariables(void)
 		NULL,
 		&ReplicateReferenceTablesOnActivate,
 		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.explain_analyze_sort_method",
+		gettext_noop("Sets the sorting method for EXPLAIN ANALYZE queries."),
+		gettext_noop("This parameter is intended for testing. It is developed "
+					 "to get consistent regression test outputs. When it is set "
+					 "to 'time', EXPLAIN ANALYZE output is sorted by execution "
+					 "duration on workers. When it is set to 'taskId', it is "
+					 "sorted by task id. By default, it is set to 'time'; but "
+					 "in regression tests, it's set to 'taskId' for consistency."),
+		&ExplainAnalyzeSortMethod,
+		EXPLAIN_ANALYZE_SORT_BY_TIME, explain_analyze_sort_method_options,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
@@ -1679,6 +1810,21 @@ MaxSharedPoolSizeGucShowHook(void)
 }
 
 
+/*
+ * LocalPoolSizeGucShowHook overrides the value that is shown to the
+ * user when the default value has not been set.
+ */
+static const char *
+LocalPoolSizeGucShowHook(void)
+{
+	StringInfo newvalue = makeStringInfo();
+
+	appendStringInfo(newvalue, "%d", GetLocalSharedPoolSize());
+
+	return (const char *) newvalue->data;
+}
+
+
 static bool
 StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource source)
 {
@@ -1698,4 +1844,22 @@ StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource source)
 		return true;
 	}
 #endif
+}
+
+
+/*
+ * CitusAuthHook is a callback for client authentication that Postgres provides.
+ * Citus uses this hook to count the number of active backends.
+ */
+static void
+CitusAuthHook(Port *port, int status)
+{
+	/* let other authentication hooks to kick in first */
+	if (original_client_auth_hook)
+	{
+		original_client_auth_hook(port, status);
+	}
+
+	RegisterClientBackendCounterDecrement();
+	IncrementClientBackendCounter();
 }

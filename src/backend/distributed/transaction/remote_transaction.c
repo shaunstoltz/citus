@@ -20,6 +20,7 @@
 #include "distributed/connection_management.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/placement_connection.h"
 #include "distributed/remote_commands.h"
 #include "distributed/remote_transaction.h"
 #include "distributed/transaction_identifier.h"
@@ -47,7 +48,6 @@ static void FinishRemoteTransactionSavepointRollback(MultiConnection *connection
 													 SubTransactionId subId);
 
 static void Assign2PCIdentifier(MultiConnection *connection);
-static void WarnAboutLeakedPreparedTransaction(MultiConnection *connection, bool commit);
 
 
 /*
@@ -215,7 +215,6 @@ StartRemoteTransactionCommit(MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
 	const bool raiseErrors = false;
-	const bool isCommit = true;
 
 	/* can only commit if transaction is in progress */
 	Assert(transaction->transactionState != REMOTE_TRANS_NOT_STARTED);
@@ -253,8 +252,6 @@ StartRemoteTransactionCommit(MultiConnection *connection)
 		if (!SendRemoteCommand(connection, command.data))
 		{
 			HandleRemoteTransactionConnectionError(connection, raiseErrors);
-
-			WarnAboutLeakedPreparedTransaction(connection, isCommit);
 		}
 	}
 	else
@@ -286,7 +283,6 @@ FinishRemoteTransactionCommit(MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
 	const bool raiseErrors = false;
-	const bool isCommit = true;
 
 	Assert(transaction->transactionState == REMOTE_TRANS_1PC_ABORTING ||
 		   transaction->transactionState == REMOTE_TRANS_1PC_COMMITTING ||
@@ -318,7 +314,6 @@ FinishRemoteTransactionCommit(MultiConnection *connection)
 		{
 			ereport(WARNING, (errmsg("failed to commit transaction on %s:%d",
 									 connection->hostname, connection->port)));
-			WarnAboutLeakedPreparedTransaction(connection, isCommit);
 		}
 	}
 	else if (transaction->transactionState == REMOTE_TRANS_1PC_ABORTING ||
@@ -358,7 +353,6 @@ StartRemoteTransactionAbort(MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
 	const bool raiseErrors = false;
-	const bool isNotCommit = false;
 
 	Assert(transaction->transactionState != REMOTE_TRANS_NOT_STARTED);
 
@@ -385,8 +379,6 @@ StartRemoteTransactionAbort(MultiConnection *connection)
 		if (!SendRemoteCommand(connection, command.data))
 		{
 			HandleRemoteTransactionConnectionError(connection, raiseErrors);
-
-			WarnAboutLeakedPreparedTransaction(connection, isNotCommit);
 		}
 		else
 		{
@@ -438,11 +430,7 @@ FinishRemoteTransactionAbort(MultiConnection *connection)
 		PGresult *result = GetRemoteCommandResult(connection, raiseErrors);
 		if (!IsResponseOK(result))
 		{
-			const bool isCommit = false;
-
 			HandleRemoteTransactionResultError(connection, result, raiseErrors);
-
-			WarnAboutLeakedPreparedTransaction(connection, isCommit);
 		}
 
 		PQclear(result);
@@ -559,18 +547,6 @@ FinishRemoteTransactionPrepare(struct MultiConnection *connection)
 							   connection->port),
 						errhint("Try re-running the command.")));
 	}
-}
-
-
-/*
- * RemoteTransactionPrepare prepares a remote transaction in a blocking
- * manner.
- */
-void
-RemoteTransactionPrepare(struct MultiConnection *connection)
-{
-	StartRemoteTransactionPrepare(connection);
-	FinishRemoteTransactionPrepare(connection);
 }
 
 
@@ -747,19 +723,6 @@ MarkRemoteTransactionCritical(struct MultiConnection *connection)
 
 
 /*
- * IsRemoteTransactionCritical returns whether the remote transaction on
- * the given connection has been marked as critical.
- */
-bool
-IsRemoteTransactionCritical(struct MultiConnection *connection)
-{
-	RemoteTransaction *transaction = &connection->remoteTransaction;
-
-	return transaction->transactionCritical;
-}
-
-
-/*
  * CloseRemoteTransaction handles closing a connection that, potentially, is
  * part of a coordinated transaction.  This should only ever be called from
  * connection_management.c, while closing a connection during a transaction.
@@ -820,8 +783,16 @@ CoordinatedRemoteTransactionsPrepare(void)
 			continue;
 		}
 
-		StartRemoteTransactionPrepare(connection);
-		connectionList = lappend(connectionList, connection);
+		/*
+		 * Check if any DML or DDL is executed over the connection on any
+		 * placement/table. If yes, we start preparing the transaction, otherwise
+		 * we skip prepare since the connection didn't perform any write (read-only)
+		 */
+		if (ConnectionModifiedPlacement(connection))
+		{
+			StartRemoteTransactionPrepare(connection);
+			connectionList = lappend(connectionList, connection);
+		}
 	}
 
 	bool raiseInterrupts = true;
@@ -836,6 +807,10 @@ CoordinatedRemoteTransactionsPrepare(void)
 
 		if (transaction->transactionState != REMOTE_TRANS_PREPARING)
 		{
+			/*
+			 * Verify that the connection didn't modify any placement
+			 */
+			Assert(!ConnectionModifiedPlacement(connection));
 			continue;
 		}
 
@@ -1316,7 +1291,7 @@ CheckRemoteTransactionsHealth(void)
  *
  * citus_<source group>_<pid>_<distributed transaction number>_<connection number>
  *
- * (at most 5+1+10+1+10+20+1+10 = 58 characters, while limit is 64)
+ * (at most 5+1+10+1+10+1+20+1+10 = 59 characters, while limit is 64)
  *
  * The source group is used to distinguish 2PCs started by different
  * coordinators. A coordinator will only attempt to recover its own 2PCs.
@@ -1427,36 +1402,4 @@ ParsePreparedTransactionName(char *preparedTransactionName,
 	}
 
 	return true;
-}
-
-
-/*
- * WarnAboutLeakedPreparedTransaction issues a WARNING explaining that a
- * prepared transaction could not be committed or rolled back, and explains
- * how to perform cleanup.
- */
-static void
-WarnAboutLeakedPreparedTransaction(MultiConnection *connection, bool commit)
-{
-	StringInfoData command;
-	RemoteTransaction *transaction = &connection->remoteTransaction;
-
-	initStringInfo(&command);
-
-	if (commit)
-	{
-		appendStringInfo(&command, "COMMIT PREPARED %s",
-						 quote_literal_cstr(transaction->preparedName));
-	}
-	else
-	{
-		appendStringInfo(&command, "ROLLBACK PREPARED %s",
-						 quote_literal_cstr(transaction->preparedName));
-	}
-
-	/* log a warning so the user may abort the transaction later */
-	ereport(WARNING, (errmsg("failed to roll back prepared transaction '%s'",
-							 transaction->preparedName),
-					  errhint("Run \"%s\" on %s:%u",
-							  command.data, connection->hostname, connection->port)));
 }

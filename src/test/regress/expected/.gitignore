@@ -21,3 +21,16 @@
 /multi_behavioral_analytics_create_table.out
 /multi_insert_select_behavioral_analytics_create_table.out
 /hyperscale_tutorial.out
+/am_chunk_filtering.out
+/am_copyto.out
+/am_data_types.out
+/am_load.out
+/fdw_block_filtering.out
+/fdw_copyto.out
+/fdw_create.out
+/fdw_data_types.out
+/fdw_load.out
+/columnar_chunk_filtering.out
+/columnar_copyto.out
+/columnar_data_types.out
+/columnar_load.out

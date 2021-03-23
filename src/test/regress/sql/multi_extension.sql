@@ -6,6 +6,11 @@
 -- It'd be nice to script generation of this file, but alas, that's
 -- not done yet.
 
+-- differentiate the output file for pg11 and versions above, with regards to objects
+-- created per citus version depending on the postgres version. Upgrade tests verify the
+-- objects are added in citus_finish_pg_upgrade()
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int > 11 AS version_above_eleven;
 
 SET citus.next_shard_id TO 580000;
 
@@ -75,15 +80,16 @@ SELECT datname, current_database(),
     usename, (SELECT extowner::regrole::text FROM pg_extension WHERE extname = 'citus')
 FROM test.maintenance_worker();
 
--- ensure no objects were created outside pg_catalog
-SELECT COUNT(*)
+-- ensure no unexpected objects were created outside pg_catalog
+SELECT pgio.type, pgio.identity
 FROM pg_depend AS pgd,
 	 pg_extension AS pge,
 	 LATERAL pg_identify_object(pgd.classid, pgd.objid, pgd.objsubid) AS pgio
 WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pgd.refobjid   = pge.oid AND
 	  pge.extname    = 'citus' AND
-	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test');
+	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar')
+ORDER BY 1, 2;
 
 
 -- DROP EXTENSION pre-created by the regression suite
@@ -95,40 +101,7 @@ SET citus.enable_object_propagation TO 'false';
 
 SET citus.enable_version_checks TO 'false';
 
-CREATE EXTENSION citus VERSION '7.0-1';
-ALTER EXTENSION citus UPDATE TO '7.0-2';
-ALTER EXTENSION citus UPDATE TO '7.0-3';
-ALTER EXTENSION citus UPDATE TO '7.0-4';
-ALTER EXTENSION citus UPDATE TO '7.0-5';
-ALTER EXTENSION citus UPDATE TO '7.0-6';
-ALTER EXTENSION citus UPDATE TO '7.0-7';
-ALTER EXTENSION citus UPDATE TO '7.0-8';
-ALTER EXTENSION citus UPDATE TO '7.0-9';
-ALTER EXTENSION citus UPDATE TO '7.0-10';
-ALTER EXTENSION citus UPDATE TO '7.0-11';
-ALTER EXTENSION citus UPDATE TO '7.0-12';
-ALTER EXTENSION citus UPDATE TO '7.0-13';
-ALTER EXTENSION citus UPDATE TO '7.0-14';
-ALTER EXTENSION citus UPDATE TO '7.0-15';
-ALTER EXTENSION citus UPDATE TO '7.1-1';
-ALTER EXTENSION citus UPDATE TO '7.1-2';
-ALTER EXTENSION citus UPDATE TO '7.1-3';
-ALTER EXTENSION citus UPDATE TO '7.1-4';
-ALTER EXTENSION citus UPDATE TO '7.2-1';
-ALTER EXTENSION citus UPDATE TO '7.2-2';
-ALTER EXTENSION citus UPDATE TO '7.2-3';
-ALTER EXTENSION citus UPDATE TO '7.3-3';
-ALTER EXTENSION citus UPDATE TO '7.4-1';
-ALTER EXTENSION citus UPDATE TO '7.4-2';
-ALTER EXTENSION citus UPDATE TO '7.4-3';
-ALTER EXTENSION citus UPDATE TO '7.5-1';
-ALTER EXTENSION citus UPDATE TO '7.5-2';
-ALTER EXTENSION citus UPDATE TO '7.5-3';
-ALTER EXTENSION citus UPDATE TO '7.5-4';
-ALTER EXTENSION citus UPDATE TO '7.5-5';
-ALTER EXTENSION citus UPDATE TO '7.5-6';
-ALTER EXTENSION citus UPDATE TO '7.5-7';
-ALTER EXTENSION citus UPDATE TO '8.0-1';
+CREATE EXTENSION citus VERSION '8.0-1';
 ALTER EXTENSION citus UPDATE TO '8.0-2';
 ALTER EXTENSION citus UPDATE TO '8.0-3';
 ALTER EXTENSION citus UPDATE TO '8.0-4';
@@ -195,7 +168,19 @@ SELECT * FROM print_extension_changes();
 
 -- Test downgrade to 9.4-1 from 9.5-1
 ALTER EXTENSION citus UPDATE TO '9.5-1';
+
+BEGIN;
+  SELECT master_add_node('localhost', :master_port, groupId=>0);
+  CREATE TABLE citus_local_table (a int);
+  SELECT create_citus_local_table('citus_local_table');
+
+  -- downgrade from 9.5-1 to 9.4-1 should fail as we have a citus local table
+  ALTER EXTENSION citus UPDATE TO '9.4-1';
+ROLLBACK;
+
+-- now we can downgrade as there is no citus local table
 ALTER EXTENSION citus UPDATE TO '9.4-1';
+
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM print_extension_changes();
 
@@ -203,29 +188,70 @@ SELECT * FROM print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '9.5-1';
 SELECT * FROM print_extension_changes();
 
+-- Test downgrade to 9.5-1 from 10.0-1
+ALTER EXTENSION citus UPDATE TO '10.0-1';
+ALTER EXTENSION citus UPDATE TO '9.5-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 10.0-1
+ALTER EXTENSION citus UPDATE TO '10.0-1';
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 10.0-1 from 10.0-2
+ALTER EXTENSION citus UPDATE TO '10.0-2';
+ALTER EXTENSION citus UPDATE TO '10.0-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 10.0-2
+ALTER EXTENSION citus UPDATE TO '10.0-2';
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 10.0-2 from 10.0-3
+ALTER EXTENSION citus UPDATE TO '10.0-3';
+ALTER EXTENSION citus UPDATE TO '10.0-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 10.0-3
+ALTER EXTENSION citus UPDATE TO '10.0-3';
+SELECT * FROM print_extension_changes();
+
+-- Test downgrade to 10.0-3 from 10.1-1
+ALTER EXTENSION citus UPDATE TO '10.1-1';
+ALTER EXTENSION citus UPDATE TO '10.0-3';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM print_extension_changes();
+
+-- Snapshot of state at 10.1-1
+ALTER EXTENSION citus UPDATE TO '10.1-1';
+SELECT * FROM print_extension_changes();
+
 DROP TABLE prev_objects, extension_diff;
 
 -- show running version
 SHOW citus.version;
 
--- ensure no objects were created outside pg_catalog
-SELECT COUNT(*)
+-- ensure no unexpected objects were created outside pg_catalog
+SELECT pgio.type, pgio.identity
 FROM pg_depend AS pgd,
 	 pg_extension AS pge,
 	 LATERAL pg_identify_object(pgd.classid, pgd.objid, pgd.objsubid) AS pgio
 WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pgd.refobjid   = pge.oid AND
 	  pge.extname    = 'citus' AND
-	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test');
+	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar')
+ORDER BY 1, 2;
 
 -- see incompatible version errors out
 RESET citus.enable_version_checks;
 DROP EXTENSION citus;
-CREATE EXTENSION citus VERSION '7.0-1';
+CREATE EXTENSION citus VERSION '8.0-1';
 
 -- Test non-distributed queries work even in version mismatch
 SET citus.enable_version_checks TO 'false';
-CREATE EXTENSION citus VERSION '7.1-1';
+CREATE EXTENSION citus VERSION '8.1-1';
 SET citus.enable_version_checks TO 'true';
 
 -- Test CREATE TABLE
@@ -257,7 +283,7 @@ ORDER BY 1;
 SELECT create_distributed_table('version_mismatch_table', 'column1');
 
 -- This function will cause fail in next ALTER EXTENSION
-CREATE OR REPLACE FUNCTION pg_catalog.master_dist_authinfo_cache_invalidate()
+CREATE OR REPLACE FUNCTION pg_catalog.relation_is_a_known_shard(regclass)
 RETURNS void LANGUAGE plpgsql
 AS $function$
 BEGIN
@@ -270,7 +296,7 @@ ALTER EXTENSION citus UPDATE TO '8.1-1';
 
 -- We can DROP problematic function and continue ALTER EXTENSION even when version checks are on
 SET citus.enable_version_checks TO 'true';
-DROP FUNCTION pg_catalog.master_dist_authinfo_cache_invalidate();
+DROP FUNCTION pg_catalog.relation_is_a_known_shard(regclass);
 
 SET citus.enable_version_checks TO 'false';
 ALTER EXTENSION citus UPDATE TO '8.1-1';
@@ -288,7 +314,7 @@ CREATE EXTENSION citus;
 
 DROP EXTENSION citus;
 SET citus.enable_version_checks TO 'false';
-CREATE EXTENSION citus VERSION '7.0-1';
+CREATE EXTENSION citus VERSION '8.0-1';
 SET citus.enable_version_checks TO 'true';
 -- during ALTER EXTENSION, we should invalidate the cache
 ALTER EXTENSION citus UPDATE;
@@ -436,3 +462,37 @@ DROP DATABASE another;
 \c - - - :worker_1_port
 DROP DATABASE another;
 
+\c - - - :master_port
+-- only the regression database should have a maintenance daemon
+SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+-- recreate the extension immediately after the maintenancae daemon errors
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
+
+-- wait for maintenance daemon restart
+SELECT datname, current_database(),
+    usename, (SELECT extowner::regrole::text FROM pg_extension WHERE extname = 'citus')
+FROM test.maintenance_worker();
+
+-- confirm that there is only one maintenance daemon
+SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+-- kill the maintenance daemon
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+-- reconnect
+\c - - - :master_port
+-- run something that goes through planner hook and therefore kicks of maintenance daemon
+SELECT 1;
+
+-- wait for maintenance daemon restart
+SELECT datname, current_database(),
+    usename, (SELECT extowner::regrole::text FROM pg_extension WHERE extname = 'citus')
+FROM test.maintenance_worker();
+
+-- confirm that there is only one maintenance daemon
+SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+DROP TABLE version_mismatch_table;

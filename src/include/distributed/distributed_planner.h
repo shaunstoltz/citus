@@ -40,8 +40,6 @@ extern int PlannerLevel;
 
 typedef struct RelationRestrictionContext
 {
-	bool hasDistributedRelation;
-	bool hasLocalRelation;
 	bool allReferenceTables;
 	List *relationRestrictionList;
 } RelationRestrictionContext;
@@ -66,15 +64,18 @@ typedef struct RelationRestriction
 	RangeTblEntry *rte;
 	RelOptInfo *relOptInfo;
 	PlannerInfo *plannerInfo;
-	List *prunedShardIntervalList;
 
 	/* list of RootPlanParams for all outer nodes */
 	List *outerPlanParamsList;
+
+	/* list of translated vars, this is copied from postgres since it gets deleted on postgres*/
+	List *translatedVars;
 } RelationRestriction;
 
 typedef struct JoinRestrictionContext
 {
 	List *joinRestrictionList;
+	bool hasSemiJoin;
 } JoinRestrictionContext;
 
 typedef struct JoinRestriction
@@ -82,8 +83,8 @@ typedef struct JoinRestriction
 	JoinType joinType;
 	List *joinRestrictInfoList;
 	PlannerInfo *plannerInfo;
-	RelOptInfo *innerrel;
-	RelOptInfo *outerrel;
+	Relids innerrelRelids;
+	Relids outerrelRelids;
 } JoinRestriction;
 
 typedef struct FastPathRestrictionContext
@@ -116,7 +117,6 @@ typedef struct PlannerRestrictionContext
 	 * Instead, we keep this struct to pass some extra information.
 	 */
 	FastPathRestrictionContext *fastPathRestrictionContext;
-	bool hasSemiJoin;
 	MemoryContext memoryContext;
 } PlannerRestrictionContext;
 
@@ -148,8 +148,10 @@ typedef struct RTEListProperties
 	/* includes hash, append and range partitioned tables */
 	bool hasDistributedTable;
 
-	/* union of above three */
+	/* union of hasReferenceTable, hasCitusLocalTable and hasDistributedTable */
 	bool hasCitusTable;
+
+	bool hasMaterializedView;
 } RTEListProperties;
 
 
@@ -220,9 +222,9 @@ extern PlannedStmt * distributed_planner(Query *parse,
 #define LOCAL_TABLE_SUBQUERY_CTE_HINT \
 	"Use CTE's or subqueries to select from local tables and use them in joins"
 
-
 extern List * ExtractRangeTableEntryList(Query *query);
 extern bool NeedsDistributedPlanning(Query *query);
+extern List * TranslatedVarsForRteIdentity(int rteIdentity);
 extern struct DistributedPlan * GetDistributedPlan(CustomScan *node);
 extern void multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 											Index restrictionIndex, RangeTblEntry *rte);

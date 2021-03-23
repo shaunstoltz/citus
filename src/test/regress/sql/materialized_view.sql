@@ -19,6 +19,11 @@ SELECT count(*) FROM temp_lineitem;
 INSERT INTO temp_lineitem SELECT * FROM air_shipped_lineitems WHERE l_shipmode = 'MAIL';
 SELECT count(*) FROM temp_lineitem;
 
+-- can create router materialized views
+CREATE MATERIALIZED VIEW mode_counts_router
+AS SELECT l_shipmode, count(*) FROM temp_lineitem WHERE  l_orderkey = 1 GROUP BY l_shipmode;
+SELECT  * FROM mode_counts_router;
+
 -- can create and query materialized views
 CREATE MATERIALIZED VIEW mode_counts
 AS SELECT l_shipmode, count(*) FROM temp_lineitem GROUP BY l_shipmode;
@@ -249,6 +254,13 @@ DELETE FROM large_partitioned WHERE id in (SELECT * FROM all_small_view_ids);
 -- make sure that materialized view in a CTE/subquery can be joined with a distributed table
 WITH cte AS (SELECT *, random() FROM small_view) SELECT count(*) FROM cte JOIN small USING(id);
 SELECT count(*) FROM (SELECT *, random() FROM small_view) as subquery JOIN small USING(id);
+
+CREATE MATERIALIZED VIEW only_intermedate_result AS
+	WITH cte_1 AS (SELECT * FROM small OFFSET 0) SELECT * FROM cte_1 ORDER BY 1,2;
+SELECT * FROM only_intermedate_result ORDER BY 1,2;
+INSERT INTO small VALUES (1000000,1000000);
+REFRESH MATERIALIZED VIEW only_intermedate_result;
+SELECT * FROM only_intermedate_result ORDER BY 1,2;
 
 DROP TABLE large_partitioned;
 DROP TABLE small CASCADE;

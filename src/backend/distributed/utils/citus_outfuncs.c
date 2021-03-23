@@ -24,6 +24,7 @@
 
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/errormessage.h"
 #include "distributed/log_utils.h"
 #include "distributed/multi_logical_planner.h"
@@ -113,6 +114,10 @@
 #define WRITE_BITMAPSET_FIELD(fldname) \
 	(appendStringInfo(str, " :" CppAsString(fldname) " "), \
 	 _outBitmapset(str, node->fldname))
+
+#define WRITE_CUSTOM_FIELD(fldname, fldvalue) \
+	(appendStringInfo(str, " :" CppAsString(fldname) " "), \
+	appendStringInfoString(str, (fldvalue)))
 
 
 /* Write an integer array (anything written as ":fldname (%d, %d") */
@@ -321,6 +326,9 @@ OutMultiExtendedOp(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(sortClauseList);
 	WRITE_NODE_FIELD(limitCount);
 	WRITE_NODE_FIELD(limitOffset);
+#if PG_VERSION_NUM >= PG_VERSION_13
+	WRITE_ENUM_FIELD(limitOption, LimitOption);
+#endif
 	WRITE_NODE_FIELD(havingQual);
 	WRITE_BOOL_FIELD(hasDistinctOn);
 	WRITE_NODE_FIELD(distinctClause);
@@ -527,6 +535,12 @@ OutTask(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(rowValuesLists);
 	WRITE_BOOL_FIELD(partiallyLocalOrRemote);
 	WRITE_BOOL_FIELD(parametersInQueryStringResolved);
+	WRITE_INT_FIELD(queryCount);
+	WRITE_UINT64_FIELD(totalReceivedTupleData);
+	WRITE_INT_FIELD(fetchedExplainAnalyzePlacementIndex);
+	WRITE_STRING_FIELD(fetchedExplainAnalyzePlan);
+	WRITE_FLOAT_FIELD(fetchedExplainAnalyzeExecutionDuration, "%.2f");
+	WRITE_BOOL_FIELD(isLocalTableModification);
 }
 
 
@@ -555,4 +569,28 @@ OutDeferredErrorMessage(OUTFUNC_ARGS)
 	WRITE_STRING_FIELD(filename);
 	WRITE_INT_FIELD(linenumber);
 	WRITE_STRING_FIELD(functionname);
+}
+
+
+void
+OutTableDDLCommand(OUTFUNC_ARGS)
+{
+	WRITE_LOCALS(TableDDLCommand);
+	WRITE_NODE_TYPE("TableDDLCommand");
+
+	switch (node->type)
+	{
+		case TABLE_DDL_COMMAND_STRING:
+		{
+			WRITE_STRING_FIELD(commandStr);
+			break;
+		}
+
+		case TABLE_DDL_COMMAND_FUNCTION:
+		{
+			char *example = node->function.function(node->function.context);
+			WRITE_CUSTOM_FIELD(function, example);
+			break;
+		}
+	}
 }

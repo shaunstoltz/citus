@@ -572,7 +572,7 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "distributed INSERT ... SELECT cannot insert into a "
-							 "citus local table",
+							 "local table that is added to metadata",
 							 NULL, NULL);
 	}
 
@@ -771,7 +771,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery,
 		copiedSubquery);
 	if (subqueryRteListProperties->hasDistributedTable)
 	{
-		AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
+		AddPartitionKeyNotNullFilterToSelect(copiedSubquery);
 	}
 
 	/* mark that we don't want the router planner to generate dummy hosts/queries */
@@ -789,7 +789,8 @@ RouterModifyTaskForShardInterval(Query *originalQuery,
 														  &relationShardList,
 														  &prunedShardIntervalListList,
 														  replacePrunedQueryWithDummy,
-														  &multiShardModifyQuery, NULL);
+														  &multiShardModifyQuery, NULL,
+														  false);
 
 	Assert(!multiShardModifyQuery);
 

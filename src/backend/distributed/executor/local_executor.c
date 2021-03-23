@@ -80,6 +80,7 @@
 
 #include "distributed/pg_version_constants.h"
 
+#include "distributed/adaptive_executor.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/citus_custom_scan.h"
 #include "distributed/citus_ruleutils.h"
@@ -88,9 +89,10 @@
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/local_plan_cache.h"
-#include "distributed/multi_executor.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_server_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h" /* to access LogRemoteCommands */
 #include "distributed/transaction_management.h"
@@ -110,7 +112,7 @@
 bool EnableLocalExecution = true;
 bool LogLocalCommands = false;
 
-LocalExecutionStatus CurrentLocalExecutionStatus = LOCAL_EXECUTION_OPTIONAL;
+static LocalExecutionStatus CurrentLocalExecutionStatus = LOCAL_EXECUTION_OPTIONAL;
 
 static void SplitLocalAndRemotePlacements(List *taskPlacementList,
 										  List **localTaskPlacementList,
@@ -126,10 +128,20 @@ static uint64 LocallyPlanAndExecuteMultipleQueries(List *queryStrings,
 static void ExtractParametersForLocalExecution(ParamListInfo paramListInfo,
 											   Oid **parameterTypes,
 											   const char ***parameterValues);
-static void LocallyExecuteUtilityTask(const char *utilityCommand);
-static void LocallyExecuteUdfTaskQuery(Query *localUdfCommandQuery);
+static void ExecuteUdfTaskQuery(Query *localUdfCommandQuery);
 static void EnsureTransitionPossible(LocalExecutionStatus from,
 									 LocalExecutionStatus to);
+
+
+/*
+ * GetCurrentLocalExecutionStatus returns the current local execution status.
+ */
+LocalExecutionStatus
+GetCurrentLocalExecutionStatus(void)
+{
+	return CurrentLocalExecutionStatus;
+}
+
 
 /*
  * ExecuteLocalTasks executes the given tasks locally.
@@ -197,6 +209,19 @@ ExecuteLocalTaskListExtended(List *taskList,
 	Oid *parameterTypes = NULL;
 	uint64 totalRowsProcessed = 0;
 
+	/*
+	 * Even if we are executing local tasks, we still enable
+	 * coordinated transaction. This is because
+	 *  (a) we might be in a transaction, and the next commands may
+	 *      require coordinated transaction
+	 *  (b) we might be executing some tasks locally and the others
+	 *      via remote execution
+	 *
+	 * Also, there is no harm enabling coordinated transaction even if
+	 * we only deal with local tasks in the transaction.
+	 */
+	UseCoordinatedTransaction();
+
 	if (paramListInfo != NULL)
 	{
 		/* not used anywhere, so declare here */
@@ -224,11 +249,22 @@ ExecuteLocalTaskListExtended(List *taskList,
 		{
 			SetLocalExecutionStatus(LOCAL_EXECUTION_REQUIRED);
 		}
+
+		if (!ReadOnlyTask(task->taskType))
+		{
+			/*
+			 * Any modification on the local execution should enable 2PC. If remote
+			 * queries are also ReadOnly, our 2PC logic is smart enough to skip sending
+			 * PREPARE to those connections.
+			 */
+			CoordinatedTransactionShouldUse2PC();
+		}
+
 		LogLocalCommand(task);
 
 		if (isUtilityCommand)
 		{
-			LocallyExecuteUtilityTask(TaskQueryString(task));
+			ExecuteUtilityCommand(TaskQueryString(task));
 			continue;
 		}
 
@@ -273,10 +309,9 @@ ExecuteLocalTaskListExtended(List *taskList,
 			if (GetTaskQueryType(task) == TASK_QUERY_TEXT_LIST)
 			{
 				List *queryStringList = task->taskQuery.data.queryStringList;
-				totalRowsProcessed += LocallyPlanAndExecuteMultipleQueries(
-					queryStringList,
-					tupleDest,
-					task);
+				totalRowsProcessed +=
+					LocallyPlanAndExecuteMultipleQueries(queryStringList, tupleDest,
+														 task);
 				continue;
 			}
 
@@ -361,59 +396,57 @@ ExtractParametersForLocalExecution(ParamListInfo paramListInfo, Oid **parameterT
 
 
 /*
- * LocallyExecuteUtilityTask executes the given local task query in the current
+ * ExecuteUtilityCommand executes the given task query in the current
  * session.
  */
-static void
-LocallyExecuteUtilityTask(const char *localTaskQueryCommand)
+void
+ExecuteUtilityCommand(const char *taskQueryCommand)
 {
-	List *parseTreeList = pg_parse_query(localTaskQueryCommand);
-	RawStmt *localTaskRawStmt = NULL;
+	List *parseTreeList = pg_parse_query(taskQueryCommand);
+	RawStmt *taskRawStmt = NULL;
 
-	foreach_ptr(localTaskRawStmt, parseTreeList)
+	foreach_ptr(taskRawStmt, parseTreeList)
 	{
-		Node *localTaskRawParseTree = localTaskRawStmt->stmt;
+		Node *taskRawParseTree = taskRawStmt->stmt;
 
 		/*
-		 * Actually, the query passed to this function would mostly be a
-		 * utility command to be executed locally. However, some utility
-		 * commands do trigger udf calls (e.g worker_apply_shard_ddl_command)
-		 * to execute commands in a generic way. But as we support local
-		 * execution of utility commands, we should also process those udf
-		 * calls locally as well. In that case, we simply execute the query
-		 * implying the udf call in below conditional block.
+		 * The query passed to this function would mostly be a utility
+		 * command. However, some utility commands trigger udf calls
+		 * (e.g alter_columnar_table_set()). In that case, we execute
+		 * the query with the udf call in below conditional block.
 		 */
-		if (IsA(localTaskRawParseTree, SelectStmt))
+		if (IsA(taskRawParseTree, SelectStmt))
 		{
 			/* we have no external parameters to rewrite the UDF call RawStmt */
-			Query *localUdfTaskQuery =
-				RewriteRawQueryStmt(localTaskRawStmt, localTaskQueryCommand, NULL, 0);
+			Query *udfTaskQuery =
+				RewriteRawQueryStmt(taskRawStmt, taskQueryCommand, NULL, 0);
 
-			LocallyExecuteUdfTaskQuery(localUdfTaskQuery);
+			ExecuteUdfTaskQuery(udfTaskQuery);
 		}
 		else
 		{
 			/*
-			 * It is a regular utility command we should execute it locally via
+			 * It is a regular utility command we should execute it via
 			 * process utility.
 			 */
-			CitusProcessUtility(localTaskRawParseTree, localTaskQueryCommand,
-								PROCESS_UTILITY_TOPLEVEL, NULL, None_Receiver, NULL);
+			ProcessUtilityParseTree(taskRawParseTree, taskQueryCommand,
+									PROCESS_UTILITY_QUERY, NULL, None_Receiver,
+									NULL);
 		}
 	}
 }
 
 
 /*
- * LocallyExecuteUdfTaskQuery executes the given udf command locally. Local udf
- * command is simply a "SELECT udf_call()" query and so it cannot be executed
+ * ExecuteUdfTaskQuery executes the given udf command. A udf command
+ * is simply a "SELECT udf_call()" query and so it cannot be executed
  * via process utility.
  */
 static void
-LocallyExecuteUdfTaskQuery(Query *localUdfTaskQuery)
+ExecuteUdfTaskQuery(Query *udfTaskQuery)
 {
 	/* we do not expect any results */
-	ExecuteQueryIntoDestReceiver(localUdfTaskQuery, NULL, None_Receiver);
+	ExecuteQueryIntoDestReceiver(udfTaskQuery, NULL, None_Receiver);
 }
 
 
@@ -538,7 +571,8 @@ SplitLocalAndRemotePlacements(List *taskPlacementList, List **localTaskPlacement
 /*
  * ExecuteLocalTaskPlan gets a planned statement which can be executed locally.
  * The function simply follows the steps to have a local execution, sets the
- * tupleStore if necessary. The function returns the
+ * tupleStore if necessary. The function returns the number of rows affected in
+ * case of DML.
  */
 static uint64
 ExecuteLocalTaskPlan(PlannedStmt *taskPlan, char *queryString,
@@ -553,12 +587,23 @@ ExecuteLocalTaskPlan(PlannedStmt *taskPlan, char *queryString,
 	RecordNonDistTableAccessesForTask(task);
 
 	/*
+	 * Some tuple destinations look at task->taskPlacementList to determine
+	 * where the result came from using the placement index. Since a local
+	 * task can only ever have 1 placement, we set the index to 0.
+	 */
+	int localPlacementIndex = 0;
+
+	/*
 	 * Use the tupleStore provided by the scanState because it is shared accross
 	 * the other task executions and the adaptive executor.
+	 *
+	 * Also note that as long as the tupleDest is provided, local execution always
+	 * stores the tuples. This is also valid for partiallyLocalOrRemote tasks
+	 * as well.
 	 */
 	DestReceiver *destReceiver = tupleDest ?
 								 CreateTupleDestDestReceiver(tupleDest, task,
-															 LOCAL_PLACEMENT_INDEX) :
+															 localPlacementIndex) :
 								 CreateDestReceiver(DestNone);
 
 	/* Create a QueryDesc for the query */
@@ -599,12 +644,12 @@ RecordNonDistTableAccessesForTask(Task *task)
 	if (list_length(taskPlacementList) == 0)
 	{
 		/*
-		 * We need at least one task placement to record relation access.
-		 * FIXME: Unfortunately, it is possible due to
-		 * https://github.com/citusdata/citus/issues/4104.
-		 * We can safely remove this check when above bug is fixed.
+		 * We should never get here, but prefer to throw an error over crashing
+		 * if we're wrong.
 		 */
-		return;
+		ereport(ERROR, (errmsg("shard " UINT64_FORMAT " does not have any shard "
+													  "placements",
+							   task->anchorShardId)));
 	}
 
 	/*
@@ -649,7 +694,7 @@ RecordNonDistTableAccessesForTask(Task *task)
 void
 SetLocalExecutionStatus(LocalExecutionStatus newStatus)
 {
-	EnsureTransitionPossible(CurrentLocalExecutionStatus, newStatus);
+	EnsureTransitionPossible(GetCurrentLocalExecutionStatus(), newStatus);
 
 	CurrentLocalExecutionStatus = newStatus;
 }
@@ -695,7 +740,7 @@ ShouldExecuteTasksLocally(List *taskList)
 		return false;
 	}
 
-	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_DISABLED)
+	if (GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_DISABLED)
 	{
 		/*
 		 * if the current transaction accessed the local node over a connection
@@ -704,42 +749,21 @@ ShouldExecuteTasksLocally(List *taskList)
 		return false;
 	}
 
-	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_REQUIRED)
+	if (GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_REQUIRED)
 	{
-		bool isValidLocalExecutionPath PG_USED_FOR_ASSERTS_ONLY = false;
-
 		/*
-		 * For various reasons, including the transaction visibility
-		 * rules (e.g., read-your-own-writes), we have to use local
-		 * execution again if it has already happened within this
-		 * transaction block.
+		 * If we already used local execution for a previous command
+		 * we should stick to it for read-your-writes policy, this can be a
+		 * case when we are inside a transaction block. Such as:
+		 *
+		 * BEGIN;
+		 * some-command; -- executed via local execution
+		 * another-command; -- this should be executed via local execution for visibility
+		 * COMMIT;
+		 *
+		 * We may need to use local execution even if we are not inside a transaction block,
+		 * however the state will go back to LOCAL_EXECUTION_OPTIONAL at the end of transaction.
 		 */
-		isValidLocalExecutionPath = IsMultiStatementTransaction() ||
-									InCoordinatedTransaction();
-
-		/*
-		 * In some cases, such as when a single command leads to a local
-		 * command execution followed by remote task (list) execution, we
-		 * still expect the remote execution to first try local execution
-		 * as TransactionAccessedLocalPlacement is set by the local execution.
-		 * The remote execution shouldn't create any local tasks as the local
-		 * execution should have executed all the local tasks. And, we are
-		 * ensuring it here.
-		 */
-		isValidLocalExecutionPath |= !AnyTaskAccessesLocalNode(taskList);
-
-		/*
-		 * We might error out later in the execution if it is not suitable
-		 * to execute the tasks locally.
-		 */
-		Assert(isValidLocalExecutionPath);
-
-		/*
-		 * TODO: A future improvement could be to keep track of which placements
-		 * have been locally executed. At this point, only use local execution
-		 * for those placements. That'd help to benefit more from parallelism.
-		 */
-
 		return true;
 	}
 
@@ -770,11 +794,14 @@ ShouldExecuteTasksLocally(List *taskList)
 	{
 		/*
 		 * For multi-task executions, we prefer to use connections for parallelism,
-		 * except when in a multi-statement transaction since there could be other
-		 * commands that require local execution.
+		 * except for two cases. First, when in a multi-statement transaction since
+		 * there could be other commands that require local execution. Second, the
+		 * task list already requires sequential execution. In that case, connection
+		 * establishment becomes an unnecessary operation.
 		 */
 
-		return IsMultiStatementTransaction() && AnyTaskAccessesLocalNode(taskList);
+		return (IsMultiStatementTransaction() || ShouldRunTasksSequentially(taskList)) &&
+			   AnyTaskAccessesLocalNode(taskList);
 	}
 
 	return false;
@@ -836,7 +863,7 @@ TaskAccessesLocalNode(Task *task)
 void
 ErrorIfTransactionAccessedPlacementsLocally(void)
 {
-	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_REQUIRED)
+	if (GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_REQUIRED)
 	{
 		ereport(ERROR,
 				(errmsg("cannot execute command because a local execution has "

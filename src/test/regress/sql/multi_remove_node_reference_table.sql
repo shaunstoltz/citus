@@ -26,7 +26,13 @@ SELECT master_remove_node('localhost', 55555);
 -- verify node exist before removal
 SELECT COUNT(*) FROM pg_dist_node WHERE nodeport = :worker_2_port;
 
+-- test recovery when removing node
+CREATE TABLE recovery_test (x int, y int);
+SELECT create_distributed_table('recovery_test','x');
+DROP TABLE recovery_test;
 SELECT master_remove_node('localhost', :worker_2_port);
+SELECT recover_prepared_transactions();
+SELECT count(*) FROM pg_dist_transaction;
 
 -- verify node is removed
 SELECT COUNT(*) FROM pg_dist_node WHERE nodeport = :worker_2_port;
@@ -103,6 +109,8 @@ WHERE colocationid IN
     (SELECT colocationid
      FROM pg_dist_partition
      WHERE logicalrelid = 'remove_node_reference_table'::regclass);
+
+SELECT master_remove_node('localhost', :worker_1_port);
 
 \c - - - :worker_1_port
 

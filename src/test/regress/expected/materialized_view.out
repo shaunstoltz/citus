@@ -29,6 +29,15 @@ SELECT count(*) FROM temp_lineitem;
   1706
 (1 row)
 
+-- can create router materialized views
+CREATE MATERIALIZED VIEW mode_counts_router
+AS SELECT l_shipmode, count(*) FROM temp_lineitem WHERE  l_orderkey = 1 GROUP BY l_shipmode;
+SELECT  * FROM mode_counts_router;
+ l_shipmode | count
+---------------------------------------------------------------------
+ AIR        |     1
+(1 row)
+
 -- can create and query materialized views
 CREATE MATERIALIZED VIEW mode_counts
 AS SELECT l_shipmode, count(*) FROM temp_lineitem GROUP BY l_shipmode;
@@ -40,7 +49,11 @@ SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
 
 -- materialized views are local, cannot join with distributed tables
 SELECT count(*) FROM mode_counts JOIN temp_lineitem USING (l_shipmode);
-ERROR:  relation mode_counts is not distributed
+ count
+---------------------------------------------------------------------
+  1706
+(1 row)
+
 -- new data is not immediately reflected in the view
 INSERT INTO temp_lineitem SELECT * FROM air_shipped_lineitems;
 SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
@@ -59,6 +72,7 @@ SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
 
 DROP MATERIALIZED VIEW mode_counts;
 DROP TABLE temp_lineitem CASCADE;
+NOTICE:  drop cascades to materialized view mode_counts_router
 -- Refresh single-shard materialized view
 CREATE MATERIALIZED VIEW materialized_view AS
 SELECT orders_hash_part.o_orderdate, total_price.price_sum
@@ -230,26 +244,24 @@ UPDATE small_view SET id = 1;
 ERROR:  cannot change materialized view "small_view"
 -- for now, using materialized views in modify statements' FROM / WHERE clauses is not supported
 UPDATE large SET id=20 FROM small_view WHERE small_view.id=large.id;
-ERROR:  materialized views in modify queries are not supported
 SELECT * FROM large ORDER BY 1, 2;
  id | tenant_id
 ---------------------------------------------------------------------
-  1 |         2
   2 |         3
   5 |         4
-  6 |         5
+ 20 |         2
+ 20 |         5
 (4 rows)
 
 -- test on a router executable update statement, this will also fail
 UPDATE large SET id=28 FROM small_view WHERE small_view.id=large.id and small_view.tenant_id=2 and large.tenant_id=2;
-ERROR:  materialized views in modify queries are not supported
 SELECT * FROM large ORDER BY 1, 2;
  id | tenant_id
 ---------------------------------------------------------------------
-  1 |         2
   2 |         3
   5 |         4
-  6 |         5
+ 20 |         2
+ 20 |         5
 (4 rows)
 
 -- delete statement on large with subquery, this should succeed
@@ -257,7 +269,7 @@ DELETE FROM large WHERE tenant_id in (SELECT tenant_id FROM small_view);
 SELECT * FROM large ORDER BY 1, 2;
  id | tenant_id
 ---------------------------------------------------------------------
-  6 |         5
+ 20 |         5
 (1 row)
 
 -- INSERT INTO views is already not supported by PostgreSQL
@@ -294,14 +306,13 @@ DELETE FROM small_view;
 ERROR:  cannot change materialized view "small_view"
 -- using mat. view in modify statements' FROM / WHERE clauses is not valid yet
 UPDATE large_partitioned SET id=20 FROM small_view WHERE small_view.id=large_partitioned.id;
-ERROR:  materialized views in modify queries are not supported
 SELECT * FROM large_partitioned ORDER BY 1, 2;
  id | tenant_id
 ---------------------------------------------------------------------
-  1 |         2
   2 |         3
   5 |         4
-  6 |         5
+ 20 |         2
+ 20 |         5
  26 |        32
  29 |        15
  60 |        51
@@ -314,10 +325,12 @@ SELECT * FROM large_partitioned ORDER BY 1, 2;
 ---------------------------------------------------------------------
   2 |         3
   5 |         4
+ 20 |         2
+ 20 |         5
  26 |        32
  29 |        15
  60 |        51
-(5 rows)
+(7 rows)
 
 -- we should still have identical rows for next test statement, then insert new rows to both tables
 INSERT INTO large_partitioned VALUES(14, 14);
@@ -338,6 +351,37 @@ SELECT count(*) FROM (SELECT *, random() FROM small_view) as subquery JOIN small
      4
 (1 row)
 
+CREATE MATERIALIZED VIEW only_intermedate_result AS
+	WITH cte_1 AS (SELECT * FROM small OFFSET 0) SELECT * FROM cte_1 ORDER BY 1,2;
+SELECT * FROM only_intermedate_result ORDER BY 1,2;
+ id  | tenant_id
+---------------------------------------------------------------------
+   1 |         2
+   6 |         3
+   7 |         4
+   8 |         2
+  14 |        14
+ 250 |        25
+ 470 |        13
+(7 rows)
+
+INSERT INTO small VALUES (1000000,1000000);
+REFRESH MATERIALIZED VIEW only_intermedate_result;
+SELECT * FROM only_intermedate_result ORDER BY 1,2;
+   id    | tenant_id
+---------------------------------------------------------------------
+       1 |         2
+       6 |         3
+       7 |         4
+       8 |         2
+      14 |        14
+     250 |        25
+     470 |        13
+ 1000000 |   1000000
+(8 rows)
+
 DROP TABLE large_partitioned;
 DROP TABLE small CASCADE;
-NOTICE:  drop cascades to materialized view small_view
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to materialized view small_view
+drop cascades to materialized view only_intermedate_result

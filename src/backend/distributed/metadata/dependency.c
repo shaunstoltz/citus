@@ -21,6 +21,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc_d.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_rewrite_d.h"
@@ -100,7 +101,7 @@ typedef struct DependencyDefinition
 		 * address is used for dependencies that are artificially added during the
 		 * chasing. Since they are added by citus code we assume the dependency needs to
 		 * be chased anyway, ofcourse it will only actually be chased if the object is a
-		 * suppported object by citus
+		 * supported object by citus
 		 */
 		ObjectAddress address;
 	} data;
@@ -119,6 +120,7 @@ typedef struct ViewDependencyNode
 
 
 static List * GetRelationTriggerFunctionDepencyList(Oid relationId);
+static List * GetRelationStatsSchemaDependencyList(Oid relationId);
 static DependencyDefinition * CreateObjectAddressDependencyDef(Oid classId, Oid objectId);
 static ObjectAddress DependencyDefinitionObjectAddress(DependencyDefinition *definition);
 
@@ -546,6 +548,19 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 	 */
 	switch (getObjectClass(address))
 	{
+#if PG_VERSION_NUM >= 120000
+		case OCLASS_AM:
+		{
+			/*
+			 * Only support access methods if they came from extensions
+			 * During the dependency resolution it will cascade into the extension and
+			 * distributed that one instead of the Access Method. Now access methods can
+			 * be configured on tables on the workers.
+			 */
+			return IsObjectAddressOwnedByExtension(address, NULL);
+		}
+#endif
+
 		case OCLASS_COLLATION:
 		case OCLASS_SCHEMA:
 		{
@@ -913,6 +928,17 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 			List *triggerFunctionDepencyList =
 				GetRelationTriggerFunctionDepencyList(relationId);
 			result = list_concat(result, triggerFunctionDepencyList);
+
+			/*
+			 * Statistics' both depend to the relations and to the schemas they belong
+			 * to. Also, pg_depend records dependencies from statistics to their schemas
+			 * but not from relations to their statistics' schemas. Given above two,
+			 * we directly expand dependencies for the relations to schemas of
+			 * statistics.
+			 */
+			List *statisticsSchemaDependencyList =
+				GetRelationStatsSchemaDependencyList(relationId);
+			result = list_concat(result, statisticsSchemaDependencyList);
 		}
 
 		default:
@@ -922,6 +948,28 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 		}
 	}
 	return result;
+}
+
+
+/*
+ * GetRelationStatsSchemaDependencyList returns a list of DependencyDefinition
+ * objects for the schemas that statistics' of the relation with relationId depends.
+ */
+static List *
+GetRelationStatsSchemaDependencyList(Oid relationId)
+{
+	List *dependencyList = NIL;
+
+	List *schemaIds = GetExplicitStatisticsSchemaIdList(relationId);
+	Oid schemaId = InvalidOid;
+	foreach_oid(schemaId, schemaIds)
+	{
+		DependencyDefinition *dependency =
+			CreateObjectAddressDependencyDef(NamespaceRelationId, schemaId);
+		dependencyList = lappend(dependencyList, dependency);
+	}
+
+	return dependencyList;
 }
 
 
@@ -1020,25 +1068,13 @@ BuildViewDependencyGraph(Oid relationId, HTAB *nodeMap)
 	node->remainingDependencyCount = 0;
 	node->dependingNodes = NIL;
 
-	ObjectAddress target = { 0 };
-	ObjectAddressSet(target, RelationRelationId, relationId);
+	Oid targetObjectClassId = RelationRelationId;
+	Oid targetObjectId = relationId;
+	List *dependencyTupleList = GetPgDependTuplesForDependingObjects(targetObjectClassId,
+																	 targetObjectId);
 
-	ScanKeyData key[2];
 	HeapTuple depTup = NULL;
-
-	/*
-	 * iterate the actual pg_depend catalog
-	 */
-	Relation depRel = table_open(DependRelationId, AccessShareLock);
-
-	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(target.classId));
-	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(target.objectId));
-	SysScanDesc depScan = systable_beginscan(depRel, DependReferenceIndexId,
-											 true, NULL, 2, key);
-
-	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
+	foreach_ptr(depTup, dependencyTupleList)
 	{
 		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
 
@@ -1053,10 +1089,45 @@ BuildViewDependencyGraph(Oid relationId, HTAB *nodeMap)
 		}
 	}
 
-	systable_endscan(depScan);
-	relation_close(depRel, AccessShareLock);
-
 	return node;
+}
+
+
+/*
+ * GetPgDependTuplesForDependingObjects scans pg_depend for given object and
+ * returns a list of heap tuples for the objects depending on it.
+ */
+List *
+GetPgDependTuplesForDependingObjects(Oid targetObjectClassId, Oid targetObjectId)
+{
+	List *dependencyTupleList = NIL;
+
+	Relation pgDepend = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyData key[2];
+	int scanKeyCount = 2;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(targetObjectClassId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(targetObjectId));
+
+	bool useIndex = true;
+	SysScanDesc depScan = systable_beginscan(pgDepend, DependReferenceIndexId,
+											 useIndex, NULL, scanKeyCount, key);
+
+	HeapTuple dependencyTuple = NULL;
+	while (HeapTupleIsValid(dependencyTuple = systable_getnext(depScan)))
+	{
+		/* copy the tuple first */
+		dependencyTuple = heap_copytuple(dependencyTuple);
+		dependencyTupleList = lappend(dependencyTupleList, dependencyTuple);
+	}
+
+	systable_endscan(depScan);
+	relation_close(pgDepend, NoLock);
+
+	return dependencyTupleList;
 }
 
 
@@ -1084,7 +1155,7 @@ GetDependingViews(Oid relationId)
 	List *dependingViews = NIL;
 	List *nodeQueue = list_make1(tableNode);
 	ViewDependencyNode *node = NULL;
-	foreach_ptr(node, nodeQueue)
+	foreach_ptr_append(node, nodeQueue)
 	{
 		ViewDependencyNode *dependingNode = NULL;
 		foreach_ptr(dependingNode, node->dependingNodes)
@@ -1136,12 +1207,13 @@ GetDependingView(Form_pg_depend pg_depend)
 	Form_pg_rewrite pg_rewrite = (Form_pg_rewrite) GETSTRUCT(rewriteTup);
 
 	bool isView = get_rel_relkind(pg_rewrite->ev_class) == RELKIND_VIEW;
+	bool isMatView = get_rel_relkind(pg_rewrite->ev_class) == RELKIND_MATVIEW;
 	bool isDifferentThanRef = pg_rewrite->ev_class != pg_depend->refobjid;
 
 	systable_endscan(rscan);
 	relation_close(rewriteRel, AccessShareLock);
 
-	if (isView && isDifferentThanRef)
+	if ((isView || isMatView) && isDifferentThanRef)
 	{
 		return pg_rewrite->ev_class;
 	}

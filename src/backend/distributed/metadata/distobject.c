@@ -45,17 +45,18 @@
 static int ExecuteCommandAsSuperuser(char *query, int paramCount, Oid *paramTypes,
 									 Datum *paramValues);
 
+PG_FUNCTION_INFO_V1(citus_unmark_object_distributed);
 PG_FUNCTION_INFO_V1(master_unmark_object_distributed);
 
 
 /*
- * master_unmark_object_distributed(classid oid, objid oid, objsubid int)
+ * citus_unmark_object_distributed(classid oid, objid oid, objsubid int)
  *
  * removes the entry for an object address from pg_dist_object. Only removes the entry if
  * the object does not exist anymore.
  */
 Datum
-master_unmark_object_distributed(PG_FUNCTION_ARGS)
+citus_unmark_object_distributed(PG_FUNCTION_ARGS)
 {
 	Oid classid = PG_GETARG_OID(0);
 	Oid objid = PG_GETARG_OID(1);
@@ -82,6 +83,16 @@ master_unmark_object_distributed(PG_FUNCTION_ARGS)
 	UnmarkObjectDistributed(&address);
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * master_unmark_object_distributed is a wrapper function for old UDF name.
+ */
+Datum
+master_unmark_object_distributed(PG_FUNCTION_ARGS)
+{
+	return citus_unmark_object_distributed(fcinfo);
 }
 
 
@@ -361,4 +372,57 @@ GetDistributedObjectAddressList(void)
 	relation_close(pgDistObjectRel, AccessShareLock);
 
 	return objectAddressList;
+}
+
+
+/*
+ * UpdateDistributedObjectColocationId gets an old and a new colocationId
+ * and updates the colocationId of all tuples in citus.pg_dist_object which
+ * have the old colocationId to the new colocationId.
+ */
+void
+UpdateDistributedObjectColocationId(uint32 oldColocationId,
+									uint32 newColocationId)
+{
+	const bool indexOK = false;
+	ScanKeyData scanKey[1];
+	Relation pgDistObjectRel = table_open(DistObjectRelationId(),
+										  RowExclusiveLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(pgDistObjectRel);
+
+	/* scan pg_dist_object for colocationId equal to old colocationId */
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_object_colocationid,
+				BTEqualStrategyNumber,
+				F_INT4EQ, UInt32GetDatum(oldColocationId));
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgDistObjectRel,
+													InvalidOid,
+													indexOK,
+													NULL, 1, scanKey);
+	HeapTuple heapTuple;
+	while (HeapTupleIsValid(heapTuple = systable_getnext(scanDescriptor)))
+	{
+		Datum values[Natts_pg_dist_object];
+		bool isnull[Natts_pg_dist_object];
+		bool replace[Natts_pg_dist_object];
+
+		memset(replace, 0, sizeof(replace));
+
+		replace[Anum_pg_dist_object_colocationid - 1] = true;
+
+		/* update the colocationId to the new one */
+		values[Anum_pg_dist_object_colocationid - 1] = UInt32GetDatum(newColocationId);
+
+		isnull[Anum_pg_dist_object_colocationid - 1] = false;
+
+		heapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull,
+									  replace);
+
+		CatalogTupleUpdate(pgDistObjectRel, &heapTuple->t_self, heapTuple);
+		CitusInvalidateRelcacheByRelid(DistObjectRelationId());
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgDistObjectRel, NoLock);
+	CommandCounterIncrement();
 }

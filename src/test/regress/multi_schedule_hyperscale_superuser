@@ -69,10 +69,10 @@ test: hyperscale_tutorial
 test: multi_basic_queries multi_subquery multi_subquery_complex_queries multi_subquery_behavioral_analytics
 test: multi_subquery_complex_reference_clause multi_subquery_window_functions multi_sql_function
 test: multi_function_in_join row_types materialized_view
-test: multi_subquery_in_where_reference_clause full_join adaptive_executor propagate_set_commands
+test: multi_subquery_in_where_reference_clause join adaptive_executor propagate_set_commands
 test: multi_subquery_union multi_subquery_in_where_clause multi_subquery_misc
 test: multi_agg_distinct multi_limit_clause_approximate multi_outer_join_reference
-test: multi_select_for_update relation_access_tracking
+test: multi_select_for_update relation_access_tracking pg13_with_ties
 test: multi_working_columns multi_having_pushdown
 test: bool_agg ch_bench_having ch_bench_subquery_repartition chbenchmark_all_queries expression_reference_join
 test: multi_agg_type_conversion multi_count_type_conversion
@@ -81,7 +81,6 @@ test: multi_join_pruning multi_hash_pruning intermediate_result_pruning
 test: multi_query_directory_cleanup
 test: multi_cross_shard
 test: multi_dropped_column_aliases foreign_key_restriction_enforcement
-test: multi_binary_master_copy_format
 
 # ----------
 # Parallel TPC-H tests to check our distributed execution behavior
@@ -177,7 +176,8 @@ test: multi_truncate
 # ----------
 # multi_foreign_key tests foreign key push down on distributed tables
 # ----------
-test: multi_foreign_key multi_foreign_key_relation_graph
+test: multi_foreign_key
+test: multi_foreign_key_relation_graph
 
 # --------
 # Replicating reference tables to coordinator.  Add coordinator to pg_dist_node

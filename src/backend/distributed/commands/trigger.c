@@ -26,6 +26,7 @@
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
@@ -75,8 +76,9 @@ GetExplicitTriggerCommandList(Oid relationId)
 	{
 		char *createTriggerCommand = pg_get_triggerdef_command(triggerId);
 
-		createTriggerCommandList = lappend(createTriggerCommandList,
-										   createTriggerCommand);
+		createTriggerCommandList = lappend(
+			createTriggerCommandList,
+			makeTableDDLCommandString(createTriggerCommand));
 	}
 
 	/* revert back to original search_path */
@@ -481,7 +483,8 @@ GetAlterTriggerDependsTriggerNameValue(AlterObjectDependsStmt *alterTriggerDepen
  * standard process utility.
  */
 List *
-PreprocessDropTriggerStmt(Node *node, const char *queryString)
+PreprocessDropTriggerStmt(Node *node, const char *queryString,
+						  ProcessUtilityContext processUtilityContext)
 {
 	DropStmt *dropTriggerStmt = castNode(DropStmt, node);
 	Assert(dropTriggerStmt->removeType == OBJECT_TRIGGER);
@@ -550,7 +553,8 @@ ErrorOutForTriggerIfNotCitusLocalTable(Oid relationId)
 		return;
 	}
 
-	ereport(ERROR, (errmsg("triggers are only supported for citus local tables")));
+	ereport(ERROR, (errmsg("triggers are only supported for local tables added "
+						   "to metadata")));
 }
 
 

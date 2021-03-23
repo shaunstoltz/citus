@@ -79,6 +79,7 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_executor.h"
+#include "distributed/listutils.h"
 #include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/placement_connection.h"
 #include "distributed/relation_access_tracking.h"
@@ -91,6 +92,7 @@
 #include "distributed/worker_protocol.h"
 #include "distributed/local_multi_copy.h"
 #include "distributed/hash_helpers.h"
+#include "distributed/transmit.h"
 #include "executor/executor.h"
 #include "foreign/foreign.h"
 
@@ -119,7 +121,9 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
  * 4MB is a good balance between memory usage and performance. Note that this
  * is irrelevant in the common case where we open one connection per placement.
  */
-#define COPY_SWITCH_OVER_THRESHOLD (4 * 1024 * 1024)
+int CopySwitchOverThresholdBytes = 4 * 1024 * 1024;
+
+#define FILE_IS_OPEN(x) (x > -1)
 
 typedef struct CopyShardState CopyShardState;
 typedef struct CopyPlacementState CopyPlacementState;
@@ -194,8 +198,11 @@ struct CopyShardState
 	/* Used as hash key. */
 	uint64 shardId;
 
-	/* used for doing local copy */
+	/* used for doing local copy, either for a shard or a co-located file */
 	CopyOutState copyOutState;
+
+	/* used when copy is targeting co-located file */
+	FileCompat fileDest;
 
 	/* containsLocalPlacement is true if we have a local placement for the shard id of this state */
 	bool containsLocalPlacement;
@@ -212,6 +219,18 @@ typedef struct ShardConnections
 	/* list of MultiConnection structs */
 	List *connectionList;
 } ShardConnections;
+
+
+/*
+ * Represents the state for allowing copy via local
+ * execution.
+ */
+typedef enum LocalCopyStatus
+{
+	LOCAL_COPY_REQUIRED,
+	LOCAL_COPY_OPTIONAL,
+	LOCAL_COPY_DISABLED
+} LocalCopyStatus;
 
 
 /* Local functions forward declarations */
@@ -258,10 +277,11 @@ static CopyConnectionState * GetConnectionState(HTAB *connectionStateHash,
 static CopyShardState * GetShardState(uint64 shardId, HTAB *shardStateHash,
 									  HTAB *connectionStateHash, bool stopOnFailure,
 									  bool *found, bool shouldUseLocalCopy, CopyOutState
-									  copyOutState, bool isCopyToIntermediateFile);
+									  copyOutState, bool isColocatedIntermediateResult);
 static MultiConnection * CopyGetPlacementConnection(HTAB *connectionStateHash,
 													ShardPlacement *placement,
-													bool stopOnFailure);
+													bool stopOnFailure,
+													bool colocatedIntermediateResult);
 static bool HasReachedAdaptiveExecutorPoolSize(List *connectionStateHash);
 static MultiConnection * GetLeastUtilisedCopyConnection(List *connectionStateList,
 														char *nodeName, int nodePort);
@@ -270,10 +290,10 @@ static List * ConnectionStateListToNode(HTAB *connectionStateHash,
 										const char *hostname, int32 port);
 static void InitializeCopyShardState(CopyShardState *shardState,
 									 HTAB *connectionStateHash,
-									 uint64 shardId, bool stopOnFailure, bool
-									 canUseLocalCopy,
+									 uint64 shardId, bool stopOnFailure,
+									 bool canUseLocalCopy,
 									 CopyOutState copyOutState,
-									 bool isCopyToIntermediateFile);
+									 bool colocatedIntermediateResult);
 static void StartPlacementStateCopyCommand(CopyPlacementState *placementState,
 										   CopyStmt *copyStatement,
 										   CopyOutState copyOutState);
@@ -322,9 +342,14 @@ static bool ContainsLocalPlacement(int64 shardId);
 static void CompleteCopyQueryTagCompat(QueryCompletionCompat *completionTag, uint64
 									   processedRowCount);
 static void FinishLocalCopy(CitusCopyDestReceiver *copyDest);
+static void CreateLocalColocatedIntermediateFile(CitusCopyDestReceiver *copyDest,
+												 CopyShardState *shardState);
+static void FinishLocalColocatedIntermediateFiles(CitusCopyDestReceiver *copyDest);
 static void CloneCopyOutStateForLocalCopy(CopyOutState from, CopyOutState to);
-static bool ShouldExecuteCopyLocally(bool isIntermediateResult);
-static void LogLocalCopyExecution(uint64 shardId);
+static LocalCopyStatus GetLocalCopyStatus(void);
+static bool ShardIntervalListHasLocalPlacements(List *shardIntervalList);
+static void LogLocalCopyToRelationExecution(uint64 shardId);
+static void LogLocalCopyToFileExecution(uint64 shardId);
 
 
 /* exports for SQL callable functions */
@@ -2068,7 +2093,7 @@ CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, int partitionColu
 	copyDest->partitionColumnIndex = partitionColumnIndex;
 	copyDest->executorState = executorState;
 	copyDest->stopOnFailure = stopOnFailure;
-	copyDest->intermediateResultIdPrefix = intermediateResultIdPrefix;
+	copyDest->colocatedIntermediateResultIdPrefix = intermediateResultIdPrefix;
 	copyDest->memoryContext = CurrentMemoryContext;
 
 	return copyDest;
@@ -2076,28 +2101,20 @@ CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, int partitionColu
 
 
 /*
- * ShouldExecuteCopyLocally returns true if the current copy
- * operation should be done locally for local placements.
+ * GetLocalCopyStatus returns the status for executing copy locally.
+ * If LOCAL_COPY_DISABLED or LOCAL_COPY_REQUIRED, the caller has to
+ * follow that. Else, the caller may decide to use local or remote
+ * execution depending on other information.
  */
-static bool
-ShouldExecuteCopyLocally(bool isIntermediateResult)
+static LocalCopyStatus
+GetLocalCopyStatus(void)
 {
-	if (!EnableLocalExecution)
+	if (!EnableLocalExecution ||
+		GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_DISABLED)
 	{
-		return false;
+		return LOCAL_COPY_DISABLED;
 	}
-
-	/*
-	 * Intermediate files are written to a file, and files are visible to all
-	 * transactions, and we use a custom copy format for copy therefore we will
-	 * use the existing logic for that.
-	 */
-	if (isIntermediateResult)
-	{
-		return false;
-	}
-
-	if (CurrentLocalExecutionStatus == LOCAL_EXECUTION_REQUIRED)
+	else if (GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_REQUIRED)
 	{
 		/*
 		 * For various reasons, including the transaction visibility
@@ -2116,12 +2133,35 @@ ShouldExecuteCopyLocally(bool isIntermediateResult)
 		 * those placements. That'd help to benefit more from parallelism.
 		 */
 
-		return true;
+		return LOCAL_COPY_REQUIRED;
+	}
+	else if (IsMultiStatementTransaction())
+	{
+		return LOCAL_COPY_REQUIRED;
 	}
 
-	/* if we connected to the localhost via a connection, we might not be able to see some previous changes that are done via the connection */
-	return CurrentLocalExecutionStatus != LOCAL_EXECUTION_DISABLED &&
-		   IsMultiStatementTransaction();
+	return LOCAL_COPY_OPTIONAL;
+}
+
+
+/*
+ * ShardIntervalListHasLocalPlacements returns true if any of the input
+ * shard placement has a local placement;
+ */
+static bool
+ShardIntervalListHasLocalPlacements(List *shardIntervalList)
+{
+	int32 localGroupId = GetLocalGroupId();
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
+	{
+		if (FindShardPlacementOnGroup(localGroupId, shardInterval->shardId) != NULL)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -2136,8 +2176,6 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 {
 	CitusCopyDestReceiver *copyDest = (CitusCopyDestReceiver *) dest;
 
-	bool isIntermediateResult = copyDest->intermediateResultIdPrefix != NULL;
-	copyDest->shouldUseLocalCopy = ShouldExecuteCopyLocally(isIntermediateResult);
 	Oid tableId = copyDest->distributedRelationId;
 
 	char *relationName = get_rel_name(tableId);
@@ -2206,7 +2244,7 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	if (cacheEntry->replicationModel == REPLICATION_MODEL_2PC ||
 		MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
 	{
-		CoordinatedTransactionUse2PC();
+		CoordinatedTransactionShouldUse2PC();
 	}
 
 	/* define how tuples will be serialised */
@@ -2254,9 +2292,13 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	/* define the template for the COPY statement that is sent to workers */
 	CopyStmt *copyStatement = makeNode(CopyStmt);
 
-	if (copyDest->intermediateResultIdPrefix != NULL)
+	bool colocatedIntermediateResults =
+		copyDest->colocatedIntermediateResultIdPrefix != NULL;
+	if (colocatedIntermediateResults)
 	{
-		copyStatement->relation = makeRangeVar(NULL, copyDest->intermediateResultIdPrefix,
+		copyStatement->relation = makeRangeVar(NULL,
+											   copyDest->
+											   colocatedIntermediateResultIdPrefix,
 											   -1);
 
 		DefElem *formatResultOption = makeDefElem("format", (Node *) makeString("result"),
@@ -2291,13 +2333,59 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	RecordRelationAccessIfNonDistTable(tableId, PLACEMENT_ACCESS_DML);
 
 	/*
-	 * For all the primary (e.g., writable) nodes, reserve a shared connection.
-	 * We do this upfront because we cannot know which nodes are going to be
-	 * accessed. Since the order of the reservation is important, we need to
-	 * do it right here. For the details on why the order important, see
-	 * the function.
+	 * Colocated intermediate results do not honor citus.max_shared_pool_size,
+	 * so we don't need to reserve any connections. Each result file is sent
+	 * over a single connection.
 	 */
-	EnsureConnectionPossibilityForPrimaryNodes();
+	if (!colocatedIntermediateResults)
+	{
+		/*
+		 * For all the primary (e.g., writable) remote nodes, reserve a shared
+		 * connection. We do this upfront because we cannot know which nodes
+		 * are going to be accessed. Since the order of the reservation is
+		 * important, we need to do it right here. For the details on why the
+		 * order important, see EnsureConnectionPossibilityForNodeList().
+		 *
+		 * We don't need to care about local node because we either get a
+		 * connection or use local connection, so it cannot be part of
+		 * the starvation. As an edge case, if it cannot get a connection
+		 * and cannot switch to local execution (e.g., disabled by user),
+		 * COPY would fail hinting the user to change the relevant settiing.
+		 */
+		EnsureConnectionPossibilityForRemotePrimaryNodes();
+	}
+
+	LocalCopyStatus localCopyStatus = GetLocalCopyStatus();
+	if (localCopyStatus == LOCAL_COPY_DISABLED)
+	{
+		copyDest->shouldUseLocalCopy = false;
+	}
+	else if (localCopyStatus == LOCAL_COPY_REQUIRED)
+	{
+		copyDest->shouldUseLocalCopy = true;
+	}
+	else if (localCopyStatus == LOCAL_COPY_OPTIONAL)
+	{
+		/*
+		 * At this point, there is no requirements for doing the copy locally.
+		 * However, if there are local placements, we can try to reserve
+		 * a connection to local node. If we cannot reserve, we can still use
+		 * local execution.
+		 *
+		 * NB: It is not advantageous to use remote execution just with a
+		 * single remote connection. In other words, a single remote connection
+		 * would not perform better than local execution. However, we prefer to
+		 * do this because it is likely that the COPY would get more connections
+		 * to parallelize the operation. In the future, we might relax this
+		 * requirement and failover to local execution as on connection attempt
+		 * failures as the executor does.
+		 */
+		if (ShardIntervalListHasLocalPlacements(shardIntervalList))
+		{
+			bool reservedConnection = TryConnectionPossibilityForLocalPrimaryNode();
+			copyDest->shouldUseLocalCopy = !reservedConnection;
+		}
+	}
 }
 
 
@@ -2366,15 +2454,16 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 
 	/* connections hash is kept in memory context */
 	MemoryContextSwitchTo(copyDest->memoryContext);
+	bool isColocatedIntermediateResult =
+		copyDest->colocatedIntermediateResultIdPrefix != NULL;
 
-	bool isIntermediateResult = copyDest->intermediateResultIdPrefix != NULL;
 	CopyShardState *shardState = GetShardState(shardId, copyDest->shardStateHash,
 											   copyDest->connectionStateHash,
 											   stopOnFailure,
 											   &cachedShardStateFound,
 											   copyDest->shouldUseLocalCopy,
 											   copyDest->copyOutState,
-											   isIntermediateResult);
+											   isColocatedIntermediateResult);
 	if (!cachedShardStateFound)
 	{
 		firstTupleInShard = true;
@@ -2395,11 +2484,21 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 		}
 	}
 
-	if (copyDest->shouldUseLocalCopy && shardState->containsLocalPlacement)
+	if (isColocatedIntermediateResult && copyDest->shouldUseLocalCopy &&
+		shardState->containsLocalPlacement)
+	{
+		if (firstTupleInShard)
+		{
+			CreateLocalColocatedIntermediateFile(copyDest, shardState);
+		}
+
+		WriteTupleToLocalFile(slot, copyDest, shardId,
+							  shardState->copyOutState, &shardState->fileDest);
+	}
+	else if (copyDest->shouldUseLocalCopy && shardState->containsLocalPlacement)
 	{
 		WriteTupleToLocalShard(slot, copyDest, shardId, shardState->copyOutState);
 	}
-
 
 	foreach(placementStateCell, shardState->placementStateList)
 	{
@@ -2414,7 +2513,7 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 			switchToCurrentPlacement = true;
 		}
 		else if (currentPlacementState != activePlacementState &&
-				 currentPlacementState->data->len > COPY_SWITCH_OVER_THRESHOLD)
+				 currentPlacementState->data->len > CopySwitchOverThresholdBytes)
 		{
 			switchToCurrentPlacement = true;
 
@@ -2616,6 +2715,8 @@ CitusCopyDestReceiverShutdown(DestReceiver *destReceiver)
 	Relation distributedRelation = copyDest->distributedRelation;
 
 	List *connectionStateList = ConnectionStateList(connectionStateHash);
+
+	FinishLocalColocatedIntermediateFiles(copyDest);
 	FinishLocalCopy(copyDest);
 
 	PG_TRY();
@@ -2661,6 +2762,61 @@ FinishLocalCopy(CitusCopyDestReceiver *copyDest)
 		{
 			FinishLocalCopyToShard(copyDest, copyShardState->shardId,
 								   copyShardState->copyOutState);
+		}
+	}
+}
+
+
+/*
+ * CreateLocalColocatedIntermediateFile creates a co-located file for the given
+ * shard, and appends the binary headers if needed. The function also modifies
+ * shardState to set the fileDest and copyOutState.
+ */
+static void
+CreateLocalColocatedIntermediateFile(CitusCopyDestReceiver *copyDest,
+									 CopyShardState *shardState)
+{
+	/* make sure the directory exists */
+	CreateIntermediateResultsDirectory();
+
+	const int fileFlags = (O_CREAT | O_RDWR | O_TRUNC);
+	const int fileMode = (S_IRUSR | S_IWUSR);
+
+	StringInfo filePath = makeStringInfo();
+	appendStringInfo(filePath, "%s_%ld", copyDest->colocatedIntermediateResultIdPrefix,
+					 shardState->shardId);
+
+	const char *fileName = QueryResultFileName(filePath->data);
+	shardState->fileDest =
+		FileCompatFromFileStart(FileOpenForTransmit(fileName, fileFlags, fileMode));
+
+	CopyOutState localFileCopyOutState = shardState->copyOutState;
+	bool isBinaryCopy = localFileCopyOutState->binary;
+	if (isBinaryCopy)
+	{
+		AppendCopyBinaryHeaders(localFileCopyOutState);
+	}
+}
+
+
+/*
+ * FinishLocalColocatedIntermediateFiles iterates over all the colocated
+ * intermediate files and finishes the COPY on all of them.
+ */
+static void
+FinishLocalColocatedIntermediateFiles(CitusCopyDestReceiver *copyDest)
+{
+	HTAB *shardStateHash = copyDest->shardStateHash;
+	HASH_SEQ_STATUS status;
+	CopyShardState *copyShardState;
+
+	foreach_htab(copyShardState, &status, shardStateHash)
+	{
+		if (copyShardState->copyOutState != NULL &&
+			FILE_IS_OPEN(copyShardState->fileDest.fd))
+		{
+			FinishLocalCopyToFile(copyShardState->copyOutState,
+								  &copyShardState->fileDest);
 		}
 	}
 }
@@ -3361,8 +3517,8 @@ ConnectionStateListToNode(HTAB *connectionStateHash, const char *hostname, int32
 static CopyShardState *
 GetShardState(uint64 shardId, HTAB *shardStateHash,
 			  HTAB *connectionStateHash, bool stopOnFailure, bool *found, bool
-			  shouldUseLocalCopy, CopyOutState copyOutState, bool
-			  isCopyToIntermediateFile)
+			  shouldUseLocalCopy, CopyOutState copyOutState,
+			  bool isColocatedIntermediateResult)
 {
 	CopyShardState *shardState = (CopyShardState *) hash_search(shardStateHash, &shardId,
 																HASH_ENTER, found);
@@ -3370,7 +3526,7 @@ GetShardState(uint64 shardId, HTAB *shardStateHash,
 	{
 		InitializeCopyShardState(shardState, connectionStateHash,
 								 shardId, stopOnFailure, shouldUseLocalCopy,
-								 copyOutState, isCopyToIntermediateFile);
+								 copyOutState, isColocatedIntermediateResult);
 	}
 
 	return shardState;
@@ -3385,8 +3541,9 @@ GetShardState(uint64 shardId, HTAB *shardStateHash,
 static void
 InitializeCopyShardState(CopyShardState *shardState,
 						 HTAB *connectionStateHash, uint64 shardId,
-						 bool stopOnFailure, bool shouldUseLocalCopy, CopyOutState
-						 copyOutState, bool isCopyToIntermediateFile)
+						 bool stopOnFailure, bool shouldUseLocalCopy,
+						 CopyOutState copyOutState,
+						 bool colocatedIntermediateResult)
 {
 	ListCell *placementCell = NULL;
 	int failedPlacementCount = 0;
@@ -3410,7 +3567,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 	shardState->placementStateList = NIL;
 	shardState->copyOutState = NULL;
 	shardState->containsLocalPlacement = ContainsLocalPlacement(shardId);
-
+	shardState->fileDest.fd = -1;
 
 	foreach(placementCell, activePlacementList)
 	{
@@ -3420,31 +3577,27 @@ InitializeCopyShardState(CopyShardState *shardState,
 		{
 			shardState->copyOutState = (CopyOutState) palloc0(sizeof(*copyOutState));
 			CloneCopyOutStateForLocalCopy(copyOutState, shardState->copyOutState);
-			LogLocalCopyExecution(shardId);
+
+			if (colocatedIntermediateResult)
+			{
+				LogLocalCopyToFileExecution(shardId);
+			}
+			else
+			{
+				LogLocalCopyToRelationExecution(shardId);
+			}
+
 			continue;
 		}
 
-		if (placement->groupId == GetLocalGroupId())
-		{
-			/*
-			 * if we are copying into an intermediate file we won't use local copy.
-			 * Files are visible to all transactions so we can still use local execution, therefore
-			 * we shouldn't restrict only using connection in this case.
-			 */
-			if (!isCopyToIntermediateFile)
-			{
-				SetLocalExecutionStatus(LOCAL_EXECUTION_DISABLED);
-			}
-		}
-
 		MultiConnection *connection =
-			CopyGetPlacementConnection(connectionStateHash, placement, stopOnFailure);
+			CopyGetPlacementConnection(connectionStateHash, placement, stopOnFailure,
+									   colocatedIntermediateResult);
 		if (connection == NULL)
 		{
 			failedPlacementCount++;
 			continue;
 		}
-
 
 		CopyConnectionState *connectionState = GetConnectionState(connectionStateHash,
 																  connection);
@@ -3514,11 +3667,11 @@ CloneCopyOutStateForLocalCopy(CopyOutState from, CopyOutState to)
 
 
 /*
- * LogLocalCopyExecution logs that the copy will be done locally for
- * the given shard.
+ * LogLocalCopyToRelationExecution logs that the copy will be done
+ * locally for the given shard.
  */
 static void
-LogLocalCopyExecution(uint64 shardId)
+LogLocalCopyToRelationExecution(uint64 shardId)
 {
 	if (!(LogRemoteCommands || LogLocalCommands))
 	{
@@ -3529,16 +3682,61 @@ LogLocalCopyExecution(uint64 shardId)
 
 
 /*
+ * LogLocalCopyToFileExecution logs that the copy will be done locally for
+ * a file colocated to the given shard.
+ */
+static void
+LogLocalCopyToFileExecution(uint64 shardId)
+{
+	if (!(LogRemoteCommands || LogLocalCommands))
+	{
+		return;
+	}
+	ereport(NOTICE, (errmsg("executing the copy locally for colocated file with "
+							"shard %lu", shardId)));
+}
+
+
+/*
  * CopyGetPlacementConnection assigns a connection to the given placement. If
  * a connection has already been assigned the placement in the current transaction
  * then it reuses the connection. Otherwise, it requests a connection for placement.
  */
 static MultiConnection *
-CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement, bool
-						   stopOnFailure)
+CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
+						   bool stopOnFailure, bool colocatedIntermediateResult)
 {
-	uint32 connectionFlags = FOR_DML;
-	char *nodeUser = CurrentUserName();
+	if (colocatedIntermediateResult)
+	{
+		/*
+		 * Colocated intermediate results are just files and not required to use
+		 * the same connections with their co-located shards. So, we are free to
+		 * use any connection we can get.
+		 *
+		 * Also, the current connection re-use logic does not know how to handle
+		 * intermediate results as the intermediate results always truncates the
+		 * existing files. That's why we we use one connection per intermediate
+		 * result.
+		 *
+		 * Also note that we are breaking the guarantees of citus.shared_pool_size
+		 * as we cannot rely on optional connections.
+		 */
+		uint32 connectionFlagsForIntermediateResult = 0;
+		MultiConnection *connection =
+			GetNodeConnection(connectionFlagsForIntermediateResult, placement->nodeName,
+							  placement->nodePort);
+
+		/*
+		 * As noted above, we want each intermediate file to go over
+		 * a separate connection.
+		 */
+		ClaimConnectionExclusively(connection);
+
+		/* and, we cannot afford to handle failures when anything goes wrong */
+		MarkRemoteTransactionCritical(connection);
+
+		return connection;
+	}
 
 	/*
 	 * Determine whether the task has to be assigned to a particular connection
@@ -3546,6 +3744,7 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 	 */
 	ShardPlacementAccess *placementAccess = CreatePlacementAccess(placement,
 																  PLACEMENT_ACCESS_DML);
+	uint32 connectionFlags = FOR_DML;
 	MultiConnection *connection =
 		GetConnectionIfPlacementAccessedInXact(connectionFlags,
 											   list_make1(placementAccess), NULL);
@@ -3582,6 +3781,12 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 		connection = GetLeastUtilisedCopyConnection(copyConnectionStateList,
 													nodeName,
 													nodePort);
+
+		/*
+		 * Make sure that the connection management remembers that Citus
+		 * accesses this placement over the connection.
+		 */
+		AssignPlacementListToConnection(list_make1(placementAccess), connection);
 
 		return connection;
 	}
@@ -3628,6 +3833,7 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 		connectionFlags |= REQUIRE_CLEAN_CONNECTION;
 	}
 
+	char *nodeUser = CurrentUserName();
 	connection = GetPlacementConnection(connectionFlags, placement, nodeUser);
 	if (connection == NULL)
 	{
@@ -3643,6 +3849,12 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 			connection =
 				GetLeastUtilisedCopyConnection(copyConnectionStateList, nodeName,
 											   nodePort);
+
+			/*
+			 * Make sure that the connection management remembers that Citus
+			 * accesses this placement over the connection.
+			 */
+			AssignPlacementListToConnection(list_make1(placementAccess), connection);
 		}
 		else
 		{

@@ -32,6 +32,7 @@
 #include "distributed/shared_connection_stats.h"
 #include "distributed/cancel_utils.h"
 #include "distributed/remote_commands.h"
+#include "distributed/time_constants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_log_messages.h"
 #include "mb/pg_wchar.h"
@@ -43,6 +44,7 @@
 
 int NodeConnectionTimeout = 30000;
 int MaxCachedConnectionsPerWorker = 1;
+int MaxCachedConnectionLifetime = 10 * MS_PER_MINUTE;
 
 HTAB *ConnectionHash = NULL;
 HTAB *ConnParamsHash = NULL;
@@ -161,6 +163,12 @@ AfterXactConnectionHandling(bool isCommit)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		AfterXactHostConnectionHandling(entry, isCommit);
 
 		/*
@@ -233,41 +241,6 @@ GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 
 
 /*
- * StartWorkerListConnections starts connections to the given worker list and
- * returns them as a MultiConnection list.
- */
-List *
-StartWorkerListConnections(List *workerNodeList, uint32 flags, const char *user,
-						   const char *database)
-{
-	List *connectionList = NIL;
-
-	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerNodeList)
-	{
-		const char *nodeName = workerNode->workerName;
-		int nodePort = workerNode->workerPort;
-		int connectionFlags = 0;
-
-		MultiConnection *connection = StartNodeUserDatabaseConnection(connectionFlags,
-																	  nodeName, nodePort,
-																	  user, database);
-
-		/*
-		 * connection can only be NULL for optional connections, which we don't
-		 * support in this codepath.
-		 */
-		Assert((flags & OPTIONAL_CONNECTION) == 0);
-		Assert(connection != NULL);
-
-		connectionList = lappend(connectionList, connection);
-	}
-
-	return connectionList;
-}
-
-
-/*
  * StartNodeUserDatabaseConnection() initiates a connection to a remote node.
  *
  * If user or database are NULL, the current session's defaults are used. The
@@ -286,13 +259,14 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	bool found;
 
 	/* do some minimal input checks */
-	strlcpy(key.hostname, hostname, MAX_NODE_LENGTH);
 	if (strlen(hostname) > MAX_NODE_LENGTH)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("hostname exceeds the maximum length of %d",
 							   MAX_NODE_LENGTH)));
 	}
+
+	strlcpy(key.hostname, hostname, MAX_NODE_LENGTH);
 
 	key.port = port;
 	if (user)
@@ -324,11 +298,24 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	 */
 
 	ConnectionHashEntry *entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
-	if (!found)
+	if (!found || !entry->isValid)
 	{
+		/*
+		 * We are just building hash entry or previously it was left in an
+		 * invalid state as we couldn't allocate memory for it.
+		 * So initialize entry->connections list here.
+		 */
+		entry->isValid = false;
 		entry->connections = MemoryContextAlloc(ConnectionContext,
 												sizeof(dlist_head));
 		dlist_init(entry->connections);
+
+		/*
+		 * If MemoryContextAlloc errors out -e.g. during an OOM-, entry->connections
+		 * stays as NULL. So entry->isValid should be set to true right after we
+		 * initialize entry->connections properly.
+		 */
+		entry->isValid = true;
 	}
 
 	/* if desired, check whether there's a usable connection */
@@ -385,7 +372,7 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 		 * remote node as it might not have any space in
 		 * max_connections for this connection establishment.
 		 *
-		 * Still, we keep track of the connnection counter.
+		 * Still, we keep track of the connection counter.
 		 */
 		IncrementSharedConnectionCounter(hostname, port);
 	}
@@ -484,6 +471,12 @@ CloseAllConnectionsAfterTransaction(void)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		dlist_iter iter;
 
 		dlist_head *connections = entry->connections;
@@ -518,7 +511,7 @@ ConnectionAvailableToNode(char *hostName, int nodePort, const char *userName,
 	ConnectionHashEntry *entry =
 		(ConnectionHashEntry *) hash_search(ConnectionHash, &key, HASH_FIND, &found);
 
-	if (!found)
+	if (!found || !entry->isValid)
 	{
 		return false;
 	}
@@ -544,6 +537,12 @@ CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		dlist_iter iter;
 
 		if (strcmp(entry->key.hostname, nodeName) != 0 || entry->key.port != nodePort)
@@ -619,6 +618,12 @@ ShutdownAllConnections(void)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != NULL)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		dlist_iter iter;
 
 		dlist_foreach(iter, entry->connections)
@@ -1229,6 +1234,12 @@ FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry)
 static void
 AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 {
+	if (!entry || !entry->isValid)
+	{
+		/* callers only pass valid hash entries but let's be on the safe side */
+		ereport(ERROR, (errmsg("connection hash entry is NULL or invalid")));
+	}
+
 	dlist_mutable_iter iter;
 	int cachedConnectionCount = 0;
 
@@ -1279,29 +1290,37 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
  * - Connection is forced to close at the end of transaction
  * - Connection is not in OK state
  * - A transaction is still in progress (usually because we are cancelling a distributed transaction)
+ * - A connection reached its maximum lifetime
  */
 static bool
 ShouldShutdownConnection(MultiConnection *connection, const int cachedConnectionCount)
 {
-	bool isCitusInitiatedBackend = false;
-
 	/*
 	 * When we are in a backend that was created to serve an internal connection
 	 * from the coordinator or another worker, we disable connection caching to avoid
 	 * escalating the number of cached connections. We can recognize such backends
 	 * from their application name.
 	 */
-	if (application_name != NULL && strcmp(application_name, CITUS_APPLICATION_NAME) == 0)
-	{
-		isCitusInitiatedBackend = true;
-	}
-
-	return isCitusInitiatedBackend ||
+	return IsCitusInitiatedRemoteBackend() ||
 		   connection->initilizationState != POOL_STATE_INITIALIZED ||
 		   cachedConnectionCount >= MaxCachedConnectionsPerWorker ||
 		   connection->forceCloseAtTransactionEnd ||
 		   PQstatus(connection->pgConn) != CONNECTION_OK ||
-		   !RemoteTransactionIdle(connection);
+		   !RemoteTransactionIdle(connection) ||
+		   (MaxCachedConnectionLifetime >= 0 &&
+			TimestampDifferenceExceeds(connection->connectionStart, GetCurrentTimestamp(),
+									   MaxCachedConnectionLifetime));
+}
+
+
+/*
+ * IsCitusInitiatedRemoteBackend returns true if we are in a backend that citus
+ * initiated via remote connection.
+ */
+bool
+IsCitusInitiatedRemoteBackend(void)
+{
+	return application_name && strcmp(application_name, CITUS_APPLICATION_NAME) == 0;
 }
 
 

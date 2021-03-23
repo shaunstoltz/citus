@@ -27,22 +27,45 @@
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/listutils.h"
+#include "distributed/local_executor.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/multi_executor.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/namespace_utils.h"
 #include "distributed/resource_lock.h"
+#include "distributed/relation_access_tracking.h"
+#include "distributed/relation_utils.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+
 /* Local functions forward declarations for helper functions */
-static List * CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt);
+static void ErrorIfCreateIndexHasTooManyColumns(IndexStmt *createIndexStatement);
+static int GetNumberOfIndexParameters(IndexStmt *createIndexStatement);
+static bool IndexAlreadyExists(IndexStmt *createIndexStatement);
+static Oid CreateIndexStmtGetIndexId(IndexStmt *createIndexStatement);
+static Oid CreateIndexStmtGetSchemaId(IndexStmt *createIndexStatement);
+static void SwitchToSequentialAndLocalExecutionIfIndexNameTooLong(
+	IndexStmt *createIndexStatement);
+static char * GenerateLongestShardPartitionIndexName(IndexStmt *createIndexStatement);
+static char * GenerateDefaultIndexName(IndexStmt *createIndexStatement);
+static List * GenerateIndexParameters(IndexStmt *createIndexStatement);
+static DDLJob * GenerateCreateIndexDDLJob(IndexStmt *createIndexStatement,
+										  const char *createIndexCommand);
+static Oid CreateIndexStmtGetRelationId(IndexStmt *createIndexStatement);
+static LOCKMODE GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement);
+static List * CreateIndexTaskList(IndexStmt *indexStmt);
 static List * CreateReindexTaskList(Oid relationId, ReindexStmt *reindexStmt);
 static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 										 void *arg);
@@ -50,7 +73,6 @@ static void RangeVarCallbackForReindexIndex(const RangeVar *rel, Oid relOid, Oid
 											oldRelOid,
 											void *arg);
 static void ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement);
-static void ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement);
 static List * DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt);
 
 
@@ -107,86 +129,394 @@ IsIndexRenameStmt(RenameStmt *renameStmt)
  * in a List. If no distributed table is involved, this function returns NIL.
  */
 List *
-PreprocessIndexStmt(Node *node, const char *createIndexCommand)
+PreprocessIndexStmt(Node *node, const char *createIndexCommand,
+					ProcessUtilityContext processUtilityContext)
 {
 	IndexStmt *createIndexStatement = castNode(IndexStmt, node);
-	List *ddlJobs = NIL;
 
-	/*
-	 * We first check whether a distributed relation is affected. For that, we need to
-	 * open the relation. To prevent race conditions with later lookups, lock the table,
-	 * and modify the rangevar to include the schema.
-	 */
-	if (createIndexStatement->relation != NULL)
+	RangeVar *relationRangeVar = createIndexStatement->relation;
+	if (relationRangeVar == NULL)
 	{
-		LOCKMODE lockmode = ShareLock;
-		MemoryContext relationContext = NULL;
-
-		/*
-		 * We don't support concurrently creating indexes for distributed
-		 * tables, but till this point, we don't know if it is a regular or a
-		 * distributed table.
-		 */
-		if (createIndexStatement->concurrent)
-		{
-			lockmode = ShareUpdateExclusiveLock;
-		}
-
-		/*
-		 * XXX: Consider using RangeVarGetRelidExtended with a permission
-		 * checking callback. Right now we'll acquire the lock before having
-		 * checked permissions, and will only fail when executing the actual
-		 * index statements.
-		 */
-		Relation relation = table_openrv(createIndexStatement->relation, lockmode);
-		Oid relationId = RelationGetRelid(relation);
-
-		bool isCitusRelation = IsCitusTable(relationId);
-
-		if (createIndexStatement->relation->schemaname == NULL)
-		{
-			/*
-			 * Before we do any further processing, fix the schema name to make sure
-			 * that a (distributed) table with the same name does not appear on the
-			 * search path in front of the current schema. We do this even if the
-			 * table is not distributed, since a distributed table may appear on the
-			 * search path by the time postgres starts processing this statement.
-			 */
-			char *namespaceName = get_namespace_name(RelationGetNamespace(relation));
-
-			/* ensure we copy string into proper context */
-			relationContext = GetMemoryChunkContext(createIndexStatement->relation);
-			createIndexStatement->relation->schemaname = MemoryContextStrdup(
-				relationContext, namespaceName);
-		}
-
-		table_close(relation, NoLock);
-
-		if (isCitusRelation)
-		{
-			char *indexName = createIndexStatement->idxname;
-			char *namespaceName = createIndexStatement->relation->schemaname;
-
-			ErrorIfUnsupportedIndexStmt(createIndexStatement);
-
-			Oid namespaceId = get_namespace_oid(namespaceName, false);
-			Oid indexRelationId = get_relname_relid(indexName, namespaceId);
-
-			/* if index does not exist, send the command to workers */
-			if (!OidIsValid(indexRelationId))
-			{
-				DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-				ddlJob->targetRelationId = relationId;
-				ddlJob->concurrentIndexCmd = createIndexStatement->concurrent;
-				ddlJob->commandString = createIndexCommand;
-				ddlJob->taskList = CreateIndexTaskList(relationId, createIndexStatement);
-
-				ddlJobs = list_make1(ddlJob);
-			}
-		}
+		/* let's be on the safe side */
+		return NIL;
 	}
 
-	return ddlJobs;
+	/*
+	 * We first check whether a distributed relation is affected. For that,
+	 * we need to open the relation. To prevent race conditions with later
+	 * lookups, lock the table.
+	 *
+	 * XXX: Consider using RangeVarGetRelidExtended with a permission
+	 * checking callback. Right now we'll acquire the lock before having
+	 * checked permissions, and will only fail when executing the actual
+	 * index statements.
+	 */
+	LOCKMODE lockMode = GetCreateIndexRelationLockMode(createIndexStatement);
+	Relation relation = table_openrv(relationRangeVar, lockMode);
+
+	/*
+	 * Before we do any further processing, fix the schema name to make sure
+	 * that a (distributed) table with the same name does not appear on the
+	 * search_path in front of the current schema. We do this even if the
+	 * table is not distributed, since a distributed table may appear on the
+	 * search_path by the time postgres starts processing this command.
+	 */
+	if (relationRangeVar->schemaname == NULL)
+	{
+		/* ensure we copy string into proper context */
+		MemoryContext relationContext = GetMemoryChunkContext(relationRangeVar);
+		char *namespaceName = RelationGetNamespaceName(relation);
+		relationRangeVar->schemaname = MemoryContextStrdup(relationContext,
+														   namespaceName);
+	}
+
+	table_close(relation, NoLock);
+
+	Oid relationId = CreateIndexStmtGetRelationId(createIndexStatement);
+	if (!IsCitusTable(relationId))
+	{
+		return NIL;
+	}
+
+	if (createIndexStatement->idxname == NULL)
+	{
+		/*
+		 * Postgres does not support indexes with over INDEX_MAX_KEYS columns
+		 * and we should not attempt to generate an index name for such cases.
+		 */
+		ErrorIfCreateIndexHasTooManyColumns(createIndexStatement);
+
+		/* ensure we copy string into proper context */
+		MemoryContext relationContext = GetMemoryChunkContext(relationRangeVar);
+		char *defaultIndexName = GenerateDefaultIndexName(createIndexStatement);
+		createIndexStatement->idxname = MemoryContextStrdup(relationContext,
+															defaultIndexName);
+	}
+
+	if (IndexAlreadyExists(createIndexStatement))
+	{
+		/*
+		 * Let standard_processUtility to error out or skip if command has
+		 * IF NOT EXISTS.
+		 */
+		return NIL;
+	}
+
+	ErrorIfUnsupportedIndexStmt(createIndexStatement);
+
+	/*
+	 * Citus has the logic to truncate the long shard names to prevent
+	 * various issues, including self-deadlocks. However, for partitioned
+	 * tables, when index is created on the parent table, the index names
+	 * on the partitions are auto-generated by Postgres. We use the same
+	 * Postgres function to generate the index names on the shards of the
+	 * partitions. If the length exceeds the limit, we switch to sequential
+	 * execution mode.
+	 *
+	 * The root cause of the problem is that postgres truncates the
+	 * table/index names if they are longer than "NAMEDATALEN - 1".
+	 * From Citus' perspective, running commands in parallel on the
+	 * shards could mean these table/index names are truncated to be
+	 * the same, and thus forming a self-deadlock as these tables/
+	 * indexes are inserted into postgres' metadata tables, like pg_class.
+	 */
+	SwitchToSequentialAndLocalExecutionIfIndexNameTooLong(createIndexStatement);
+
+	DDLJob *ddlJob = GenerateCreateIndexDDLJob(createIndexStatement, createIndexCommand);
+	return list_make1(ddlJob);
+}
+
+
+/*
+ * ErrorIfCreateIndexHasTooManyColumns errors out if given CREATE INDEX command
+ * would use more than INDEX_MAX_KEYS columns.
+ */
+static void
+ErrorIfCreateIndexHasTooManyColumns(IndexStmt *createIndexStatement)
+{
+	int numberOfIndexParameters = GetNumberOfIndexParameters(createIndexStatement);
+	if (numberOfIndexParameters <= INDEX_MAX_KEYS)
+	{
+		return;
+	}
+
+	ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS),
+					errmsg("cannot use more than %d columns in an index",
+						   INDEX_MAX_KEYS)));
+}
+
+
+/*
+ * GetNumberOfIndexParameters returns number of parameters to be used when
+ * creating the index to be defined by given CREATE INDEX command.
+ */
+static int
+GetNumberOfIndexParameters(IndexStmt *createIndexStatement)
+{
+	List *indexParams = createIndexStatement->indexParams;
+	List *indexIncludingParams = createIndexStatement->indexIncludingParams;
+	return list_length(indexParams) + list_length(indexIncludingParams);
+}
+
+
+/*
+ * IndexAlreadyExists returns true if index to be created by given CREATE INDEX
+ * command already exists.
+ */
+static bool
+IndexAlreadyExists(IndexStmt *createIndexStatement)
+{
+	Oid indexRelationId = CreateIndexStmtGetIndexId(createIndexStatement);
+	return OidIsValid(indexRelationId);
+}
+
+
+/*
+ * CreateIndexStmtGetIndexId returns OID of the index that given CREATE INDEX
+ * command attempts to create if it's already created before. Otherwise, returns
+ * InvalidOid.
+ */
+static Oid
+CreateIndexStmtGetIndexId(IndexStmt *createIndexStatement)
+{
+	char *indexName = createIndexStatement->idxname;
+	Oid namespaceId = CreateIndexStmtGetSchemaId(createIndexStatement);
+	Oid indexRelationId = get_relname_relid(indexName, namespaceId);
+	return indexRelationId;
+}
+
+
+/*
+ * CreateIndexStmtGetSchemaId returns schemaId of the schema that given
+ * CREATE INDEX command operates on.
+ */
+static Oid
+CreateIndexStmtGetSchemaId(IndexStmt *createIndexStatement)
+{
+	RangeVar *relationRangeVar = createIndexStatement->relation;
+	char *schemaName = relationRangeVar->schemaname;
+	bool missingOk = false;
+	Oid namespaceId = get_namespace_oid(schemaName, missingOk);
+	return namespaceId;
+}
+
+
+/*
+ * ExecuteFunctionOnEachTableIndex executes the given pgIndexProcessor function on each
+ * index of the given relation.
+ * It returns a list that is filled by the pgIndexProcessor.
+ */
+List *
+ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor pgIndexProcessor)
+{
+	List *result = NIL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+
+	PushOverrideEmptySearchPath(CurrentMemoryContext);
+
+	/* open system catalog and scan all indexes that belong to this table */
+	Relation pgIndex = table_open(IndexRelationId, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_index_indrelid,
+				BTEqualStrategyNumber, F_OIDEQ, relationId);
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgIndex,
+													IndexIndrelidIndexId, true, /* indexOK */
+													NULL, scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_index indexForm = (Form_pg_index) GETSTRUCT(heapTuple);
+		pgIndexProcessor(indexForm, &result);
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	/* clean up scan and close system catalog */
+	systable_endscan(scanDescriptor);
+	table_close(pgIndex, AccessShareLock);
+
+	/* revert back to original search_path */
+	PopOverrideSearchPath();
+
+	return result;
+}
+
+
+/*
+ * SwitchToSequentialOrLocalExecutionIfIndexNameTooLong generates the longest index name
+ * on the shards of the partitions, and if exceeds the limit switches to sequential and
+ * local execution to prevent self-deadlocks.
+ */
+static void
+SwitchToSequentialAndLocalExecutionIfIndexNameTooLong(IndexStmt *createIndexStatement)
+{
+	Oid relationId = CreateIndexStmtGetRelationId(createIndexStatement);
+	if (!PartitionedTable(relationId))
+	{
+		/* Citus already handles long names for regular tables */
+		return;
+	}
+
+	if (ShardIntervalCount(relationId) == 0)
+	{
+		/*
+		 * Relation has no shards, so we cannot run into "long shard index
+		 * name" issue.
+		 */
+		return;
+	}
+
+	char *indexName = GenerateLongestShardPartitionIndexName(createIndexStatement);
+	if (indexName &&
+		strnlen(indexName, NAMEDATALEN) >= NAMEDATALEN - 1)
+	{
+		if (ParallelQueryExecutedInTransaction())
+		{
+			/*
+			 * If there has already been a parallel query executed, the sequential mode
+			 * would still use the already opened parallel connections to the workers,
+			 * thus contradicting our purpose of using sequential mode.
+			 */
+			ereport(ERROR, (errmsg(
+								"The index name (%s) on a shard is too long and could lead "
+								"to deadlocks when executed in a transaction "
+								"block after a parallel query", indexName),
+							errhint("Try re-running the transaction with "
+									"\"SET LOCAL citus.multi_shard_modify_mode TO "
+									"\'sequential\';\"")));
+		}
+		else
+		{
+			elog(DEBUG1, "the index name on the shards of the partition "
+						 "is too long, switching to sequential and local execution "
+						 "mode to prevent self deadlocks: %s", indexName);
+
+			SetLocalMultiShardModifyModeToSequential();
+			SetLocalExecutionStatus(LOCAL_EXECUTION_REQUIRED);
+		}
+	}
+}
+
+
+/*
+ * GenerateLongestShardPartitionIndexName emulates Postgres index name
+ * generation for partitions on the shards. It returns the longest
+ * possible index name.
+ */
+static char *
+GenerateLongestShardPartitionIndexName(IndexStmt *createIndexStatement)
+{
+	Oid relationId = CreateIndexStmtGetRelationId(createIndexStatement);
+	Oid longestNamePartitionId = PartitionWithLongestNameRelationId(relationId);
+	if (!OidIsValid(longestNamePartitionId))
+	{
+		/* no partitions have been created yet */
+		return NULL;
+	}
+
+	char *longestPartitionShardName = get_rel_name(longestNamePartitionId);
+	ShardInterval *shardInterval = LoadShardIntervalWithLongestShardName(
+		longestNamePartitionId);
+	AppendShardIdToName(&longestPartitionShardName, shardInterval->shardId);
+
+	IndexStmt *createLongestShardIndexStmt = copyObject(createIndexStatement);
+	createLongestShardIndexStmt->relation->relname = longestPartitionShardName;
+
+	char *choosenIndexName = GenerateDefaultIndexName(createLongestShardIndexStmt);
+	return choosenIndexName;
+}
+
+
+/*
+ * GenerateDefaultIndexName is a wrapper around postgres function ChooseIndexName
+ * that generates default index name for the index to be created by given CREATE
+ * INDEX statement as postgres would do.
+ *
+ * (See DefineIndex at postgres/src/backend/commands/indexcmds.c)
+ */
+static char *
+GenerateDefaultIndexName(IndexStmt *createIndexStatement)
+{
+	char *relationName = createIndexStatement->relation->relname;
+	Oid namespaceId = CreateIndexStmtGetSchemaId(createIndexStatement);
+	List *indexParams = GenerateIndexParameters(createIndexStatement);
+	List *indexColNames = ChooseIndexColumnNames(indexParams);
+	char *indexName = ChooseIndexName(relationName, namespaceId, indexColNames,
+									  createIndexStatement->excludeOpNames,
+									  createIndexStatement->primary,
+									  createIndexStatement->isconstraint);
+
+	return indexName;
+}
+
+
+/*
+ * GenerateIndexParameters is a helper function that creates a list of parameters
+ * required to assign a default index name for the index to be created by given
+ * CREATE INDEX command.
+ */
+static List *
+GenerateIndexParameters(IndexStmt *createIndexStatement)
+{
+	List *indexParams = createIndexStatement->indexParams;
+	List *indexIncludingParams = createIndexStatement->indexIncludingParams;
+	List *allIndexParams = list_concat(list_copy(indexParams),
+									   list_copy(indexIncludingParams));
+	return allIndexParams;
+}
+
+
+/*
+ * GenerateCreateIndexDDLJob returns DDLJob for given CREATE INDEX command.
+ */
+static DDLJob *
+GenerateCreateIndexDDLJob(IndexStmt *createIndexStatement, const char *createIndexCommand)
+{
+	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
+
+	ddlJob->targetRelationId = CreateIndexStmtGetRelationId(createIndexStatement);
+	ddlJob->concurrentIndexCmd = createIndexStatement->concurrent;
+	ddlJob->startNewTransaction = createIndexStatement->concurrent;
+	ddlJob->commandString = createIndexCommand;
+	ddlJob->taskList = CreateIndexTaskList(createIndexStatement);
+
+	return ddlJob;
+}
+
+
+/*
+ * CreateIndexStmtGetRelationId returns relationId for relation that given
+ * CREATE INDEX command operates on.
+ */
+static Oid
+CreateIndexStmtGetRelationId(IndexStmt *createIndexStatement)
+{
+	RangeVar *relationRangeVar = createIndexStatement->relation;
+	LOCKMODE lockMode = GetCreateIndexRelationLockMode(createIndexStatement);
+	bool missingOk = false;
+	Oid relationId = RangeVarGetRelid(relationRangeVar, lockMode, missingOk);
+	return relationId;
+}
+
+
+/*
+ * GetCreateIndexRelationLockMode returns required lock mode to open the
+ * relation that given CREATE INDEX command operates on.
+ */
+static LOCKMODE
+GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement)
+{
+	if (createIndexStatement->concurrent)
+	{
+		return ShareUpdateExclusiveLock;
+	}
+	else
+	{
+		return ShareLock;
+	}
 }
 
 
@@ -199,7 +529,8 @@ PreprocessIndexStmt(Node *node, const char *createIndexCommand)
  * in a List. If no distributed table is involved, this function returns NIL.
  */
 List *
-PreprocessReindexStmt(Node *node, const char *reindexCommand)
+PreprocessReindexStmt(Node *node, const char *reindexCommand,
+					  ProcessUtilityContext processUtilityContext)
 {
 	ReindexStmt *reindexStatement = castNode(ReindexStmt, node);
 	List *ddlJobs = NIL;
@@ -284,6 +615,7 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
 			ddlJob->targetRelationId = relationId;
 #if PG_VERSION_NUM >= PG_VERSION_12
 			ddlJob->concurrentIndexCmd = reindexStatement->concurrent;
+			ddlJob->startNewTransaction = reindexStatement->concurrent;
 #else
 			ddlJob->concurrentIndexCmd = false;
 #endif
@@ -307,7 +639,8 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand)
  * in a List. If no distributed table is involved, this function returns NIL.
  */
 List *
-PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand)
+PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand,
+						ProcessUtilityContext processUtilityContext)
 {
 	DropStmt *dropIndexStatement = castNode(DropStmt, node);
 	List *ddlJobs = NIL;
@@ -363,9 +696,21 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand)
 		bool isCitusRelation = IsCitusTable(relationId);
 		if (isCitusRelation)
 		{
+			if (OidIsValid(distributedIndexId))
+			{
+				/*
+				 * We already have a distributed index in the list, and Citus
+				 * currently only support dropping a single distributed index.
+				 */
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot drop multiple distributed objects in "
+									   "a single command"),
+								errhint("Try dropping each object in a separate DROP "
+										"command.")));
+			}
+
 			distributedIndexId = indexId;
 			distributedRelationId = relationId;
-			break;
 		}
 	}
 
@@ -373,10 +718,20 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand)
 	{
 		DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-		ErrorIfUnsupportedDropIndexStmt(dropIndexStatement);
+		if (AnyForeignKeyDependsOnIndex(distributedIndexId))
+		{
+			MarkInvalidateForeignKeyGraph();
+		}
 
 		ddlJob->targetRelationId = distributedRelationId;
 		ddlJob->concurrentIndexCmd = dropIndexStatement->concurrent;
+
+		/*
+		 * We do not want DROP INDEX CONCURRENTLY to commit locally before
+		 * sending commands, because if there is a failure we would like to
+		 * to be able to repeat the DROP INDEX later.
+		 */
+		ddlJob->startNewTransaction = false;
 		ddlJob->commandString = dropIndexCommand;
 		ddlJob->taskList = DropIndexTaskList(distributedRelationId, distributedIndexId,
 											 dropIndexStatement);
@@ -442,23 +797,6 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 	CommitTransactionCommand();
 	StartTransactionCommand();
 
-	/* now, update index's validity in a way that can roll back */
-	Relation pg_index = table_open(IndexRelationId, RowExclusiveLock);
-
-	HeapTuple indexTuple = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(
-												   indexRelationId));
-	Assert(HeapTupleIsValid(indexTuple)); /* better be present, we have lock! */
-
-	/* mark as valid, save, and update pg_index indexes */
-	Form_pg_index indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
-	indexForm->indisvalid = true;
-
-	CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
-
-	/* clean up; index now marked valid, but ROLLBACK will mark invalid */
-	heap_freetuple(indexTuple);
-	table_close(pg_index, RowExclusiveLock);
-
 	return NIL;
 }
 
@@ -470,6 +808,7 @@ PostprocessIndexStmt(Node *node, const char *queryString)
  *
  * ALTER INDEX SET ()
  * ALTER INDEX RESET ()
+ * ALTER INDEX ALTER COLUMN SET STATISTICS
  */
 void
 ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
@@ -486,6 +825,7 @@ ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
 			case AT_SetRelOptions:  /* SET (...) */
 			case AT_ResetRelOptions:    /* RESET (...) */
 			case AT_ReplaceRelOptions:  /* replace entire option list */
+			case AT_SetStatistics:  /* SET STATISTICS */
 			{
 				/* this command is supported by Citus */
 				break;
@@ -499,8 +839,8 @@ ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("alter index ... set tablespace ... "
 								"is currently unsupported"),
-						 errdetail("Only RENAME TO, SET (), and RESET () "
-								   "are supported.")));
+						 errdetail("Only RENAME TO, SET (), RESET () "
+								   "and SET STATISTICS are supported.")));
 				return; /* keep compiler happy */
 			}
 		}
@@ -509,13 +849,13 @@ ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
 
 
 /*
- * CreateIndexTaskList builds a list of tasks to execute a CREATE INDEX command
- * against a specified distributed table.
+ * CreateIndexTaskList builds a list of tasks to execute a CREATE INDEX command.
  */
 static List *
-CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt)
+CreateIndexTaskList(IndexStmt *indexStmt)
 {
 	List *taskList = NIL;
+	Oid relationId = CreateIndexStmtGetRelationId(indexStmt);
 	List *shardIntervalList = LoadShardIntervalList(relationId);
 	StringInfoData ddlString;
 	uint64 jobId = INVALID_JOB_ID;
@@ -777,14 +1117,6 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation, Oid relId, Oid oldRelI
 static void
 ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 {
-	char *indexRelationName = createIndexStatement->idxname;
-	if (indexRelationName == NULL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("creating index without a name on a distributed table is "
-							   "currently unsupported")));
-	}
-
 	if (createIndexStatement->tableSpace != NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -849,26 +1181,6 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 
 
 /*
- * ErrorIfUnsupportedDropIndexStmt checks if the corresponding drop index statement is
- * supported for distributed tables and errors out if it is not.
- */
-static void
-ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement)
-{
-	Assert(dropIndexStatement->removeType == OBJECT_INDEX);
-
-	if (list_length(dropIndexStatement->objects) > 1)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot drop multiple distributed objects in a "
-							   "single command"),
-						errhint("Try dropping each object in a separate DROP "
-								"command.")));
-	}
-}
-
-
-/*
  * DropIndexTaskList builds a list of tasks to execute a DROP INDEX command
  * against a specified distributed table.
  */
@@ -920,4 +1232,41 @@ DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt)
 	}
 
 	return taskList;
+}
+
+
+/*
+ * MarkIndexValid marks an index as valid after a CONCURRENTLY command. We mark
+ * indexes invalid in PostProcessIndexStmt and then commit, such that any failure
+ * leaves behind an invalid index. We mark it as valid here when the command
+ * completes.
+ */
+void
+MarkIndexValid(IndexStmt *indexStmt)
+{
+	Assert(indexStmt->concurrent);
+	Assert(IsCoordinator());
+
+	/*
+	 * We make sure schema name is not null in the PreprocessIndexStmt
+	 */
+	bool missingOk = false;
+	Oid schemaId = get_namespace_oid(indexStmt->relation->schemaname, missingOk);
+
+	Oid relationId PG_USED_FOR_ASSERTS_ONLY =
+		get_relname_relid(indexStmt->relation->relname, schemaId);
+
+	Assert(IsCitusTable(relationId));
+
+	/* get the affected relation and index */
+	Relation relation = table_openrv(indexStmt->relation, ShareUpdateExclusiveLock);
+	Oid indexRelationId = get_relname_relid(indexStmt->idxname,
+											schemaId);
+	Relation indexRelation = index_open(indexRelationId, RowExclusiveLock);
+
+	/* mark index as valid, in-place (cannot be rolled back) */
+	index_set_state_flags(indexRelationId, INDEX_CREATE_SET_VALID);
+
+	table_close(relation, NoLock);
+	index_close(indexRelation, NoLock);
 }

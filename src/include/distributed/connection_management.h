@@ -82,7 +82,8 @@ typedef enum MultiConnectionState
 	MULTI_CONNECTION_CONNECTING,
 	MULTI_CONNECTION_CONNECTED,
 	MULTI_CONNECTION_FAILED,
-	MULTI_CONNECTION_LOST
+	MULTI_CONNECTION_LOST,
+	MULTI_CONNECTION_TIMED_OUT
 } MultiConnectionState;
 
 
@@ -177,6 +178,9 @@ typedef struct ConnectionHashEntry
 {
 	ConnectionHashKey key;
 	dlist_head *connections;
+
+	/* connections list is valid or not */
+	bool isValid;
 } ConnectionHashEntry;
 
 /* hash entry for cached connection parameters */
@@ -195,6 +199,9 @@ extern int NodeConnectionTimeout;
 
 /* maximum number of connections to cache per worker per session */
 extern int MaxCachedConnectionsPerWorker;
+
+/* maximum lifetime of connections in miliseconds */
+extern int MaxCachedConnectionLifetime;
 
 /* parameters used for outbound connections */
 extern char *NodeConninfo;
@@ -229,8 +236,6 @@ extern MultiConnection * StartNodeConnection(uint32 flags, const char *hostname,
 extern MultiConnection * GetNodeUserDatabaseConnection(uint32 flags, const char *hostname,
 													   int32 port, const char *user,
 													   const char *database);
-extern List * StartWorkerListConnections(List *workerList, uint32 flags, const char *user,
-										 const char *database);
 extern MultiConnection * StartNodeUserDatabaseConnection(uint32 flags,
 														 const char *hostname,
 														 int32 port,
@@ -250,6 +255,7 @@ extern void FinishConnectionListEstablishment(List *multiConnectionList);
 extern void FinishConnectionEstablishment(MultiConnection *connection);
 extern void ClaimConnectionExclusively(MultiConnection *connection);
 extern void UnclaimConnection(MultiConnection *connection);
+extern bool IsCitusInitiatedRemoteBackend(void);
 
 /* time utilities */
 extern double MillisecondsPassedSince(instr_time moment);

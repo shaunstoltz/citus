@@ -39,7 +39,6 @@ extern char * DistributionDeleteCommand(const char *schemaName,
 extern char * TableOwnerResetCommand(Oid distributedRelationId);
 extern char * NodeListInsertCommand(List *workerNodeList);
 extern List * ShardListInsertCommand(List *shardIntervalList);
-extern List * ShardDeleteCommandList(ShardInterval *shardInterval);
 extern char * NodeDeleteCommand(uint32 nodeId);
 extern char * NodeStateUpdateCommand(uint32 nodeId, bool isActive);
 extern char * ShouldHaveShardsUpdateCommand(uint32 nodeId, bool shouldHaveShards);
@@ -51,11 +50,14 @@ extern char * PlacementUpsertCommand(uint64 shardId, uint64 placementId, int sha
 extern void CreateTableMetadataOnWorkers(Oid relationId);
 extern void MarkNodeHasMetadata(const char *nodeName, int32 nodePort, bool hasMetadata);
 extern void MarkNodeMetadataSynced(const char *nodeName, int32 nodePort, bool synced);
-extern MetadataSyncResult SyncMetadataToNodes(void);
+extern BackgroundWorkerHandle * SpawnSyncMetadataToNodes(Oid database, Oid owner);
 extern bool SendOptionalCommandListToWorkerInTransaction(const char *nodeName, int32
 														 nodePort,
 														 const char *nodeUser,
 														 List *commandList);
+extern void SyncMetadataToNodesMain(Datum main_arg);
+extern void SignalMetadataSyncDaemon(Oid database, int sig);
+extern bool ShouldInitiateMetadataSync(bool *lockFailure);
 
 #define DELETE_ALL_NODES "TRUNCATE pg_dist_node CASCADE"
 #define REMOVE_ALL_CLUSTERED_TABLES_COMMAND \

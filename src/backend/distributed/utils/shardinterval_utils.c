@@ -28,29 +28,6 @@
 
 
 /*
- * LowestShardIntervalById returns the shard interval with the lowest shard
- * ID from a list of shard intervals.
- */
-ShardInterval *
-LowestShardIntervalById(List *shardIntervalList)
-{
-	ShardInterval *lowestShardInterval = NULL;
-
-	ShardInterval *shardInterval = NULL;
-	foreach_ptr(shardInterval, shardIntervalList)
-	{
-		if (lowestShardInterval == NULL ||
-			lowestShardInterval->shardId > shardInterval->shardId)
-		{
-			lowestShardInterval = shardInterval;
-		}
-	}
-
-	return lowestShardInterval;
-}
-
-
-/*
  * SortedShardIntervalArray sorts the input shardIntervalArray. Shard intervals with
  * no min/max values are placed at the end of the array.
  */
@@ -251,8 +228,8 @@ ShardIndex(ShardInterval *shardInterval)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("finding index of a given shard is only supported for "
-							   "hash distributed tables, reference tables and citus "
-							   "local tables")));
+							   "hash distributed tables, reference tables and local "
+							   "tables that are added to citus metadata")));
 	}
 
 	/* short-circuit for reference tables */
@@ -488,7 +465,7 @@ SingleReplicatedTable(Oid relationId)
 	List *shardPlacementList = NIL;
 
 	/* we could have append/range distributed tables without shards */
-	if (list_length(shardList) <= 1)
+	if (list_length(shardList) == 0)
 	{
 		return false;
 	}

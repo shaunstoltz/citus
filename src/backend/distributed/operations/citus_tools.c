@@ -40,7 +40,7 @@ static void ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray,
 													 StringInfo *commandStringArray,
 													 bool *statusArray,
 													 StringInfo *resultStringArray,
-													 int commmandCount);
+													 int commandCount);
 static bool GetConnectionStatusAndResult(MultiConnection *connection, bool *resultStatus,
 										 StringInfo queryResultString);
 static bool EvaluateQueryResult(MultiConnection *connection, PGresult *queryResult,
@@ -51,7 +51,7 @@ static void ExecuteCommandsAndStoreResults(StringInfo *nodeNameArray,
 										   StringInfo *commandStringArray,
 										   bool *statusArray,
 										   StringInfo *resultStringArray,
-										   int commmandCount);
+										   int commandCount);
 static bool ExecuteRemoteQueryOrCommand(char *nodeName, uint32 nodePort,
 										char *queryString, StringInfo queryResult);
 static Tuplestorestate * CreateTupleStore(TupleDesc tupleDescriptor,
@@ -112,7 +112,12 @@ master_run_on_worker(PG_FUNCTION_ARGS)
 						"function return type are not compatible")));
 	}
 
-	/* prepare storage for status and result values */
+	/*
+	 * prepare storage for status and result values.
+	 * commandCount is based on user input however, it is the length of list
+	 * instead of a user given integer, hence this should be safe here in terms
+	 * of memory allocation.
+	 */
 	bool *statusArray = palloc0(commandCount * sizeof(bool));
 	StringInfo *resultArray = palloc0(commandCount * sizeof(StringInfo));
 	for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
@@ -211,14 +216,14 @@ static void
 ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePortArray,
 										 StringInfo *commandStringArray,
 										 bool *statusArray, StringInfo *resultStringArray,
-										 int commmandCount)
+										 int commandCount)
 {
 	MultiConnection **connectionArray =
-		palloc0(commmandCount * sizeof(MultiConnection *));
+		palloc0(commandCount * sizeof(MultiConnection *));
 	int finishedCount = 0;
 
 	/* start connections asynchronously */
-	for (int commandIndex = 0; commandIndex < commmandCount; commandIndex++)
+	for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
 	{
 		char *nodeName = nodeNameArray[commandIndex]->data;
 		int nodePort = nodePortArray[commandIndex];
@@ -228,7 +233,7 @@ ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePor
 	}
 
 	/* establish connections */
-	for (int commandIndex = 0; commandIndex < commmandCount; commandIndex++)
+	for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
 	{
 		MultiConnection *connection = connectionArray[commandIndex];
 		StringInfo queryResultString = resultStringArray[commandIndex];
@@ -252,7 +257,7 @@ ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePor
 	}
 
 	/* send queries at once */
-	for (int commandIndex = 0; commandIndex < commmandCount; commandIndex++)
+	for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
 	{
 		MultiConnection *connection = connectionArray[commandIndex];
 		char *queryString = commandStringArray[commandIndex]->data;
@@ -279,9 +284,9 @@ ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePor
 	}
 
 	/* check for query results */
-	while (finishedCount < commmandCount)
+	while (finishedCount < commandCount)
 	{
-		for (int commandIndex = 0; commandIndex < commmandCount; commandIndex++)
+		for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
 		{
 			MultiConnection *connection = connectionArray[commandIndex];
 			StringInfo queryResultString = resultStringArray[commandIndex];
@@ -306,7 +311,7 @@ ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePor
 
 		CHECK_FOR_INTERRUPTS();
 
-		if (finishedCount < commmandCount)
+		if (finishedCount < commandCount)
 		{
 			long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
 			pg_usleep(sleepIntervalPerCycle);
@@ -463,9 +468,9 @@ StoreErrorMessage(MultiConnection *connection, StringInfo queryResultString)
 static void
 ExecuteCommandsAndStoreResults(StringInfo *nodeNameArray, int *nodePortArray,
 							   StringInfo *commandStringArray, bool *statusArray,
-							   StringInfo *resultStringArray, int commmandCount)
+							   StringInfo *resultStringArray, int commandCount)
 {
-	for (int commandIndex = 0; commandIndex < commmandCount; commandIndex++)
+	for (int commandIndex = 0; commandIndex < commandCount; commandIndex++)
 	{
 		char *nodeName = nodeNameArray[commandIndex]->data;
 		int32 nodePort = nodePortArray[commandIndex];
@@ -504,7 +509,13 @@ ExecuteRemoteQueryOrCommand(char *nodeName, uint32 nodePort, char *queryString,
 		return false;
 	}
 
-	SendRemoteCommand(connection, queryString);
+	if (!SendRemoteCommand(connection, queryString))
+	{
+		appendStringInfo(queryResultString, "failed to send query to %s:%d", nodeName,
+						 (int) nodePort);
+		return false;
+	}
+
 	PGresult *queryResult = GetRemoteCommandResult(connection, raiseInterrupts);
 	bool success = EvaluateQueryResult(connection, queryResult, queryResultString);
 

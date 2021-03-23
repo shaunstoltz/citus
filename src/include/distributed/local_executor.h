@@ -14,11 +14,6 @@
 #include "distributed/citus_custom_scan.h"
 #include "distributed/tuple_destination.h"
 
-/*
- * Used as TupleDestination->putTuple's placementIndex when executing
- * local tasks.
- */
-#define LOCAL_PLACEMENT_INDEX -1
 
 /* enabled with GUCs*/
 extern bool EnableLocalExecution;
@@ -31,9 +26,8 @@ typedef enum LocalExecutionStatus
 	LOCAL_EXECUTION_DISABLED
 } LocalExecutionStatus;
 
-extern enum LocalExecutionStatus CurrentLocalExecutionStatus;
-
 /* extern function declarations */
+extern LocalExecutionStatus GetCurrentLocalExecutionStatus(void);
 extern uint64 ExecuteLocalTaskList(List *taskList, TupleDestination *defaultTupleDest);
 extern uint64 ExecuteLocalUtilityTaskList(List *utilityTaskList);
 extern uint64 ExecuteLocalTaskListExtended(List *taskList, ParamListInfo
@@ -43,6 +37,7 @@ extern uint64 ExecuteLocalTaskListExtended(List *taskList, ParamListInfo
 										   bool isUtilityCommand);
 extern void ExtractLocalAndRemoteTasks(bool readOnlyPlan, List *taskList,
 									   List **localTaskList, List **remoteTaskList);
+extern void ExecuteUtilityCommand(const char *utilityCommand);
 extern bool ShouldExecuteTasksLocally(List *taskList);
 extern bool AnyTaskAccessesLocalNode(List *taskList);
 extern bool TaskAccessesLocalNode(Task *task);

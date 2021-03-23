@@ -83,6 +83,82 @@ typedef enum
 	SHARD_PLACEMENT_RANDOM = 3
 } ShardPlacementPolicyType;
 
+/*
+ * TableDDLCommandType encodes the implementation used by TableDDLCommand. See comments in
+ * TableDDLCpmmand for details.
+ */
+typedef enum TableDDLCommandType
+{
+	TABLE_DDL_COMMAND_STRING,
+	TABLE_DDL_COMMAND_FUNCTION,
+} TableDDLCommandType;
+
+
+struct TableDDLCommand;
+typedef struct TableDDLCommand TableDDLCommand;
+typedef char *(*TableDDLFunction)(void *context);
+typedef char *(*TableDDLShardedFunction)(uint64 shardId, void *context);
+
+/*
+ * TableDDLCommand holds the definition of a command to be executed to bring the table and
+ * or shard into a certain state. The command needs to be able to serialized into two
+ * versions:
+ *  - one version should have the vanilla commands operating on the base table. These are
+ *    used for example to create the MX table shards
+ *  - the second versions should replace all identifiers with an identifier containing the
+ *    shard id.
+ *
+ * Current implementations are
+ *  - command string, created via makeTableDDLCommandString. This variant contains a ddl
+ *    command that will be wrapped in `worker_apply_shard_ddl_command` when applied
+ *    against a shard.
+ */
+struct TableDDLCommand
+{
+	CitusNode node;
+
+	/* encoding the type this TableDDLCommand contains */
+	TableDDLCommandType type;
+
+	/*
+	 * This union contains one (1) typed field for every implementation for
+	 * TableDDLCommand. A union enforces no overloading of fields but instead requiers at
+	 * most one of the fields to be used at any time.
+	 */
+	union
+	{
+		/*
+		 * CommandStr is used when type is set to TABLE_DDL_COMMAND_STRING. It holds the
+		 * sql ddl command string representing the ddl command.
+		 */
+		char *commandStr;
+
+		/*
+		 * function is used when type is set to TABLE_DDL_COMMAND_FUNCTION. It contains
+		 * function pointers and a context to be passed to the functions to be able to
+		 * construct the sql commands for sharded and non-sharded tables.
+		 */
+		struct
+		{
+			TableDDLFunction function;
+			TableDDLShardedFunction shardedFunction;
+			void *context;
+		}
+		function;
+	};
+};
+
+/* make functions for TableDDLCommand */
+extern TableDDLCommand * makeTableDDLCommandString(char *commandStr);
+extern TableDDLCommand * makeTableDDLCommandFunction(TableDDLFunction function,
+													 TableDDLShardedFunction
+													 shardedFunction,
+													 void *context);
+
+extern char * GetShardedTableDDLCommand(TableDDLCommand *command, uint64 shardId,
+										char *schemaName);
+extern char * GetTableDDLCommand(TableDDLCommand *command);
+
 
 /* Config variables managed via guc.c */
 extern int ShardCount;
@@ -100,10 +176,11 @@ extern bool CStoreTable(Oid relationId);
 extern uint64 GetNextShardId(void);
 extern uint64 GetNextPlacementId(void);
 extern Oid ResolveRelationId(text *relationName, bool missingOk);
-extern List * GetTableDDLEvents(Oid relationId, bool forShardCreation);
-extern List * GetTableConstructionCommands(Oid relationId);
-extern List * GetTableCreationCommands(Oid relationId, bool forShardCreation);
-extern List * GetTableBuildingCommands(Oid relationId, bool includeSequenceDefaults);
+extern List * GetFullTableCreationCommands(Oid relationId, bool includeSequenceDefaults);
+extern List * GetPostLoadTableCreationCommands(Oid relationId, bool includeIndexes);
+extern List * GetPreLoadTableCreationCommands(Oid relationId,
+											  bool includeSequenceDefaults,
+											  char *accessMethod);
 extern List * GetTableIndexAndConstraintCommands(Oid relationId);
 extern bool IndexImpliedByAConstraint(Form_pg_index indexForm);
 extern char ShardStorageType(Oid relationId);
@@ -152,6 +229,7 @@ extern Datum master_apply_delete_command(PG_FUNCTION_ARGS);
 extern Datum master_drop_sequences(PG_FUNCTION_ARGS);
 extern Datum master_modify_multiple_shards(PG_FUNCTION_ARGS);
 extern Datum lock_relation_if_exists(PG_FUNCTION_ARGS);
+extern Datum citus_drop_all_shards(PG_FUNCTION_ARGS);
 extern Datum master_drop_all_shards(PG_FUNCTION_ARGS);
 extern int MasterDropAllShards(Oid relationId, char *schemaName, char *relationName);
 
@@ -177,6 +255,11 @@ extern ShardPlacement * SearchShardPlacementInList(List *shardPlacementList,
 extern ShardPlacement * SearchShardPlacementInListOrError(List *shardPlacementList,
 														  const char *nodeName,
 														  uint32 nodePort);
+extern void ErrorIfMoveCitusLocalTable(Oid relationId);
 extern char LookupShardTransferMode(Oid shardReplicationModeOid);
+extern void BlockWritesToShardList(List *shardList);
+extern List * WorkerApplyShardDDLCommandList(List *ddlCommandList, int64 shardId);
+extern List * GetForeignConstraintCommandsToReferenceTable(ShardInterval *shardInterval);
+
 
 #endif   /* COORDINATOR_PROTOCOL_H */

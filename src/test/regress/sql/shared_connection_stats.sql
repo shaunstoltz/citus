@@ -148,7 +148,8 @@ COMMIT;
 -- now, some of the optional connections would be skipped,
 -- and only 5 connections are used per node
 BEGIN;
-	SELECT count(*), pg_sleep(0.1) FROM test;
+	SET LOCAL citus.max_adaptive_executor_pool_size TO 16;
+	with cte_1 as (select pg_sleep(0.1) is null, a from test) SELECT a from cte_1 ORDER By 1 LIMIT 1;
 	SELECT
 		connection_count_to_node
 	FROM
@@ -325,6 +326,7 @@ BEGIN;
 	-- when COPY is used with _max_query_parallelization
 	-- it ignores the shared pool size
 	SET LOCAL citus.force_max_query_parallelization TO ON;
+	SET LOCAL citus.max_adaptive_executor_pool_size TO 16;
 	COPY test FROM PROGRAM 'seq 32';
 
 	SELECT
@@ -338,14 +340,16 @@ BEGIN;
 		hostname, port;
 ROLLBACK;
 
--- INSERT SELECT with RETURNING/ON CONFLICT clauses should honor shared_pool_size
+-- INSERT SELECT with RETURNING/ON CONFLICT clauses does not honor shared_pool_size
 -- in underlying COPY commands
 BEGIN;
 	SELECT pg_sleep(0.1);
-	INSERT INTO test SELECT i FROM generate_series(0,10) i RETURNING *;
+	-- make sure that we hit at least 4 shards per node, where 20 rows
+	-- is enough
+	INSERT INTO test SELECT i FROM generate_series(0,20) i RETURNING *;
 
 	SELECT
-		connection_count_to_node
+		connection_count_to_node > current_setting('citus.max_shared_pool_size')::int
 	FROM
 		citus_remote_connection_stats()
 	WHERE
@@ -507,6 +511,7 @@ SELECT pg_reload_conf();
 SELECT pg_sleep(0.1);
 
 -- cache connections to the nodes
+SET citus.force_max_query_parallelization TO ON;
 SELECT count(*) FROM test;
 BEGIN;
 	-- we should not have any reserved connections
@@ -514,6 +519,21 @@ BEGIN;
 	COPY test FROM PROGRAM 'seq 32';
 	SELECT * FROM citus_reserved_connection_stats() ORDER BY 1,2;
 COMMIT;
+
+-- should close all connections
+SET citus.max_cached_connection_lifetime TO '0s';
+SELECT count(*) FROM test;
+
+-- show that no connections are cached
+SELECT
+	connection_count_to_node
+FROM
+	citus_remote_connection_stats()
+WHERE
+	port IN (SELECT node_port FROM master_get_active_worker_nodes()) AND
+	database_name = 'regression'
+ORDER BY
+	hostname, port;
 
 -- in case other tests relies on these setting, reset them
 ALTER SYSTEM RESET citus.distributed_deadlock_detection_factor;

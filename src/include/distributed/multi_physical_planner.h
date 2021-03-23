@@ -311,7 +311,8 @@ typedef struct Task
 	/*
 	 * totalReceivedTupleData only counts the data for a single placement. So
 	 * for RETURNING DML this is not really correct. This is used by
-	 * EXPLAIN ANALYZE, to display the amount of received bytes.
+	 * EXPLAIN ANALYZE, to display the amount of received bytes. The local execution
+	 * does not increment this value, so only used for remote execution.
 	 */
 	uint64 totalReceivedTupleData;
 
@@ -321,6 +322,17 @@ typedef struct Task
 	 */
 	char *fetchedExplainAnalyzePlan;
 	int fetchedExplainAnalyzePlacementIndex;
+
+	/*
+	 * Execution Duration fetched from worker. This is saved to be used later by
+	 * ExplainTaskList().
+	 */
+	double fetchedExplainAnalyzeExecutionDuration;
+
+	/*
+	 * isLocalTableModification is true if the task is on modifying a local table.
+	 */
+	bool isLocalTableModification;
 } Task;
 
 
@@ -528,6 +540,7 @@ extern Node *  WrapUngroupedVarsInAnyValueAggregate(Node *expression,
 													List *groupClauseList,
 													List *targetList,
 													bool checkExpressionEquality);
+extern CollateExpr * RelabelTypeToCollateExpr(RelabelType *relabelType);
 
 /*
  * Function declarations for building, updating constraints and simple operator
@@ -537,11 +550,9 @@ extern Node * BuildBaseConstraint(Var *column);
 extern void UpdateConstraint(Node *baseConstraint, ShardInterval *shardInterval);
 extern bool BinaryOpExpression(Expr *clause, Node **leftOperand, Node **rightOperand);
 extern bool SimpleOpExpression(Expr *clause);
-extern bool OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn);
 
 /* helper functions */
 extern Var * MakeInt4Column(void);
-extern Const * MakeInt4Constant(Datum constantValue);
 extern int CompareShardPlacements(const void *leftElement, const void *rightElement);
 extern bool ShardIntervalsOverlap(ShardInterval *firstInterval,
 								  ShardInterval *secondInterval);
@@ -554,8 +565,6 @@ extern StringInfo ArrayObjectToString(ArrayType *arrayObject,
 
 /* function declarations for Task and Task list operations */
 extern bool TasksEqual(const Task *a, const Task *b);
-extern List * TaskListAppendUnique(List *list, Task *task);
-extern List * TaskListConcatUnique(List *list1, List *list2);
 extern bool TaskListMember(const List *taskList, const Task *task);
 extern List * TaskListDifference(const List *list1, const List *list2);
 extern List * AssignAnchorShardTaskList(List *taskList);
@@ -564,13 +573,18 @@ extern List * RoundRobinAssignTaskList(List *taskList);
 extern List * RoundRobinReorder(List *placementList);
 extern void SetPlacementNodeMetadata(ShardPlacement *placement, WorkerNode *workerNode);
 extern int CompareTasksByTaskId(const void *leftElement, const void *rightElement);
+extern int CompareTasksByExecutionDuration(const void *leftElement, const
+										   void *rightElement);
 
 /* function declaration for creating Task */
 extern List * QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 									   RelationRestrictionContext *
 									   relationRestrictionContext,
 									   List *prunedRelationShardList, TaskType taskType,
-									   bool modifyRequiresCoordinatorEvaluation);
+									   bool modifyRequiresCoordinatorEvaluation,
+									   DeferredErrorMessage **planningError);
+
+extern bool ModifyLocalTableJob(Job *job);
 
 /* function declarations for managing jobs */
 extern uint64 UniqueJobId(void);
@@ -584,5 +598,6 @@ extern RangeTblEntry * DerivedRangeTableEntry(MultiNode *multiNode, List *column
 											  List *funcColumnTypeMods,
 											  List *funcCollations);
 
+extern List * FetchEqualityAttrNumsForRTE(Node *quals);
 
 #endif   /* MULTI_PHYSICAL_PLANNER_H */

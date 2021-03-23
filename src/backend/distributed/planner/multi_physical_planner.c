@@ -50,8 +50,10 @@
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/query_pushdown_planning.h"
+#include "distributed/query_utils.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shard_pruning.h"
+#include "distributed/string_utils.h"
 
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
@@ -131,13 +133,17 @@ static List * QueryFromList(List *rangeTableList);
 static Node * QueryJoinTree(MultiNode *multiNode, List *dependentJobList,
 							List **rangeTableList);
 static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry,
-										List *l_colnames, List *r_colnames,
-										List *leftColVars, List *rightColVars);
+										Oid leftRelId,
+										Oid rightRelId,
+										List *leftColumnVars,
+										List *rightColumnVars);
 static RangeTblEntry * JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList,
 										   List *rangeTableList);
 static int ExtractRangeTableId(Node *node);
-static void ExtractColumns(RangeTblEntry *rangeTableEntry, int rangeTableId,
-						   List *dependentJobList, List **columnNames, List **columnVars);
+static void ExtractColumns(RangeTblEntry *callingRTE, int rangeTableId,
+						   List **columnNames, List **columnVars);
+static RangeTblEntry * ConstructCallingRTE(RangeTblEntry *rangeTableEntry,
+										   List *dependentJobList);
 static Query * BuildSubqueryJobQuery(MultiNode *multiNode);
 static void UpdateAllColumnAttributes(Node *columnContainer, List *rangeTableList,
 									  List *dependentJobList);
@@ -167,7 +173,8 @@ static Task * QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 									  RelationRestrictionContext *restrictionContext,
 									  uint32 taskId,
 									  TaskType taskType,
-									  bool modifyRequiresCoordinatorEvaluation);
+									  bool modifyRequiresCoordinatorEvaluation,
+									  DeferredErrorMessage **planningError);
 static bool ShardIntervalsEqual(FmgrInfo *comparisonFunction,
 								Oid collation,
 								ShardInterval *firstInterval,
@@ -220,14 +227,21 @@ static void AssignDataFetchDependencies(List *taskList);
 static uint32 TaskListHighestTaskId(List *taskList);
 static List * MapTaskList(MapMergeJob *mapMergeJob, List *filterTaskList);
 static StringInfo CreateMapQueryString(MapMergeJob *mapMergeJob, Task *filterTask,
-									   char *partitionColumnName);
-static char * ColumnName(Var *column, List *rangeTableList);
+									   uint32 partitionColumnIndex);
 static List * MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList,
 							uint32 taskIdIndex);
 static StringInfo ColumnNameArrayString(uint32 columnCount, uint64 generatingJobId);
 static StringInfo ColumnTypeArrayString(List *targetEntryList);
 static bool CoPlacedShardIntervals(ShardInterval *firstInterval,
 								   ShardInterval *secondInterval);
+
+static List * FetchEqualityAttrNumsForRTEOpExpr(OpExpr *opExpr);
+static List * FetchEqualityAttrNumsForRTEBoolExpr(BoolExpr *boolExpr);
+static List * FetchEqualityAttrNumsForList(List *nodeList);
+static int PartitionColumnIndex(Var *targetVar, List *targetList);
+#if PG_VERSION_NUM >= PG_VERSION_13
+static List * GetColumnOriginalIndexes(Oid relationId);
+#endif
 
 
 /*
@@ -256,6 +270,27 @@ CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
 	distributedPlan->expectResults = true;
 
 	return distributedPlan;
+}
+
+
+/*
+ * ModifyLocalTableJob returns true if the given task contains
+ * a modification of local table.
+ */
+bool
+ModifyLocalTableJob(Job *job)
+{
+	if (job == NULL)
+	{
+		return false;
+	}
+	List *taskList = job->taskList;
+	if (list_length(taskList) != 1)
+	{
+		return false;
+	}
+	Task *singleTask = (Task *) linitial(taskList);
+	return singleTask->isLocalTableModification;
 }
 
 
@@ -515,6 +550,9 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	List *sortClauseList = NIL;
 	Node *limitCount = NULL;
 	Node *limitOffset = NULL;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	LimitOption limitOption = LIMIT_OPTION_DEFAULT;
+#endif
 	Node *havingQual = NULL;
 	bool hasDistinctOn = false;
 	List *distinctClause = NIL;
@@ -596,6 +634,9 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 
 		limitCount = extendedOp->limitCount;
 		limitOffset = extendedOp->limitOffset;
+#if PG_VERSION_NUM >= PG_VERSION_13
+		limitOption = extendedOp->limitOption;
+#endif
 		sortClauseList = extendedOp->sortClauseList;
 		havingQual = extendedOp->havingQual;
 	}
@@ -651,6 +692,9 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	jobQuery->groupClause = groupClauseList;
 	jobQuery->limitOffset = limitOffset;
 	jobQuery->limitCount = limitCount;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	jobQuery->limitOption = limitOption;
+#endif
 	jobQuery->havingQual = havingQual;
 	jobQuery->hasAggs = contain_aggs_of_level((Node *) targetList, 0) ||
 						contain_aggs_of_level((Node *) havingQual, 0);
@@ -780,7 +824,21 @@ static List *
 QueryTargetList(MultiNode *multiNode)
 {
 	List *projectNodeList = FindNodesOfType(multiNode, T_MultiProject);
-	Assert(list_length(projectNodeList) > 0);
+	if (list_length(projectNodeList) == 0)
+	{
+		/*
+		 * The physical planner assumes that all worker queries would have
+		 * target list entries based on the fact that at least the column
+		 * on the JOINs have to be on the target list. However, there is
+		 * an exception to that if there is a cartesian product join and
+		 * there is no additional target list entries belong to one side
+		 * of the JOIN. Once we support cartesian product join, we should
+		 * remove this error.
+		 */
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot perform distributed planning on this query"),
+						errdetail("Cartesian products are currently unsupported")));
+	}
 
 	MultiProject *topProjectNode = (MultiProject *) linitial(projectNodeList);
 	List *columnList = topProjectNode->columnList;
@@ -1250,10 +1308,14 @@ JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTable
 	rangeTableEntry->subquery = NULL;
 	rangeTableEntry->eref = makeAlias("unnamed_join", NIL);
 
-	ExtractColumns(leftRTE, leftRangeTableId, dependentJobList,
+	RangeTblEntry *leftCallingRTE = ConstructCallingRTE(leftRTE, dependentJobList);
+	RangeTblEntry *rightCallingRte = ConstructCallingRTE(rightRTE, dependentJobList);
+	ExtractColumns(leftCallingRTE, leftRangeTableId,
 				   &leftColumnNames, &leftColumnVars);
-	ExtractColumns(rightRTE, rightRangeTableId, dependentJobList,
+	ExtractColumns(rightCallingRte, rightRangeTableId,
 				   &rightColumnNames, &rightColumnVars);
+	Oid leftRelId = leftCallingRTE->relid;
+	Oid rightRelId = rightCallingRte->relid;
 	joinedColumnNames = list_concat(joinedColumnNames, leftColumnNames);
 	joinedColumnNames = list_concat(joinedColumnNames, rightColumnNames);
 	joinedColumnVars = list_concat(joinedColumnVars, leftColumnVars);
@@ -1262,37 +1324,77 @@ JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTable
 	rangeTableEntry->eref->colnames = joinedColumnNames;
 	rangeTableEntry->joinaliasvars = joinedColumnVars;
 
-	SetJoinRelatedColumnsCompat(rangeTableEntry,
-								leftColumnNames, rightColumnNames, leftColumnVars,
+	SetJoinRelatedColumnsCompat(rangeTableEntry, leftRelId, rightRelId, leftColumnVars,
 								rightColumnVars);
 
 	return rangeTableEntry;
 }
 
 
+/*
+ * SetJoinRelatedColumnsCompat sets join related fields on the given range table entry.
+ * Currently it sets joinleftcols/joinrightcols which are introduced with postgres 13.
+ * For more info see postgres commit: 9ce77d75c5ab094637cc4a446296dc3be6e3c221
+ */
 static void
-SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry,
-							List *leftColumnNames, List *rightColumnNames,
+SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, Oid leftRelId, Oid rightRelId,
 							List *leftColumnVars, List *rightColumnVars)
 {
 	#if PG_VERSION_NUM >= PG_VERSION_13
 
 	/* We don't have any merged columns so set it to 0 */
 	rangeTableEntry->joinmergedcols = 0;
-	int numvars = list_length(leftColumnVars);
-	for (int varId = 1; varId <= numvars; varId++)
+
+	if (OidIsValid(leftRelId))
 	{
-		rangeTableEntry->joinleftcols = lappend_int(rangeTableEntry->joinleftcols, varId);
+		rangeTableEntry->joinleftcols = GetColumnOriginalIndexes(leftRelId);
 	}
-	numvars = list_length(rightColumnVars);
-	for (int varId = 1; varId <= numvars; varId++)
+	else
 	{
-		rangeTableEntry->joinrightcols = lappend_int(rangeTableEntry->joinrightcols,
-													 varId);
+		int leftColsSize = list_length(leftColumnVars);
+		rangeTableEntry->joinleftcols = GeneratePositiveIntSequenceList(leftColsSize);
 	}
+
+	if (OidIsValid(rightRelId))
+	{
+		rangeTableEntry->joinrightcols = GetColumnOriginalIndexes(rightRelId);
+	}
+	else
+	{
+		int rightColsSize = list_length(rightColumnVars);
+		rangeTableEntry->joinrightcols = GeneratePositiveIntSequenceList(rightColsSize);
+	}
+
 	#endif
 }
 
+
+#if PG_VERSION_NUM >= PG_VERSION_13
+
+/*
+ * GetColumnOriginalIndexes gets the original indexes of columns by taking column drops into account.
+ */
+static List *
+GetColumnOriginalIndexes(Oid relationId)
+{
+	List *originalIndexes = NIL;
+	Relation relation = table_open(relationId, AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(relation);
+	for (int columnIndex = 0; columnIndex < tupleDescriptor->natts; columnIndex++)
+	{
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
+		if (currentColumn->attisdropped)
+		{
+			continue;
+		}
+		originalIndexes = lappend_int(originalIndexes, columnIndex + 1);
+	}
+	table_close(relation, NoLock);
+	return originalIndexes;
+}
+
+
+#endif
 
 /*
  * ExtractRangeTableId gets the range table id from a node that could
@@ -1322,13 +1424,28 @@ ExtractRangeTableId(Node *node)
 
 /*
  * ExtractColumns gets a list of column names and vars for a given range
- * table entry using expandRTE. Since the range table entries in a job
- * query are mocked RTE_FUNCTION entries, it first translates the RTE's
- * to a form that expandRTE can handle.
+ * table entry using expandRTE.
  */
 static void
-ExtractColumns(RangeTblEntry *rangeTableEntry, int rangeTableId, List *dependentJobList,
+ExtractColumns(RangeTblEntry *callingRTE, int rangeTableId,
 			   List **columnNames, List **columnVars)
+{
+	int subLevelsUp = 0;
+	int location = -1;
+	bool includeDroppedColumns = false;
+	expandRTE(callingRTE, rangeTableId, subLevelsUp, location, includeDroppedColumns,
+			  columnNames, columnVars);
+}
+
+
+/*
+ * ConstructCallingRTE constructs a calling RTE from the given range table entry and
+ * dependentJobList in case of repartition joins. Since the range table entries in a job
+ * query are mocked RTE_FUNCTION entries, this construction is needed to form an RTE
+ * that expandRTE can handle.
+ */
+static RangeTblEntry *
+ConstructCallingRTE(RangeTblEntry *rangeTableEntry, List *dependentJobList)
 {
 	RangeTblEntry *callingRTE = NULL;
 
@@ -1370,8 +1487,7 @@ ExtractColumns(RangeTblEntry *rangeTableEntry, int rangeTableId, List *dependent
 	{
 		ereport(ERROR, (errmsg("unsupported Citus RTE kind: %d", rangeTableKind)));
 	}
-
-	expandRTE(callingRTE, rangeTableId, 0, -1, false, columnNames, columnVars);
+	return callingRTE;
 }
 
 
@@ -2027,11 +2143,17 @@ BuildJobTreeTaskList(Job *jobTree, PlannerRestrictionContext *plannerRestriction
 													relationRestrictionContext,
 													&isMultiShardQuery, NULL);
 
+			DeferredErrorMessage *deferredErrorMessage = NULL;
 			sqlTaskList = QueryPushdownSqlTaskList(job->jobQuery, job->jobId,
 												   plannerRestrictionContext->
 												   relationRestrictionContext,
 												   prunedRelationShardList, READ_TASK,
-												   false);
+												   false,
+												   &deferredErrorMessage);
+			if (deferredErrorMessage != NULL)
+			{
+				RaiseDeferredErrorInternal(deferredErrorMessage, ERROR);
+			}
 		}
 		else
 		{
@@ -2109,7 +2231,8 @@ List *
 QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 						 RelationRestrictionContext *relationRestrictionContext,
 						 List *prunedRelationShardList, TaskType taskType, bool
-						 modifyRequiresCoordinatorEvaluation)
+						 modifyRequiresCoordinatorEvaluation,
+						 DeferredErrorMessage **planningError)
 {
 	List *sqlTaskList = NIL;
 	ListCell *restrictionCell = NULL;
@@ -2123,8 +2246,11 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 
 	if (list_length(relationRestrictionContext->relationRestrictionList) == 0)
 	{
-		ereport(ERROR, (errmsg("cannot handle complex subqueries when the "
-							   "router executor is disabled")));
+		*planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									   "cannot handle complex subqueries when the "
+									   "router executor is disabled",
+									   NULL, NULL);
+		return NIL;
 	}
 
 	/* defaults to be used if this is a reference table-only query */
@@ -2149,8 +2275,11 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 		/* we expect distributed tables to have the same shard count */
 		if (shardCount > 0 && shardCount != cacheEntry->shardIntervalArrayLength)
 		{
-			ereport(ERROR, (errmsg("shard counts of co-located tables do not "
-								   "match")));
+			*planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										   "shard counts of co-located tables do not "
+										   "match",
+										   NULL, NULL);
+			return NIL;
 		}
 
 		if (taskRequiredForShardIndex == NULL)
@@ -2213,7 +2342,12 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 													 relationRestrictionContext,
 													 taskIdIndex,
 													 taskType,
-													 modifyRequiresCoordinatorEvaluation);
+													 modifyRequiresCoordinatorEvaluation,
+													 planningError);
+		if (*planningError != NULL)
+		{
+			return NIL;
+		}
 		subqueryTask->jobId = jobId;
 		sqlTaskList = lappend(sqlTaskList, subqueryTask);
 
@@ -2389,7 +2523,8 @@ ErrorIfUnsupportedShardDistribution(Query *query)
 static Task *
 QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 						RelationRestrictionContext *restrictionContext, uint32 taskId,
-						TaskType taskType, bool modifyRequiresCoordinatorEvaluation)
+						TaskType taskType, bool modifyRequiresCoordinatorEvaluation,
+						DeferredErrorMessage **planningError)
 {
 	Query *taskQuery = copyObject(originalQuery);
 
@@ -2468,8 +2603,12 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 	List *taskPlacementList = PlacementsForWorkersContainingAllShards(taskShardList);
 	if (list_length(taskPlacementList) == 0)
 	{
-		ereport(ERROR, (errmsg("cannot find a worker that has active placements for all "
-							   "shards in the query")));
+		*planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									   "cannot find a worker that has active placements for all "
+									   "shards in the query",
+									   NULL, NULL);
+
+		return NULL;
 	}
 
 	/*
@@ -2809,6 +2948,24 @@ SqlTaskList(Job *job)
 	}
 
 	return sqlTaskList;
+}
+
+
+/*
+ * RelabelTypeToCollateExpr converts RelabelType's into CollationExpr's.
+ * With that, we will be able to pushdown COLLATE's.
+ */
+CollateExpr *
+RelabelTypeToCollateExpr(RelabelType *relabelType)
+{
+	Assert(OidIsValid(relabelType->resultcollid));
+
+	CollateExpr *collateExpr = makeNode(CollateExpr);
+	collateExpr->arg = relabelType->arg;
+	collateExpr->collOid = relabelType->resultcollid;
+	collateExpr->location = relabelType->location;
+
+	return collateExpr;
 }
 
 
@@ -3332,36 +3489,6 @@ SimpleOpExpression(Expr *clause)
 
 
 /*
- * OpExpressionContainsColumn checks if the operator expression contains the
- * given partition column. We assume that given operator expression is a simple
- * operator expression which means it is a binary operator expression with
- * operands of a var and a non-null constant.
- */
-bool
-OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn)
-{
-	Node *leftOperand;
-	Node *rightOperand;
-	if (!BinaryOpExpression((Expr *) operatorExpression, &leftOperand, &rightOperand))
-	{
-		return false;
-	}
-	Var *column = NULL;
-
-	if (IsA(leftOperand, Var))
-	{
-		column = (Var *) leftOperand;
-	}
-	else
-	{
-		column = (Var *) rightOperand;
-	}
-
-	return equal(column, partitionColumn);
-}
-
-
-/*
  * MakeInt4Column creates a column of int4 type with invalid table id and max
  * attribute number.
  */
@@ -3378,27 +3505,6 @@ MakeInt4Column()
 	Var *int4Column = makeVar(tableId, columnAttributeNumber, columnType,
 							  columnTypeMod, columnCollationOid, columnLevelSup);
 	return int4Column;
-}
-
-
-/*
- * MakeInt4Constant creates a new constant of int4 type and assigns the given
- * value as a constant value.
- */
-Const *
-MakeInt4Constant(Datum constantValue)
-{
-	Oid constantType = INT4OID;
-	int32 constantTypeMode = -1;
-	Oid constantCollationId = InvalidOid;
-	int constantLength = sizeof(int32);
-	bool constantIsNull = false;
-	bool constantByValue = true;
-
-	Const *int4Constant = makeConst(constantType, constantTypeMode, constantCollationId,
-									constantLength, constantValue, constantIsNull,
-									constantByValue);
-	return int4Constant;
 }
 
 
@@ -3562,6 +3668,122 @@ NodeIsRangeTblRefReferenceTable(Node *node, List *rangeTableList)
 		return false;
 	}
 	return IsCitusTableType(rangeTableEntry->relid, REFERENCE_TABLE);
+}
+
+
+/*
+ * FetchEqualityAttrNumsForRTE fetches the attribute numbers from quals
+ * which have an equality operator
+ */
+List *
+FetchEqualityAttrNumsForRTE(Node *node)
+{
+	if (node == NULL)
+	{
+		return NIL;
+	}
+	if (IsA(node, List))
+	{
+		return FetchEqualityAttrNumsForList((List *) node);
+	}
+	else if (IsA(node, OpExpr))
+	{
+		return FetchEqualityAttrNumsForRTEOpExpr((OpExpr *) node);
+	}
+	else if (IsA(node, BoolExpr))
+	{
+		return FetchEqualityAttrNumsForRTEBoolExpr((BoolExpr *) node);
+	}
+	return NIL;
+}
+
+
+/*
+ * FetchEqualityAttrNumsForList fetches the attribute numbers of expression
+ * of the form "= constant" from the given node list.
+ */
+static List *
+FetchEqualityAttrNumsForList(List *nodeList)
+{
+	List *attributeNums = NIL;
+	Node *node = NULL;
+	bool hasAtLeastOneEquality = false;
+	foreach_ptr(node, nodeList)
+	{
+		List *fetchedEqualityAttrNums =
+			FetchEqualityAttrNumsForRTE(node);
+		hasAtLeastOneEquality |= list_length(fetchedEqualityAttrNums) > 0;
+		attributeNums = list_concat(attributeNums, fetchedEqualityAttrNums);
+	}
+
+	/*
+	 * the given list is in the form of AND'ed expressions
+	 * hence if we have one equality then it is enough.
+	 * E.g: dist.a = 5 AND dist.a > 10
+	 */
+	if (hasAtLeastOneEquality)
+	{
+		return attributeNums;
+	}
+	return NIL;
+}
+
+
+/*
+ * FetchEqualityAttrNumsForRTEOpExpr fetches the attribute numbers of expression
+ * of the form "= constant" from the given opExpr.
+ */
+static List *
+FetchEqualityAttrNumsForRTEOpExpr(OpExpr *opExpr)
+{
+	if (!OperatorImplementsEquality(opExpr->opno))
+	{
+		return NIL;
+	}
+
+	List *attributeNums = NIL;
+	Var *var = NULL;
+	if (VarConstOpExprClause(opExpr, &var, NULL))
+	{
+		attributeNums = lappend_int(attributeNums, var->varattno);
+	}
+	return attributeNums;
+}
+
+
+/*
+ * FetchEqualityAttrNumsForRTEBoolExpr fetches the attribute numbers of expression
+ * of the form "= constant" from the given boolExpr.
+ */
+static List *
+FetchEqualityAttrNumsForRTEBoolExpr(BoolExpr *boolExpr)
+{
+	if (boolExpr->boolop != AND_EXPR && boolExpr->boolop != OR_EXPR)
+	{
+		return NIL;
+	}
+
+	List *attributeNums = NIL;
+	bool hasEquality = true;
+	Node *arg = NULL;
+	foreach_ptr(arg, boolExpr->args)
+	{
+		List *attributeNumsInSubExpression = FetchEqualityAttrNumsForRTE(arg);
+		if (boolExpr->boolop == AND_EXPR)
+		{
+			hasEquality |= list_length(attributeNumsInSubExpression) > 0;
+		}
+		else if (boolExpr->boolop == OR_EXPR)
+		{
+			hasEquality &= list_length(attributeNumsInSubExpression) > 0;
+		}
+		attributeNums = list_concat(attributeNums, attributeNumsInSubExpression);
+	}
+	if (hasEquality)
+	{
+		return attributeNums;
+	}
+	return NIL;
 }
 
 
@@ -4289,11 +4511,10 @@ MapTaskList(MapMergeJob *mapMergeJob, List *filterTaskList)
 {
 	List *mapTaskList = NIL;
 	Query *filterQuery = mapMergeJob->job.jobQuery;
-	List *rangeTableList = filterQuery->rtable;
 	ListCell *filterTaskCell = NULL;
 	Var *partitionColumn = mapMergeJob->partitionColumn;
-	char *partitionColumnName = NULL;
 
+	uint32 partitionColumnResNo = 0;
 	List *groupClauseList = filterQuery->groupClause;
 	if (groupClauseList != NIL)
 	{
@@ -4302,29 +4523,19 @@ MapTaskList(MapMergeJob *mapMergeJob, List *filterTaskList)
 														  targetEntryList);
 		TargetEntry *groupByTargetEntry = (TargetEntry *) linitial(groupTargetEntryList);
 
-		partitionColumnName = groupByTargetEntry->resname;
+		partitionColumnResNo = groupByTargetEntry->resno;
 	}
 	else
 	{
-		TargetEntry *targetEntry = tlist_member((Expr *) partitionColumn,
-												filterQuery->targetList);
-		if (targetEntry != NULL)
-		{
-			/* targetEntry->resname may be NULL */
-			partitionColumnName = targetEntry->resname;
-		}
-
-		if (partitionColumnName == NULL)
-		{
-			partitionColumnName = ColumnName(partitionColumn, rangeTableList);
-		}
+		partitionColumnResNo = PartitionColumnIndex(partitionColumn,
+													filterQuery->targetList);
 	}
 
 	foreach(filterTaskCell, filterTaskList)
 	{
 		Task *filterTask = (Task *) lfirst(filterTaskCell);
 		StringInfo mapQueryString = CreateMapQueryString(mapMergeJob, filterTask,
-														 partitionColumnName);
+														 partitionColumnResNo);
 
 		/* convert filter query task into map task */
 		Task *mapTask = filterTask;
@@ -4339,11 +4550,39 @@ MapTaskList(MapMergeJob *mapMergeJob, List *filterTaskList)
 
 
 /*
+ * PartitionColumnIndex finds the index of the given target var.
+ */
+static int
+PartitionColumnIndex(Var *targetVar, List *targetList)
+{
+	TargetEntry *targetEntry = NULL;
+	int resNo = 1;
+	foreach_ptr(targetEntry, targetList)
+	{
+		if (IsA(targetEntry->expr, Var))
+		{
+			Var *candidateVar = (Var *) targetEntry->expr;
+			if (candidateVar->varattno == targetVar->varattno &&
+				candidateVar->varno == targetVar->varno)
+			{
+				return resNo;
+			}
+			resNo++;
+		}
+	}
+
+	ereport(ERROR, (errmsg("unexpected state: %d varno %d varattno couldn't be found",
+						   targetVar->varno, targetVar->varattno)));
+	return resNo;
+}
+
+
+/*
  * CreateMapQueryString creates and returns the map query string for the given filterTask.
  */
 static StringInfo
 CreateMapQueryString(MapMergeJob *mapMergeJob, Task *filterTask,
-					 char *partitionColumnName)
+					 uint32 partitionColumnIndex)
 {
 	uint64 jobId = filterTask->jobId;
 	uint32 taskId = filterTask->taskId;
@@ -4389,8 +4628,9 @@ CreateMapQueryString(MapMergeJob *mapMergeJob, Task *filterTask,
 		partitionCommand = HASH_PARTITION_COMMAND;
 	}
 
+	char *partitionColumnIndextText = ConvertIntToString(partitionColumnIndex);
 	appendStringInfo(mapQueryString, partitionCommand, jobId, taskId,
-					 filterQueryEscapedText, partitionColumnName,
+					 filterQueryEscapedText, partitionColumnIndextText,
 					 partitionColumnTypeFullName, splitPointString->data);
 	return mapQueryString;
 }
@@ -4483,40 +4723,6 @@ RowModifyLevelForQuery(Query *query)
 	}
 
 	return ROW_MODIFY_NONE;
-}
-
-
-/*
- * ColumnName resolves the given column's name. The given column could belong to
- * a regular table or to an intermediate table formed to execute a distributed
- * query.
- */
-static char *
-ColumnName(Var *column, List *rangeTableList)
-{
-	char *columnName = NULL;
-	Index tableId = column->varno;
-	AttrNumber columnNumber = column->varattno;
-	RangeTblEntry *rangeTableEntry = rt_fetch(tableId, rangeTableList);
-
-	CitusRTEKind rangeTableKind = GetRangeTblKind(rangeTableEntry);
-	if (rangeTableKind == CITUS_RTE_REMOTE_QUERY)
-	{
-		Alias *referenceNames = rangeTableEntry->eref;
-		List *columnNameList = referenceNames->colnames;
-		int columnIndex = columnNumber - 1;
-
-		Value *columnValue = (Value *) list_nth(columnNameList, columnIndex);
-		columnName = strVal(columnValue);
-	}
-	else if (rangeTableKind == CITUS_RTE_RELATION)
-	{
-		Oid relationId = rangeTableEntry->relid;
-		columnName = get_attname(relationId, columnNumber, false);
-	}
-
-	Assert(columnName != NULL);
-	return columnName;
 }
 
 
@@ -4934,47 +5140,6 @@ TasksEqual(const Task *a, const Task *b)
 }
 
 
-/*
- * TaskListAppendUnique returns a list that contains the elements of the
- * input task list and appends the input task parameter if it doesn't already
- * exists the list.
- */
-List *
-TaskListAppendUnique(List *list, Task *task)
-{
-	if (TaskListMember(list, task))
-	{
-		return list;
-	}
-
-	return lappend(list, task);
-}
-
-
-/*
- * TaskListConcatUnique append to list1 each member of list2 that isn't
- * already in list1. Whether an element is already a member of the list
- * is determined via TaskListMember().
- */
-List *
-TaskListConcatUnique(List *list1, List *list2)
-{
-	ListCell *taskCell = NULL;
-
-	foreach(taskCell, list2)
-	{
-		Task *currentTask = (Task *) lfirst(taskCell);
-
-		if (!TaskListMember(list1, currentTask))
-		{
-			list1 = lappend(list1, currentTask);
-		}
-	}
-
-	return list1;
-}
-
-
 /* Is the passed in Task a member of the list. */
 bool
 TaskListMember(const List *taskList, const Task *task)
@@ -5369,7 +5534,6 @@ ActiveShardPlacementLists(List *taskList)
 	{
 		Task *task = (Task *) lfirst(taskCell);
 		uint64 anchorShardId = task->anchorShardId;
-
 		List *shardPlacementList = ActiveShardPlacementList(anchorShardId);
 
 		/* filter out shard placements that reside in inactive nodes */
@@ -5570,7 +5734,9 @@ SetPlacementNodeMetadata(ShardPlacement *placement, WorkerNode *workerNode)
 }
 
 
-/* Helper function to compare two tasks by their taskId. */
+/*
+ * CompareTasksByTaskId is a helper function to compare two tasks by their taskId.
+ */
 int
 CompareTasksByTaskId(const void *leftElement, const void *rightElement)
 {

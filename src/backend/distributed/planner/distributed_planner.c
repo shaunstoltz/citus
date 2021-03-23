@@ -49,6 +49,7 @@
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
 #include "parser/parsetree.h"
 #include "parser/parse_type.h"
 #if PG_VERSION_NUM >= PG_VERSION_12
@@ -98,6 +99,7 @@ static PlannedStmt * FinalizeNonRouterPlan(PlannedStmt *localPlan,
 										   DistributedPlan *distributedPlan,
 										   CustomScan *customScan);
 static PlannedStmt * FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan);
+static AppendRelInfo * FindTargetAppendRelInfo(PlannerInfo *root, int relationRteIndex);
 static List * makeTargetListFromCustomScanList(List *custom_scan_tlist);
 static List * makeCustomScanTargetlistFromExistingTargetList(List *existingTargetlist);
 static int32 BlessRecordExpressionList(List *exprs);
@@ -124,6 +126,7 @@ static PlannedStmt * PlanFastPathDistributedStmt(DistributedPlanningContext *pla
 static PlannedStmt * PlanDistributedStmt(DistributedPlanningContext *planContext,
 										 int rteIdCounter);
 static RTEListProperties * GetRTEListProperties(List *rangeTableList);
+static List * TranslatedVars(PlannerInfo *root, int relationIndex);
 
 
 /* Distributed planner hook */
@@ -410,11 +413,10 @@ AdjustPartitioningForDistributedPlanning(List *rangeTableList,
 		/*
 		 * We want Postgres to behave partitioned tables as regular relations
 		 * (i.e. we do not want to expand them to their partitions). To do this
-		 * we set each distributed partitioned table's inh flag to appropriate
+		 * we set each partitioned table's inh flag to appropriate
 		 * value before and after dropping to the standart_planner.
 		 */
 		if (rangeTableEntry->rtekind == RTE_RELATION &&
-			IsCitusTable(rangeTableEntry->relid) &&
 			PartitionedTable(rangeTableEntry->relid))
 		{
 			rangeTableEntry->inh = setPartitionedTablesInherited;
@@ -615,8 +617,6 @@ CreateDistributedPlannedStmt(DistributedPlanningContext *planContext)
 {
 	uint64 planId = NextPlanId++;
 	bool hasUnresolvedParams = false;
-	JoinRestrictionContext *joinRestrictionContext =
-		planContext->plannerRestrictionContext->joinRestrictionContext;
 
 	PlannedStmt *resultPlan = NULL;
 
@@ -645,9 +645,6 @@ CreateDistributedPlannedStmt(DistributedPlanningContext *planContext)
 	{
 		hasUnresolvedParams = true;
 	}
-
-	planContext->plannerRestrictionContext->joinRestrictionContext =
-		RemoveDuplicateJoinRestrictions(joinRestrictionContext);
 
 	DistributedPlan *distributedPlan =
 		CreateDistributedPlan(planId, planContext->originalQuery, planContext->query,
@@ -1707,6 +1704,19 @@ multi_join_restriction_hook(PlannerInfo *root,
 							JoinType jointype,
 							JoinPathExtraData *extra)
 {
+	if (bms_is_empty(innerrel->relids) || bms_is_empty(outerrel->relids))
+	{
+		/*
+		 * We do not expect empty relids. Still, ignoring such JoinRestriction is
+		 * preferable for two reasons:
+		 * 1. This might be a query that doesn't rely on JoinRestrictions at all (e.g.,
+		 * local query).
+		 * 2. We cannot process them when they are empty (and likely to segfault if
+		 * we allow as-is).
+		 */
+		ereport(DEBUG1, (errmsg("Join restriction information is NULL")));
+	}
+
 	/*
 	 * Use a memory context that's guaranteed to live long enough, could be
 	 * called in a more shortly lived one (e.g. with GEQO).
@@ -1716,23 +1726,22 @@ multi_join_restriction_hook(PlannerInfo *root,
 	MemoryContext restrictionsMemoryContext = plannerRestrictionContext->memoryContext;
 	MemoryContext oldMemoryContext = MemoryContextSwitchTo(restrictionsMemoryContext);
 
-	/*
-	 * We create a copy of restrictInfoList because it may be created in a memory
-	 * context which will be deleted when we still need it, thus we create a copy
-	 * of it in our memory context.
-	 */
-	List *restrictInfoList = copyObject(extra->restrictlist);
-
 	JoinRestrictionContext *joinRestrictionContext =
 		plannerRestrictionContext->joinRestrictionContext;
 	Assert(joinRestrictionContext != NULL);
 
 	JoinRestriction *joinRestriction = palloc0(sizeof(JoinRestriction));
 	joinRestriction->joinType = jointype;
-	joinRestriction->joinRestrictInfoList = restrictInfoList;
 	joinRestriction->plannerInfo = root;
-	joinRestriction->innerrel = innerrel;
-	joinRestriction->outerrel = outerrel;
+
+	/*
+	 * We create a copy of restrictInfoList and relids because with geqo they may
+	 * be created in a memory context which will be deleted when we still need it,
+	 * thus we create a copy of it in our memory context.
+	 */
+	joinRestriction->joinRestrictInfoList = copyObject(extra->restrictlist);
+	joinRestriction->innerrelRelids = bms_copy(innerrel->relids);
+	joinRestriction->outerrelRelids = bms_copy(outerrel->relids);
 
 	joinRestrictionContext->joinRestrictionList =
 		lappend(joinRestrictionContext->joinRestrictionList, joinRestriction);
@@ -1742,8 +1751,8 @@ multi_join_restriction_hook(PlannerInfo *root,
 	 * later safely convert any semi joins in the rewritten query to inner
 	 * joins.
 	 */
-	plannerRestrictionContext->hasSemiJoin = plannerRestrictionContext->hasSemiJoin ||
-											 extra->sjinfo->jointype == JOIN_SEMI;
+	joinRestrictionContext->hasSemiJoin = joinRestrictionContext->hasSemiJoin ||
+										  extra->sjinfo->jointype == JOIN_SEMI;
 
 	MemoryContextSwitchTo(oldMemoryContext);
 }
@@ -1797,7 +1806,6 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	MemoryContext oldMemoryContext = MemoryContextSwitchTo(restrictionsMemoryContext);
 
 	bool distributedTable = IsCitusTable(rte->relid);
-	bool localTable = !distributedTable;
 
 	RelationRestriction *relationRestriction = palloc0(sizeof(RelationRestriction));
 	relationRestriction->index = restrictionIndex;
@@ -1806,15 +1814,14 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	relationRestriction->relOptInfo = relOptInfo;
 	relationRestriction->distributedRelation = distributedTable;
 	relationRestriction->plannerInfo = root;
-	relationRestriction->prunedShardIntervalList = NIL;
 
 	/* see comments on GetVarFromAssignedParam() */
 	relationRestriction->outerPlanParamsList = OuterPlanParamsList(root);
+	relationRestriction->translatedVars = TranslatedVars(root,
+														 relationRestriction->index);
 
 	RelationRestrictionContext *relationRestrictionContext =
 		plannerRestrictionContext->relationRestrictionContext;
-	relationRestrictionContext->hasDistributedRelation |= distributedTable;
-	relationRestrictionContext->hasLocalRelation |= localTable;
 
 	/*
 	 * We're also keeping track of whether all participant
@@ -1832,6 +1839,61 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 		lappend(relationRestrictionContext->relationRestrictionList, relationRestriction);
 
 	MemoryContextSwitchTo(oldMemoryContext);
+}
+
+
+/*
+ * TranslatedVars deep copies the translated vars for the given relation index
+ * if there is any append rel list.
+ */
+static List *
+TranslatedVars(PlannerInfo *root, int relationIndex)
+{
+	List *translatedVars = NIL;
+
+	if (root->append_rel_list != NIL)
+	{
+		AppendRelInfo *targetAppendRelInfo =
+			FindTargetAppendRelInfo(root, relationIndex);
+		if (targetAppendRelInfo != NULL)
+		{
+			/* postgres deletes translated_vars after pg13, hence we deep copy them here */
+			Node *targetNode = NULL;
+			foreach_ptr(targetNode, targetAppendRelInfo->translated_vars)
+			{
+				translatedVars =
+					lappend(translatedVars, copyObject(targetNode));
+			}
+		}
+	}
+	return translatedVars;
+}
+
+
+/*
+ * FindTargetAppendRelInfo finds the target append rel info for the given
+ * relation rte index.
+ */
+static AppendRelInfo *
+FindTargetAppendRelInfo(PlannerInfo *root, int relationRteIndex)
+{
+	AppendRelInfo *appendRelInfo = NULL;
+
+	/* iterate on the queries that are part of UNION ALL subselects */
+	foreach_ptr(appendRelInfo, root->append_rel_list)
+	{
+		/*
+		 * We're only interested in the child rel that is equal to the
+		 * relation we're investigating. Here we don't need to find the offset
+		 * because postgres adds an offset to child_relid and parent_relid after
+		 * calling multi_relation_restriction_hook.
+		 */
+		if (appendRelInfo->child_relid == relationRteIndex)
+		{
+			return appendRelInfo;
+		}
+	}
+	return NULL;
 }
 
 
@@ -2142,6 +2204,33 @@ CreateAndPushPlannerRestrictionContext(void)
 
 
 /*
+ * TranslatedVarsForRteIdentity gets an rteIdentity and returns the
+ * translatedVars that belong to the range table relation. If no
+ * translatedVars found, the function returns NIL;
+ */
+List *
+TranslatedVarsForRteIdentity(int rteIdentity)
+{
+	PlannerRestrictionContext *currentPlannerRestrictionContext =
+		CurrentPlannerRestrictionContext();
+
+	List *relationRestrictionList =
+		currentPlannerRestrictionContext->relationRestrictionContext->
+		relationRestrictionList;
+	RelationRestriction *relationRestriction = NULL;
+	foreach_ptr(relationRestriction, relationRestrictionList)
+	{
+		if (GetRTEIdentity(relationRestriction->rte) == rteIdentity)
+		{
+			return relationRestriction->translatedVars;
+		}
+	}
+
+	return NIL;
+}
+
+
+/*
  * CurrentRestrictionContext returns the most recently added
  * PlannerRestrictionContext from the plannerRestrictionContextList list.
  */
@@ -2289,9 +2378,38 @@ GetRTEListProperties(List *rangeTableList)
 	RangeTblEntry *rangeTableEntry = NULL;
 	foreach_ptr(rangeTableEntry, rangeTableList)
 	{
-		if (!(rangeTableEntry->rtekind == RTE_RELATION &&
-			  rangeTableEntry->relkind == RELKIND_RELATION))
+		if (rangeTableEntry->rtekind != RTE_RELATION)
 		{
+			continue;
+		}
+		else if (rangeTableEntry->relkind == RELKIND_VIEW)
+		{
+			/*
+			 * Skip over views, distributed tables within (regular) views are
+			 * already in rangeTableList.
+			 */
+			continue;
+		}
+
+
+		if (rangeTableEntry->relkind == RELKIND_MATVIEW)
+		{
+			/*
+			 * Record materialized views as they are similar to postgres local tables
+			 * but it is nice to record them separately.
+			 *
+			 * Regular tables, partitioned tables or foreign tables can be a local or
+			 * distributed tables and we can qualify them accurately.
+			 *
+			 * For regular views, we don't care because their definitions are already
+			 * in the same query tree and we can detect what is inside the view definition.
+			 *
+			 * For materialized views, they are just local tables in the queries. But, when
+			 * REFRESH MATERIALIZED VIEW is used, they behave similar to regular views, adds
+			 * the view definition to the query. Hence, it is useful to record it seperately
+			 * and let the callers decide on what to do.
+			 */
+			rteListProperties->hasMaterializedView = true;
 			continue;
 		}
 

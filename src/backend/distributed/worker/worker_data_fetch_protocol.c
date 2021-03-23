@@ -396,8 +396,8 @@ worker_apply_shard_ddl_command(PG_FUNCTION_ARGS)
 
 	/* extend names in ddl command and apply extended command */
 	RelayEventExtendNames(ddlCommandNode, schemaName, shardId);
-	CitusProcessUtility(ddlCommandNode, ddlCommand, PROCESS_UTILITY_TOPLEVEL, NULL,
-						None_Receiver, NULL);
+	ProcessUtilityParseTree(ddlCommandNode, ddlCommand, PROCESS_UTILITY_QUERY, NULL,
+							None_Receiver, NULL);
 
 	PG_RETURN_VOID();
 }
@@ -428,8 +428,8 @@ worker_apply_inter_shard_ddl_command(PG_FUNCTION_ARGS)
 	RelayEventExtendNamesForInterShardCommands(ddlCommandNode, leftShardId,
 											   leftShardSchemaName, rightShardId,
 											   rightShardSchemaName);
-	CitusProcessUtility(ddlCommandNode, ddlCommand, PROCESS_UTILITY_TOPLEVEL, NULL,
-						None_Receiver, NULL);
+	ProcessUtilityParseTree(ddlCommandNode, ddlCommand, PROCESS_UTILITY_QUERY, NULL,
+							None_Receiver, NULL);
 
 	PG_RETURN_VOID();
 }
@@ -461,8 +461,8 @@ worker_apply_sequence_command(PG_FUNCTION_ARGS)
 	}
 
 	/* run the CREATE SEQUENCE command */
-	CitusProcessUtility(commandNode, commandString, PROCESS_UTILITY_TOPLEVEL, NULL,
-						None_Receiver, NULL);
+	ProcessUtilityParseTree(commandNode, commandString, PROCESS_UTILITY_QUERY, NULL,
+							None_Receiver, NULL);
 	CommandCounterIncrement();
 
 	CreateSeqStmt *createSequenceStatement = (CreateSeqStmt *) commandNode;
@@ -522,32 +522,6 @@ ExtractShardIdFromTableName(const char *tableName, bool missingOk)
 	}
 
 	return shardId;
-}
-
-
-/*
- * TableDDLCommandList takes in the given table name, and fetches the list of
- * DDL commands used in creating the table. If an error occurs during fetching,
- * the function returns an empty list.
- */
-List *
-TableDDLCommandList(const char *nodeName, uint32 nodePort, const char *tableName)
-{
-	PGresult *result = NULL;
-	uint32 connectionFlag = FORCE_NEW_CONNECTION;
-
-	StringInfo queryString = makeStringInfo();
-	appendStringInfo(queryString, GET_TABLE_DDL_EVENTS, tableName);
-	MultiConnection *connection = GetNodeConnection(connectionFlag, nodeName, nodePort);
-
-	ExecuteOptionalRemoteCommand(connection, queryString->data, &result);
-	List *ddlCommandList = ReadFirstColumnAsText(result);
-
-	PQclear(result);
-	ForgetResults(connection);
-	CloseConnection(connection);
-
-	return ddlCommandList;
 }
 
 
@@ -694,8 +668,8 @@ worker_append_table_to_shard(PG_FUNCTION_ARGS)
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
-	CitusProcessUtility((Node *) localCopyCommand, queryString->data,
-						PROCESS_UTILITY_TOPLEVEL, NULL, None_Receiver, NULL);
+	ProcessUtilityParseTree((Node *) localCopyCommand, queryString->data,
+							PROCESS_UTILITY_QUERY, NULL, None_Receiver, NULL);
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
@@ -807,8 +781,8 @@ AlterSequenceMinMax(Oid sequenceId, char *schemaName, char *sequenceName,
 		SetDefElemArg(alterSequenceStatement, "restart", startFloatArg);
 
 		/* since the command is an AlterSeqStmt, a dummy command string works fine */
-		CitusProcessUtility((Node *) alterSequenceStatement, dummyString,
-							PROCESS_UTILITY_TOPLEVEL, NULL, None_Receiver, NULL);
+		ProcessUtilityParseTree((Node *) alterSequenceStatement, dummyString,
+								PROCESS_UTILITY_QUERY, NULL, None_Receiver, NULL);
 	}
 }
 

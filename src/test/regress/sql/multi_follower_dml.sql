@@ -9,7 +9,7 @@ CREATE TABLE reference_table (a int, b int, z bigserial);
 SELECT create_reference_table('reference_table');
 
 CREATE TABLE citus_local_table (a int, b int, z bigserial);
-SELECT create_citus_local_table('citus_local_table');
+SELECT citus_add_local_table_to_metadata('citus_local_table');
 
 CREATE TABLE local (a int, b int);
 
@@ -151,7 +151,7 @@ SELECT * FROM reference_table ORDER BY a;
 INSERT INTO citus_local_table (a, b, z) VALUES (1, 2, 3);
 SELECT * FROM citus_local_table ORDER BY a;
 
-\c - - - :master_port
+\c -reuse-previous=off regression - - :master_port
 DROP TABLE the_table;
 DROP TABLE reference_table;
 DROP TABLE citus_local_table;

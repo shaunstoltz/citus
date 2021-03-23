@@ -668,19 +668,20 @@ SELECT * FROM raw_data ORDER BY val;
 ---------------------------------------------------------------------
 (0 rows)
 
--- Test that local tables are barred
+-- Test that local tables are can be updated
+-- selecting from distributed tables
 UPDATE local_table lt SET val = mt.val
 FROM modify_table mt WHERE mt.id = lt.id;
-ERROR:  cannot plan modifications with local tables involving citus tables
-HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 -- Including inside CTEs
 WITH cte AS (
 	UPDATE local_table lt SET val = mt.val
 	FROM modify_table mt WHERE mt.id = lt.id
 	RETURNING lt.id, lt.val
 ) SELECT * FROM cte JOIN modify_table mt ON mt.id = cte.id ORDER BY 1,2;
-ERROR:  cannot plan modifications with local tables involving citus tables
-HINT:  Use CTE's or subqueries to select from local tables and use them in joins
+ id | val | id | val
+---------------------------------------------------------------------
+(0 rows)
+
 -- Make sure checks for volatile functions apply to CTEs too
 WITH cte AS (UPDATE modify_table SET val = random() WHERE id = 3 RETURNING *)
 SELECT * FROM cte JOIN modify_table mt ON mt.id = 3 AND mt.id = cte.id ORDER BY 1,2;
@@ -821,6 +822,69 @@ EXECUTE olu(1,ARRAY[1,2],ARRAY[1,2]);
  {1}       | {1}       | {NULL}
 (1 row)
 
+-- test insert query with insert CTE
+WITH insert_cte AS
+       (INSERT INTO with_modifying.modify_table VALUES (23, 7))
+INSERT INTO with_modifying.anchor_table VALUES (1998);
+SELECT * FROM with_modifying.modify_table WHERE id = 23 AND val = 7;
+ id | val
+---------------------------------------------------------------------
+ 23 |   7
+(1 row)
+
+SELECT * FROM with_modifying.anchor_table WHERE id = 1998;
+  id
+---------------------------------------------------------------------
+ 1998
+(1 row)
+
+-- test insert query with multiple CTEs
+WITH select_cte AS (SELECT * FROM with_modifying.anchor_table),
+       modifying_cte AS (INSERT INTO with_modifying.anchor_table SELECT * FROM select_cte)
+INSERT INTO with_modifying.anchor_table VALUES (1995);
+SELECT * FROM with_modifying.anchor_table ORDER BY 1;
+  id
+---------------------------------------------------------------------
+    1
+    1
+    2
+    2
+ 1995
+ 1998
+ 1998
+(7 rows)
+
+-- test with returning
+WITH returning_cte AS (INSERT INTO with_modifying.anchor_table values (1997) RETURNING *)
+INSERT INTO with_modifying.anchor_table VALUES (1996);
+SELECT * FROM with_modifying.anchor_table WHERE id IN (1996, 1997) ORDER BY 1;
+  id
+---------------------------------------------------------------------
+ 1996
+ 1997
+(2 rows)
+
+-- test insert query with select CTE
+WITH select_cte AS
+       (SELECT * FROM with_modifying.modify_table)
+INSERT INTO with_modifying.anchor_table VALUES (1990);
+SELECT * FROM with_modifying.anchor_table WHERE id = 1990;
+  id
+---------------------------------------------------------------------
+ 1990
+(1 row)
+
+-- even if we do multi-row insert, it is not fast path router due to cte
+WITH select_cte AS (SELECT 1 AS col)
+INSERT INTO with_modifying.anchor_table VALUES (1991), (1992);
+SELECT * FROM with_modifying.anchor_table WHERE id IN (1991, 1992) ORDER BY 1;
+  id
+---------------------------------------------------------------------
+ 1991
+ 1992
+(2 rows)
+
+DELETE FROM with_modifying.anchor_table WHERE id IN (1990, 1991, 1992, 1995, 1996, 1997, 1998);
 -- Test with replication factor 2
 SET citus.shard_replication_factor to 2;
 DROP TABLE modify_table;

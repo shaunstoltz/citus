@@ -68,6 +68,7 @@
 /* Config variables that enable printing distributed query plans */
 bool ExplainDistributedQueries = true;
 bool ExplainAllTasks = false;
+int ExplainAnalyzeSortMethod = EXPLAIN_ANALYZE_SORT_BY_TIME;
 
 /*
  * If enabled, EXPLAIN ANALYZE output & other statistics of last worker task
@@ -82,6 +83,7 @@ typedef struct
 	bool verbose;
 	bool costs;
 	bool buffers;
+	bool wal;
 	bool timing;
 	bool summary;
 	ExplainFormat format;
@@ -90,7 +92,7 @@ typedef struct
 
 /* EXPLAIN flags of current distributed explain */
 static ExplainOptions CurrentDistributedQueryExplainOptions = {
-	0, 0, 0, 0, 0, EXPLAIN_FORMAT_TEXT
+	0, 0, 0, 0, 0, 0, EXPLAIN_FORMAT_TEXT
 };
 
 /* Result for a single remote EXPLAIN command */
@@ -151,7 +153,7 @@ static void ExplainAnalyzeDestPutTuple(TupleDestination *self, Task *task,
 static TupleDesc ExplainAnalyzeDestTupleDescForQuery(TupleDestination *self, int
 													 queryNumber);
 static char * WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc);
-static List * SplitString(const char *str, char delimiter);
+static List * SplitString(const char *str, char delimiter, int maxLength);
 
 /* Static Explain functions copied from explain.c */
 static void ExplainOneQuery(Query *query, int cursorOptions,
@@ -529,8 +531,34 @@ ExplainMapMergeJob(MapMergeJob *mapMergeJob, ExplainState *es)
 
 
 /*
- * ExplainTaskList shows the remote EXPLAIN for the first task in taskList,
- * or all tasks if citus.explain_all_tasks is on.
+ * CompareTasksByFetchedExplainAnalyzeDuration is a helper function to compare two tasks by their execution duration.
+ */
+static int
+CompareTasksByFetchedExplainAnalyzeDuration(const void *leftElement, const
+											void *rightElement)
+{
+	const Task *leftTask = *((const Task **) leftElement);
+	const Task *rightTask = *((const Task **) rightElement);
+
+	double leftTaskExecutionDuration = leftTask->fetchedExplainAnalyzeExecutionDuration;
+	double rightTaskExecutionDuration = rightTask->fetchedExplainAnalyzeExecutionDuration;
+
+	double diff = leftTaskExecutionDuration - rightTaskExecutionDuration;
+	if (diff > 0)
+	{
+		return -1;
+	}
+	else if (diff < 0)
+	{
+		return 1;
+	}
+	return 0;
+}
+
+
+/*
+ * ExplainTaskList shows the remote EXPLAIN and execution time for the first task
+ * in taskList, or all tasks if citus.explain_all_tasks is on.
  */
 static void
 ExplainTaskList(CitusScanState *scanState, List *taskList, ExplainState *es,
@@ -540,8 +568,17 @@ ExplainTaskList(CitusScanState *scanState, List *taskList, ExplainState *es,
 	ListCell *remoteExplainCell = NULL;
 	List *remoteExplainList = NIL;
 
-	/* make sure that the output is consistent */
-	taskList = SortList(taskList, CompareTasksByTaskId);
+	/* if tasks are executed, we sort them by time; unless we are on a test env */
+	if (es->analyze && ExplainAnalyzeSortMethod == EXPLAIN_ANALYZE_SORT_BY_TIME)
+	{
+		/* sort by execution duration only in case of ANALYZE */
+		taskList = SortList(taskList, CompareTasksByFetchedExplainAnalyzeDuration);
+	}
+	else
+	{
+		/* make sure that the output is consistent */
+		taskList = SortList(taskList, CompareTasksByTaskId);
+	}
 
 	foreach(taskCell, taskList)
 	{
@@ -605,8 +642,11 @@ GetSavedRemoteExplain(Task *task, ExplainState *es)
 	 */
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
+		/*
+		 * We limit the size of EXPLAIN plans to RSIZE_MAX_MEM (256MB).
+		 */
 		remotePlan->explainOutputList = SplitString(task->fetchedExplainAnalyzePlan,
-													'\n');
+													'\n', RSIZE_MAX_MEM);
 	}
 	else
 	{
@@ -865,12 +905,18 @@ BuildRemoteExplainQuery(char *queryString, ExplainState *es)
 
 	appendStringInfo(explainQuery,
 					 "EXPLAIN (ANALYZE %s, VERBOSE %s, "
-					 "COSTS %s, BUFFERS %s, TIMING %s, SUMMARY %s, "
-					 "FORMAT %s) %s",
+					 "COSTS %s, BUFFERS %s, "
+#if PG_VERSION_NUM >= PG_VERSION_13
+					 "WAL %s, "
+#endif
+					 "TIMING %s, SUMMARY %s, FORMAT %s) %s",
 					 es->analyze ? "TRUE" : "FALSE",
 					 es->verbose ? "TRUE" : "FALSE",
 					 es->costs ? "TRUE" : "FALSE",
 					 es->buffers ? "TRUE" : "FALSE",
+#if PG_VERSION_NUM >= PG_VERSION_13
+					 es->wal ? "TRUE" : "FALSE",
+#endif
 					 es->timing ? "TRUE" : "FALSE",
 					 es->summary ? "TRUE" : "FALSE",
 					 formatStr,
@@ -966,6 +1012,9 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 
 	/* use the same defaults as NewExplainState() for following options */
 	es->buffers = ExtractFieldBoolean(explainOptions, "buffers", es->buffers);
+#if PG_VERSION_NUM >= PG_VERSION_13
+	es->wal = ExtractFieldBoolean(explainOptions, "wal", es->wal);
+#endif
 	es->costs = ExtractFieldBoolean(explainOptions, "costs", es->costs);
 	es->summary = ExtractFieldBoolean(explainOptions, "summary", es->summary);
 	es->verbose = ExtractFieldBoolean(explainOptions, "verbose", es->verbose);
@@ -1014,7 +1063,7 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 
 	INSTR_TIME_SET_CURRENT(planStart);
 
-	PlannedStmt *plan = pg_plan_query_compat(query, NULL, 0, NULL);
+	PlannedStmt *plan = pg_plan_query_compat(query, NULL, CURSOR_OPT_PARALLEL_OK, NULL);
 
 	INSTR_TIME_SET_CURRENT(planDuration);
 	INSTR_TIME_SUBTRACT(planDuration, planStart);
@@ -1167,6 +1216,9 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	/* save the flags of current EXPLAIN command */
 	CurrentDistributedQueryExplainOptions.costs = es->costs;
 	CurrentDistributedQueryExplainOptions.buffers = es->buffers;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	CurrentDistributedQueryExplainOptions.wal = es->wal;
+#endif
 	CurrentDistributedQueryExplainOptions.verbose = es->verbose;
 	CurrentDistributedQueryExplainOptions.summary = es->summary;
 	CurrentDistributedQueryExplainOptions.timing = es->timing;
@@ -1222,13 +1274,15 @@ CreateExplainAnlyzeDestination(Task *task, TupleDestination *taskDest)
 	tupleDestination->originalTaskDestination = taskDest;
 
 #if PG_VERSION_NUM >= PG_VERSION_12
-	TupleDesc lastSavedExplainAnalyzeTupDesc = CreateTemplateTupleDesc(1);
+	TupleDesc lastSavedExplainAnalyzeTupDesc = CreateTemplateTupleDesc(2);
 #else
-	TupleDesc lastSavedExplainAnalyzeTupDesc = CreateTemplateTupleDesc(1, false);
+	TupleDesc lastSavedExplainAnalyzeTupDesc = CreateTemplateTupleDesc(2, false);
 #endif
 
 	TupleDescInitEntry(lastSavedExplainAnalyzeTupDesc, 1, "explain analyze", TEXTOID, 0,
 					   0);
+	TupleDescInitEntry(lastSavedExplainAnalyzeTupDesc, 2, "duration", FLOAT8OID, 0, 0);
+
 	tupleDestination->lastSavedExplainAnalyzeTupDesc = lastSavedExplainAnalyzeTupDesc;
 
 	tupleDestination->pub.putTuple = ExplainAnalyzeDestPutTuple;
@@ -1268,7 +1322,16 @@ ExplainAnalyzeDestPutTuple(TupleDestination *self, Task *task,
 			return;
 		}
 
+		Datum executionDuration = heap_getattr(heapTuple, 2, tupDesc, &isNull);
+
+		if (isNull)
+		{
+			ereport(WARNING, (errmsg("received null execution time from worker")));
+			return;
+		}
+
 		char *fetchedExplainAnalyzePlan = TextDatumGetCString(explainAnalyze);
+		double fetchedExplainAnalyzeExecutionDuration = DatumGetFloat8(executionDuration);
 
 		/*
 		 * Allocate fetchedExplainAnalyzePlan in the same context as the Task, since we are
@@ -1278,7 +1341,7 @@ ExplainAnalyzeDestPutTuple(TupleDestination *self, Task *task,
 		 * calls to CheckNodeCopyAndSerialization() which asserts copy functions of the task
 		 * work as expected, which will try to copy this value in a future execution.
 		 *
-		 * Why we don't we just allocate this field in executor context and reset it before
+		 * Why don't we just allocate this field in executor context and reset it before
 		 * the next execution? Because when an error is raised we can skip pretty much most
 		 * of the meaningful places that we can insert the reset.
 		 *
@@ -1292,6 +1355,8 @@ ExplainAnalyzeDestPutTuple(TupleDestination *self, Task *task,
 			MemoryContextStrdup(taskContext, fetchedExplainAnalyzePlan);
 		tupleDestination->originalTask->fetchedExplainAnalyzePlacementIndex =
 			placementIndex;
+		tupleDestination->originalTask->fetchedExplainAnalyzeExecutionDuration =
+			fetchedExplainAnalyzeExecutionDuration;
 	}
 	else
 	{
@@ -1382,7 +1447,7 @@ ExplainAnalyzeTaskList(List *originalTaskList,
 		const char *queryString = TaskQueryString(explainAnalyzeTask);
 		char *wrappedQuery = WrapQueryForExplainAnalyze(queryString, tupleDesc);
 		char *fetchQuery =
-			"SELECT explain_analyze_output FROM worker_last_saved_explain_analyze()";
+			"SELECT explain_analyze_output, execution_duration FROM worker_last_saved_explain_analyze()";
 		SetTaskQueryStringList(explainAnalyzeTask, list_make2(wrappedQuery, fetchQuery));
 
 		TupleDestination *originalTaskDest = originalTask->tupleDest ?
@@ -1430,18 +1495,33 @@ WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
 	}
 
 	StringInfo explainOptions = makeStringInfo();
-	appendStringInfo(explainOptions, "{\"verbose\": %s, \"costs\": %s, \"buffers\": %s, "
-									 "\"timing\": %s, \"summary\": %s, \"format\": \"%s\"}",
+	appendStringInfo(explainOptions,
+					 "{\"verbose\": %s, \"costs\": %s, \"buffers\": %s, "
+#if PG_VERSION_NUM >= PG_VERSION_13
+					 "\"wal\": %s, "
+#endif
+					 "\"timing\": %s, \"summary\": %s, \"format\": \"%s\"}",
 					 CurrentDistributedQueryExplainOptions.verbose ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.costs ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.buffers ? "true" : "false",
+#if PG_VERSION_NUM >= PG_VERSION_13
+					 CurrentDistributedQueryExplainOptions.wal ? "true" : "false",
+#endif
 					 CurrentDistributedQueryExplainOptions.timing ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.summary ? "true" : "false",
 					 ExplainFormatStr(CurrentDistributedQueryExplainOptions.format));
 
 	StringInfo wrappedQuery = makeStringInfo();
+
+	/*
+	 * We do not include dummy column if original query didn't return any columns.
+	 * Otherwise, number of columns that original query returned wouldn't match
+	 * number of columns returned by worker_save_query_explain_analyze.
+	 */
+	char *workerSaveQueryFetchCols = (tupleDesc->natts == 0) ? "" : "*";
 	appendStringInfo(wrappedQuery,
-					 "SELECT * FROM worker_save_query_explain_analyze(%s, %s) AS (%s)",
+					 "SELECT %s FROM worker_save_query_explain_analyze(%s, %s) AS (%s)",
+					 workerSaveQueryFetchCols,
 					 quote_literal_cstr(queryString),
 					 quote_literal_cstr(explainOptions->data),
 					 columnDef->data);
@@ -1459,9 +1539,9 @@ WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
  * it isn't safe if by any chance str is not null-terminated.
  */
 static List *
-SplitString(const char *str, char delimiter)
+SplitString(const char *str, char delimiter, int maxLength)
 {
-	size_t len = strnlen_s(str, RSIZE_MAX_STR);
+	size_t len = strnlen(str, maxLength);
 	if (len == 0)
 	{
 		return NIL;
@@ -1580,7 +1660,10 @@ ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es
 
 	if (es->buffers)
 		instrument_option |= INSTRUMENT_BUFFERS;
-
+#if PG_VERSION_NUM >= PG_VERSION_13
+	if (es->wal)
+		instrument_option |= INSTRUMENT_WAL;
+#endif
 	/*
 	 * We always collect timing for the entire statement, even when node-level
 	 * timing is off, so we don't look at es->timing here.  (We could skip

@@ -24,7 +24,6 @@
 /* Control flags for FormatCollateExtended, compatible with format_type_extended */
 #define FORMAT_COLLATE_ALLOW_INVALID 0x02       /* allow invalid types */
 #define FORMAT_COLLATE_FORCE_QUALIFY 0x04       /* force qualification of collate */
-extern char * FormatCollateBE(Oid collate_oid);
 extern char * FormatCollateBEQualified(Oid collate_oid);
 extern char * FormatCollateExtended(Oid collid, bits16 flags);
 
@@ -54,6 +53,22 @@ extern void QualifyAlterTableSchemaStmt(Node *stmt);
 
 /* forward declarations for deparse_schema_stmts.c */
 extern char * DeparseGrantOnSchemaStmt(Node *stmt);
+extern char * DeparseAlterSchemaRenameStmt(Node *stmt);
+
+/* forward declarations for deparse_statistics_stmts.c */
+extern char * DeparseCreateStatisticsStmt(Node *node);
+extern char * DeparseDropStatisticsStmt(List *nameList, bool ifExists);
+extern char * DeparseAlterStatisticsRenameStmt(Node *node);
+extern char * DeparseAlterStatisticsSchemaStmt(Node *node);
+extern char * DeparseAlterStatisticsStmt(Node *node);
+extern char * DeparseAlterStatisticsOwnerStmt(Node *node);
+
+extern void QualifyCreateStatisticsStmt(Node *node);
+extern void QualifyDropStatisticsStmt(Node *node);
+extern void QualifyAlterStatisticsRenameStmt(Node *node);
+extern void QualifyAlterStatisticsSchemaStmt(Node *node);
+extern void QualifyAlterStatisticsStmt(Node *node);
+extern void QualifyAlterStatisticsOwnerStmt(Node *node);
 
 /* forward declarations for deparse_type_stmts.c */
 extern char * DeparseCompositeTypeStmt(Node *stmt);

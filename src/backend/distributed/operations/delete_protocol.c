@@ -95,6 +95,7 @@ static char * CreateDropShardPlacementCommand(const char *schemaName,
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_apply_delete_command);
+PG_FUNCTION_INFO_V1(citus_drop_all_shards);
 PG_FUNCTION_INFO_V1(master_drop_all_shards);
 PG_FUNCTION_INFO_V1(master_drop_sequences);
 
@@ -176,7 +177,7 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot delete from table"),
-						errdetail("Delete statements on reference and citus "
+						errdetail("Delete statements on reference and "
 								  "local tables are not supported.")));
 	}
 
@@ -207,12 +208,12 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 
 
 /*
- * master_drop_all_shards attempts to drop all shards for a given relation.
+ * citus_drop_all_shards attempts to drop all shards for a given relation.
  * Unlike master_apply_delete_command, this function can be called even
  * if the table has already been dropped.
  */
 Datum
-master_drop_all_shards(PG_FUNCTION_ARGS)
+citus_drop_all_shards(PG_FUNCTION_ARGS)
 {
 	Oid relationId = PG_GETARG_OID(0);
 	text *schemaNameText = PG_GETARG_TEXT_P(1);
@@ -236,7 +237,7 @@ master_drop_all_shards(PG_FUNCTION_ARGS)
 	CheckTableSchemaNameForDrop(relationId, &schemaName, &relationName);
 
 	/*
-	 * master_drop_all_shards is typically called from the DROP TABLE trigger,
+	 * citus_drop_all_shards is typically called from the DROP TABLE trigger,
 	 * but could be called by a user directly. Make sure we have an
 	 * AccessExclusiveLock to prevent any other commands from running on this table
 	 * concurrently.
@@ -252,86 +253,25 @@ master_drop_all_shards(PG_FUNCTION_ARGS)
 
 
 /*
- * master_drop_sequences attempts to drop a list of sequences on worker nodes.
- * The "IF EXISTS" clause is used to permit dropping sequences even if they may not
- * exist. If the commands fail on the workers, the operation is rolled back.
- * If ddl propagation (citus.enable_ddl_propagation) is set to off, then the function
- * returns without doing anything.
+ * master_drop_all_shards is a wrapper function for old UDF name.
+ */
+Datum
+master_drop_all_shards(PG_FUNCTION_ARGS)
+{
+	return citus_drop_all_shards(fcinfo);
+}
+
+
+/*
+ * master_drop_sequences was previously used to drop sequences on workers
+ * when using metadata syncing.
+ *
+ * It may still be called when dropping objects during CREATE EXTENSION,
+ * hence the function remains in place.
  */
 Datum
 master_drop_sequences(PG_FUNCTION_ARGS)
 {
-	ArrayType *sequenceNamesArray = PG_GETARG_ARRAYTYPE_P(0);
-	Datum sequenceNameDatum = 0;
-	bool isNull = false;
-	StringInfo dropSeqCommand = makeStringInfo();
-
-	if (!CitusHasBeenLoaded())
-	{
-		/* ignore calls during CREATE EXTENSION citus */
-		PG_RETURN_VOID();
-	}
-
-	CheckCitusVersion(ERROR);
-
-	/*
-	 * Do nothing if DDL propagation is switched off or we're not on
-	 * the coordinator. Here we prefer to not error out on the workers
-	 * because this function is called on every dropped sequence and
-	 * we don't want to mess up the sequences that are not associated
-	 * with distributed tables.
-	 */
-	if (!EnableDDLPropagation || !IsCoordinator())
-	{
-		PG_RETURN_VOID();
-	}
-
-	/* iterate over sequence names to build single command to DROP them all */
-	ArrayIterator sequenceIterator = array_create_iterator(sequenceNamesArray, 0, NULL);
-	while (array_iterate(sequenceIterator, &sequenceNameDatum, &isNull))
-	{
-		if (isNull)
-		{
-			ereport(ERROR, (errmsg("unexpected NULL sequence name"),
-							errcode(ERRCODE_INVALID_PARAMETER_VALUE)));
-		}
-
-		text *sequenceNameText = DatumGetTextP(sequenceNameDatum);
-		Oid sequenceOid = ResolveRelationId(sequenceNameText, true);
-		if (OidIsValid(sequenceOid))
-		{
-			/*
-			 * This case (e.g., OID is valid) could only happen when a user manually calls
-			 * the UDF. So, ensure that the user has right to drop the sequence.
-			 *
-			 * In case the UDF is called via the DROP trigger, the OID wouldn't be valid since
-			 * the trigger is called after DROP happens.
-			 */
-			EnsureSequenceOwner(sequenceOid);
-		}
-
-		/* append command portion if we haven't added any sequence names yet */
-		if (dropSeqCommand->len == 0)
-		{
-			appendStringInfoString(dropSeqCommand, "DROP SEQUENCE IF EXISTS");
-		}
-		else
-		{
-			/* otherwise, add a comma to separate subsequent sequence names */
-			appendStringInfoChar(dropSeqCommand, ',');
-		}
-
-		appendStringInfo(dropSeqCommand, " %s", TextDatumGetCString(sequenceNameText));
-	}
-
-	if (dropSeqCommand->len != 0)
-	{
-		appendStringInfoString(dropSeqCommand, " CASCADE");
-
-		SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
-		SendCommandToWorkersWithMetadata(dropSeqCommand->data);
-	}
-
 	PG_RETURN_VOID();
 }
 
@@ -392,7 +332,7 @@ DropShards(Oid relationId, char *schemaName, char *relationName,
 	 */
 	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
 	{
-		CoordinatedTransactionUse2PC();
+		CoordinatedTransactionShouldUse2PC();
 	}
 
 	List *dropTaskList = DropTaskList(relationId, schemaName, relationName,

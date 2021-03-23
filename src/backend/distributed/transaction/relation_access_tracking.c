@@ -6,7 +6,7 @@
  *   are intended to track the relation accesses within a transaction. The
  *   logic here is mostly useful when a reference table is referred by
  *   a distributed table via a foreign key. Whenever such a pair of tables
- *   are acccesed inside a transaction, Citus should detect and act
+ *   are accessed inside a transaction, Citus should detect and act
  *   accordingly.
  *
  * Copyright (c) Citus Data, Inc.
@@ -772,7 +772,7 @@ CheckConflictingRelationAccesses(Oid relationId, ShardPlacementAccessType access
 								   "a parallel operation on a distributed table",
 								   relationName),
 							errdetail("When there is a foreign key to a reference "
-									  "table or to a citus local table, Citus needs "
+									  "table or to a local table, Citus needs "
 									  "to perform all operations over a single "
 									  "connection per node to ensure consistency."),
 							errhint("Try re-running the transaction with "
@@ -798,7 +798,7 @@ CheckConflictingRelationAccesses(Oid relationId, ShardPlacementAccessType access
 			/*
 			 * Switching to sequential mode is admittedly confusing and, could be useless
 			 * and less performant in some cases. However, if we do not switch to
-			 * sequential mode at this point, we'd loose the opportunity to do so
+			 * sequential mode at this point, we'd lose the opportunity to do so
 			 * later when a parallel query is executed on the hash distributed relations
 			 * that are referencing this reference table.
 			 */

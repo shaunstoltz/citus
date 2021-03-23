@@ -312,8 +312,7 @@ NodeTryGetRteRelid(Node *node)
 
 	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
 
-	if (!(rangeTableEntry->rtekind == RTE_RELATION &&
-		  rangeTableEntry->relkind == RELKIND_RELATION))
+	if (rangeTableEntry->rtekind != RTE_RELATION)
 	{
 		return InvalidOid;
 	}
@@ -335,14 +334,19 @@ IsCitusTableRTE(Node *node)
 
 
 /*
- * IsPostgresLocalTableRte gets a node and returns true if the node is a
- * range table relation entry that points to a postgres local table.
+ * IsDistributedOrReferenceTableRTE returns true if the given node
+ * is eeither a distributed(hash/range/append) or reference table.
  */
 bool
-IsPostgresLocalTableRte(Node *node)
+IsDistributedOrReferenceTableRTE(Node *node)
 {
 	Oid relationId = NodeTryGetRteRelid(node);
-	return OidIsValid(relationId) && !IsCitusTable(relationId);
+	if (!OidIsValid(relationId))
+	{
+		return false;
+	}
+	return IsCitusTableType(relationId, DISTRIBUTED_TABLE) ||
+		   IsCitusTableType(relationId, REFERENCE_TABLE);
 }
 
 
@@ -368,18 +372,6 @@ IsReferenceTableRTE(Node *node)
 {
 	Oid relationId = NodeTryGetRteRelid(node);
 	return relationId != InvalidOid && IsCitusTableType(relationId, REFERENCE_TABLE);
-}
-
-
-/*
- * IsCitusLocalTableRTE gets a node and returns true if the node
- * is a range table relation entry that points to a citus local table.
- */
-bool
-IsCitusLocalTableRTE(Node *node)
-{
-	Oid relationId = NodeTryGetRteRelid(node);
-	return OidIsValid(relationId) && IsCitusTableType(relationId, CITUS_LOCAL_TABLE);
 }
 
 
@@ -857,18 +849,6 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 						   "equal filter on joining columns.";
 	const char *filterHint = "Consider using an equality filter on the distributed "
 							 "table's partition column.";
-
-	/*
-	 * There could be Sublinks in the target list as well. To produce better
-	 * error messages we're checking if that's the case.
-	 */
-	if (queryTree->hasSubLinks && TargetListContainsSubquery(queryTree))
-	{
-		preconditionsSatisfied = false;
-		errorMessage = "could not run distributed query with subquery outside the "
-					   "FROM, WHERE and HAVING clauses";
-		errorHint = filterHint;
-	}
 
 	if (queryTree->setOperations)
 	{
@@ -1777,6 +1757,9 @@ MultiExtendedOpNode(Query *queryTree, Query *originalQuery)
 	extendedOpNode->sortClauseList = queryTree->sortClause;
 	extendedOpNode->limitCount = queryTree->limitCount;
 	extendedOpNode->limitOffset = queryTree->limitOffset;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	extendedOpNode->limitOption = queryTree->limitOption;
+#endif
 	extendedOpNode->havingQual = queryTree->havingQual;
 	extendedOpNode->distinctClause = queryTree->distinctClause;
 	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;

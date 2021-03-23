@@ -366,26 +366,6 @@ LockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode)
 }
 
 
-/*
- * TryLockShardDistributionMetadata tries to grab a lock for distribution
- * metadata related to the specified shard, returning false if the lock
- * is currently taken. Any locks acquired using this method are released
- * at transaction end.
- */
-bool
-TryLockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode)
-{
-	LOCKTAG tag;
-	const bool sessionLock = false;
-	const bool dontWait = true;
-
-	SetLocktagForShardDistributionMetadata(shardId, &tag);
-	bool lockAcquired = LockAcquire(&tag, lockMode, sessionLock, dontWait);
-
-	return lockAcquired;
-}
-
-
 static void
 SetLocktagForShardDistributionMetadata(int64 shardId, LOCKTAG *tag)
 {
@@ -530,16 +510,17 @@ LockShardResource(uint64 shardId, LOCKMODE lockmode)
 }
 
 
-/* Releases the lock associated with the relay file fetching/DML task. */
+/* LockTransactionRecovery acquires a lock for transaction recovery */
 void
-UnlockShardResource(uint64 shardId, LOCKMODE lockmode)
+LockTransactionRecovery(LOCKMODE lockmode)
 {
 	LOCKTAG tag;
 	const bool sessionLock = false;
+	const bool dontWait = false;
 
-	SET_LOCKTAG_SHARD_RESOURCE(tag, MyDatabaseId, shardId);
+	SET_LOCKTAG_CITUS_OPERATION(tag, CITUS_TRANSACTION_RECOVERY);
 
-	LockRelease(&tag, lockmode, sessionLock);
+	(void) LockAcquire(&tag, lockmode, sessionLock, dontWait);
 }
 
 

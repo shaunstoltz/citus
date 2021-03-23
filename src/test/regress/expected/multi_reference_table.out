@@ -1198,16 +1198,10 @@ DEBUG:  performing repartitioned INSERT ... SELECT
 RESET client_min_messages;
 -- some tests for mark_tables_colocated
 -- should error out
-SELECT mark_tables_colocated('colocated_table_test_2', ARRAY['reference_table_test']);
-ERROR:  cannot colocate tables colocated_table_test_2 and reference_table_test
-DETAIL:  Replication models don't match for colocated_table_test_2 and reference_table_test.
--- should work sliently
-SELECT mark_tables_colocated('reference_table_test', ARRAY['reference_table_test_fifth']);
- mark_tables_colocated
----------------------------------------------------------------------
-
-(1 row)
-
+SELECT update_distributed_table_colocation('colocated_table_test_2', colocate_with => 'reference_table_test');
+ERROR:  relation reference_table_test should be a hash distributed table
+SELECT update_distributed_table_colocation('reference_table_test', colocate_with => 'reference_table_test_fifth');
+ERROR:  relation reference_table_test_fifth should be a hash distributed table
 -- ensure that reference tables on
 -- different queries works as expected
 CREATE SCHEMA reference_schema;
@@ -1410,7 +1404,7 @@ ALTER TABLE reference_schema.reference_table_ddl_test RENAME TO reference_table_
 -- cannot delete / drop shards from a reference table
 SELECT master_apply_delete_command('DELETE FROM reference_schema.reference_table_ddl');
 ERROR:  cannot delete from table
-DETAIL:  Delete statements on reference and citus local tables are not supported.
+DETAIL:  Delete statements on reference and local tables are not supported.
 -- cannot add shards
 SELECT master_create_empty_shard('reference_schema.reference_table_ddl');
 ERROR:  relation "reference_schema.reference_table_ddl" is a reference table
@@ -1433,10 +1427,10 @@ SELECT master_update_shard_statistics(:a_shard_id);
 
 CREATE TABLE append_reference_tmp_table (id INT);
 SELECT  master_append_table_to_shard(:a_shard_id, 'append_reference_tmp_table', 'localhost', :master_port);
-ERROR:  cannot append to shardId 1250019
-DETAIL:  We currently don't support appending to shards in hash-partitioned, reference and citus local tables
+ERROR:  cannot append to shardId xxxxxx
+DETAIL:  We currently don't support appending to shards in hash-partitioned, reference and local tables
 SELECT master_get_table_ddl_events('reference_schema.reference_table_ddl');
-                                                                           master_get_table_ddl_events
+                                                                                master_get_table_ddl_events
 ---------------------------------------------------------------------
  CREATE TABLE reference_schema.reference_table_ddl (value_2 double precision DEFAULT 25.0, value_3 text NOT NULL, value_4 timestamp without time zone, value_5 double precision)
  ALTER TABLE reference_schema.reference_table_ddl OWNER TO postgres
@@ -1611,34 +1605,31 @@ ROLLBACK;
 EXPLAIN (COSTS OFF) SELECT value_1, count(*) FROM colocated_table_test GROUP BY value_1
 HAVING (SELECT rt.value_2 FROM reference_table_test rt where rt.value_2 = 2) > 0
 ORDER BY 1;
-                                            QUERY PLAN
+                                         QUERY PLAN
 ---------------------------------------------------------------------
  Sort
    Sort Key: remote_scan.value_1
-   InitPlan 1 (returns $0)
-     ->  Function Scan on read_intermediate_result intermediate_result
-   ->  HashAggregate
-         Group Key: remote_scan.value_1
-         ->  Result
-               One-Time Filter: ($0 > '0'::double precision)
+   ->  Custom Scan (Citus Adaptive)
+         ->  Distributed Subplan XXX_1
                ->  Custom Scan (Citus Adaptive)
-                     Filter: ($0 > '0'::double precision)
-                     ->  Distributed Subplan XXX_1
-                           ->  Custom Scan (Citus Adaptive)
-                                 Task Count: 1
-                                 Tasks Shown: All
-                                 ->  Task
-                                       Node: host=localhost port=xxxxx dbname=regression
-                                       ->  Seq Scan on reference_table_test_1250000 rt
-                                             Filter: (value_2 = '2'::double precision)
-                     Task Count: 6
-                     Tasks Shown: One of 6
+                     Task Count: 1
+                     Tasks Shown: All
                      ->  Task
                            Node: host=localhost port=xxxxx dbname=regression
-                           ->  HashAggregate
-                                 Group Key: colocated_table_test.value_1
-                                 ->  Seq Scan on colocated_table_test_1250005 colocated_table_test
-(25 rows)
+                           ->  Seq Scan on reference_table_test_1250000 rt
+                                 Filter: (value_2 = '2'::double precision)
+         Task Count: 6
+         Tasks Shown: One of 6
+         ->  Task
+               Node: host=localhost port=xxxxx dbname=regression
+               ->  HashAggregate
+                     Group Key: colocated_table_test.value_1
+                     InitPlan 1 (returns $0)
+                       ->  Function Scan on read_intermediate_result intermediate_result
+                     ->  Result
+                           One-Time Filter: ($0 > '0'::double precision)
+                           ->  Seq Scan on colocated_table_test_1250005 colocated_table_test
+(22 rows)
 
 WITH a as (SELECT rt.value_2 FROM reference_table_test rt where rt.value_2 = 2)
 SELECT ct.value_1, count(*) FROM colocated_table_test ct join a on ct.value_1 = a.value_2

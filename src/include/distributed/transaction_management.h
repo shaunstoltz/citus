@@ -111,7 +111,8 @@ extern bool TransactionModifiedNodeMetadata;
  */
 extern void UseCoordinatedTransaction(void);
 extern bool InCoordinatedTransaction(void);
-extern void CoordinatedTransactionUse2PC(void);
+extern void CoordinatedTransactionShouldUse2PC(void);
+extern bool GetCoordinatedTransactionShouldUse2PC(void);
 extern bool IsMultiStatementTransaction(void);
 extern void EnsureDistributedTransactionId(void);
 
@@ -119,9 +120,9 @@ extern void EnsureDistributedTransactionId(void);
 extern void InitializeTransactionManagement(void);
 
 /* other functions */
-extern List * ActiveSubXacts(void);
 extern List * ActiveSubXactContexts(void);
 extern StringInfo BeginAndSetDistributedTransactionIdCommand(void);
+extern void TriggerMetadataSyncOnCommit(void);
 
 
 #endif /*  TRANSACTION_MANAGMENT_H */

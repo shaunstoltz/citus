@@ -155,6 +155,39 @@ SELECT lock_relation_if_exists('test', 'ACCESS SHARE');
 SELECT lock_relation_if_exists('test', 'EXCLUSIVE');
 ABORT;
 
+-- test creating columnar tables and accessing to columnar metadata tables via unprivileged user
+
+-- all below 5 commands should throw no permission errors
+-- read columnar metadata table
+SELECT * FROM columnar.stripe;
+-- alter a columnar setting
+SET columnar.chunk_group_row_limit = 1050;
+
+DO $proc$
+BEGIN
+IF substring(current_Setting('server_version'), '\d+')::int >= 12 THEN
+  EXECUTE $$
+    -- create columnar table
+    CREATE TABLE columnar_table (a int) USING columnar;
+    -- alter a columnar table that is created by that unprivileged user
+    SELECT alter_columnar_table_set('columnar_table', chunk_group_row_limit => 100);
+    -- and drop it
+    DROP TABLE columnar_table;
+  $$;
+END IF;
+END$proc$;
+
+-- cannot modify columnar metadata table as unprivileged user
+INSERT INTO columnar.stripe VALUES(99);
+-- Cannot drop columnar metadata table as unprivileged user.
+-- Privileged user also cannot drop but with a different error message.
+-- (since citus extension has a dependency to it)
+DROP TABLE columnar.chunk;
+
+
+-- test whether a read-only user can read from citus_tables view
+SELECT distribution_column FROM citus_tables WHERE table_name = 'test'::regclass;
+
 
 -- check no permission
 SET ROLE no_access;
@@ -192,11 +225,8 @@ ABORT;
 
 SELECT * FROM citus_stat_statements_reset();
 
--- should not be allowed to upgrade to reference table
-SELECT upgrade_to_reference_table('singleshard');
-
 -- should not be allowed to co-located tables
-SELECT mark_tables_colocated('test', ARRAY['test_coloc'::regclass]);
+SELECT update_distributed_table_colocation('test', colocate_with => 'test_coloc');
 
 -- should not be allowed to take any locks
 BEGIN;
@@ -338,44 +368,6 @@ SET ROLE full_access;
 CREATE TABLE full_access_user_schema.t2(id int);
 SELECT create_distributed_table('full_access_user_schema.t2', 'id');
 RESET ROLE;
-
--- a user with all privileges on a schema should be able to upgrade a distributed table to
--- a reference table
-SET ROLE full_access;
-BEGIN;
-CREATE TABLE full_access_user_schema.r1(id int);
-SET LOCAL citus.shard_count TO 1;
-SELECT create_distributed_table('full_access_user_schema.r1', 'id');
-SELECT upgrade_to_reference_table('full_access_user_schema.r1');
-COMMIT;
-RESET ROLE;
-
--- the super user should be able to upgrade a distributed table to a reference table, even
--- if it is owned by another user
-SET ROLE full_access;
-BEGIN;
-CREATE TABLE full_access_user_schema.r2(id int);
-SET LOCAL citus.shard_count TO 1;
-SELECT create_distributed_table('full_access_user_schema.r2', 'id');
-COMMIT;
-RESET ROLE;
-
--- the usage_access should not be able to upgrade the table
-SET ROLE usage_access;
-SELECT upgrade_to_reference_table('full_access_user_schema.r2');
-RESET ROLE;
-
--- the super user should be able
-SELECT upgrade_to_reference_table('full_access_user_schema.r2');
-
--- verify the owner of the shards for the reference table
-SELECT result FROM run_command_on_workers($cmd$
-  SELECT tableowner FROM pg_tables WHERE
-    true
-    AND schemaname = 'full_access_user_schema'
-    AND tablename LIKE 'r2_%'
-  LIMIT 1;
-$cmd$);
 
 -- super user should be the only one being able to call worker_cleanup_job_schema_cache
 SELECT worker_cleanup_job_schema_cache();

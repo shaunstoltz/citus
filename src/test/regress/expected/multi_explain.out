@@ -2029,7 +2029,7 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
         Node: host=localhost port=xxxxx dbname=regression
         ->  Insert on explain_analyze_test_570009 citus_table_alias (actual rows=0 loops=1)
               ->  Seq Scan on explain_analyze_test_570009 explain_analyze_test (actual rows=1 loops=1)
-                    Filter: ((worker_hash(a) >= '-2147483648'::integer) AND (worker_hash(a) <= '-1073741825'::integer))
+                    Filter: (a IS NOT NULL)
 ROLLBACK;
 DROP TABLE explain_analyze_test;
 -- test EXPLAIN ANALYZE works fine with primary keys
@@ -2286,15 +2286,14 @@ Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
 EXPLAIN :default_analyze_flags
 SELECT count(distinct a) FROM (SELECT GREATEST(random(), 2) r, a FROM dist_table) t NATURAL JOIN ref_table;
 Aggregate (actual rows=1 loops=1)
-  ->  Custom Scan (Citus Adaptive) (actual rows=10 loops=1)
+  ->  Custom Scan (Citus Adaptive) (actual rows=4 loops=1)
         Task Count: 4
-        Tuple data received from nodes: 11 bytes
+        Tuple data received from nodes: 4 bytes
         Tasks Shown: One of 4
         ->  Task
-              Tuple data received from node: 5 bytes
+              Tuple data received from node: 1 bytes
               Node: host=localhost port=xxxxx dbname=regression
-              ->  Group (actual rows=4 loops=1)
-                    Group Key: t.a
+              ->  Aggregate (actual rows=1 loops=1)
                     ->  Merge Join (actual rows=4 loops=1)
                           Merge Cond: (t.a = ref_table.a)
                           ->  Sort (actual rows=4 loops=1)
@@ -2310,7 +2309,7 @@ EXPLAIN :default_analyze_flags
 SELECT count(distinct a) FROM dist_table
 WHERE EXISTS(SELECT random() < 2 FROM dist_table NATURAL JOIN ref_table);
 Aggregate (actual rows=1 loops=1)
-  ->  Custom Scan (Citus Adaptive) (actual rows=10 loops=1)
+  ->  Custom Scan (Citus Adaptive) (actual rows=4 loops=1)
         ->  Distributed Subplan XXX_1
               Intermediate Data Size: 70 bytes
               Result destination: Send to 2 nodes
@@ -2332,13 +2331,12 @@ Aggregate (actual rows=1 loops=1)
                                       Sort Method: quicksort  Memory: 25kB
                                       ->  Seq Scan on ref_table_570021 ref_table (actual rows=10 loops=1)
         Task Count: 4
-        Tuple data received from nodes: 11 bytes
+        Tuple data received from nodes: 4 bytes
         Tasks Shown: One of 4
         ->  Task
-              Tuple data received from node: 5 bytes
+              Tuple data received from node: 1 bytes
               Node: host=localhost port=xxxxx dbname=regression
-              ->  HashAggregate (actual rows=4 loops=1)
-                    Group Key: dist_table.a
+              ->  Aggregate (actual rows=1 loops=1)
                     InitPlan 1 (returns $0)
                       ->  Function Scan on read_intermediate_result intermediate_result (actual rows=1 loops=1)
                     ->  Result (actual rows=4 loops=1)
@@ -2366,7 +2364,7 @@ Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
                     Node: host=localhost port=xxxxx dbname=regression
                     ->  Insert on dist_table_570017 citus_table_alias (actual rows=8 loops=1)
                           ->  Seq Scan on dist_table_570017 dist_table (actual rows=8 loops=1)
-                                Filter: ((worker_hash(a) >= '-2147483648'::integer) AND (worker_hash(a) <= '-1073741825'::integer))
+                                Filter: (a IS NOT NULL)
   ->  Distributed Subplan XXX_2
         Intermediate Data Size: 150 bytes
         Result destination: Write locally
@@ -2820,7 +2818,7 @@ Custom Scan (Citus Adaptive)
         Node: host=localhost port=xxxxx dbname=regression
         ->  Insert on simple_570026 citus_table_alias
               ->  Seq Scan on simple_570026 simple
-                    Filter: ((name = ANY ('{x,y}'::text[])) AND (worker_hash(id) >= '-2147483648'::integer) AND (worker_hash(id) <= '-1'::integer))
+                    Filter: ((id IS NOT NULL) AND (name = ANY ('{x,y}'::text[])))
 EXPLAIN :default_analyze_flags EXECUTE distributed_insert_select('x', 'y');
 Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
   Task Count: 2
@@ -2829,7 +2827,7 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
         Node: host=localhost port=xxxxx dbname=regression
         ->  Insert on simple_570026 citus_table_alias (actual rows=0 loops=1)
               ->  Seq Scan on simple_570026 simple (actual rows=0 loops=1)
-                    Filter: ((name = ANY (ARRAY[$1, $2])) AND (worker_hash(id) >= '-2147483648'::integer) AND (worker_hash(id) <= '-1'::integer))
+                    Filter: ((id IS NOT NULL) AND (name = ANY (ARRAY[$1, $2])))
                     Rows Removed by Filter: 1
 deallocate distributed_insert_select;
 -- prepared cte
@@ -2900,7 +2898,7 @@ Custom Scan (Citus Adaptive)
         ->  Insert on users_table_2_570028 citus_table_alias
               Conflict Resolution: UPDATE
               Conflict Arbiter Indexes: users_table_2_pkey_570028
-              ->  Seq Scan on users_table_2_570028 users_table_2
+              ->  Seq Scan on users_table_2_570028 users_table_xxx
 EXPLAIN :default_analyze_flags execute p4(20,20);
 Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
   Task Count: 1
@@ -2912,5 +2910,124 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
               Conflict Arbiter Indexes: users_table_2_pkey_570028
               Tuples Inserted: 0
               Conflicting Tuples: 0
-              ->  Seq Scan on users_table_2_570028 users_table_2 (actual rows=0 loops=1)
-DROP TABLE simple, users_table_2;
+              ->  Seq Scan on users_table_2_570028 users_table_xxx (actual rows=0 loops=1)
+-- simple test to confirm we can fetch long (>4KB) plans
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM users_table_2 WHERE value_1::text = '00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000X';
+Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
+  Task Count: 1
+  Tuple data received from nodes: 0 bytes
+  Tasks Shown: All
+  ->  Task
+        Tuple data received from node: 0 bytes
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on users_table_2_570028 users_table_xxx (actual rows=0 loops=1)
+              Filter: ((value_1)::text = '00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000X'::text)
+-- sorted explain analyze output
+CREATE TABLE explain_analyze_execution_time (a int);
+INSERT INTO explain_analyze_execution_time VALUES (2);
+SELECT create_distributed_table('explain_analyze_execution_time', 'a');
+
+-- show that we can sort the output wrt execution time
+-- we do the following hack to make the test outputs
+-- be consistent. First, ingest a single row then add
+-- pg_sleep() call on the query. Postgres will only
+-- sleep for the shard that has the single row, so that
+-- will definitely be slower
+set citus.explain_analyze_sort_method to "taskId";
+EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE) select a, CASE WHEN pg_sleep(0.4) IS NULL THEN  'x' END from explain_analyze_execution_time;
+Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+  Task Count: 2
+  Tuple data received from nodes: 1 bytes
+  Tasks Shown: One of 2
+  ->  Task
+        Tuple data received from node: 0 bytes
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on explain_analyze_execution_time_570029 explain_analyze_execution_time (actual rows=0 loops=1)
+set citus.explain_analyze_sort_method to "execution-time";
+EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE) select a, CASE WHEN pg_sleep(0.4) IS NULL THEN  'x' END from explain_analyze_execution_time;
+Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+  Task Count: 2
+  Tuple data received from nodes: 1 bytes
+  Tasks Shown: One of 2
+  ->  Task
+        Tuple data received from node: 1 bytes
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on explain_analyze_execution_time_570030 explain_analyze_execution_time (actual rows=1 loops=1)
+-- reset back
+reset citus.explain_analyze_sort_method;
+DROP TABLE explain_analyze_execution_time;
+CREATE SCHEMA multi_explain;
+SET search_path TO multi_explain;
+-- test EXPLAIN ANALYZE when original query returns no columns
+CREATE TABLE reference_table(a int);
+SELECT create_reference_table('reference_table');
+
+INSERT INTO reference_table VALUES (1);
+EXPLAIN :default_analyze_flags SELECT FROM reference_table;
+Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+  Task Count: 1
+  Tasks Shown: All
+  ->  Task
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on reference_table_570031 reference_table (actual rows=1 loops=1)
+CREATE TABLE distributed_table_1(a int, b int);
+SELECT create_distributed_table('distributed_table_1','a');
+
+INSERT INTO distributed_table_1 values (1,1);
+EXPLAIN :default_analyze_flags SELECT row_number() OVER() AS r FROM distributed_table_1;
+WindowAgg (actual rows=1 loops=1)
+  ->  Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+        Task Count: 2
+        Tasks Shown: One of 2
+        ->  Task
+              Node: host=localhost port=xxxxx dbname=regression
+              ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+CREATE TABLE distributed_table_2(a int, b int);
+SELECT create_distributed_table('distributed_table_2','a');
+
+INSERT INTO distributed_table_2 VALUES (1,1);
+EXPLAIN :default_analyze_flags
+WITH r AS (SELECT row_number() OVER () AS r FROM distributed_table_1)
+SELECT * FROM distributed_table_2
+JOIN r ON (r = distributed_table_2.b)
+LIMIT 3;
+Limit (actual rows=1 loops=1)
+  ->  Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+        ->  Distributed Subplan XXX_1
+              Intermediate Data Size: 14 bytes
+              Result destination: Send to 2 nodes
+              ->  WindowAgg (actual rows=1 loops=1)
+                    ->  Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+                          Task Count: 2
+                          Tasks Shown: One of 2
+                          ->  Task
+                                Node: host=localhost port=xxxxx dbname=regression
+                                ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+        Task Count: 2
+        Tuple data received from nodes: 3 bytes
+        Tasks Shown: One of 2
+        ->  Task
+              Tuple data received from node: 3 bytes
+              Node: host=localhost port=xxxxx dbname=regression
+              ->  Limit (actual rows=1 loops=1)
+                    ->  Nested Loop (actual rows=1 loops=1)
+                          Join Filter: (distributed_table_2.b = intermediate_result.r)
+                          ->  Function Scan on read_intermediate_result intermediate_result (actual rows=1 loops=1)
+                          ->  Seq Scan on distributed_table_2_570034 distributed_table_xxx (actual rows=1 loops=1)
+EXPLAIN :default_analyze_flags SELECT FROM (SELECT * FROM reference_table) subquery;
+Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+  Task Count: 1
+  Tasks Shown: All
+  ->  Task
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on reference_table_570031 reference_table (actual rows=1 loops=1)
+PREPARE dummy_prep_stmt(int) AS SELECT FROM distributed_table_1;
+EXPLAIN :default_analyze_flags EXECUTE dummy_prep_stmt(50);
+Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
+  Task Count: 2
+  Tasks Shown: One of 2
+  ->  Task
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+SET client_min_messages TO ERROR;
+DROP SCHEMA multi_explain CASCADE;

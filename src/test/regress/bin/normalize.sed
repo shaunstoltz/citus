@@ -14,14 +14,17 @@ s/shard [0-9]+/shard xxxxx/g
 s/assigned task [0-9]+ to node/assigned task to node/
 s/node group [12] (but|does)/node group \1/
 
+# discard "USING heap" in "CREATE TABLE ... USING heap"
+s/CREATE(.*)TABLE(.*)USING heap/CREATE\1TABLE\2/g
+
 # Differing names can have differing table column widths
 s/^-[+-]{2,}$/---------------------------------------------------------------------/g
 
 # In foreign_key_to_reference_table, normalize shard table names, etc in
 # the generated plan
-s/"(foreign_key_2_|fkey_ref_to_dist_|fkey_ref_)[0-9]+"/"\1xxxxxxx"/g
+s/"(foreign_key_2_|fkey_ref_to_dist_|fkey_ref_|fkey_to_ref_)[0-9]+"/"\1xxxxxxx"/g
 s/"(referenced_table_|referencing_table_|referencing_table2_)[0-9]+"/"\1xxxxxxx"/g
-s/"(referencing_table_0_|referenced_table2_)[0-9]+"/"\1xxxxxxx"/g
+s/"(referencing_table_0_|referencing_table_4_|referenced_table2_)[0-9]+"/"\1xxxxxxx"/g
 s/\(id\)=\([0-9]+\)/(id)=(X)/g
 s/\(ref_id\)=\([0-9]+\)/(ref_id)=(X)/g
 
@@ -100,6 +103,7 @@ s/_id_ref_id_fkey/_id_fkey/g
 s/_ref_id_id_fkey_/_ref_id_fkey_/g
 s/fk_test_2_col1_col2_fkey/fk_test_2_col1_fkey/g
 s/_id_other_column_ref_fkey/_id_fkey/g
+s/"(collections_list_|collection_users_|collection_users_fkey_)[0-9]+"/"\1xxxxxxx"/g
 
 # pg13 changes
 s/of relation ".*" violates not-null constraint/violates not-null constraint/g
@@ -157,5 +161,73 @@ s/Citus.*currently supports/Citus currently supports/g
 s/prepared transaction with identifier .* does not exist/prepared transaction with identifier "citus_x_yyyyyy_zzz_w" does not exist/g
 s/failed to roll back prepared transaction '.*'/failed to roll back prepared transaction 'citus_x_yyyyyy_zzz_w'/g
 
+# Table aliases for partitioned tables in explain outputs might change
+# regardless of postgres appended an _int suffix to alias, we always append _xxx suffix
+# Can be removed when we remove support for pg11 and pg12.
+# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>_<aliasId>" and
+# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>" becomes
+# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>_xxx"
+s/(->.*Scan on\ +)(.*)(_[0-9]+)(_[0-9]+) \2(_[0-9]+|_xxx)?/\1\2\3\4 \2_xxx/g
+
+# Table aliases for partitioned tables in "Hash Cond:" lines of explain outputs might change
+# This is only for multi_partitioning.sql test file
+# regardless of postgres appended an _int suffix to alias, we always append _xxx suffix
+# Can be removed when we remove support for pg11 and pg12.
+s/(partitioning_hash_join_test)(_[0-9]|_xxx)?(\.[a-zA-Z]+)/\1_xxx\3/g
+s/(partitioning_hash_test)(_[0-9]|_xxx)?(\.[a-zA-Z]+)/\1_xxx\3/g
+
 # Errors with binary decoding where OIDs should be normalized
 s/wrong data type: [0-9]+, expected [0-9]+/wrong data type: XXXX, expected XXXX/g
+
+# Errors with relation OID does not exist
+s/relation with OID [0-9]+ does not exist/relation with OID XXXX does not exist/g
+
+# ignore event triggers, mainly due to the event trigger for columnar
+/^DEBUG:  EventTriggerInvoke [0-9]+$/d
+
+# ignore DEBUG1 messages that Postgres generates
+/^DEBUG:  rehashing catalog cache id [0-9]+$/d
+
+# ignore JIT related messages
+/^DEBUG:  probing availability of JIT.*/d
+/^DEBUG:  provider not available, disabling JIT for current session.*/d
+/^DEBUG:  time to inline:.*/d
+/^DEBUG:  successfully loaded JIT.*/d
+
+# ignore timing statistics for VACUUM VERBOSE
+/CPU: user: .*s, system: .*s, elapsed: .*s/d
+
+# normalize storage id of columnar tables
+s/^storage id: [0-9]+$/storage id: xxxxx/g
+
+# normalize notice messages in citus_local_tables
+s/(NOTICE:  executing.*)citus_local_tables_test_schema.citus_local_table_4_[0-9]+(.*)/\1citus_local_tables_test_schema.citus_local_table_4_xxxx\2/g
+s/(NOTICE:  executing.*)\([0-9]+, 'citus_local_tables_test_schema', [0-9]+(.*)/\1\(xxxxx, 'citus_local_tables_test_schema', xxxxx\2/g
+s/citus_local_table_4_idx_[0-9]+/citus_local_table_4_idx_xxxxxx/g
+s/citus_local_table_4_[0-9]+/citus_local_table_4_xxxxxx/g
+s/ERROR:  cannot append to shardId [0-9]+/ERROR:  cannot append to shardId xxxxxx/g
+
+# hide warning/hint message that we get when executing create_citus_local_table
+/local tables that are added to metadata but not chained with reference tables via foreign keys might be automatically converted back to postgres tables$/d
+/Consider setting citus.enable_local_reference_table_foreign_keys to 'off' to disable this behavior$/d
+
+# normalize partitioned table shard constraint name errors for upgrade_partition_constraints_(before|after)
+s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
+
+# normalize for distributed deadlock delay in isolation_metadata_sync_deadlock
+# isolation tester first detects a lock, but then deadlock detector cancels the
+# session. Sometimes happens that deadlock detector cancels the session before
+# lock detection, so we normalize it by removing these two lines.
+/^ <waiting ...>$/ {
+    N; /\nstep s1-update-2: <... completed>$/ {
+        s/.*//g
+    }
+}
+
+# normalize long table shard name errors for alter_table_set_access_method and alter_distributed_table
+s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
+s/^(DEBUG:  the name of the shard \(abcde_01234567890123456789012345678901234567890_f7ff6612)_([0-9])+/\1_xxxxxx/g
+
+# normalize long index name errors for multi_index_statements
+s/^(ERROR:  The index name \(test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g
+s/^(DEBUG:  the index name on the shards of the partition is too long, switching to sequential and local execution mode to prevent self deadlocks: test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g

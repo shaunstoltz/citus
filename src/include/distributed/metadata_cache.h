@@ -125,20 +125,25 @@ typedef enum
 	/* hash, range or append distributed table */
 	DISTRIBUTED_TABLE,
 
+	/* hash- or range-distributed table */
+	STRICTLY_PARTITIONED_DISTRIBUTED_TABLE,
+
 	REFERENCE_TABLE,
 	CITUS_LOCAL_TABLE,
 
 	/* table without a dist key such as reference table */
-	CITUS_TABLE_WITH_NO_DIST_KEY
+	CITUS_TABLE_WITH_NO_DIST_KEY,
+
+	ANY_CITUS_TABLE_TYPE
 } CitusTableType;
 
+extern List * AllCitusTableIds(void);
 extern bool IsCitusTableType(Oid relationId, CitusTableType tableType);
 extern bool IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEtnry,
 									   CitusTableType tableType);
 
 extern bool IsCitusTable(Oid relationId);
 extern bool IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel);
-extern bool IsReferenceTableByDistParams(char partitionMethod, char replicationModel);
 extern List * CitusTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
 extern Oid RelationIdForShard(uint64 shardId);
@@ -151,17 +156,18 @@ extern CitusTableCacheEntry * LookupCitusTableCacheEntry(Oid relationId);
 extern DistObjectCacheEntry * LookupDistObjectCacheEntry(Oid classid, Oid objid, int32
 														 objsubid);
 extern int32 GetLocalGroupId(void);
-extern List * DistTableOidList(void);
-extern List * ReferenceTableOidList(void);
 extern void CitusTableCacheFlushInvalidatedEntries(void);
 extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
 extern List * ShardPlacementList(uint64 shardId);
+extern bool ShardExists(int64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
 extern void InvalidateForeignKeyGraph(void);
 extern void FlushDistTableCache(void);
 extern void InvalidateMetadataSystemCache(void);
+extern List * CitusTableTypeIdList(CitusTableType citusTableType);
 extern Datum DistNodeMetadata(void);
+extern bool ClusterHasReferenceTable(void);
 extern bool HasUniformHashDistribution(ShardInterval **shardIntervalArray,
 									   int shardIntervalArrayLength);
 extern bool HasUninitializedShardInterval(ShardInterval **sortedShardIntervalArray,
@@ -187,8 +193,10 @@ extern bool MajorVersionsCompatible(char *leftVersion, char *rightVersion);
 extern void ErrorIfInconsistentShardIntervals(CitusTableCacheEntry *cacheEntry);
 extern void EnsureModificationsCanRun(void);
 extern char LookupDistributionMethod(Oid distributionMethodOid);
+extern bool RelationExists(Oid relationId);
 
 /* access WorkerNodeHash */
+extern bool HasAnyNodes(void);
 extern HTAB * GetWorkerNodeHash(void);
 extern WorkerNode * LookupNodeByNodeId(uint32 nodeId);
 extern WorkerNode * LookupNodeByNodeIdOrError(uint32 nodeId);
@@ -200,7 +208,6 @@ extern Oid CitusCatalogNamespaceId(void);
 /* relation oids */
 extern Oid DistColocationRelationId(void);
 extern Oid DistColocationConfigurationIndexId(void);
-extern Oid DistColocationColocationidIndexId(void);
 extern Oid DistPartitionRelationId(void);
 extern Oid DistShardRelationId(void);
 extern Oid DistPlacementRelationId(void);
@@ -220,7 +227,6 @@ extern Oid DistPlacementShardidIndexId(void);
 extern Oid DistPlacementPlacementidIndexId(void);
 extern Oid DistTransactionRelationId(void);
 extern Oid DistTransactionGroupIndexId(void);
-extern Oid DistTransactionRecordIndexId(void);
 extern Oid DistPlacementGroupidIndexId(void);
 extern Oid DistObjectPrimaryKeyIndexId(void);
 
@@ -232,9 +238,7 @@ extern Oid CitusCopyFormatTypeId(void);
 extern Oid CitusReadIntermediateResultFuncId(void);
 Oid CitusReadIntermediateResultArrayFuncId(void);
 extern Oid CitusExtraDataContainerFuncId(void);
-extern Oid CitusWorkerHashFunctionId(void);
 extern Oid CitusAnyValueFunctionId(void);
-extern Oid CitusTextSendAsJsonbFunctionId(void);
 extern Oid PgTableVisibleFuncId(void);
 extern Oid CitusTableVisibleFuncId(void);
 extern Oid JsonbExtractPathFuncId(void);
@@ -242,7 +246,6 @@ extern Oid JsonbExtractPathFuncId(void);
 /* enum oids */
 extern Oid PrimaryNodeRoleId(void);
 extern Oid SecondaryNodeRoleId(void);
-extern Oid UnavailableNodeRoleId(void);
 extern Oid CitusCopyFormatTypeId(void);
 extern Oid TextCopyFormatId(void);
 extern Oid BinaryCopyFormatId(void);

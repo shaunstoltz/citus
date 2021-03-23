@@ -89,7 +89,7 @@ citus_truncate_trigger(PG_FUNCTION_ARGS)
 		char *schemaName = get_namespace_name(schemaId);
 		char *relationName = get_rel_name(relationId);
 
-		DirectFunctionCall3(master_drop_all_shards,
+		DirectFunctionCall3(citus_drop_all_shards,
 							ObjectIdGetDatum(relationId),
 							CStringGetTextDatum(relationName),
 							CStringGetTextDatum(schemaName));
@@ -272,7 +272,7 @@ ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("truncating distributed foreign tables is "
 								   "currently unsupported"),
-							errhint("Use master_drop_all_shards to remove "
+							errhint("Use citus_drop_all_shards to remove "
 									"foreign table's shards.")));
 		}
 	}
@@ -326,7 +326,7 @@ ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command)
 
 			ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
 							 errdetail(
-								 "Reference table \"%s\" is modified, which might lead "
+								 "Table \"%s\" is modified, which might lead "
 								 "to data inconsistencies or distributed deadlocks via "
 								 "parallel accesses to hash distributed tables due to "
 								 "foreign keys. Any parallel modification to "

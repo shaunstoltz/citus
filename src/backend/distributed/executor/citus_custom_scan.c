@@ -326,6 +326,7 @@ CitusBeginModifyScan(CustomScanState *node, EState *estate, int eflags)
 	scanState->distributedPlan = currentPlan;
 
 	Job *workerJob = currentPlan->workerJob;
+
 	Query *jobQuery = workerJob->jobQuery;
 
 	if (ModifyJobNeedsEvaluation(workerJob))
@@ -341,9 +342,12 @@ CitusBeginModifyScan(CustomScanState *node, EState *estate, int eflags)
 		/*
 		 * At this point, we're about to do the shard pruning for fast-path queries.
 		 * Given that pruning is deferred always for INSERTs, we get here
-		 * !EnableFastPathRouterPlanner  as well.
+		 * !EnableFastPathRouterPlanner  as well. Given that INSERT statements with
+		 * CTEs/sublinks etc are not eligible for fast-path router plan, we get here
+		 * jobQuery->commandType == CMD_INSERT as well.
 		 */
-		Assert(currentPlan->fastPathRouterPlan || !EnableFastPathRouterPlanner);
+		Assert(currentPlan->fastPathRouterPlan || !EnableFastPathRouterPlanner ||
+			   jobQuery->commandType == CMD_INSERT);
 
 		/*
 		 * We can only now decide which shard to use, so we need to build a new task
@@ -367,16 +371,22 @@ CitusBeginModifyScan(CustomScanState *node, EState *estate, int eflags)
 		RebuildQueryStrings(workerJob);
 	}
 
-	/*
-	 * Now that we know the shard ID(s) we can acquire the necessary shard metadata
-	 * locks. Once we have the locks it's safe to load the placement metadata.
-	 */
 
-	/* prevent concurrent placement changes */
-	AcquireMetadataLocks(workerJob->taskList);
+	/* We skip shard related things if the job contains only local tables */
+	if (!ModifyLocalTableJob(workerJob))
+	{
+		/*
+		 * Now that we know the shard ID(s) we can acquire the necessary shard metadata
+		 * locks. Once we have the locks it's safe to load the placement metadata.
+		 */
 
-	/* modify tasks are always assigned using first-replica policy */
-	workerJob->taskList = FirstReplicaAssignTaskList(workerJob->taskList);
+		/* prevent concurrent placement changes */
+		AcquireMetadataLocks(workerJob->taskList);
+
+		/* modify tasks are always assigned using first-replica policy */
+		workerJob->taskList = FirstReplicaAssignTaskList(workerJob->taskList);
+	}
+
 
 	/*
 	 * Now that we have populated the task placements we can determine whether
@@ -537,9 +547,12 @@ RegenerateTaskForFasthPathQuery(Job *workerJob)
 		shardId = GetAnchorShardId(shardIntervalList);
 	}
 
+	bool isLocalTableModification = false;
 	GenerateSingleShardRouterTaskList(workerJob,
 									  relationShardList,
-									  placementList, shardId);
+									  placementList,
+									  shardId,
+									  isLocalTableModification);
 }
 
 
@@ -557,6 +570,9 @@ AdaptiveExecutorCreateScan(CustomScan *scan)
 
 	scanState->customScanState.methods = &AdaptiveExecutorCustomExecMethods;
 	scanState->PreExecScan = &CitusPreExecScan;
+
+	scanState->finishedPreScan = false;
+	scanState->finishedRemoteScan = false;
 
 	return (Node *) scanState;
 }
@@ -577,6 +593,9 @@ NonPushableInsertSelectCreateScan(CustomScan *scan)
 
 	scanState->customScanState.methods =
 		&NonPushableInsertSelectCustomExecMethods;
+
+	scanState->finishedPreScan = false;
+	scanState->finishedRemoteScan = false;
 
 	return (Node *) scanState;
 }

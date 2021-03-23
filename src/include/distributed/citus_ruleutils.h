@@ -30,7 +30,8 @@ extern Oid get_extension_schema(Oid ext_oid);
 extern char * pg_get_serverdef_string(Oid tableRelationId);
 extern char * pg_get_sequencedef_string(Oid sequenceRelid);
 extern Form_pg_sequence pg_get_sequencedef(Oid sequenceRelationId);
-extern char * pg_get_tableschemadef_string(Oid tableRelationId, bool forShardCreation);
+extern char * pg_get_tableschemadef_string(Oid tableRelationId, bool forShardCreation,
+										   char *accessMethod);
 extern void EnsureRelationKindSupported(Oid relationId);
 extern char * pg_get_tablecolumnoptionsdef_string(Oid tableRelationId);
 extern void deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid,
@@ -38,7 +39,6 @@ extern void deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid,
 extern void deparse_shard_reindex_statement(ReindexStmt *origStmt, Oid distrelid,
 											int64 shardid, StringInfo buffer);
 extern char * pg_get_indexclusterdef_string(Oid indexRelationId);
-extern List * pg_get_table_grants(Oid relationId);
 extern bool contain_nextval_expression_walker(Node *node, void *context);
 extern char * pg_get_replica_identity_command(Oid tableRelationId);
 extern const char * RoleSpecString(RoleSpec *spec, bool withQuoteIdentifier);
@@ -49,6 +49,7 @@ char * pg_get_rule_expr(Node *expression);
 extern void deparse_shard_query(Query *query, Oid distrelid, int64 shardid,
 								StringInfo buffer);
 extern char * pg_get_triggerdef_command(Oid triggerId);
+extern char * pg_get_statisticsobj_worker(Oid statextid, bool missing_ok);
 extern char * generate_relation_name(Oid relid, List *namespaces);
 extern char * generate_qualified_relation_name(Oid relid);
 extern char * generate_operator_name(Oid operid, Oid arg1, Oid arg2);

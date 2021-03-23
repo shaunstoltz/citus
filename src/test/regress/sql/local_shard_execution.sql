@@ -56,6 +56,15 @@ SELECT create_distributed_table('stats', 'account_id', colocate_with => 'account
 INSERT INTO accounts (id) VALUES ('foo');
 INSERT INTO stats (account_id, spent) VALUES ('foo', 100);
 
+CREATE TABLE abcd(a int, b int, c int, d int);
+SELECT create_distributed_table('abcd', 'b');
+
+INSERT INTO abcd VALUES (1,2,3,4);
+INSERT INTO abcd VALUES (2,3,4,5);
+INSERT INTO abcd VALUES (3,4,5,6);
+
+ALTER TABLE abcd DROP COLUMN a;
+
 -- connection worker and get ready for the tests
 \c - - - :worker_1_port
 SET search_path TO local_shard_execution;
@@ -217,6 +226,29 @@ SELECT * FROM second_distributed_table WHERE key = 1 ORDER BY 1,2;
 INSERT INTO distributed_table VALUES (1, '22', 20);
 INSERT INTO second_distributed_table VALUES (1, '1');
 
+CREATE VIEW abcd_view AS SELECT * FROM abcd;
+
+SELECT * FROM abcd first join abcd second on first.b = second.b ORDER BY 1,2,3,4;
+
+BEGIN;
+SELECT * FROM abcd first join abcd second on first.b = second.b ORDER BY 1,2,3,4;
+END;
+
+BEGIN;
+SELECT * FROM abcd_view first join abcd_view second on first.b = second.b ORDER BY 1,2,3,4;
+END;
+
+BEGIN;
+SELECT * FROM abcd first full join abcd second on first.b = second.b ORDER BY 1,2,3,4;
+END;
+
+BEGIN;
+SELECT * FROM abcd first join abcd second USING(b) ORDER BY 1,2,3,4;
+END;
+
+BEGIN;
+SELECT * FROM abcd first join abcd second USING(b) join abcd third on first.b=third.b ORDER BY 1,2,3,4;
+END;
 
 -- copy always happens via distributed execution irrespective of the
 -- shards that are accessed
@@ -340,7 +372,7 @@ BEGIN;
 	TRUNCATE distributed_table CASCADE;
 ROLLBACK;
 
--- a local query is followed by a command that cannot be executed locally
+-- a local query is followed by an INSERT..SELECT via the coordinator
 BEGIN;
 	SELECT count(*) FROM distributed_table WHERE key = 1;
 
@@ -353,11 +385,12 @@ SELECT count(*) FROM distributed_table;
 SELECT count(*) FROM distributed_table d1 join distributed_table d2 using(age);
 ROLLBACK;
 
--- a local query is followed by a command that cannot be executed locally
+-- a local query is followed by an INSERT..SELECT with re-partitioning
 BEGIN;
-	SELECT count(*) FROM distributed_table WHERE key = 1;
-
-	INSERT INTO distributed_table (key) SELECT key+1 FROM distributed_table;
+	SELECT count(*) FROM distributed_table WHERE key = 6;
+	INSERT INTO reference_table (key) SELECT -key FROM distributed_table;
+	INSERT INTO distributed_table (key) SELECT -key FROM distributed_table;
+	SELECT count(*) FROM distributed_table WHERE key = -6;
 ROLLBACK;
 
 INSERT INTO distributed_table VALUES (1, '11',21) ON CONFLICT(key) DO UPDATE SET value = '29' RETURNING *;
@@ -530,9 +563,8 @@ INSERT INTO reference_table VALUES (1),(2),(3),(4),(5),(6) RETURNING *;
 INSERT INTO distributed_table VALUES (1, '11',21), (5,'55',22) ON CONFLICT(key) DO UPDATE SET value = (EXCLUDED.value::int + 1)::text RETURNING *;
 
 
--- distributed execution of multi-rows INSERTs, where some part of the execution
--- could have been done via local execution but the executor choose the other way around
--- because the command is a multi-shard query
+-- distributed execution of multi-rows INSERTs, where executor
+-- is smart enough to execute local tasks via local execution
 INSERT INTO distributed_table VALUES (1, '11',21), (2,'22',22), (3,'33',33), (4,'44',44),(5,'55',55) ON CONFLICT(key) DO UPDATE SET value = (EXCLUDED.value::int + 1)::text RETURNING *;
 
 

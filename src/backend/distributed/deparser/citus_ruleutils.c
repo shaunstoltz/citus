@@ -26,6 +26,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
@@ -71,7 +72,6 @@ static void deparse_index_columns(StringInfo buffer, List *indexParameterList,
 static void AppendOptionListToString(StringInfo stringData, List *options);
 static void AppendStorageParametersToString(StringInfo stringBuffer,
 											List *optionList);
-static const char * convert_aclright_to_string(int aclright);
 static void simple_quote_literal(StringInfo buf, const char *val);
 static char * flatten_reloptions(Oid relid);
 
@@ -248,7 +248,8 @@ pg_get_sequencedef(Oid sequenceRelationId)
  * DEFAULT clauses for columns getting their default values from a sequence.
  */
 char *
-pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
+pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults,
+							 char *accessMethod)
 {
 	char relationKind = 0;
 	bool firstAttributePrinted = false;
@@ -451,6 +452,31 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 		appendStringInfo(&buffer, " PARTITION BY %s ", partitioningInformation);
 	}
 
+#if PG_VERSION_NUM >= 120000
+
+	/*
+	 * Add table access methods for pg12 and higher when the table is configured with an
+	 * access method
+	 */
+	if (accessMethod)
+	{
+		appendStringInfo(&buffer, " USING %s", quote_identifier(accessMethod));
+	}
+	else if (OidIsValid(relation->rd_rel->relam))
+	{
+		HeapTuple amTup = SearchSysCache1(AMOID, ObjectIdGetDatum(
+											  relation->rd_rel->relam));
+		if (!HeapTupleIsValid(amTup))
+		{
+			elog(ERROR, "cache lookup failed for access method %u",
+				 relation->rd_rel->relam);
+		}
+		Form_pg_am amForm = (Form_pg_am) GETSTRUCT(amTup);
+		appendStringInfo(&buffer, " USING %s", quote_identifier(NameStr(amForm->amname)));
+		ReleaseSysCache(amTup);
+	}
+#endif
+
 	/*
 	 * Add any reloptions (storage parameters) defined on the table in a WITH
 	 * clause.
@@ -478,6 +504,12 @@ void
 EnsureRelationKindSupported(Oid relationId)
 {
 	char relationKind = get_rel_relkind(relationId);
+	if (!relationKind)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("relation with OID %d does not exist",
+							   relationId)));
+	}
 
 	bool supportedRelationKind = RegularTable(relationId) ||
 								 relationKind == RELKIND_FOREIGN_TABLE;
@@ -657,12 +689,13 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 							  StringInfo buffer)
 {
 	IndexStmt *indexStmt = copyObject(origStmt); /* copy to avoid modifications */
-	char *relationName = indexStmt->relation->relname;
-	char *indexName = indexStmt->idxname;
 
 	/* extend relation and index name using shard identifier */
-	AppendShardIdToName(&relationName, shardid);
-	AppendShardIdToName(&indexName, shardid);
+	AppendShardIdToName(&(indexStmt->relation->relname), shardid);
+	AppendShardIdToName(&(indexStmt->idxname), shardid);
+
+	char *relationName = indexStmt->relation->relname;
+	char *indexName = indexStmt->idxname;
 
 	/* use extended shard name and transformed stmt for deparsing */
 	List *deparseContext = deparse_context_for(relationName, distrelid);
@@ -722,10 +755,10 @@ deparse_shard_reindex_statement(ReindexStmt *origStmt, Oid distrelid, int64 shar
 	if (reindexStmt->kind == REINDEX_OBJECT_INDEX ||
 		reindexStmt->kind == REINDEX_OBJECT_TABLE)
 	{
-		relationName = reindexStmt->relation->relname;
-
 		/* extend relation and index name using shard identifier */
-		AppendShardIdToName(&relationName, shardid);
+		AppendShardIdToName(&(reindexStmt->relation->relname), shardid);
+
+		relationName = reindexStmt->relation->relname;
 	}
 
 	appendStringInfoString(buffer, "REINDEX ");
@@ -877,138 +910,6 @@ pg_get_indexclusterdef_string(Oid indexRelationId)
 
 
 /*
- * pg_get_table_grants returns a list of sql statements which recreate the
- * permissions for a specific table.
- *
- * This function is modeled after aclexplode(), don't change too heavily.
- */
-List *
-pg_get_table_grants(Oid relationId)
-{
-	/* *INDENT-OFF* */
-	StringInfoData buffer;
-	List *defs = NIL;
-	bool isNull = false;
-
-	Relation relation = relation_open(relationId, AccessShareLock);
-	char *relationName = generate_relation_name(relationId, NIL);
-
-	initStringInfo(&buffer);
-
-	/* lookup all table level grants */
-	HeapTuple classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
-	if (!HeapTupleIsValid(classTuple))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("relation with OID %u does not exist",
-						relationId)));
-	}
-
-	Datum aclDatum = SysCacheGetAttr(RELOID, classTuple, Anum_pg_class_relacl,
-							   &isNull);
-
-	ReleaseSysCache(classTuple);
-
-	if (!isNull)
-	{
-
-		/*
-		 * First revoke all default permissions, so we can start adding the
-		 * exact permissions from the master. Note that we only do so if there
-		 * are any actual grants; an empty grant set signals default
-		 * permissions.
-		 *
-		 * Note: This doesn't work correctly if default permissions have been
-		 * changed with ALTER DEFAULT PRIVILEGES - but that's hard to fix
-		 * properly currently.
-		 */
-		appendStringInfo(&buffer, "REVOKE ALL ON %s FROM PUBLIC",
-						 relationName);
-		defs = lappend(defs, pstrdup(buffer.data));
-		resetStringInfo(&buffer);
-
-		/* iterate through the acl datastructure, emit GRANTs */
-
-		Acl *acl = DatumGetAclP(aclDatum);
-		AclItem *aidat = ACL_DAT(acl);
-
-		int offtype = -1;
-		int i = 0;
-		while (i < ACL_NUM(acl))
-		{
-			AclItem    *aidata = NULL;
-			AclMode		priv_bit = 0;
-
-			offtype++;
-
-			if (offtype == N_ACL_RIGHTS)
-			{
-				offtype = 0;
-				i++;
-				if (i >= ACL_NUM(acl)) /* done */
-				{
-					break;
-				}
-			}
-
-			aidata = &aidat[i];
-			priv_bit = 1 << offtype;
-
-			if (ACLITEM_GET_PRIVS(*aidata) & priv_bit)
-			{
-				const char *roleName = NULL;
-				const char *withGrant = "";
-
-				if (aidata->ai_grantee != 0)
-				{
-
-					HeapTuple htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aidata->ai_grantee));
-					if (HeapTupleIsValid(htup))
-					{
-						Form_pg_authid authForm = ((Form_pg_authid) GETSTRUCT(htup));
-
-						roleName = quote_identifier(NameStr(authForm->rolname));
-
-						ReleaseSysCache(htup);
-					}
-					else
-					{
-						elog(ERROR, "cache lookup failed for role %u", aidata->ai_grantee);
-					}
-				}
-				else
-				{
-					roleName = "PUBLIC";
-				}
-
-				if ((ACLITEM_GET_GOPTIONS(*aidata) & priv_bit) != 0)
-				{
-					withGrant = " WITH GRANT OPTION";
-				}
-
-				appendStringInfo(&buffer, "GRANT %s ON %s TO %s%s",
-								 convert_aclright_to_string(priv_bit),
-								 relationName,
-								 roleName,
-								 withGrant);
-
-				defs = lappend(defs, pstrdup(buffer.data));
-
-				resetStringInfo(&buffer);
-			}
-		}
-	}
-
-	resetStringInfo(&buffer);
-
-	relation_close(relation, NoLock);
-	return defs;
-	/* *INDENT-ON* */
-}
-
-
-/*
  * generate_qualified_relation_name computes the schema-qualified name to display for a
  * relation specified by OID.
  */
@@ -1108,45 +1009,6 @@ AppendStorageParametersToString(StringInfo stringBuffer, List *optionList)
 	}
 
 	appendStringInfo(stringBuffer, ")");
-}
-
-
-/* copy of postgresql's function, which is static as well */
-static const char *
-convert_aclright_to_string(int aclright)
-{
-	/* *INDENT-OFF* */
-	switch (aclright)
-	{
-		case ACL_INSERT:
-			return "INSERT";
-		case ACL_SELECT:
-			return "SELECT";
-		case ACL_UPDATE:
-			return "UPDATE";
-		case ACL_DELETE:
-			return "DELETE";
-		case ACL_TRUNCATE:
-			return "TRUNCATE";
-		case ACL_REFERENCES:
-			return "REFERENCES";
-		case ACL_TRIGGER:
-			return "TRIGGER";
-		case ACL_EXECUTE:
-			return "EXECUTE";
-		case ACL_USAGE:
-			return "USAGE";
-		case ACL_CREATE:
-			return "CREATE";
-		case ACL_CREATE_TEMP:
-			return "TEMPORARY";
-		case ACL_CONNECT:
-			return "CONNECT";
-		default:
-			elog(ERROR, "unrecognized aclright: %d", aclright);
-			return NULL;
-	}
-	/* *INDENT-ON* */
 }
 
 

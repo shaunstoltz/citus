@@ -140,7 +140,6 @@ typedef struct MetadataCacheData
 	Oid distObjectPrimaryKeyIndexId;
 	Oid distColocationRelationId;
 	Oid distColocationConfigurationIndexId;
-	Oid distColocationColocationidIndexId;
 	Oid distPartitionRelationId;
 	Oid distPartitionLogicalRelidIndexId;
 	Oid distPartitionColocationidIndexId;
@@ -151,7 +150,6 @@ typedef struct MetadataCacheData
 	Oid distPlacementGroupidIndexId;
 	Oid distTransactionRelationId;
 	Oid distTransactionGroupIndexId;
-	Oid distTransactionRecordIndexId;
 	Oid citusCatalogNamespaceId;
 	Oid copyFormatTypeId;
 	Oid readIntermediateResultFuncId;
@@ -165,7 +163,6 @@ typedef struct MetadataCacheData
 	Oid textCopyFormatId;
 	Oid primaryNodeRoleId;
 	Oid secondaryNodeRoleId;
-	Oid unavailableNodeRoleId;
 	Oid pgTableIsVisibleFuncId;
 	Oid citusTableIsVisibleFuncId;
 	Oid jsonbExtractPathFuncId;
@@ -258,18 +255,25 @@ static void InvalidateCitusTableCacheEntrySlot(CitusTableCacheEntrySlot *cacheSl
 static void InvalidateDistTableCache(void);
 static void InvalidateDistObjectCache(void);
 static void InitializeTableCacheEntry(int64 shardId);
-static bool IsCitusTableTypeInternal(CitusTableCacheEntry *tableEntry, CitusTableType
-									 tableType);
+static bool IsCitusTableTypeInternal(char partitionMethod, char replicationModel,
+									 CitusTableType tableType);
 static bool RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry);
 
 
 /* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(citus_dist_partition_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_partition_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_dist_shard_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_shard_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_dist_placement_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_placement_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_dist_node_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_node_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_dist_local_group_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_local_group_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_conninfo_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_authinfo_cache_invalidate);
+PG_FUNCTION_INFO_V1(citus_dist_object_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_object_cache_invalidate);
 PG_FUNCTION_INFO_V1(role_exists);
 PG_FUNCTION_INFO_V1(authinfo_valid);
@@ -313,7 +317,7 @@ IsCitusTableType(Oid relationId, CitusTableType tableType)
 	{
 		return false;
 	}
-	return IsCitusTableTypeInternal(tableEntry, tableType);
+	return IsCitusTableTypeCacheEntry(tableEntry, tableType);
 }
 
 
@@ -324,7 +328,8 @@ IsCitusTableType(Oid relationId, CitusTableType tableType)
 bool
 IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEntry, CitusTableType tableType)
 {
-	return IsCitusTableTypeInternal(tableEntry, tableType);
+	return IsCitusTableTypeInternal(tableEntry->partitionMethod,
+									tableEntry->replicationModel, tableType);
 }
 
 
@@ -333,47 +338,59 @@ IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEntry, CitusTableType tabl
  * the given table type group. For definition of table types, see CitusTableType.
  */
 static bool
-IsCitusTableTypeInternal(CitusTableCacheEntry *tableEntry, CitusTableType tableType)
+IsCitusTableTypeInternal(char partitionMethod, char replicationModel,
+						 CitusTableType tableType)
 {
 	switch (tableType)
 	{
 		case HASH_DISTRIBUTED:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_HASH;
+			return partitionMethod == DISTRIBUTE_BY_HASH;
 		}
 
 		case APPEND_DISTRIBUTED:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_APPEND;
+			return partitionMethod == DISTRIBUTE_BY_APPEND;
 		}
 
 		case RANGE_DISTRIBUTED:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_RANGE;
+			return partitionMethod == DISTRIBUTE_BY_RANGE;
 		}
 
 		case DISTRIBUTED_TABLE:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_HASH ||
-				   tableEntry->partitionMethod == DISTRIBUTE_BY_RANGE ||
-				   tableEntry->partitionMethod == DISTRIBUTE_BY_APPEND;
+			return partitionMethod == DISTRIBUTE_BY_HASH ||
+				   partitionMethod == DISTRIBUTE_BY_RANGE ||
+				   partitionMethod == DISTRIBUTE_BY_APPEND;
+		}
+
+		case STRICTLY_PARTITIONED_DISTRIBUTED_TABLE:
+		{
+			return partitionMethod == DISTRIBUTE_BY_HASH ||
+				   partitionMethod == DISTRIBUTE_BY_RANGE;
 		}
 
 		case REFERENCE_TABLE:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_NONE &&
-				   tableEntry->replicationModel == REPLICATION_MODEL_2PC;
+			return partitionMethod == DISTRIBUTE_BY_NONE &&
+				   replicationModel == REPLICATION_MODEL_2PC;
 		}
 
 		case CITUS_LOCAL_TABLE:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_NONE &&
-				   tableEntry->replicationModel != REPLICATION_MODEL_2PC;
+			return partitionMethod == DISTRIBUTE_BY_NONE &&
+				   replicationModel != REPLICATION_MODEL_2PC;
 		}
 
 		case CITUS_TABLE_WITH_NO_DIST_KEY:
 		{
-			return tableEntry->partitionMethod == DISTRIBUTE_BY_NONE;
+			return partitionMethod == DISTRIBUTE_BY_NONE;
+		}
+
+		case ANY_CITUS_TABLE_TYPE:
+		{
+			return true;
 		}
 
 		default:
@@ -445,18 +462,6 @@ IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel)
 
 
 /*
- * IsReferenceTableByDistParams returns true if given partitionMethod and
- * replicationModel would identify a reference table.
- */
-bool
-IsReferenceTableByDistParams(char partitionMethod, char replicationModel)
-{
-	return partitionMethod == DISTRIBUTE_BY_NONE &&
-		   replicationModel == REPLICATION_MODEL_2PC;
-}
-
-
-/*
  * CitusTableList returns a list that includes all the valid distributed table
  * cache entries.
  */
@@ -468,10 +473,10 @@ CitusTableList(void)
 	Assert(CitusHasBeenLoaded() && CheckCitusVersion(WARNING));
 
 	/* first, we need to iterate over pg_dist_partition */
-	List *distTableOidList = DistTableOidList();
+	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
 
 	Oid relationId = InvalidOid;
-	foreach_oid(relationId, distTableOidList)
+	foreach_oid(relationId, citusTableIdList)
 	{
 		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
@@ -672,6 +677,18 @@ ResolveGroupShardPlacement(GroupShardPlacement *groupShardPlacement,
 
 
 /*
+ * HasAnyNodes returns whether there are any nodes in pg_dist_node.
+ */
+bool
+HasAnyNodes(void)
+{
+	PrepareWorkerNodeCache();
+
+	return WorkerNodeCount > 0;
+}
+
+
+/*
  * LookupNodeByNodeId returns a worker node by nodeId or NULL if the node
  * cannot be found.
  */
@@ -832,7 +849,7 @@ InitializeTableCacheEntry(int64 shardId)
 	Oid relationId = LookupShardRelationFromCatalog(shardId, missingOk);
 
 	/* trigger building the cache for the shard id */
-	GetCitusTableCacheEntry(relationId);
+	GetCitusTableCacheEntry(relationId); /* lgtm[cpp/return-value-ignored] */
 }
 
 
@@ -2129,17 +2146,6 @@ DistColocationConfigurationIndexId(void)
 }
 
 
-/* return oid of pg_dist_colocation_pkey index */
-Oid
-DistColocationColocationidIndexId(void)
-{
-	CachedRelationLookup("pg_dist_colocation_pkey",
-						 &MetadataCache.distColocationColocationidIndexId);
-
-	return MetadataCache.distColocationColocationidIndexId;
-}
-
-
 /* return oid of pg_dist_partition relation */
 Oid
 DistPartitionRelationId(void)
@@ -2236,17 +2242,6 @@ DistTransactionGroupIndexId(void)
 						 &MetadataCache.distTransactionGroupIndexId);
 
 	return MetadataCache.distTransactionGroupIndexId;
-}
-
-
-/* return oid of pg_dist_transaction_unique_constraint */
-Oid
-DistTransactionRecordIndexId(void)
-{
-	CachedRelationLookup("pg_dist_transaction_unique_constraint",
-						 &MetadataCache.distTransactionRecordIndexId);
-
-	return MetadataCache.distTransactionRecordIndexId;
 }
 
 
@@ -2365,25 +2360,6 @@ CitusExtraDataContainerFuncId(void)
 }
 
 
-/* return oid of the worker_hash function */
-Oid
-CitusWorkerHashFunctionId(void)
-{
-	if (MetadataCache.workerHashFunctionId == InvalidOid)
-	{
-		Oid citusExtensionOid = get_extension_oid("citus", false);
-		Oid citusSchemaOid = get_extension_schema(citusExtensionOid);
-		char *citusSchemaName = get_namespace_name(citusSchemaOid);
-		const int argCount = 1;
-
-		MetadataCache.workerHashFunctionId =
-			FunctionOid(citusSchemaName, "worker_hash", argCount);
-	}
-
-	return MetadataCache.workerHashFunctionId;
-}
-
-
 /* return oid of the any_value aggregate function */
 Oid
 CitusAnyValueFunctionId(void)
@@ -2396,24 +2372,6 @@ CitusAnyValueFunctionId(void)
 	}
 
 	return MetadataCache.anyValueFunctionId;
-}
-
-
-/* return oid of the citus_text_send_as_jsonb(text) function */
-Oid
-CitusTextSendAsJsonbFunctionId(void)
-{
-	if (MetadataCache.textSendAsJsonbFunctionId == InvalidOid)
-	{
-		List *nameList = list_make2(makeString("pg_catalog"),
-									makeString("citus_text_send_as_jsonb"));
-		Oid paramOids[1] = { TEXTOID };
-
-		MetadataCache.textSendAsJsonbFunctionId =
-			LookupFuncName(nameList, 1, paramOids, false);
-	}
-
-	return MetadataCache.textSendAsJsonbFunctionId;
 }
 
 
@@ -2677,22 +2635,8 @@ SecondaryNodeRoleId(void)
 }
 
 
-/* return the Oid of the 'unavailable' nodeRole enum value */
-Oid
-UnavailableNodeRoleId(void)
-{
-	if (!MetadataCache.unavailableNodeRoleId)
-	{
-		MetadataCache.unavailableNodeRoleId = LookupStringEnumValueId("noderole",
-																	  "unavailable");
-	}
-
-	return MetadataCache.unavailableNodeRoleId;
-}
-
-
 /*
- * master_dist_partition_cache_invalidate is a trigger function that performs
+ * citus_dist_partition_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_partition are changed
  * on the SQL level.
  *
@@ -2700,7 +2644,7 @@ UnavailableNodeRoleId(void)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldLogicalRelationId = InvalidOid;
@@ -2759,7 +2703,17 @@ master_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_shard_cache_invalidate is a trigger function that performs
+ * master_dist_partition_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_partition_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_dist_shard_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_shard are changed
  * on the SQL level.
  *
@@ -2767,7 +2721,7 @@ master_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldLogicalRelationId = InvalidOid;
@@ -2826,7 +2780,17 @@ master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_placement_cache_invalidate is a trigger function that performs
+ * master_dist_shard_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_shard_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_dist_placement_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_placement are
  * changed on the SQL level.
  *
@@ -2834,7 +2798,7 @@ master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldShardId = InvalidOid;
@@ -2905,7 +2869,17 @@ master_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_node_cache_invalidate is a trigger function that performs
+ * master_dist_placement_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_placement_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_dist_node_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_node are changed
  * on the SQL level.
  *
@@ -2913,7 +2887,7 @@ master_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
@@ -2930,7 +2904,17 @@ master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_authinfo_cache_invalidate is a trigger function that performs
+ * master_dist_node_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_node_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_conninfo_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_authinfo are changed
  * on the SQL level.
  *
@@ -2938,7 +2922,7 @@ master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_authinfo_cache_invalidate(PG_FUNCTION_ARGS)
+citus_conninfo_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
@@ -2955,7 +2939,17 @@ master_dist_authinfo_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_local_group_cache_invalidate is a trigger function that performs
+ * master_dist_authinfo_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_authinfo_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_conninfo_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_dist_local_group_cache_invalidate is a trigger function that performs
  * relcache invalidations when the contents of pg_dist_local_group are changed
  * on the SQL level.
  *
@@ -2963,7 +2957,7 @@ master_dist_authinfo_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
@@ -2980,7 +2974,17 @@ master_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
 
 
 /*
- * master_dist_object_cache_invalidate is a trigger function that performs relcache
+ * master_dist_local_group_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_local_group_cache_invalidate(fcinfo);
+}
+
+
+/*
+ * citus_dist_object_cache_invalidate is a trigger function that performs relcache
  * invalidation when the contents of pg_dist_object are changed on the SQL
  * level.
  *
@@ -2988,7 +2992,7 @@ master_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
  * are much easier ways to waste CPU than causing cache invalidations.
  */
 Datum
-master_dist_object_cache_invalidate(PG_FUNCTION_ARGS)
+citus_dist_object_cache_invalidate(PG_FUNCTION_ARGS)
 {
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
@@ -3001,6 +3005,16 @@ master_dist_object_cache_invalidate(PG_FUNCTION_ARGS)
 	CitusInvalidateRelcacheByRelid(DistObjectRelationId());
 
 	PG_RETURN_DATUM(PointerGetDatum(NULL));
+}
+
+
+/*
+ * master_dist_object_cache_invalidate is a wrapper function for old UDF name.
+ */
+Datum
+master_dist_object_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	return citus_dist_object_cache_invalidate(fcinfo);
 }
 
 
@@ -3582,6 +3596,15 @@ InvalidateForeignRelationGraphCacheCallback(Datum argument, Oid relationId)
 void
 InvalidateForeignKeyGraph(void)
 {
+	if (!CitusHasBeenLoaded())
+	{
+		/*
+		 * We should not try to invalidate foreign key graph
+		 * if citus is not loaded.
+		 */
+		return;
+	}
+
 	CitusInvalidateRelcacheByRelid(DistColocationRelationId());
 
 	/* bump command counter to force invalidation to take effect */
@@ -3775,57 +3798,29 @@ InvalidateMetadataSystemCache(void)
 
 
 /*
- * DistTableOidList iterates over the pg_dist_partition table and returns
- * a list that consists of the logicalrelids.
+ * AllCitusTableIds returns all citus table ids.
  */
 List *
-DistTableOidList(void)
+AllCitusTableIds(void)
 {
-	ScanKeyData scanKey[1];
-	int scanKeyCount = 0;
-	List *distTableOidList = NIL;
-
-	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgDistPartition,
-													InvalidOid, false,
-													NULL, scanKeyCount, scanKey);
-
-	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
-
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	while (HeapTupleIsValid(heapTuple))
-	{
-		bool isNull = false;
-		Datum relationIdDatum = heap_getattr(heapTuple,
-											 Anum_pg_dist_partition_logicalrelid,
-											 tupleDescriptor, &isNull);
-		Oid relationId = DatumGetObjectId(relationIdDatum);
-		distTableOidList = lappend_oid(distTableOidList, relationId);
-
-		heapTuple = systable_getnext(scanDescriptor);
-	}
-
-	systable_endscan(scanDescriptor);
-	table_close(pgDistPartition, AccessShareLock);
-
-	return distTableOidList;
+	return CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
 }
 
 
 /*
- * ReferenceTableOidList function scans pg_dist_partition to create a list of all
- * reference tables. To create the list, it performs sequential scan. Since it is not
- * expected that this function will be called frequently, it is OK not to use index scan.
- * If this function becomes performance bottleneck, it is possible to modify this function
- * to perform index scan.
+ * CitusTableTypeIdList function scans pg_dist_partition and returns a
+ * list of OID's for the tables matching given citusTableType.
+ * To create the list, it performs sequential scan. Since it is not expected
+ * that this function will be called frequently, it is OK not to use index
+ * scan. If this function becomes performance bottleneck, it is possible to
+ * modify this function to perform index scan.
  */
 List *
-ReferenceTableOidList()
+CitusTableTypeIdList(CitusTableType citusTableType)
 {
 	ScanKeyData scanKey[1];
 	int scanKeyCount = 0;
-	List *referenceTableOidList = NIL;
+	List *relationIdList = NIL;
 
 	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
 
@@ -3839,14 +3834,18 @@ ReferenceTableOidList()
 	while (HeapTupleIsValid(heapTuple))
 	{
 		bool isNull = false;
-		char partitionMethod = heap_getattr(heapTuple,
-											Anum_pg_dist_partition_partmethod,
-											tupleDescriptor, &isNull);
-		char replicationModel = heap_getattr(heapTuple,
-											 Anum_pg_dist_partition_repmodel,
-											 tupleDescriptor, &isNull);
 
-		if (IsReferenceTableByDistParams(partitionMethod, replicationModel))
+		Datum partMethodDatum =
+			heap_getattr(heapTuple, Anum_pg_dist_partition_partmethod,
+						 tupleDescriptor, &isNull);
+		Datum replicationModelDatum =
+			heap_getattr(heapTuple, Anum_pg_dist_partition_repmodel,
+						 tupleDescriptor, &isNull);
+
+		Oid partitionMethod = DatumGetChar(partMethodDatum);
+		Oid replicationModel = DatumGetChar(replicationModelDatum);
+
+		if (IsCitusTableTypeInternal(partitionMethod, replicationModel, citusTableType))
 		{
 			Datum relationIdDatum = heap_getattr(heapTuple,
 												 Anum_pg_dist_partition_logicalrelid,
@@ -3854,7 +3853,7 @@ ReferenceTableOidList()
 
 			Oid relationId = DatumGetObjectId(relationIdDatum);
 
-			referenceTableOidList = lappend_oid(referenceTableOidList, relationId);
+			relationIdList = lappend_oid(relationIdList, relationId);
 		}
 
 		heapTuple = systable_getnext(scanDescriptor);
@@ -3863,7 +3862,18 @@ ReferenceTableOidList()
 	systable_endscan(scanDescriptor);
 	table_close(pgDistPartition, AccessShareLock);
 
-	return referenceTableOidList;
+	return relationIdList;
+}
+
+
+/*
+ * ClusterHasReferenceTable returns true if the cluster has
+ * any reference table.
+ */
+bool
+ClusterHasReferenceTable(void)
+{
+	return list_length(CitusTableTypeIdList(REFERENCE_TABLE)) > 0;
 }
 
 
@@ -4046,6 +4056,37 @@ LookupShardRelationFromCatalog(int64 shardId, bool missingOk)
 	table_close(pgDistShard, NoLock);
 
 	return relationId;
+}
+
+
+/*
+ * ShardExists returns whether the given shard ID exists in pg_dist_shard.
+ */
+bool
+ShardExists(int64 shardId)
+{
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	Relation pgDistShard = table_open(DistShardRelationId(), AccessShareLock);
+	bool shardExists = false;
+
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_shard_shardid,
+				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(shardId));
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgDistShard,
+													DistShardShardidIndexId(), true,
+													NULL, scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	if (HeapTupleIsValid(heapTuple))
+	{
+		shardExists = true;
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgDistShard, NoLock);
+
+	return shardExists;
 }
 
 
@@ -4290,6 +4331,24 @@ CachedRelationNamespaceLookup(const char *relationName, Oid relnamespace,
 								relationName)));
 		}
 	}
+}
+
+
+/*
+ * RelationExists returns whether a relation with the given OID exists.
+ */
+bool
+RelationExists(Oid relationId)
+{
+	HeapTuple relTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
+
+	bool relationExists = HeapTupleIsValid(relTuple);
+	if (relationExists)
+	{
+		ReleaseSysCache(relTuple);
+	}
+
+	return relationExists;
 }
 
 

@@ -38,6 +38,7 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/shard_cleaner.h"
 #include "distributed/statistics_collection.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/version_compat.h"
@@ -92,6 +93,7 @@ typedef struct MaintenanceDaemonDBData
 /* config variable for distributed deadlock detection timeout */
 double DistributedDeadlockDetectionTimeoutFactor = 2.0;
 int Recover2PCInterval = 60000;
+int DeferShardDeleteInterval = 60000;
 
 /* config variables for metadata sync timeout */
 int MetadataSyncInterval = 60000;
@@ -109,13 +111,15 @@ static HTAB *MaintenanceDaemonDBHash;
 static volatile sig_atomic_t got_SIGHUP = false;
 static volatile sig_atomic_t got_SIGTERM = false;
 
+/* set to true when becoming a maintenance daemon */
+static bool IsMaintenanceDaemon = false;
+
 static void MaintenanceDaemonSigTermHandler(SIGNAL_ARGS);
 static void MaintenanceDaemonSigHupHandler(SIGNAL_ARGS);
 static size_t MaintenanceDaemonShmemSize(void);
 static void MaintenanceDaemonShmemInit(void);
 static void MaintenanceDaemonShmemExit(int code, Datum arg);
 static void MaintenanceDaemonErrorContext(void *arg);
-static bool LockCitusExtension(void);
 static bool MetadataSyncTriggeredCheckAndReset(MaintenanceDaemonDBData *dbData);
 static void WarnMaintenanceDaemonNotStarted(void);
 
@@ -165,15 +169,28 @@ InitializeMaintenanceDaemonBackend(void)
 		return;
 	}
 
-	/* maintenance daemon can ignore itself */
-	if (dbData->workerPid == MyProcPid)
+	if (!found)
 	{
+		/* ensure the values in MaintenanceDaemonDBData are zero */
+		memset(((char *) dbData) + sizeof(Oid), 0,
+			   sizeof(MaintenanceDaemonDBData) - sizeof(Oid));
+	}
+
+	if (IsMaintenanceDaemon)
+	{
+		/*
+		 * InitializeMaintenanceDaemonBackend is called by the maintenance daemon
+		 * itself. In that case, we clearly don't need to start another maintenance
+		 * daemon.
+		 */
 		LWLockRelease(&MaintenanceDaemonControl->lock);
 		return;
 	}
 
 	if (!found || !dbData->daemonStarted)
 	{
+		Assert(dbData->workerPid == 0);
+
 		BackgroundWorker worker;
 		BackgroundWorkerHandle *handle = NULL;
 
@@ -270,7 +287,15 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	bool retryStatsCollection USED_WITH_LIBCURL_ONLY = false;
 	ErrorContextCallback errorCallback;
 	TimestampTz lastRecoveryTime = 0;
+	TimestampTz lastShardCleanTime = 0;
 	TimestampTz nextMetadataSyncTime = 0;
+
+
+	/*
+	 * We do metadata sync in a separate background worker. We need its
+	 * handle to be able to check its status.
+	 */
+	BackgroundWorkerHandle *metadataSyncBgwHandle = NULL;
 
 	/*
 	 * Look up this worker's configuration.
@@ -292,12 +317,32 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		proc_exit(0);
 	}
 
+	if (myDbData->workerPid != 0)
+	{
+		/*
+		 * Another maintenance daemon is running. This usually happens because
+		 * postgres restarts the daemon after an non-zero exit, and
+		 * InitializeMaintenanceDaemonBackend started one before postgres did.
+		 * In that case, the first one stays and the last one exits.
+		 */
+
+		proc_exit(0);
+	}
+
 	before_shmem_exit(MaintenanceDaemonShmemExit, main_arg);
 
-	Assert(myDbData->workerPid == 0);
-
-	/* from this point, DROP DATABASE will attempt to kill the worker */
+	/*
+	 * Signal that I am the maintenance daemon now.
+	 *
+	 * From this point, DROP DATABASE/EXTENSION will send a SIGTERM to me.
+	 */
 	myDbData->workerPid = MyProcPid;
+
+	/*
+	 * Signal that we are running. This in mainly needed in case of restart after
+	 * an error, otherwise the daemonStarted flag is already true.
+	 */
+	myDbData->daemonStarted = true;
 
 	/* wire up signals */
 	pqsignal(SIGTERM, MaintenanceDaemonSigTermHandler);
@@ -305,6 +350,8 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	myDbData->latch = MyLatch;
+
+	IsMaintenanceDaemon = true;
 
 	LWLockRelease(&MaintenanceDaemonControl->lock);
 
@@ -330,6 +377,12 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	/* make worker recognizable in pg_stat_activity */
 	pgstat_report_appname("Citus Maintenance Daemon");
 
+	/*
+	 * Terminate orphaned metadata sync daemons spawned from previously terminated
+	 * or crashed maintenanced instances.
+	 */
+	SignalMetadataSyncDaemon(databaseOid, SIGTERM);
+
 	/* enter main loop */
 	while (!got_SIGTERM)
 	{
@@ -338,8 +391,6 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		bool foundDeadlock = false;
 
 		CHECK_FOR_INTERRUPTS();
-
-		Assert(myDbData->workerPid == MyProcPid);
 
 		CitusTableCacheFlushInvalidatedEntries();
 
@@ -411,20 +462,41 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		}
 #endif
 
-		if (!RecoveryInProgress() &&
-			(MetadataSyncTriggeredCheckAndReset(myDbData) ||
-			 GetCurrentTimestamp() >= nextMetadataSyncTime))
+		pid_t metadataSyncBgwPid = 0;
+		BgwHandleStatus metadataSyncStatus =
+			metadataSyncBgwHandle != NULL ?
+			GetBackgroundWorkerPid(metadataSyncBgwHandle, &metadataSyncBgwPid) :
+			BGWH_STOPPED;
+
+		if (metadataSyncStatus != BGWH_STOPPED &&
+			GetCurrentTimestamp() >= nextMetadataSyncTime)
 		{
-			bool metadataSyncFailed = false;
+			/*
+			 * Metadata sync is still running, recheck in a short while.
+			 */
+			int nextTimeout = MetadataSyncRetryInterval;
+			nextMetadataSyncTime =
+				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), nextTimeout);
+			timeout = Min(timeout, nextTimeout);
+		}
+		else if (!RecoveryInProgress() &&
+				 metadataSyncStatus == BGWH_STOPPED &&
+				 (MetadataSyncTriggeredCheckAndReset(myDbData) ||
+				  GetCurrentTimestamp() >= nextMetadataSyncTime))
+		{
+			if (metadataSyncBgwHandle)
+			{
+				TerminateBackgroundWorker(metadataSyncBgwHandle);
+				pfree(metadataSyncBgwHandle);
+				metadataSyncBgwHandle = NULL;
+			}
 
 			InvalidateMetadataSystemCache();
 			StartTransactionCommand();
-
-			/*
-			 * Some functions in ruleutils.c, which we use to get the DDL for
-			 * metadata propagation, require an active snapshot.
-			 */
 			PushActiveSnapshot(GetTransactionSnapshot());
+
+			int nextTimeout = MetadataSyncRetryInterval;
+			bool syncMetadata = false;
 
 			if (!LockCitusExtension())
 			{
@@ -433,25 +505,28 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			}
 			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
 			{
-				MetadataSyncResult result = SyncMetadataToNodes();
-				metadataSyncFailed = (result != METADATA_SYNC_SUCCESS);
+				bool lockFailure = false;
+				syncMetadata = ShouldInitiateMetadataSync(&lockFailure);
 
 				/*
-				 * Notification means we had an attempt on synchronization
-				 * without being blocked for pg_dist_node access.
+				 * If lock fails, we need to recheck in a short while. If we are
+				 * going to sync metadata, we should recheck in a short while to
+				 * see if it failed. Otherwise, we can wait longer.
 				 */
-				if (result != METADATA_SYNC_FAILED_LOCK)
-				{
-					Async_Notify(METADATA_SYNC_CHANNEL, NULL);
-				}
+				nextTimeout = (lockFailure || syncMetadata) ?
+							  MetadataSyncRetryInterval :
+							  MetadataSyncInterval;
 			}
 
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			ProcessCompletedNotifies();
 
-			int64 nextTimeout = metadataSyncFailed ? MetadataSyncRetryInterval :
-								MetadataSyncInterval;
+			if (syncMetadata)
+			{
+				metadataSyncBgwHandle =
+					SpawnSyncMetadataToNodes(MyDatabaseId, myDbData->userOid);
+			}
+
 			nextMetadataSyncTime =
 				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), nextTimeout);
 			timeout = Min(timeout, nextTimeout);
@@ -547,6 +622,45 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			timeout = Min(timeout, deadlockTimeout);
 		}
 
+		if (!RecoveryInProgress() && DeferShardDeleteInterval > 0 &&
+			TimestampDifferenceExceeds(lastShardCleanTime, GetCurrentTimestamp(),
+									   DeferShardDeleteInterval))
+		{
+			int numberOfDroppedShards = 0;
+
+			InvalidateMetadataSystemCache();
+			StartTransactionCommand();
+
+			if (!LockCitusExtension())
+			{
+				ereport(DEBUG1, (errmsg(
+									 "could not lock the citus extension, skipping shard cleaning")));
+			}
+			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+			{
+				/*
+				 * Record last shard clean time at start to ensure we run once per
+				 * DeferShardDeleteInterval.
+				 */
+				lastShardCleanTime = GetCurrentTimestamp();
+
+				numberOfDroppedShards = TryDropMarkedShards();
+			}
+
+			CommitTransactionCommand();
+
+			if (numberOfDroppedShards > 0)
+			{
+				ereport(LOG, (errmsg("maintenance daemon dropped %d distributed "
+									 "shards previously marked to be removed",
+									 numberOfDroppedShards)));
+			}
+
+			/* make sure we don't wait too long */
+			timeout = Min(timeout, DeferShardDeleteInterval);
+		}
+
+
 		/*
 		 * Wait until timeout, or until somebody wakes us up. Also cast the timeout to
 		 * integer where we've calculated it using double for not losing the precision.
@@ -567,15 +681,6 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			/* check for changed configuration */
 			if (myDbData->userOid != GetSessionUserId())
 			{
-				/*
-				 * Reset myDbData->daemonStarted so InitializeMaintenanceDaemonBackend()
-				 * notices this is a restart.
-				 */
-				LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
-				myDbData->daemonStarted = false;
-				myDbData->workerPid = 0;
-				LWLockRelease(&MaintenanceDaemonControl->lock);
-
 				/* return code of 1 requests worker restart */
 				proc_exit(1);
 			}
@@ -595,6 +700,11 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			got_SIGHUP = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
+	}
+
+	if (metadataSyncBgwHandle)
+	{
+		TerminateBackgroundWorker(metadataSyncBgwHandle);
 	}
 }
 
@@ -687,8 +797,15 @@ MaintenanceDaemonShmemExit(int code, Datum arg)
 	MaintenanceDaemonDBData *myDbData = (MaintenanceDaemonDBData *)
 										hash_search(MaintenanceDaemonDBHash, &databaseOid,
 													HASH_FIND, NULL);
-	if (myDbData && myDbData->workerPid == MyProcPid)
+
+	/* myDbData is NULL after StopMaintenanceDaemon */
+	if (myDbData != NULL)
 	{
+		/*
+		 * Confirm that I am still the registered maintenance daemon before exiting.
+		 */
+		Assert(myDbData->workerPid == MyProcPid);
+
 		myDbData->daemonStarted = false;
 		myDbData->workerPid = 0;
 	}
@@ -749,7 +866,7 @@ MaintenanceDaemonErrorContext(void *arg)
  * LockCitusExtension acquires a lock on the Citus extension or returns
  * false if the extension does not exist or is being dropped.
  */
-static bool
+bool
 LockCitusExtension(void)
 {
 	Oid extensionOid = get_extension_oid("citus", true);

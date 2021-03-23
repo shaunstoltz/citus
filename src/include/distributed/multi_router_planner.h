@@ -42,7 +42,8 @@ extern DeferredErrorMessage * PlanRouterQuery(Query *originalQuery,
 											  List **prunedShardIntervalListList,
 											  bool replacePrunedQueryWithDummy,
 											  bool *multiShardModifyQuery,
-											  Const **partitionValueConst);
+											  Const **partitionValueConst,
+											  bool *containOnlyLocalTable);
 extern List * RelationShardListForShardIntervalList(List *shardIntervalList,
 													bool *shardsPresent);
 extern List * CreateTaskPlacementListForShardIntervals(List *shardIntervalList,
@@ -74,8 +75,7 @@ extern RangeTblEntry * ExtractResultRelationRTE(Query *query);
 extern RangeTblEntry * ExtractResultRelationRTEOrError(Query *query);
 extern RangeTblEntry * ExtractDistributedInsertValuesRTE(Query *query);
 extern bool IsMultiRowInsert(Query *query);
-extern void AddShardIntervalRestrictionToSelect(Query *subqery,
-												ShardInterval *shardInterval);
+extern void AddPartitionKeyNotNullFilterToSelect(Query *subqery);
 extern bool UpdateOrDeleteQuery(Query *query);
 
 extern uint64 GetAnchorShardId(List *relationShardList);
@@ -85,7 +85,9 @@ extern List * TargetShardIntervalForFastPathQuery(Query *query,
 												  Const **outGoingPartitionValueConst);
 extern void GenerateSingleShardRouterTaskList(Job *job,
 											  List *relationShardList,
-											  List *placementList, uint64 shardId);
+											  List *placementList,
+											  uint64 shardId,
+											  bool isLocalTableModification);
 
 /*
  * FastPathPlanner is a subset of router planner, that's why we prefer to
@@ -95,6 +97,7 @@ extern void GenerateSingleShardRouterTaskList(Job *job,
 extern PlannedStmt * FastPathPlanner(Query *originalQuery, Query *parse, ParamListInfo
 									 boundParams);
 extern bool FastPathRouterQuery(Query *query, Node **distributionKeyValue);
+extern bool JoinConditionIsOnFalse(List *relOptInfo);
 
 
 #endif /* MULTI_ROUTER_PLANNER_H */

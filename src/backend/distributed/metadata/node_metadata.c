@@ -41,10 +41,13 @@
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shared_connection_stats.h"
+#include "distributed/string_utils.h"
+#include "distributed/transaction_recovery.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
 #include "lib/stringinfo.h"
+#include "postmaster/postmaster.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -86,6 +89,7 @@ typedef struct NodeMetadata
 
 /* local function forward declarations */
 static int ActivateNode(char *nodeName, int nodePort);
+static bool CanRemoveReferenceTablePlacements(void);
 static void RemoveNodeFromCluster(char *nodeName, int32 nodePort);
 static int AddNodeMetadata(char *nodeName, int32 nodePort, NodeMetadata
 						   *nodeMetadata, bool *nodeAlreadyExists);
@@ -93,6 +97,7 @@ static WorkerNode * SetNodeState(char *nodeName, int32 nodePort, bool isActive);
 static HeapTuple GetNodeTuple(const char *nodeName, int32 nodePort);
 static int32 GetNextGroupId(void);
 static int GetNextNodeId(void);
+static void InsertPlaceholderCoordinatorRecord(void);
 static void InsertNodeRow(int nodeid, char *nodename, int32 nodeport, NodeMetadata
 						  *nodeMetadata);
 static void DeleteNodeRow(char *nodename, int32 nodeport);
@@ -100,18 +105,32 @@ static void SetUpDistributedTableDependencies(WorkerNode *workerNode);
 static WorkerNode * TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple);
 static void PropagateNodeWideObjects(WorkerNode *newWorkerNode);
 static WorkerNode * ModifiableWorkerNode(const char *nodeName, int32 nodePort);
+static bool NodeIsLocal(WorkerNode *worker);
+static void SetLockTimeoutLocally(int32 lock_cooldown);
 static void UpdateNodeLocation(int32 nodeId, char *newNodeName, int32 newNodePort);
 static bool UnsetMetadataSyncedForAll(void);
+static void ErrorIfCoordinatorMetadataSetFalse(WorkerNode *workerNode, Datum value,
+											   char *field);
 static WorkerNode * SetShouldHaveShards(WorkerNode *workerNode, bool shouldHaveShards);
 
+
 /* declarations for dynamic loading */
+PG_FUNCTION_INFO_V1(citus_set_coordinator_host);
+PG_FUNCTION_INFO_V1(citus_add_node);
 PG_FUNCTION_INFO_V1(master_add_node);
+PG_FUNCTION_INFO_V1(citus_add_inactive_node);
 PG_FUNCTION_INFO_V1(master_add_inactive_node);
+PG_FUNCTION_INFO_V1(citus_add_secondary_node);
 PG_FUNCTION_INFO_V1(master_add_secondary_node);
+PG_FUNCTION_INFO_V1(citus_set_node_property);
 PG_FUNCTION_INFO_V1(master_set_node_property);
+PG_FUNCTION_INFO_V1(citus_remove_node);
 PG_FUNCTION_INFO_V1(master_remove_node);
+PG_FUNCTION_INFO_V1(citus_disable_node);
 PG_FUNCTION_INFO_V1(master_disable_node);
+PG_FUNCTION_INFO_V1(citus_activate_node);
 PG_FUNCTION_INFO_V1(master_activate_node);
+PG_FUNCTION_INFO_V1(citus_update_node);
 PG_FUNCTION_INFO_V1(master_update_node);
 PG_FUNCTION_INFO_V1(get_shard_id_for_distribution_column);
 
@@ -136,11 +155,69 @@ DefaultNodeMetadata()
 
 
 /*
- * master_add_node function adds a new node to the cluster and returns its id. It also
+ * citus_set_coordinator_host configures the hostname and port through which worker
+ * nodes can connect to the coordinator.
+ */
+Datum
+citus_set_coordinator_host(PG_FUNCTION_ARGS)
+{
+	text *nodeName = PG_GETARG_TEXT_P(0);
+	int32 nodePort = PG_GETARG_INT32(1);
+	char *nodeNameString = text_to_cstring(nodeName);
+
+	NodeMetadata nodeMetadata = DefaultNodeMetadata();
+	nodeMetadata.groupId = 0;
+	nodeMetadata.shouldHaveShards = false;
+	nodeMetadata.nodeRole = PG_GETARG_OID(2);
+
+	Name nodeClusterName = PG_GETARG_NAME(3);
+	nodeMetadata.nodeCluster = NameStr(*nodeClusterName);
+
+	CheckCitusVersion(ERROR);
+
+	/* prevent concurrent modification */
+	LockRelationOid(DistNodeRelationId(), RowShareLock);
+
+	bool isCoordinatorInMetadata = false;
+	WorkerNode *coordinatorNode = PrimaryNodeForGroup(COORDINATOR_GROUP_ID,
+													  &isCoordinatorInMetadata);
+	if (!isCoordinatorInMetadata)
+	{
+		bool nodeAlreadyExists = false;
+
+		/* add the coordinator to pg_dist_node if it was not already added */
+		AddNodeMetadata(nodeNameString, nodePort, &nodeMetadata,
+						&nodeAlreadyExists);
+
+		/* we just checked */
+		Assert(!nodeAlreadyExists);
+	}
+	else
+	{
+		/*
+		 * since AddNodeMetadata takes an exclusive lock on pg_dist_node, we
+		 * do not need to worry about concurrent changes (e.g. deletion) and
+		 * can proceed to update immediately.
+		 */
+
+		UpdateNodeLocation(coordinatorNode->nodeId, nodeNameString, nodePort);
+
+		/* clear cached plans that have the old host/port */
+		ResetPlanCache();
+	}
+
+	TransactionModifiedNodeMetadata = true;
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_add_node function adds a new node to the cluster and returns its id. It also
  * replicates all reference tables to the new node.
  */
 Datum
-master_add_node(PG_FUNCTION_ARGS)
+citus_add_node(PG_FUNCTION_ARGS)
 {
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -169,6 +246,12 @@ master_add_node(PG_FUNCTION_ARGS)
 		nodeMetadata.nodeRole = PG_GETARG_OID(3);
 	}
 
+	if (nodeMetadata.groupId == COORDINATOR_GROUP_ID)
+	{
+		/* by default, we add the coordinator without shards */
+		nodeMetadata.shouldHaveShards = false;
+	}
+
 	int nodeId = AddNodeMetadata(nodeNameString, nodePort, &nodeMetadata,
 								 &nodeAlreadyExists);
 	TransactionModifiedNodeMetadata = true;
@@ -188,12 +271,22 @@ master_add_node(PG_FUNCTION_ARGS)
 
 
 /*
- * master_add_inactive_node function adds a new node to the cluster as inactive node
+ * master_add_node is a wrapper function for old UDF name.
+ */
+Datum
+master_add_node(PG_FUNCTION_ARGS)
+{
+	return citus_add_node(fcinfo);
+}
+
+
+/*
+ * citus_add_inactive_node function adds a new node to the cluster as inactive node
  * and returns id of the newly added node. It does not replicate reference
  * tables to the new node, it only adds new node to the pg_dist_node table.
  */
 Datum
-master_add_inactive_node(PG_FUNCTION_ARGS)
+citus_add_inactive_node(PG_FUNCTION_ARGS)
 {
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -208,6 +301,11 @@ master_add_inactive_node(PG_FUNCTION_ARGS)
 
 	CheckCitusVersion(ERROR);
 
+	if (nodeMetadata.groupId == COORDINATOR_GROUP_ID)
+	{
+		ereport(ERROR, (errmsg("coordinator node cannot be added as inactive node")));
+	}
+
 	int nodeId = AddNodeMetadata(nodeNameString, nodePort, &nodeMetadata,
 								 &nodeAlreadyExists);
 	TransactionModifiedNodeMetadata = true;
@@ -217,11 +315,21 @@ master_add_inactive_node(PG_FUNCTION_ARGS)
 
 
 /*
- * master_add_secondary_node adds a new secondary node to the cluster. It accepts as
+ * master_add_inactive_node is a wrapper function for old UDF name.
+ */
+Datum
+master_add_inactive_node(PG_FUNCTION_ARGS)
+{
+	return citus_add_inactive_node(fcinfo);
+}
+
+
+/*
+ * citus_add_secondary_node adds a new secondary node to the cluster. It accepts as
  * arguments the primary node it should share a group with.
  */
 Datum
-master_add_secondary_node(PG_FUNCTION_ARGS)
+citus_add_secondary_node(PG_FUNCTION_ARGS)
 {
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -251,16 +359,26 @@ master_add_secondary_node(PG_FUNCTION_ARGS)
 
 
 /*
- * master_remove_node function removes the provided node from the pg_dist_node table of
+ * master_add_secondary_node is a wrapper function for old UDF name.
+ */
+Datum
+master_add_secondary_node(PG_FUNCTION_ARGS)
+{
+	return citus_add_secondary_node(fcinfo);
+}
+
+
+/*
+ * citus_remove_node function removes the provided node from the pg_dist_node table of
  * the master node and all nodes with metadata.
- * The call to the master_remove_node should be done by the super user and the specified
+ * The call to the citus_remove_node should be done by the super user and the specified
  * node should not have any active placements.
  * This function also deletes all reference table placements belong to the given node from
  * pg_dist_placement, but it does not drop actual placement at the node. In the case of
  * re-adding the node, master_add_node first drops and re-creates the reference tables.
  */
 Datum
-master_remove_node(PG_FUNCTION_ARGS)
+citus_remove_node(PG_FUNCTION_ARGS)
 {
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -275,19 +393,29 @@ master_remove_node(PG_FUNCTION_ARGS)
 
 
 /*
- * master_disable_node function sets isactive value of the provided node as inactive at
- * master node and all nodes with metadata regardless of the node having an active shard
+ * master_remove_node is a wrapper function for old UDF name.
+ */
+Datum
+master_remove_node(PG_FUNCTION_ARGS)
+{
+	return citus_remove_node(fcinfo);
+}
+
+
+/*
+ * citus_disable_node function sets isactive value of the provided node as inactive at
+ * coordinator and all nodes with metadata regardless of the node having an active shard
  * placement.
  *
- * The call to the master_disable_node must be done by the super user.
+ * The call to the citus_disable_node must be done by the super user.
  *
  * This function also deletes all reference table placements belong to the given node
  * from pg_dist_placement, but it does not drop actual placement at the node. In the case
- * of re-activating the node, master_add_node first drops and re-creates the reference
+ * of re-activating the node, citus_add_node first drops and re-creates the reference
  * tables.
  */
 Datum
-master_disable_node(PG_FUNCTION_ARGS)
+citus_disable_node(PG_FUNCTION_ARGS)
 {
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -330,13 +458,23 @@ master_disable_node(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(savedContext);
 		ErrorData *edata = CopyErrorData();
 
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("Disabling %s:%d failed", workerNode->workerName,
-							   nodePort),
-						errdetail("%s", edata->message),
-						errhint(
-							"If you are using MX, try stop_metadata_sync_to_node(hostname, port) "
-							"for nodes that are down before disabling them.")));
+		if (ClusterHasKnownMetadataWorkers())
+		{
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("Disabling %s:%d failed", workerNode->workerName,
+								   nodePort),
+							errdetail("%s", edata->message),
+							errhint(
+								"If you are using MX, try stop_metadata_sync_to_node(hostname, port) "
+								"for nodes that are down before disabling them.")));
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("Disabling %s:%d failed", workerNode->workerName,
+								   nodePort),
+							errdetail("%s", edata->message)));
+		}
 	}
 	PG_END_TRY();
 
@@ -345,10 +483,20 @@ master_disable_node(PG_FUNCTION_ARGS)
 
 
 /*
- * master_set_node_property sets a property of the node
+ * master_disable_node is a wrapper function for old UDF name.
  */
 Datum
-master_set_node_property(PG_FUNCTION_ARGS)
+master_disable_node(PG_FUNCTION_ARGS)
+{
+	return citus_disable_node(fcinfo);
+}
+
+
+/*
+ * citus_set_node_property sets a property of the node
+ */
+Datum
+citus_set_node_property(PG_FUNCTION_ARGS)
 {
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -372,6 +520,16 @@ master_set_node_property(PG_FUNCTION_ARGS)
 	TransactionModifiedNodeMetadata = true;
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * master_set_node_property is a wrapper function for old UDF name.
+ */
+Datum
+master_set_node_property(PG_FUNCTION_ARGS)
+{
+	return citus_set_node_property(fcinfo);
 }
 
 
@@ -423,7 +581,7 @@ SetUpDistributedTableDependencies(WorkerNode *newWorkerNode)
 		{
 			MarkNodeHasMetadata(newWorkerNode->workerName, newWorkerNode->workerPort,
 								true);
-			TriggerMetadataSync(MyDatabaseId);
+			TriggerMetadataSyncOnCommit();
 		}
 	}
 }
@@ -490,11 +648,11 @@ ModifiableWorkerNode(const char *nodeName, int32 nodePort)
 
 
 /*
- * master_activate_node UDF activates the given node. It sets the node's isactive
+ * citus_activate_node UDF activates the given node. It sets the node's isactive
  * value to active and replicates all reference tables to that node.
  */
 Datum
-master_activate_node(PG_FUNCTION_ARGS)
+citus_activate_node(PG_FUNCTION_ARGS)
 {
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -506,6 +664,16 @@ master_activate_node(PG_FUNCTION_ARGS)
 	TransactionModifiedNodeMetadata = true;
 
 	PG_RETURN_INT32(workerNode->nodeId);
+}
+
+
+/*
+ * master_activate_node is a wrapper function for old UDF name.
+ */
+Datum
+master_activate_node(PG_FUNCTION_ARGS)
+{
+	return citus_activate_node(fcinfo);
 }
 
 
@@ -529,6 +697,17 @@ GroupForNode(char *nodeName, int nodePort)
 
 
 /*
+ * NodeIsPrimaryAndLocal returns whether the argument represents the local
+ * primary node.
+ */
+bool
+NodeIsPrimaryAndRemote(WorkerNode *worker)
+{
+	return NodeIsPrimary(worker) && !NodeIsLocal(worker);
+}
+
+
+/*
  * NodeIsPrimary returns whether the argument represents a primary node.
  */
 bool
@@ -543,6 +722,16 @@ NodeIsPrimary(WorkerNode *worker)
 	}
 
 	return worker->nodeRole == primaryRole;
+}
+
+
+/*
+ * NodeIsLocal returns whether the argument represents the local node.
+ */
+static bool
+NodeIsLocal(WorkerNode *worker)
+{
+	return worker->groupId == GetLocalGroupId();
 }
 
 
@@ -647,12 +836,12 @@ ActivateNode(char *nodeName, int nodePort)
 
 
 /*
- * master_update_node moves the requested node to a different nodename and nodeport. It
+ * citus_update_node moves the requested node to a different nodename and nodeport. It
  * locks to ensure no queries are running concurrently; and is intended for customers who
  * are running their own failover solution.
  */
 Datum
-master_update_node(PG_FUNCTION_ARGS)
+citus_update_node(PG_FUNCTION_ARGS)
 {
 	int32 nodeId = PG_GETARG_INT32(0);
 
@@ -723,7 +912,7 @@ master_update_node(PG_FUNCTION_ARGS)
 	 *   In case of node failure said long-running queries will fail in the end
 	 *   anyway as they will be unable to commit successfully on the failed
 	 *   machine. To cause quick failure of these queries use force => true
-	 *   during the invocation of master_update_node to terminate conflicting
+	 *   during the invocation of citus_update_node to terminate conflicting
 	 *   backends proactively.
 	 *
 	 * It might be worth blocking reads to a secondary for the same reasons,
@@ -739,6 +928,24 @@ master_update_node(PG_FUNCTION_ARGS)
 		if (force)
 		{
 			handle = StartLockAcquireHelperBackgroundWorker(MyProcPid, lock_cooldown);
+			if (!handle)
+			{
+				/*
+				 * We failed to start a background worker, which probably means that we exceeded
+				 * max_worker_processes, and this is unlikely to be resolved by retrying. We do not want
+				 * to repeatedly throw an error because if citus_update_node is called to complete a
+				 * failover then finishing is the only way to bring the cluster back up. Therefore we
+				 * give up on killing other backends and simply wait for the lock. We do set
+				 * lock_timeout to lock_cooldown, because we don't want to wait forever to get a lock.
+				 */
+				SetLockTimeoutLocally(lock_cooldown);
+				ereport(WARNING, (errmsg(
+									  "could not start background worker to kill backends with conflicting"
+									  " locks to force the update. Degrading to acquiring locks "
+									  "with a lock time out."),
+								  errhint(
+									  "Increasing max_worker_processes might help.")));
+			}
 		}
 
 		placementList = AllShardPlacementsOnNodeGroup(workerNode->groupId);
@@ -759,7 +966,7 @@ master_update_node(PG_FUNCTION_ARGS)
 
 	/*
 	 * Propagate the updated pg_dist_node entry to all metadata workers.
-	 * citus-ha uses master_update_node() in a prepared transaction, and
+	 * citus-ha uses citus_update_node() in a prepared transaction, and
 	 * we don't support coordinated prepared transactions, so we cannot
 	 * propagate the changes to the worker nodes here. Instead we mark
 	 * all metadata nodes as not-synced and ask maintenanced to do the
@@ -771,7 +978,7 @@ master_update_node(PG_FUNCTION_ARGS)
 	 */
 	if (UnsetMetadataSyncedForAll())
 	{
-		TriggerMetadataSync(MyDatabaseId);
+		TriggerMetadataSyncOnCommit();
 	}
 
 	if (handle != NULL)
@@ -786,6 +993,29 @@ master_update_node(PG_FUNCTION_ARGS)
 	TransactionModifiedNodeMetadata = true;
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * master_update_node is a wrapper function for old UDF name.
+ */
+Datum
+master_update_node(PG_FUNCTION_ARGS)
+{
+	return citus_update_node(fcinfo);
+}
+
+
+/*
+ * SetLockTimeoutLocally sets the lock_timeout to the given value.
+ * This setting is local.
+ */
+static void
+SetLockTimeoutLocally(int32 lockCooldown)
+{
+	set_config_option("lock_timeout", ConvertIntToString(lockCooldown),
+					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
+					  GUC_ACTION_LOCAL, true, 0, false);
 }
 
 
@@ -1053,20 +1283,39 @@ RemoveNodeFromCluster(char *nodeName, int32 nodePort)
 	WorkerNode *workerNode = ModifiableWorkerNode(nodeName, nodePort);
 	if (NodeIsPrimary(workerNode))
 	{
+		if (CanRemoveReferenceTablePlacements())
+		{
+			/*
+			 * Delete reference table placements so they are not taken into account
+			 * for the check if there are placements after this.
+			 */
+			DeleteAllReferenceTablePlacementsFromNodeGroup(workerNode->groupId);
+		}
 		bool onlyConsiderActivePlacements = false;
-
-		/*
-		 * Delete reference table placements so they are not taken into account
-		 * for the check if there are placements after this
-		 */
-		DeleteAllReferenceTablePlacementsFromNodeGroup(workerNode->groupId);
-
 		if (NodeGroupHasShardPlacements(workerNode->groupId,
 										onlyConsiderActivePlacements))
 		{
-			ereport(ERROR, (errmsg("you cannot remove the primary node of a node group "
-								   "which has shard placements")));
+			if (ClusterHasReferenceTable())
+			{
+				ereport(ERROR, (errmsg(
+									"cannot remove the last worker node because there are reference "
+									"tables and it would cause data loss on reference tables"),
+								errhint(
+									"To proceed, either drop the reference tables or use "
+									"undistribute_table() function to convert them to local tables")));
+			}
+			ereport(ERROR, (errmsg("cannot remove the primary node of a node group "
+								   "which has shard placements"),
+							errhint(
+								"To proceed, either drop the distributed tables or use "
+								"undistribute_table() function to convert them to local tables")));
 		}
+
+		/*
+		 * Secondary nodes are read-only, never 2PC is used.
+		 * Hence, no items can be inserted to pg_dist_transaction for secondary nodes.
+		 */
+		DeleteWorkerTransactions(workerNode);
 	}
 
 	DeleteNodeRow(workerNode->workerName, nodePort);
@@ -1077,6 +1326,18 @@ RemoveNodeFromCluster(char *nodeName, int32 nodePort)
 	CloseNodeConnectionsAfterTransaction(workerNode->workerName, nodePort);
 
 	SendCommandToWorkersWithMetadata(nodeDeleteCommand);
+}
+
+
+/*
+ * CanRemoveReferenceTablePlacements returns true if active primary
+ * node count is more than 1, which means that even if we remove a node
+ * we will still have some other node that has reference table placement.
+ */
+static bool
+CanRemoveReferenceTablePlacements(void)
+{
+	return ActivePrimaryNodeCount() > 1;
 }
 
 
@@ -1123,19 +1384,80 @@ AddNodeMetadata(char *nodeName, int32 nodePort,
 	*nodeAlreadyExists = false;
 
 	/*
-	 * Take an exclusive lock on pg_dist_node to serialize node changes.
+	 * Prevent / wait for concurrent modification before checking whether
+	 * the worker already exists in pg_dist_node.
+	 */
+	LockRelationOid(DistNodeRelationId(), RowShareLock);
+
+	WorkerNode *workerNode = FindWorkerNodeAnyCluster(nodeName, nodePort);
+	if (workerNode != NULL)
+	{
+		/* return early without holding locks when the node already exists */
+		*nodeAlreadyExists = true;
+
+		return workerNode->nodeId;
+	}
+
+	/*
+	 * We are going to change pg_dist_node, prevent any concurrent reads that
+	 * are not tolerant to concurrent node addition by taking an exclusive
+	 * lock (conflicts with all but AccessShareLock).
+	 *
 	 * We may want to relax or have more fine-grained locking in the future
 	 * to allow users to add multiple nodes concurrently.
 	 */
 	LockRelationOid(DistNodeRelationId(), ExclusiveLock);
 
-	WorkerNode *workerNode = FindWorkerNodeAnyCluster(nodeName, nodePort);
+	/* recheck in case 2 node additions pass the first check concurrently */
+	workerNode = FindWorkerNodeAnyCluster(nodeName, nodePort);
 	if (workerNode != NULL)
 	{
-		/* fill return data and return */
 		*nodeAlreadyExists = true;
 
 		return workerNode->nodeId;
+	}
+
+	if (nodeMetadata->groupId != COORDINATOR_GROUP_ID &&
+		strcmp(nodeName, "localhost") != 0)
+	{
+		/*
+		 * User tries to add a worker with a non-localhost address. If the coordinator
+		 * is added with "localhost" as well, the worker won't be able to connect.
+		 */
+
+		bool isCoordinatorInMetadata = false;
+		WorkerNode *coordinatorNode = PrimaryNodeForGroup(COORDINATOR_GROUP_ID,
+														  &isCoordinatorInMetadata);
+		if (isCoordinatorInMetadata &&
+			strcmp(coordinatorNode->workerName, "localhost") == 0)
+		{
+			ereport(ERROR, (errmsg("cannot add a worker node when the coordinator "
+								   "hostname is set to localhost"),
+							errdetail("Worker nodes need to be able to connect to the "
+									  "coordinator to transfer data."),
+							errhint("Use SELECT citus_set_coordinator_host('<hostname>') "
+									"to configure the coordinator hostname")));
+		}
+	}
+
+	/*
+	 * When adding the first worker when the coordinator has shard placements,
+	 * print a notice on how to drain the coordinator.
+	 */
+	if (nodeMetadata->groupId != COORDINATOR_GROUP_ID && CoordinatorAddedAsWorkerNode() &&
+		ActivePrimaryNonCoordinatorNodeCount() == 0 &&
+		NodeGroupHasShardPlacements(COORDINATOR_GROUP_ID, true))
+	{
+		WorkerNode *coordinator = CoordinatorNodeIfAddedAsWorkerOrError();
+
+		ereport(NOTICE, (errmsg("shards are still on the coordinator after adding the "
+								"new node"),
+						 errhint("Use SELECT rebalance_table_shards(); to balance "
+								 "shards data between workers and coordinator or "
+								 "SELECT citus_drain_node(%s,%d); to permanently "
+								 "move shards away from the coordinator.",
+								 quote_literal_cstr(coordinator->workerName),
+								 coordinator->workerPort)));
 	}
 
 	/* user lets Citus to decide on the group that the newly added node should be in */
@@ -1144,11 +1466,19 @@ AddNodeMetadata(char *nodeName, int32 nodePort,
 		nodeMetadata->groupId = GetNextGroupId();
 	}
 
-	/* if this is a coordinator, we shouldn't place shards on it */
 	if (nodeMetadata->groupId == COORDINATOR_GROUP_ID)
 	{
-		nodeMetadata->shouldHaveShards = false;
+		/*
+		 * Coordinator has always the authoritative metadata, reflect this
+		 * fact in the pg_dist_node.
+		 */
 		nodeMetadata->hasMetadata = true;
+		nodeMetadata->metadataSynced = true;
+
+		/*
+		 * There is no concept of "inactive" coordinator, so hard code it.
+		 */
+		nodeMetadata->isActive = true;
 	}
 
 	/* if nodeRole hasn't been added yet there's a constraint for one-node-per-group */
@@ -1220,8 +1550,17 @@ SetWorkerColumn(WorkerNode *workerNode, int columnIndex, Datum value)
 
 	switch (columnIndex)
 	{
+		case Anum_pg_dist_node_hasmetadata:
+		{
+			ErrorIfCoordinatorMetadataSetFalse(workerNode, value, "hasmetadata");
+
+			break;
+		}
+
 		case Anum_pg_dist_node_isactive:
 		{
+			ErrorIfCoordinatorMetadataSetFalse(workerNode, value, "isactive");
+
 			metadataSyncCommand = NodeStateUpdateCommand(workerNode->nodeId,
 														 DatumGetBool(value));
 			break;
@@ -1231,6 +1570,13 @@ SetWorkerColumn(WorkerNode *workerNode, int columnIndex, Datum value)
 		{
 			metadataSyncCommand = ShouldHaveShardsUpdateCommand(workerNode->nodeId,
 																DatumGetBool(value));
+			break;
+		}
+
+		case Anum_pg_dist_node_metadatasynced:
+		{
+			ErrorIfCoordinatorMetadataSetFalse(workerNode, value, "metadatasynced");
+
 			break;
 		}
 
@@ -1266,6 +1612,22 @@ SetWorkerColumn(WorkerNode *workerNode, int columnIndex, Datum value)
 	/* we also update the column at worker nodes */
 	SendCommandToWorkersWithMetadata(metadataSyncCommand);
 	return newWorkerNode;
+}
+
+
+/*
+ * ErrorIfCoordinatorMetadataSetFalse throws an error if the input node
+ * is the coordinator and the value is false.
+ */
+static void
+ErrorIfCoordinatorMetadataSetFalse(WorkerNode *workerNode, Datum value, char *field)
+{
+	bool valueBool = DatumGetBool(value);
+	if (!valueBool && workerNode->groupId == COORDINATOR_GROUP_ID)
+	{
+		ereport(ERROR, (errmsg("cannot change \"%s\" field of the "
+							   "coordinator node", field)));
+	}
 }
 
 
@@ -1410,6 +1772,53 @@ EnsureCoordinator(void)
 		ereport(ERROR, (errmsg("operation is not allowed on this node"),
 						errhint("Connect to the coordinator and run it again.")));
 	}
+}
+
+
+/*
+ * InsertCoordinatorIfClusterEmpty can be used to ensure Citus tables can be
+ * created even on a node that has just performed CREATE EXTENSION citus;
+ */
+void
+InsertCoordinatorIfClusterEmpty(void)
+{
+	/* prevent concurrent node additions */
+	Relation pgDistNode = table_open(DistNodeRelationId(), RowShareLock);
+
+	if (!HasAnyNodes())
+	{
+		/*
+		 * create_distributed_table being called for the first time and there are
+		 * no pg_dist_node records. Add a record for the coordinator.
+		 */
+		InsertPlaceholderCoordinatorRecord();
+	}
+
+	/*
+	 * We release the lock, if InsertPlaceholderCoordinatorRecord was called
+	 * we already have a strong (RowExclusive) lock.
+	 */
+	table_close(pgDistNode, RowShareLock);
+}
+
+
+/*
+ * InsertPlaceholderCoordinatorRecord inserts a placeholder record for the coordinator
+ * to be able to create distributed tables on a single node.
+ */
+static void
+InsertPlaceholderCoordinatorRecord(void)
+{
+	NodeMetadata nodeMetadata = DefaultNodeMetadata();
+	nodeMetadata.groupId = 0;
+	nodeMetadata.shouldHaveShards = true;
+	nodeMetadata.nodeRole = PrimaryNodeRoleId();
+	nodeMetadata.nodeCluster = "default";
+
+	bool nodeAlreadyExists = false;
+
+	/* as long as there is a single node, localhost should be ok */
+	AddNodeMetadata("localhost", PostPortNumber, &nodeMetadata, &nodeAlreadyExists);
 }
 
 
@@ -1624,7 +2033,7 @@ UnsetMetadataSyncedForAll(void)
 	bool indexOK = false;
 
 	/*
-	 * Concurrent master_update_node() calls might iterate and try to update
+	 * Concurrent citus_update_node() calls might iterate and try to update
 	 * pg_dist_node in different orders. To protect against deadlock, we
 	 * get an exclusive lock here.
 	 */

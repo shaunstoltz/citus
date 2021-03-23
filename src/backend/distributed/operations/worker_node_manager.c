@@ -308,16 +308,13 @@ ActivePrimaryNonCoordinatorNodeCount(void)
 
 
 /*
- * ActiveReadableNonCoordinatorNodeCount returns the number of groups with a node we can read from.
- * This method excludes coordinator even if it is added as a worker.
+ * ActivePrimaryNodeCount returns the number of groups with a primary in the cluster.
  */
 uint32
-ActiveReadableNonCoordinatorNodeCount(void)
+ActivePrimaryNodeCount(void)
 {
-	List *workerNodeList = ActiveReadableNonCoordinatorNodeList();
-	uint32 liveWorkerCount = list_length(workerNodeList);
-
-	return liveWorkerCount;
+	List *nodeList = ActivePrimaryNodeList(NoLock);
+	return list_length(nodeList);
 }
 
 
@@ -396,6 +393,18 @@ ActivePrimaryNodeList(LOCKMODE lockMode)
 
 
 /*
+ * ActivePrimaryRemoteNodeList returns a list of all active primary nodes in
+ * workerNodeHash.
+ */
+List *
+ActivePrimaryRemoteNodeList(LOCKMODE lockMode)
+{
+	EnsureModificationsCanRun();
+	return FilterActiveNodeListFunc(lockMode, NodeIsPrimaryAndRemote);
+}
+
+
+/*
  * NodeIsPrimaryWorker returns true if the node is a primary worker node.
  */
 static bool
@@ -407,16 +416,12 @@ NodeIsPrimaryWorker(WorkerNode *node)
 
 /*
  * CoordinatorAddedAsWorkerNode returns true if coordinator is added to the
- * pg_dist_node. This function also acquires ShareLock on pg_dist_node
- * and does not release it to ensure that existency of the coordinator in
- * metadata won't be changed until the end of transaction.
+ * pg_dist_node.
  */
 bool
 CoordinatorAddedAsWorkerNode()
 {
 	bool groupContainsNodes = false;
-
-	LockRelationOid(DistNodeRelationId(), ShareLock);
 
 	PrimaryNodeForGroup(COORDINATOR_GROUP_ID, &groupContainsNodes);
 

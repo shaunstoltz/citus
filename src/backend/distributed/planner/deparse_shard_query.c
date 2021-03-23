@@ -13,6 +13,8 @@
 #include "c.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
+#include "catalog/pg_constraint.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/deparse_shard_query.h"
@@ -34,10 +36,14 @@
 #include "storage/lock.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 
-static void UpdateTaskQueryString(Query *query, Oid distributedTableId,
-								  RangeTblEntry *valuesRTE, Task *task);
+static void AddInsertAliasIfNeeded(Query *query);
+static void UpdateTaskQueryString(Query *query, Task *task);
+static bool ReplaceRelationConstraintByShardConstraint(List *relationShardList,
+													   OnConflictExpr *onConflict);
+static RelationShard * FindRelationShard(Oid inputRelationId, List *relationShardList);
 static void ConvertRteToSubqueryWithEmptyResult(RangeTblEntry *rte);
 static bool ShouldLazyDeparseQuery(Task *task);
 static char * DeparseTaskQuery(Task *task, Query *query);
@@ -52,26 +58,42 @@ RebuildQueryStrings(Job *workerJob)
 {
 	Query *originalQuery = workerJob->jobQuery;
 	List *taskList = workerJob->taskList;
-	Oid relationId = ((RangeTblEntry *) linitial(originalQuery->rtable))->relid;
-	RangeTblEntry *valuesRTE = ExtractDistributedInsertValuesRTE(originalQuery);
-
 	Task *task = NULL;
+
+	if (originalQuery->commandType == CMD_INSERT)
+	{
+		AddInsertAliasIfNeeded(originalQuery);
+	}
 
 	foreach_ptr(task, taskList)
 	{
 		Query *query = originalQuery;
 
-		if (UpdateOrDeleteQuery(query) && list_length(taskList) > 1)
+		/*
+		 * Copy the query if there are multiple tasks. If there is a single
+		 * task, we scribble on the original query to avoid the copying
+		 * overhead.
+		 */
+		if (list_length(taskList) > 1)
 		{
 			query = copyObject(originalQuery);
+		}
+
+		if (UpdateOrDeleteQuery(query))
+		{
+			/*
+			 * For UPDATE and DELETE queries, we may have subqueries and joins, so
+			 * we use relation shard list to update shard names and call
+			 * pg_get_query_def() directly.
+			 */
+			List *relationShardList = task->relationShardList;
+			UpdateRelationToShardNames((Node *) query, relationShardList);
 		}
 		else if (query->commandType == CMD_INSERT && task->modifyWithSubquery)
 		{
 			/* for INSERT..SELECT, adjust shard names in SELECT part */
 			List *relationShardList = task->relationShardList;
 			ShardInterval *shardInterval = LoadShardInterval(task->anchorShardId);
-
-			query = copyObject(originalQuery);
 
 			RangeTblEntry *copiedInsertRte = ExtractResultRelationRTEOrError(query);
 			RangeTblEntry *copiedSubqueryRte = ExtractSelectRangeTableEntry(query);
@@ -80,34 +102,23 @@ RebuildQueryStrings(Job *workerJob)
 			/* there are no restrictions to add for reference and citus local tables */
 			if (IsCitusTableType(shardInterval->relationId, DISTRIBUTED_TABLE))
 			{
-				AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
+				AddPartitionKeyNotNullFilterToSelect(copiedSubquery);
 			}
 
 			ReorderInsertSelectTargetLists(query, copiedInsertRte, copiedSubqueryRte);
 
-			/* setting an alias simplifies deparsing of RETURNING */
-			if (copiedInsertRte->alias == NULL)
-			{
-				Alias *alias = makeAlias(CITUS_TABLE_ALIAS, NIL);
-				copiedInsertRte->alias = alias;
-			}
-
 			UpdateRelationToShardNames((Node *) copiedSubquery, relationShardList);
 		}
-		else if (query->commandType == CMD_INSERT && (query->onConflict != NULL ||
-													  valuesRTE != NULL))
+
+		if (query->commandType == CMD_INSERT)
 		{
+			RangeTblEntry *modifiedRelationRTE = linitial(originalQuery->rtable);
+
 			/*
-			 * Always an alias in UPSERTs and multi-row INSERTs to avoid
-			 * deparsing issues (e.g. RETURNING might reference the original
-			 * table name, which has been replaced by a shard name).
+			 * We store the modified relaiton ID in the task so we can lazily call
+			 * deparse_shard_query when the string is needed
 			 */
-			RangeTblEntry *rangeTableEntry = linitial(query->rtable);
-			if (rangeTableEntry->alias == NULL)
-			{
-				Alias *alias = makeAlias(CITUS_TABLE_ALIAS, NIL);
-				rangeTableEntry->alias = alias;
-			}
+			task->anchorDistributedTableId = modifiedRelationRTE->relid;
 		}
 
 		bool isQueryObjectOrText = GetTaskQueryType(task) == TASK_QUERY_TEXT ||
@@ -117,7 +128,7 @@ RebuildQueryStrings(Job *workerJob)
 								? "(null)"
 								: ApplyLogRedaction(TaskQueryString(task)))));
 
-		UpdateTaskQueryString(query, relationId, valuesRTE, task);
+		UpdateTaskQueryString(query, task);
 
 		/*
 		 * If parameters were resolved in the job query, then they are now also
@@ -132,53 +143,68 @@ RebuildQueryStrings(Job *workerJob)
 
 
 /*
- * UpdateTaskQueryString updates the query string stored within the provided
- * Task. If the Task has row values from a multi-row INSERT, those are injected
- * into the provided query (using the provided valuesRTE, which must belong to
- * the query) before deparse occurs (the query's full VALUES list will be
- * restored before this function returns).
+ * AddInsertAliasIfNeeded adds an alias in UPSERTs and multi-row INSERTs to avoid
+ * deparsing issues (e.g. RETURNING might reference the original table name,
+ * which has been replaced by a shard name).
  */
 static void
-UpdateTaskQueryString(Query *query, Oid distributedTableId, RangeTblEntry *valuesRTE,
-					  Task *task)
+AddInsertAliasIfNeeded(Query *query)
+{
+	Assert(query->commandType == CMD_INSERT);
+
+	if (query->onConflict == NULL &&
+		ExtractDistributedInsertValuesRTE(query) == NULL)
+	{
+		/* simple single-row insert does not need an alias */
+		return;
+	}
+
+	RangeTblEntry *rangeTableEntry = linitial(query->rtable);
+	if (rangeTableEntry->alias != NULL)
+	{
+		/* INSERT already has an alias */
+		return;
+	}
+
+	Alias *alias = makeAlias(CITUS_TABLE_ALIAS, NIL);
+	rangeTableEntry->alias = alias;
+}
+
+
+/*
+ * UpdateTaskQueryString updates the query string stored within the provided
+ * Task. If the Task has row values from a multi-row INSERT, those are injected
+ * into the provided query before deparse occurs (the query's full VALUES list
+ * will be restored before this function returns).
+ */
+static void
+UpdateTaskQueryString(Query *query, Task *task)
 {
 	List *oldValuesLists = NIL;
-
-	if (valuesRTE != NULL)
-	{
-		Assert(valuesRTE->rtekind == RTE_VALUES);
-		Assert(task->rowValuesLists != NULL);
-
-		oldValuesLists = valuesRTE->values_lists;
-		valuesRTE->values_lists = task->rowValuesLists;
-	}
-
-	if (query->commandType != CMD_INSERT)
-	{
-		/*
-		 * For UPDATE and DELETE queries, we may have subqueries and joins, so
-		 * we use relation shard list to update shard names and call
-		 * pg_get_query_def() directly.
-		 */
-		List *relationShardList = task->relationShardList;
-		UpdateRelationToShardNames((Node *) query, relationShardList);
-	}
-	else if (ShouldLazyDeparseQuery(task))
-	{
-		/*
-		 * not all insert queries are copied before calling this
-		 * function, so we do it here
-		 */
-		query = copyObject(query);
-	}
+	RangeTblEntry *valuesRTE = NULL;
 
 	if (query->commandType == CMD_INSERT)
 	{
-		/*
-		 * We store this in the task so we can lazily call
-		 * deparse_shard_query when the string is needed
-		 */
-		task->anchorDistributedTableId = distributedTableId;
+		/* extract the VALUES from the INSERT */
+		valuesRTE = ExtractDistributedInsertValuesRTE(query);
+
+		if (valuesRTE != NULL)
+		{
+			Assert(valuesRTE->rtekind == RTE_VALUES);
+			Assert(task->rowValuesLists != NULL);
+
+			oldValuesLists = valuesRTE->values_lists;
+			valuesRTE->values_lists = task->rowValuesLists;
+		}
+
+		if (ShouldLazyDeparseQuery(task))
+		{
+			/*
+			 * not all insert queries are copied before calling this
+			 * function, so we do it here
+			 */
+			query = copyObject(query);
+		}
 	}
 
 	SetTaskQueryIfShouldLazyDeparse(task, query);
@@ -203,9 +229,6 @@ bool
 UpdateRelationToShardNames(Node *node, List *relationShardList)
 {
 	uint64 shardId = INVALID_SHARD_ID;
-	Oid relationId = InvalidOid;
-	ListCell *relationShardCell = NULL;
-	RelationShard *relationShard = NULL;
 
 	if (node == NULL)
 	{
@@ -238,24 +261,8 @@ UpdateRelationToShardNames(Node *node, List *relationShardList)
 		return false;
 	}
 
-	/*
-	 * Search for the restrictions associated with the RTE. There better be
-	 * some, otherwise this query wouldn't be eligible as a router query.
-	 *
-	 * FIXME: We should probably use a hashtable here, to do efficient
-	 * lookup.
-	 */
-	foreach(relationShardCell, relationShardList)
-	{
-		relationShard = (RelationShard *) lfirst(relationShardCell);
-
-		if (newRte->relid == relationShard->relationId)
-		{
-			break;
-		}
-
-		relationShard = NULL;
-	}
+	RelationShard *relationShard = FindRelationShard(newRte->relid,
+													 relationShardList);
 
 	bool replaceRteWithNullValues = relationShard == NULL ||
 									relationShard->shardId == INVALID_SHARD_ID;
@@ -266,7 +273,7 @@ UpdateRelationToShardNames(Node *node, List *relationShardList)
 	}
 
 	shardId = relationShard->shardId;
-	relationId = relationShard->relationId;
+	Oid relationId = relationShard->relationId;
 
 	char *relationName = get_rel_name(relationId);
 	AppendShardIdToName(&relationName, shardId);
@@ -300,6 +307,13 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 								 relationShardList, QTW_EXAMINE_RTES_BEFORE);
 	}
 
+	if (IsA(node, OnConflictExpr))
+	{
+		OnConflictExpr *onConflict = (OnConflictExpr *) node;
+
+		return ReplaceRelationConstraintByShardConstraint(relationShardList, onConflict);
+	}
+
 	if (!IsA(node, RangeTblEntry))
 	{
 		return expression_tree_walker(node, UpdateRelationsToLocalShardTables,
@@ -313,27 +327,8 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 		return false;
 	}
 
-	/*
-	 * Search for the restrictions associated with the RTE. There better be
-	 * some, otherwise this query wouldn't be eligible as a router query.
-	 *
-	 * FIXME: We should probably use a hashtable here, to do efficient
-	 * lookup.
-	 */
-	ListCell *relationShardCell = NULL;
-	RelationShard *relationShard = NULL;
-
-	foreach(relationShardCell, relationShardList)
-	{
-		relationShard = (RelationShard *) lfirst(relationShardCell);
-
-		if (newRte->relid == relationShard->relationId)
-		{
-			break;
-		}
-
-		relationShard = NULL;
-	}
+	RelationShard *relationShard = FindRelationShard(newRte->relid,
+													 relationShardList);
 
 	/* the function should only be called with local shards */
 	if (relationShard == NULL)
@@ -347,6 +342,92 @@ UpdateRelationsToLocalShardTables(Node *node, List *relationShardList)
 	newRte->relid = shardOid;
 
 	return false;
+}
+
+
+/*
+ * ReplaceRelationConstraintByShardConstraint replaces given OnConflictExpr's
+ * constraint id with constraint id of the corresponding shard.
+ */
+static bool
+ReplaceRelationConstraintByShardConstraint(List *relationShardList,
+										   OnConflictExpr *onConflict)
+{
+	Oid constraintId = onConflict->constraint;
+
+	if (!OidIsValid(constraintId))
+	{
+		return false;
+	}
+
+	Oid constraintRelationId = InvalidOid;
+
+	HeapTuple heapTuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constraintId));
+	if (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_constraint contup = (Form_pg_constraint) GETSTRUCT(heapTuple);
+
+		constraintRelationId = contup->conrelid;
+		ReleaseSysCache(heapTuple);
+	}
+
+	/*
+	 * We can return here without calling the walker function, since we know there
+	 * will be no possible tables or constraints after this point, by the syntax.
+	 */
+	if (!OidIsValid(constraintRelationId))
+	{
+		ereport(ERROR, (errmsg("Invalid relation id (%u) for constraint: %s",
+							   constraintRelationId, get_constraint_name(constraintId))));
+	}
+
+	RelationShard *relationShard = FindRelationShard(constraintRelationId,
+													 relationShardList);
+
+	if (relationShard != NULL)
+	{
+		char *constraintName = get_constraint_name(constraintId);
+
+		AppendShardIdToName(&constraintName, relationShard->shardId);
+
+		Oid shardOid = GetTableLocalShardOid(relationShard->relationId,
+											 relationShard->shardId);
+
+		Oid shardConstraintId = get_relation_constraint_oid(shardOid, constraintName,
+															false);
+
+		onConflict->constraint = shardConstraintId;
+
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * FindRelationShard finds the RelationShard for shard relation with
+ * given Oid if exists in given relationShardList. Otherwise, returns NULL.
+ */
+static RelationShard *
+FindRelationShard(Oid inputRelationId, List *relationShardList)
+{
+	RelationShard *relationShard = NULL;
+
+	/*
+	 * Search for the restrictions associated with the RTE. There better be
+	 * some, otherwise this query wouldn't be eligible as a router query.
+	 * FIXME: We should probably use a hashtable here, to do efficient lookup.
+	 */
+	foreach_ptr(relationShard, relationShardList)
+	{
+		if (inputRelationId == relationShard->relationId)
+		{
+			return relationShard;
+		}
+	}
+
+	return NULL;
 }
 
 
