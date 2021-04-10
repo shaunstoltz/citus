@@ -29,9 +29,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
-#if PG_VERSION_NUM >= 12000
 #include "catalog/pg_proc.h"
-#endif
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -59,6 +57,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
 #include "distributed/version_compat.h"
@@ -98,7 +97,8 @@ static void CreateHashDistributedTableShards(Oid relationId, int shardCount,
 											 Oid colocatedTableId, bool localTableEmpty);
 static uint32 ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 									  char distributionMethod, char replicationModel,
-									  int shardCount, char *colocateWithTableName,
+									  int shardCount, bool shardCountIsStrict,
+									  char *colocateWithTableName,
 									  bool viaDeprecatedAPI);
 static void EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 										   char distributionMethod, uint32 colocationId,
@@ -177,7 +177,7 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
 	CreateDistributedTable(relationId, distributionColumn, distributionMethod,
-						   ShardCount, colocateWithTableName, viaDeprecatedAPI);
+						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
 
 	relation_close(relation, NoLock);
 
@@ -193,12 +193,37 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 Datum
 create_distributed_table(PG_FUNCTION_ARGS)
 {
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
+	{
+		PG_RETURN_VOID();
+	}
 	bool viaDeprecatedAPI = false;
 
 	Oid relationId = PG_GETARG_OID(0);
 	text *distributionColumnText = PG_GETARG_TEXT_P(1);
 	Oid distributionMethodOid = PG_GETARG_OID(2);
 	text *colocateWithTableNameText = PG_GETARG_TEXT_P(3);
+	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
+
+	bool shardCountIsStrict = false;
+	int shardCount = ShardCount;
+	if (!PG_ARGISNULL(4))
+	{
+		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0 &&
+			pg_strncasecmp(colocateWithTableName, "none", NAMEDATALEN) != 0)
+		{
+			ereport(ERROR, (errmsg("Cannot use colocate_with with a table "
+								   "and shard_count at the same time")));
+		}
+
+		shardCount = PG_GETARG_INT32(4);
+
+		/*
+		 * if shard_count parameter is given than we have to
+		 * make sure table has that many shards
+		 */
+		shardCountIsStrict = true;
+	}
 
 	CheckCitusVersion(ERROR);
 
@@ -227,10 +252,16 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	Assert(distributionColumn != NULL);
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
-	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
+	if (shardCount < 1 || shardCount > MAX_SHARD_COUNT)
+	{
+		ereport(ERROR, (errmsg("%d is outside the valid range for "
+							   "parameter \"shard_count\" (1 .. %d)",
+							   shardCount, MAX_SHARD_COUNT)));
+	}
 
 	CreateDistributedTable(relationId, distributionColumn, distributionMethod,
-						   ShardCount, colocateWithTableName, viaDeprecatedAPI);
+						   shardCount, shardCountIsStrict, colocateWithTableName,
+						   viaDeprecatedAPI);
 
 	PG_RETURN_VOID();
 }
@@ -286,7 +317,7 @@ create_reference_table(PG_FUNCTION_ARGS)
 	}
 
 	CreateDistributedTable(relationId, distributionColumn, DISTRIBUTE_BY_NONE,
-						   ShardCount, colocateWithTableName, viaDeprecatedAPI);
+						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
 	PG_RETURN_VOID();
 }
 
@@ -343,7 +374,8 @@ EnsureRelationExists(Oid relationId)
  */
 void
 CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributionMethod,
-					   int shardCount, char *colocateWithTableName, bool viaDeprecatedAPI)
+					   int shardCount, bool shardCountIsStrict,
+					   char *colocateWithTableName, bool viaDeprecatedAPI)
 {
 	/*
 	 * EnsureTableNotDistributed errors out when relation is a citus table but
@@ -418,7 +450,8 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	 */
 	uint32 colocationId = ColocationIdForNewTable(relationId, distributionColumn,
 												  distributionMethod, replicationModel,
-												  shardCount, colocateWithTableName,
+												  shardCount, shardCountIsStrict,
+												  colocateWithTableName,
 												  viaDeprecatedAPI);
 
 	EnsureRelationCanBeDistributed(relationId, distributionColumn, distributionMethod,
@@ -491,7 +524,7 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 		foreach_oid(partitionRelationId, partitionList)
 		{
 			CreateDistributedTable(partitionRelationId, distributionColumn,
-								   distributionMethod, shardCount,
+								   distributionMethod, shardCount, false,
 								   colocateWithTableName, viaDeprecatedAPI);
 		}
 	}
@@ -696,8 +729,8 @@ CreateHashDistributedTableShards(Oid relationId, int shardCount,
 static uint32
 ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 						char distributionMethod, char replicationModel,
-						int shardCount, char *colocateWithTableName,
-						bool viaDeprecatedAPI)
+						int shardCount, bool shardCountIsStrict,
+						char *colocateWithTableName, bool viaDeprecatedAPI)
 {
 	uint32 colocationId = INVALID_COLOCATION_ID;
 
@@ -743,6 +776,27 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 			colocationId = ColocationId(shardCount, ShardReplicationFactor,
 										distributionColumnType,
 										distributionColumnCollation);
+
+			/*
+			 * if the shardCount is strict then we check if the shard count
+			 * of the colocated table is actually shardCount
+			 */
+			if (shardCountIsStrict && colocationId != INVALID_COLOCATION_ID)
+			{
+				Oid colocatedTableId = ColocatedTableId(colocationId);
+
+				if (colocatedTableId != InvalidOid)
+				{
+					CitusTableCacheEntry *cacheEntry =
+						GetCitusTableCacheEntry(colocatedTableId);
+					int colocatedTableShardCount = cacheEntry->shardIntervalArrayLength;
+
+					if (colocatedTableShardCount != shardCount)
+					{
+						colocationId = INVALID_COLOCATION_ID;
+					}
+				}
+			}
 
 			if (colocationId == INVALID_COLOCATION_ID)
 			{
@@ -819,18 +873,6 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 
 	ErrorIfTableIsACatalogTable(relation);
 
-#if PG_VERSION_NUM < PG_VERSION_12
-
-	/* verify target relation does not use WITH (OIDS) PostgreSQL feature */
-	if (relationDesc->tdhasoid)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot distribute relation: %s", relationName),
-						errdetail("Distributed relations must not specify the WITH "
-								  "(OIDS) option in their definitions.")));
-	}
-#endif
-
 	/* verify target relation does not use identity columns */
 	if (RelationUsesIdentityColumns(relationDesc))
 	{
@@ -866,7 +908,6 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 									  "defined to use hash partitioning.")));
 		}
 
-#if PG_VERSION_NUM >= PG_VERSION_12
 		if (distributionColumn->varcollid != InvalidOid &&
 			!get_collation_isdeterministic(distributionColumn->varcollid))
 		{
@@ -874,7 +915,6 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 							errmsg("Hash distributed partition columns may not use "
 								   "a non deterministic collation")));
 		}
-#endif
 	}
 	else if (distributionMethod == DISTRIBUTE_BY_RANGE)
 	{
@@ -1539,12 +1579,8 @@ DoCopyFromLocalTableIntoShards(Relation distributedRelation,
 							   EState *estate)
 {
 	/* begin reading from local table */
-#if PG_VERSION_NUM >= PG_VERSION_12
 	TableScanDesc scan = table_beginscan(distributedRelation, GetActiveSnapshot(), 0,
 										 NULL);
-#else
-	HeapScanDesc scan = heap_beginscan(distributedRelation, GetActiveSnapshot(), 0, NULL);
-#endif
 
 	MemoryContext oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
@@ -1593,11 +1629,7 @@ DoCopyFromLocalTableIntoShards(Relation distributedRelation,
 	MemoryContextSwitchTo(oldContext);
 
 	/* finish reading from the local table */
-#if PG_VERSION_NUM >= PG_VERSION_12
 	table_endscan(scan);
-#else
-	heap_endscan(scan);
-#endif
 }
 
 
@@ -1615,10 +1647,8 @@ TupleDescColumnNameList(TupleDesc tupleDescriptor)
 		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
 		char *columnName = NameStr(currentColumn->attname);
 
-		if (currentColumn->attisdropped
-#if PG_VERSION_NUM >= PG_VERSION_12
-			|| currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
-#endif
+		if (currentColumn->attisdropped ||
+			currentColumn->attgenerated == ATTRIBUTE_GENERATED_STORED
 			)
 		{
 			continue;
@@ -1660,7 +1690,6 @@ static bool
 DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 											Var *distributionColumn)
 {
-#if PG_VERSION_NUM >= PG_VERSION_12
 	Form_pg_attribute attributeForm = TupleDescAttr(relationDesc,
 													distributionColumn->varattno - 1);
 
@@ -1668,7 +1697,6 @@ DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 	{
 		return true;
 	}
-#endif
 
 	return false;
 }

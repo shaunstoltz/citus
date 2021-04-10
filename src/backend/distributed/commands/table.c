@@ -10,9 +10,7 @@
 
 #include "postgres.h"
 #include "distributed/pg_version_constants.h"
-#if PG_VERSION_NUM >= PG_VERSION_12
 #include "access/genam.h"
-#endif
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/index.h"
@@ -180,16 +178,42 @@ PreprocessDropTableStmt(Node *node, const char *queryString,
  *
  * This function also processes CREATE TABLE ... PARTITION OF statements via
  * PostprocessCreateTableStmtPartitionOf function.
+ *
+ * Also CREATE TABLE ... INHERITS ... commands are filtered here. If the inherited
+ * table is a distributed table, this function errors out, as we currently don't
+ * support local tables inheriting a distributed table.
  */
 void
 PostprocessCreateTableStmt(CreateStmt *createStatement, const char *queryString)
 {
 	PostprocessCreateTableStmtForeignKeys(createStatement);
 
-	if (createStatement->inhRelations != NIL && createStatement->partbound != NULL)
+	if (createStatement->inhRelations != NIL)
 	{
-		/* process CREATE TABLE ... PARTITION OF command */
-		PostprocessCreateTableStmtPartitionOf(createStatement, queryString);
+		if (createStatement->partbound != NULL)
+		{
+			/* process CREATE TABLE ... PARTITION OF command */
+			PostprocessCreateTableStmtPartitionOf(createStatement, queryString);
+		}
+		else
+		{
+			/* process CREATE TABLE ... INHERITS ... */
+			RangeVar *parentRelation = NULL;
+			foreach_ptr(parentRelation, createStatement->inhRelations)
+			{
+				bool missingOk = false;
+				Oid parentRelationId = RangeVarGetRelid(parentRelation, NoLock,
+														missingOk);
+				Assert(parentRelationId != InvalidOid);
+
+				if (IsCitusTable(parentRelationId))
+				{
+					/* here we error out if inheriting a distributed table */
+					ereport(ERROR, (errmsg("non-distributed tables cannot inherit "
+										   "distributed tables")));
+				}
+			}
+		}
 	}
 }
 
@@ -325,7 +349,7 @@ PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
 		bool viaDeprecatedAPI = false;
 
 		CreateDistributedTable(relationId, parentDistributionColumn,
-							   parentDistributionMethod, ShardCount,
+							   parentDistributionMethod, ShardCount, false,
 							   parentRelationName, viaDeprecatedAPI);
 	}
 }
@@ -399,7 +423,7 @@ PostprocessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement,
 				bool viaDeprecatedAPI = false;
 
 				CreateDistributedTable(partitionRelationId, distributionColumn,
-									   distributionMethod, ShardCount,
+									   distributionMethod, ShardCount, false,
 									   parentRelationName, viaDeprecatedAPI);
 			}
 		}

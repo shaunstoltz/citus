@@ -61,13 +61,8 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
-#if PG_VERSION_NUM >= PG_VERSION_12
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
-#else
-#include "nodes/relation.h"
-#include "optimizer/var.h"
-#endif
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
@@ -4366,16 +4361,8 @@ FragmentAlias(RangeTblEntry *rangeTableEntry, RangeTableFragment *fragment)
 		Oid relationId = rangeTableEntry->relid;
 		char *relationName = get_rel_name(relationId);
 
-		/*
-		 * If the table is not in the default namespace (public), we include it in
-		 * the fragment alias.
-		 */
 		Oid schemaId = get_rel_namespace(relationId);
 		schemaName = get_namespace_name(schemaId);
-		if (strncmp(schemaName, "public", NAMEDATALEN) == 0)
-		{
-			schemaName = NULL;
-		}
 
 		aliasName = relationName;
 
