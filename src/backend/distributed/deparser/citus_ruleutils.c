@@ -31,6 +31,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_index.h"
@@ -40,10 +41,12 @@
 #include "distributed/citus_ruleutils.h"
 #include "distributed/listutils.h"
 #include "distributed/multi_partitioning_utils.h"
-#include "distributed/relay_utility.h"
-#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/relay_utility.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_protocol.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodes.h"
@@ -74,6 +77,7 @@ static void AppendStorageParametersToString(StringInfo stringBuffer,
 											List *optionList);
 static void simple_quote_literal(StringInfo buf, const char *val);
 static char * flatten_reloptions(Oid relid);
+
 
 /*
  * pg_get_extensiondef_string finds the foreign data wrapper that corresponds to

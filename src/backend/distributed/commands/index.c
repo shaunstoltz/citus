@@ -62,7 +62,6 @@ static List * GenerateIndexParameters(IndexStmt *createIndexStatement);
 static DDLJob * GenerateCreateIndexDDLJob(IndexStmt *createIndexStatement,
 										  const char *createIndexCommand);
 static Oid CreateIndexStmtGetRelationId(IndexStmt *createIndexStatement);
-static LOCKMODE GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement);
 static List * CreateIndexTaskList(IndexStmt *indexStmt);
 static List * CreateReindexTaskList(Oid relationId, ReindexStmt *reindexStmt);
 static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid,
@@ -303,7 +302,8 @@ CreateIndexStmtGetSchemaId(IndexStmt *createIndexStatement)
  * It returns a list that is filled by the pgIndexProcessor.
  */
 List *
-ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor pgIndexProcessor)
+ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor pgIndexProcessor,
+								int indexFlags)
 {
 	List *result = NIL;
 	ScanKeyData scanKey[1];
@@ -325,7 +325,7 @@ ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor pgIndexProcesso
 	while (HeapTupleIsValid(heapTuple))
 	{
 		Form_pg_index indexForm = (Form_pg_index) GETSTRUCT(heapTuple);
-		pgIndexProcessor(indexForm, &result);
+		pgIndexProcessor(indexForm, &result, indexFlags);
 
 		heapTuple = systable_getnext(scanDescriptor);
 	}
@@ -502,7 +502,7 @@ CreateIndexStmtGetRelationId(IndexStmt *createIndexStatement)
  * GetCreateIndexRelationLockMode returns required lock mode to open the
  * relation that given CREATE INDEX command operates on.
  */
-static LOCKMODE
+LOCKMODE
 GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement)
 {
 	if (createIndexStatement->concurrent)

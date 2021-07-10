@@ -133,8 +133,9 @@ typedef struct MultiConnection
 	/* is the connection currently in use, and shouldn't be used by anything else */
 	bool claimedExclusively;
 
-	/* time connection establishment was started, for timeout */
-	TimestampTz connectionStart;
+	/* time connection establishment was started, for timeout and executor stats */
+	instr_time connectionEstablishmentStart;
+	instr_time connectionEstablishmentEnd;
 
 	/* membership in list of list of connections in ConnectionHashEntry */
 	dlist_node connectionNode;
@@ -205,6 +206,7 @@ extern int MaxCachedConnectionLifetime;
 
 /* parameters used for outbound connections */
 extern char *NodeConninfo;
+extern char *LocalHostName;
 
 /* the hash tables are externally accessiable */
 extern HTAB *ConnectionHash;
@@ -256,9 +258,11 @@ extern void FinishConnectionEstablishment(MultiConnection *connection);
 extern void ClaimConnectionExclusively(MultiConnection *connection);
 extern void UnclaimConnection(MultiConnection *connection);
 extern bool IsCitusInitiatedRemoteBackend(void);
+extern void MarkConnectionConnected(MultiConnection *connection);
 
 /* time utilities */
 extern double MillisecondsPassedSince(instr_time moment);
 extern long MillisecondsToTimeout(instr_time start, long msAfterStart);
 
+extern void WarmUpConnParamsHash(void);
 #endif /* CONNECTION_MANAGMENT_H */

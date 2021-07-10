@@ -26,6 +26,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
@@ -69,6 +70,9 @@ PG_FUNCTION_INFO_V1(update_distributed_table_colocation);
 Datum
 mark_tables_colocated(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+
 	Oid sourceRelationId = PG_GETARG_OID(0);
 	ArrayType *relationIdArrayObject = PG_GETARG_ARRAYTYPE_P(1);
 
@@ -79,8 +83,6 @@ mark_tables_colocated(PG_FUNCTION_ARGS)
 							   "operation")));
 	}
 
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
 	EnsureTableOwner(sourceRelationId);
 
 	Datum *relationIdDatumArray = DeconstructArrayObject(relationIdArrayObject);
@@ -107,11 +109,12 @@ mark_tables_colocated(PG_FUNCTION_ARGS)
 Datum
 update_distributed_table_colocation(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+
 	Oid targetRelationId = PG_GETARG_OID(0);
 	text *colocateWithTableNameText = PG_GETARG_TEXT_P(1);
 
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
 	EnsureTableOwner(targetRelationId);
 
 	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
@@ -347,8 +350,10 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 									  leftRelationName, rightRelationName)));
 		}
 
-		List *leftPlacementList = ShardPlacementList(leftShardId);
-		List *rightPlacementList = ShardPlacementList(rightShardId);
+		List *leftPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+			leftShardId);
+		List *rightPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+			rightShardId);
 
 		if (list_length(leftPlacementList) != list_length(rightPlacementList))
 		{
@@ -984,6 +989,75 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 	}
 
 	Assert(list_length(colocatedTableList) == list_length(colocatedShardList));
+
+	return SortList(colocatedShardList, CompareShardIntervalsById);
+}
+
+
+/*
+ * ColocatedNonPartitionShardIntervalList function returns list of shard intervals
+ * which are co-located with given shard, except partitions. If given shard is belong
+ * to append or range distributed table, co-location is not valid for that shard.
+ * Therefore such shard is only co-located with itself.
+ */
+List *
+ColocatedNonPartitionShardIntervalList(ShardInterval *shardInterval)
+{
+	Oid distributedTableId = shardInterval->relationId;
+	List *colocatedShardList = NIL;
+
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
+
+	/*
+	 * If distribution type of the table is append or range, each shard of the shard
+	 * is only co-located with itself. We don't expect this case to happen, since
+	 * distributing partitioned tables in only supported for hash-distributed tables.
+	 * Therefore, currently we can't cover here with a test.
+	 */
+	if (IsCitusTableTypeCacheEntry(cacheEntry, APPEND_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, RANGE_DISTRIBUTED))
+	{
+		ShardInterval *copyShardInterval = CopyShardInterval(shardInterval);
+
+		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
+
+		return colocatedShardList;
+	}
+
+	ereport(DEBUG1, (errmsg("skipping child tables for relation named: %s",
+							get_rel_name(distributedTableId))));
+
+	int shardIntervalIndex = ShardIndex(shardInterval);
+	List *colocatedTableList = ColocatedTableList(distributedTableId);
+
+	/* ShardIndex have to find index of given shard */
+	Assert(shardIntervalIndex >= 0);
+
+	Oid colocatedTableId = InvalidOid;
+	foreach_oid(colocatedTableId, colocatedTableList)
+	{
+		if (PartitionTable(colocatedTableId))
+		{
+			continue;
+		}
+
+		CitusTableCacheEntry *colocatedTableCacheEntry =
+			GetCitusTableCacheEntry(colocatedTableId);
+
+		/*
+		 * Since we iterate over co-located tables, shard count of each table should be
+		 * same and greater than shardIntervalIndex.
+		 */
+		Assert(cacheEntry->shardIntervalArrayLength ==
+			   colocatedTableCacheEntry->shardIntervalArrayLength);
+
+		ShardInterval *colocatedShardInterval =
+			colocatedTableCacheEntry->sortedShardIntervalArray[shardIntervalIndex];
+
+		ShardInterval *copyShardInterval = CopyShardInterval(colocatedShardInterval);
+
+		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
+	}
 
 	return SortList(colocatedShardList, CompareShardIntervalsById);
 }

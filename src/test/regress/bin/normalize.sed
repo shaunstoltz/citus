@@ -111,6 +111,9 @@ s/partition ".*" would be violated by some row/partition would be violated by so
 s/of relation ".*" contains null values/contains null values/g
 s/of relation "t1" is violated by some row/is violated by some row/g
 
+# pg13.1 changes
+s/^ERROR:  insufficient columns in PRIMARY KEY constraint definition$/ERROR:  unique constraint on partitioned table must include all partitioning columns/g
+
 # intermediate_results
 s/(ERROR.*)pgsql_job_cache\/([0-9]+_[0-9]+_[0-9]+)\/(.*).data/\1pgsql_job_cache\/xx_x_xxx\/\3.data/g
 
@@ -218,3 +221,9 @@ s/^(DEBUG:  the name of the shard \(abcde_01234567890123456789012345678901234567
 # normalize long index name errors for multi_index_statements
 s/^(ERROR:  The index name \(test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g
 s/^(DEBUG:  the index name on the shards of the partition is too long, switching to sequential and local execution mode to prevent self deadlocks: test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g
+
+# normalize errors for not being able to connect to a non-existing host
+s/could not translate host name "foobar" to address: .*$/could not translate host name "foobar" to address: <system specific error>/g
+
+# ignore PL/pgSQL line numbers that differ on Mac builds
+s/(CONTEXT:  PL\/pgSQL function .* line )([0-9]+)/\1XX/g

@@ -75,7 +75,7 @@ static void DropDefaultColumnDefinition(Oid relationId, char *columnName);
 static void TransferSequenceOwnership(Oid ownedSequenceId, Oid targetRelationId,
 									  char *columnName);
 static void InsertMetadataForCitusLocalTable(Oid citusLocalTableId, uint64 shardId);
-static void FinalizeCitusLocalTableCreation(Oid relationId);
+static void FinalizeCitusLocalTableCreation(Oid relationId, List *dependentSequenceList);
 
 
 PG_FUNCTION_INFO_V1(citus_add_local_table_to_metadata);
@@ -179,7 +179,7 @@ remove_local_tables_from_metadata(PG_FUNCTION_ARGS)
  * properties:
  *  - it will have only one shard,
  *  - its distribution method will be DISTRIBUTE_BY_NONE,
- *  - its replication model will be ReplicationModel,
+ *  - its replication model will be REPLICATION_MODEL_STREAMING,
  *  - its replication factor will be set to 1.
  * Similar to reference tables, it has only 1 placement. In addition to that, that
  * single placement is only allowed to be on the coordinator.
@@ -315,7 +315,18 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys)
 
 	InsertMetadataForCitusLocalTable(shellRelationId, shardId);
 
-	FinalizeCitusLocalTableCreation(shellRelationId);
+	/*
+	 * Ensure that the sequences used in column defaults of the table
+	 * have proper types
+	 */
+	List *attnumList = NIL;
+	List *dependentSequenceList = NIL;
+	GetDependentSequencesWithRelation(shellRelationId, &attnumList,
+									  &dependentSequenceList, 0);
+	EnsureDistributedSequencesHaveOneType(shellRelationId, dependentSequenceList,
+										  attnumList);
+
+	FinalizeCitusLocalTableCreation(shellRelationId, dependentSequenceList);
 }
 
 
@@ -996,9 +1007,7 @@ InsertMetadataForCitusLocalTable(Oid citusLocalTableId, uint64 shardId)
 	Assert(shardId != INVALID_SHARD_ID);
 
 	char distributionMethod = DISTRIBUTE_BY_NONE;
-	char replicationModel = ReplicationModel;
-
-	Assert(replicationModel != REPLICATION_MODEL_2PC);
+	char replicationModel = REPLICATION_MODEL_STREAMING;
 
 	uint32 colocationId = INVALID_COLOCATION_ID;
 	Var *distributionColumn = NULL;
@@ -1027,9 +1036,11 @@ InsertMetadataForCitusLocalTable(Oid citusLocalTableId, uint64 shardId)
  * FinalizeCitusLocalTableCreation completes creation of the citus local table
  * with relationId by performing operations that should be done after creating
  * the shard and inserting the metadata.
+ * If the cluster has metadata workers, we ensure proper propagation of the
+ * sequences dependent with the table.
  */
 static void
-FinalizeCitusLocalTableCreation(Oid relationId)
+FinalizeCitusLocalTableCreation(Oid relationId, List *dependentSequenceList)
 {
 	/*
 	 * If it is a foreign table, then skip creating citus truncate trigger
@@ -1042,6 +1053,14 @@ FinalizeCitusLocalTableCreation(Oid relationId)
 
 	if (ShouldSyncTableMetadata(relationId))
 	{
+		if (ClusterHasKnownMetadataWorkers())
+		{
+			/*
+			 * Ensure sequence dependencies and mark them as distributed
+			 * before creating table metadata on workers
+			 */
+			MarkSequenceListDistributedAndPropagateDependencies(dependentSequenceList);
+		}
 		CreateTableMetadataOnWorkers(relationId);
 	}
 

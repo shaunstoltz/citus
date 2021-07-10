@@ -4,7 +4,6 @@ CREATE SCHEMA multi_mx_function_call_delegation;
 SET search_path TO multi_mx_function_call_delegation, public;
 
 SET citus.shard_replication_factor TO 2;
-SET citus.replication_model TO 'statement';
 
 -- This table requires specific settings, create before getting into things
 create table mx_call_dist_table_replica(id int, val int);
@@ -12,7 +11,6 @@ select create_distributed_table('mx_call_dist_table_replica', 'id');
 insert into mx_call_dist_table_replica values (9,1),(8,2),(7,3),(6,4),(5,5);
 
 SET citus.shard_replication_factor TO 1;
-SET citus.replication_model TO 'streaming';
 
 --
 -- Create tables and functions we want to use in tests
@@ -224,8 +222,10 @@ WITH r AS (
 ) SELECT * FROM test, r, t WHERE t.c=0;
 
 -- Test that we don't propagate to non-metadata worker nodes
+SET client_min_messages TO WARNING;
 select stop_metadata_sync_to_node('localhost', :worker_1_port);
 select stop_metadata_sync_to_node('localhost', :worker_2_port);
+SET client_min_messages TO DEBUG1;
 select mx_call_func(2, 0);
 SET client_min_messages TO NOTICE;
 select start_metadata_sync_to_node('localhost', :worker_1_port);
@@ -237,7 +237,7 @@ select start_metadata_sync_to_node('localhost', :worker_2_port);
 \c - - - :master_port
 SET search_path to multi_mx_function_call_delegation, public;
 SET client_min_messages TO DEBUG1;
-SET citus.replication_model = 'streaming';
+SET citus.shard_replication_factor = 1;
 
 --
 -- Test non-const parameter values
@@ -261,8 +261,10 @@ select mx_call_func(2, 0), mx_call_func(0, 2);
 DO $$ BEGIN perform mx_call_func_tbl(40); END; $$;
 SELECT * FROM mx_call_dist_table_1 WHERE id >= 40 ORDER BY id, val;
 
--- Prepared statements. Repeat six times to test for generic plans
+-- Prepared statements. Repeat 8 times to test for generic plans
 PREPARE call_plan (int, int) AS SELECT mx_call_func($1, $2);
+EXECUTE call_plan(2, 0);
+EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);
 EXECUTE call_plan(2, 0);

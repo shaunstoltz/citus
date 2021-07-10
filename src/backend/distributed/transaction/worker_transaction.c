@@ -96,7 +96,7 @@ SendCommandToWorkerAsUser(const char *nodeName, int32 nodePort, const char *node
 	uint32 connectionFlags = 0;
 
 	UseCoordinatedTransaction();
-	CoordinatedTransactionShouldUse2PC();
+	Use2PCForCoordinatedTransaction();
 
 	MultiConnection *transactionConnection = GetNodeUserDatabaseConnection(
 		connectionFlags, nodeName,
@@ -404,7 +404,7 @@ SendCommandToWorkersParamsInternal(TargetWorkerSet targetWorkerSet, const char *
 	List *workerNodeList = TargetWorkerSetNodeList(targetWorkerSet, ShareLock);
 
 	UseCoordinatedTransaction();
-	CoordinatedTransactionShouldUse2PC();
+	Use2PCForCoordinatedTransaction();
 
 	/* open connections in parallel */
 	WorkerNode *workerNode = NULL;
@@ -506,6 +506,53 @@ SendCommandListToWorkerInSingleTransaction(const char *nodeName, int32 nodePort,
 
 	RemoteTransactionCommit(workerConnection);
 	CloseConnection(workerConnection);
+}
+
+
+/*
+ * SendOptionalCommandListToWorkerInTransaction sends the given command list to
+ * the given worker in a single transaction. If any of the commands fail, it
+ * rollbacks the transaction, and otherwise commits.
+ */
+bool
+SendOptionalCommandListToWorkerInTransaction(const char *nodeName, int32 nodePort,
+											 const char *nodeUser, List *commandList)
+{
+	int connectionFlags = FORCE_NEW_CONNECTION;
+	bool failed = false;
+
+	MultiConnection *workerConnection = GetNodeUserDatabaseConnection(connectionFlags,
+																	  nodeName, nodePort,
+																	  nodeUser, NULL);
+	if (PQstatus(workerConnection->pgConn) != CONNECTION_OK)
+	{
+		return false;
+	}
+	RemoteTransactionBegin(workerConnection);
+
+	/* iterate over the commands and execute them in the same connection */
+	const char *commandString = NULL;
+	foreach_ptr(commandString, commandList)
+	{
+		if (ExecuteOptionalRemoteCommand(workerConnection, commandString, NULL) != 0)
+		{
+			failed = true;
+			break;
+		}
+	}
+
+	if (failed)
+	{
+		RemoteTransactionAbort(workerConnection);
+	}
+	else
+	{
+		RemoteTransactionCommit(workerConnection);
+	}
+
+	CloseConnection(workerConnection);
+
+	return !failed;
 }
 
 

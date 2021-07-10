@@ -594,12 +594,14 @@ LoadShardPlacement(uint64 shardId, uint64 placementId)
 
 
 /*
- * FindShardPlacementOnGroup returns the shard placement for the given shard
- * on the given group, or returns NULL if no placement for the shard exists
- * on the group.
+ * ShardPlacementOnGroupIncludingOrphanedPlacements returns the shard placement
+ * for the given shard on the given group, or returns NULL if no placement for
+ * the shard exists on the group.
+ *
+ * NOTE: This can return inactive or orphaned placements.
  */
 ShardPlacement *
-FindShardPlacementOnGroup(int32 groupId, uint64 shardId)
+ShardPlacementOnGroupIncludingOrphanedPlacements(int32 groupId, uint64 shardId)
 {
 	ShardPlacement *placementOnNode = NULL;
 
@@ -614,7 +616,6 @@ FindShardPlacementOnGroup(int32 groupId, uint64 shardId)
 	for (int placementIndex = 0; placementIndex < numberOfPlacements; placementIndex++)
 	{
 		GroupShardPlacement *placement = &placementArray[placementIndex];
-
 		if (placement->groupId == groupId)
 		{
 			placementOnNode = ResolveGroupShardPlacement(placement, tableEntry,
@@ -624,6 +625,28 @@ FindShardPlacementOnGroup(int32 groupId, uint64 shardId)
 	}
 
 	return placementOnNode;
+}
+
+
+/*
+ * ActiveShardPlacementOnGroup returns the active shard placement for the
+ * given shard on the given group, or returns NULL if no active placement for
+ * the shard exists on the group.
+ */
+ShardPlacement *
+ActiveShardPlacementOnGroup(int32 groupId, uint64 shardId)
+{
+	ShardPlacement *placement =
+		ShardPlacementOnGroupIncludingOrphanedPlacements(groupId, shardId);
+	if (placement == NULL)
+	{
+		return NULL;
+	}
+	if (placement->shardState != SHARD_STATE_ACTIVE)
+	{
+		return NULL;
+	}
+	return placement;
 }
 
 
@@ -791,13 +814,14 @@ LookupNodeForGroup(int32 groupId)
 
 /*
  * ShardPlacementList returns the list of placements for the given shard from
- * the cache.
+ * the cache. This list includes placements that are orphaned, because they
+ * their deletion is postponed to a later point (shardstate = 4).
  *
  * The returned list is deep copied from the cache and thus can be modified
  * and pfree()d freely.
  */
 List *
-ShardPlacementList(uint64 shardId)
+ShardPlacementListIncludingOrphanedPlacements(uint64 shardId)
 {
 	List *placementList = NIL;
 
@@ -2641,6 +2665,8 @@ SecondaryNodeRoleId(void)
 Datum
 citus_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldLogicalRelationId = InvalidOid;
 	Oid newLogicalRelationId = InvalidOid;
@@ -2650,8 +2676,6 @@ citus_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	if (RelationGetRelid(triggerData->tg_relation) != DistPartitionRelationId())
 	{
@@ -2718,6 +2742,8 @@ master_dist_partition_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldLogicalRelationId = InvalidOid;
 	Oid newLogicalRelationId = InvalidOid;
@@ -2727,8 +2753,6 @@ citus_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	if (RelationGetRelid(triggerData->tg_relation) != DistShardRelationId())
 	{
@@ -2795,6 +2819,8 @@ master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	TriggerData *triggerData = (TriggerData *) fcinfo->context;
 	Oid oldShardId = InvalidOid;
 	Oid newShardId = InvalidOid;
@@ -2804,8 +2830,6 @@ citus_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	/*
 	 * Before 7.0-2 this trigger is on pg_dist_shard_placement,
@@ -2884,13 +2908,13 @@ master_dist_placement_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	CitusInvalidateRelcacheByRelid(DistNodeRelationId());
 
@@ -2919,13 +2943,13 @@ master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_conninfo_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	/* no-op in community edition */
 
@@ -2954,13 +2978,13 @@ master_dist_authinfo_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	CitusInvalidateRelcacheByRelid(DistLocalGroupIdRelationId());
 
@@ -2989,13 +3013,13 @@ master_dist_local_group_cache_invalidate(PG_FUNCTION_ARGS)
 Datum
 citus_dist_object_cache_invalidate(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	if (!CALLED_AS_TRIGGER(fcinfo))
 	{
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("must be called as trigger")));
 	}
-
-	CheckCitusVersion(ERROR);
 
 	CitusInvalidateRelcacheByRelid(DistObjectRelationId());
 
@@ -3344,8 +3368,7 @@ GetLocalGroupId(void)
 		return LocalGroupId;
 	}
 
-	Oid localGroupTableOid = get_relname_relid("pg_dist_local_group",
-											   PG_CATALOG_NAMESPACE);
+	Oid localGroupTableOid = DistLocalGroupIdRelationId();
 	if (localGroupTableOid == InvalidOid)
 	{
 		return 0;

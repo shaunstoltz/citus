@@ -148,7 +148,7 @@ SELECT table_name::text, shard_count, access_method FROM public.citus_tables WHE
 
 
 -- test with metadata sync
-SET citus.replication_model TO 'streaming';
+SET citus.shard_replication_factor TO 1;
 SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
 
 CREATE TABLE metadata_sync_table (a BIGSERIAL);
@@ -159,7 +159,6 @@ SELECT alter_distributed_table('metadata_sync_table', shard_count:=8);
 
 SELECT table_name, shard_count FROM public.citus_tables WHERE table_name::text = 'metadata_sync_table';
 
-SET citus.replication_model TO DEFAULT;
 SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
 
 -- test complex cascade operations
@@ -307,6 +306,13 @@ ALTER TABLE partition_lengths RENAME TO partition_lengths_1234567890123456789012
 
 -- verify alter_distributed_table works with long partitioned table names
 SELECT alter_distributed_table('partition_lengths_12345678901234567890123456789012345678901234567890', shard_count := 17, cascade_to_colocated := false);
+
+-- verify that alter_distributed_table doesn't change the access methods for the views on the table
+CREATE TABLE test_am_matview(a int);
+SELECT create_distributed_table('test_am_matview' ,'a', colocate_with:='none');
+CREATE MATERIALIZED VIEW test_mat_view_am USING COLUMNAR AS SELECT count(*), a FROM test_am_matview GROUP BY a ;
+SELECT alter_distributed_table('test_am_matview', shard_count:= 52);
+SELECT amname FROM pg_am WHERE oid IN (SELECT relam FROM pg_class WHERE relname ='test_mat_view_am');
 
 SET client_min_messages TO WARNING;
 DROP SCHEMA alter_distributed_table CASCADE;

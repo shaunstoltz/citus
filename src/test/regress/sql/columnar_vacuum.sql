@@ -6,7 +6,7 @@ CREATE TABLE t(a int, b int) USING columnar;
 
 CREATE VIEW t_stripes AS
 SELECT * FROM columnar.stripe a, pg_class b
-WHERE a.storage_id = columnar_relation_storageid(b.oid) AND b.relname='t';
+WHERE a.storage_id = columnar_test_helpers.columnar_relation_storageid(b.oid) AND b.relname='t';
 
 SELECT count(*) FROM t_stripes;
 
@@ -17,13 +17,21 @@ INSERT INTO t SELECT i, i * i FROM generate_series(21, 30) i;
 SELECT sum(a), sum(b) FROM t;
 SELECT count(*) FROM t_stripes;
 
+select
+  version_major, version_minor, reserved_stripe_id, reserved_row_number, reserved_offset
+  from columnar_test_helpers.columnar_storage_info('t');
+
 -- vacuum full should merge stripes together
 VACUUM FULL t;
 
-SELECT * FROM chunk_group_consistency;
+SELECT * FROM columnar_test_helpers.chunk_group_consistency;
 
 SELECT sum(a), sum(b) FROM t;
 SELECT count(*) FROM t_stripes;
+
+select
+  version_major, version_minor, reserved_stripe_id, reserved_row_number, reserved_offset
+  from columnar_test_helpers.columnar_storage_info('t');
 
 -- test the case when all data cannot fit into a single stripe
 SELECT alter_columnar_table_set('t', stripe_row_limit => 1000);
@@ -34,7 +42,11 @@ SELECT count(*) FROM t_stripes;
 
 VACUUM FULL t;
 
-SELECT * FROM chunk_group_consistency;
+select
+  version_major, version_minor, reserved_stripe_id, reserved_row_number, reserved_offset
+  from columnar_test_helpers.columnar_storage_info('t');
+
+SELECT * FROM columnar_test_helpers.chunk_group_consistency;
 
 SELECT sum(a), sum(b) FROM t;
 SELECT count(*) FROM t_stripes;
@@ -44,13 +56,13 @@ ALTER TABLE t DROP COLUMN a;
 
 SELECT stripe_num, attr_num, chunk_group_num, minimum_value IS NULL, maximum_value IS NULL
 FROM columnar.chunk a, pg_class b
-WHERE a.storage_id = columnar_relation_storageid(b.oid) AND b.relname='t' ORDER BY 1, 2, 3;
+WHERE a.storage_id = columnar_test_helpers.columnar_relation_storageid(b.oid) AND b.relname='t' ORDER BY 1, 2, 3;
 
 VACUUM FULL t;
 
 SELECT stripe_num, attr_num, chunk_group_num, minimum_value IS NULL, maximum_value IS NULL
 FROM columnar.chunk a, pg_class b
-WHERE a.storage_id = columnar_relation_storageid(b.oid) AND b.relname='t' ORDER BY 1, 2, 3;
+WHERE a.storage_id = columnar_test_helpers.columnar_relation_storageid(b.oid) AND b.relname='t' ORDER BY 1, 2, 3;
 
 -- Make sure we cleaned-up the transient table metadata after VACUUM FULL commands
 SELECT count(distinct storage_id) - :columnar_table_count FROM columnar.stripe;
@@ -95,8 +107,11 @@ INSERT INTO t SELECT i / 5 FROM generate_series(1, 1500) i;
 COMMIT;
 
 VACUUM VERBOSE t;
+select
+  version_major, version_minor, reserved_stripe_id, reserved_row_number, reserved_offset
+  from columnar_test_helpers.columnar_storage_info('t');
 
-SELECT * FROM chunk_group_consistency;
+SELECT * FROM columnar_test_helpers.chunk_group_consistency;
 
 SELECT count(*) FROM t;
 
@@ -114,7 +129,7 @@ SELECT alter_columnar_table_set('t', compression => 'pglz');
 VACUUM FULL t;
 VACUUM VERBOSE t;
 
-SELECT * FROM chunk_group_consistency;
+SELECT * FROM columnar_test_helpers.chunk_group_consistency;
 
 DROP TABLE t;
 DROP VIEW t_stripes;
@@ -131,6 +146,6 @@ INSERT INTO t SELECT 1, 'a', 'xyz' FROM generate_series(1, 1000000) i;
 
 VACUUM VERBOSE t;
 
-SELECT * FROM chunk_group_consistency;
+SELECT * FROM columnar_test_helpers.chunk_group_consistency;
 
 DROP TABLE t;

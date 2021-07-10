@@ -34,6 +34,7 @@
 #include "catalog/pg_am.h"
 #include "columnar/columnar.h"
 #include "columnar/columnar_tableam.h"
+#include "commands/defrem.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
@@ -199,10 +200,10 @@ static char * CreateWorkerChangeSequenceDependencyCommand(char *sequenceSchemaNa
 														  char *sourceName,
 														  char *targetSchemaName,
 														  char *targetName);
+static char * GetAccessMethodForMatViewIfExists(Oid viewOid);
 static bool WillRecreateForeignKeyToReferenceTable(Oid relationId,
 												   CascadeToColocatedOption cascadeOption);
 static void WarningsForDroppingForeignKeysWithDistributedTables(Oid relationId);
-static void ExecuteQueryViaSPI(char *query, int SPIOK);
 
 PG_FUNCTION_INFO_V1(undistribute_table);
 PG_FUNCTION_INFO_V1(alter_distributed_table);
@@ -217,10 +218,10 @@ PG_FUNCTION_INFO_V1(worker_change_sequence_dependency);
 Datum
 undistribute_table(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 	bool cascadeViaForeignKeys = PG_GETARG_BOOL(1);
-
-	CheckCitusVersion(ERROR);
 
 	TableConversionParameters params = {
 		.relationId = relationId,
@@ -241,6 +242,8 @@ undistribute_table(PG_FUNCTION_ARGS)
 Datum
 alter_distributed_table(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 
 	char *distributionColumn = NULL;
@@ -278,9 +281,6 @@ alter_distributed_table(PG_FUNCTION_ARGS)
 		}
 	}
 
-	CheckCitusVersion(ERROR);
-
-
 	TableConversionParameters params = {
 		.relationId = relationId,
 		.distributionColumn = distributionColumn,
@@ -303,12 +303,12 @@ alter_distributed_table(PG_FUNCTION_ARGS)
 Datum
 alter_table_set_access_method(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 
 	text *accessMethodText = PG_GETARG_TEXT_P(1);
 	char *accessMethod = text_to_cstring(accessMethodText);
-
-	CheckCitusVersion(ERROR);
 
 	TableConversionParameters params = {
 		.relationId = relationId,
@@ -556,8 +556,11 @@ ConvertTable(TableConversionState *con)
 
 		includeIndexes = false;
 	}
+
+	bool includeReplicaIdentity = true;
 	List *postLoadCommands = GetPostLoadTableCreationCommands(con->relationId,
-															  includeIndexes);
+															  includeIndexes,
+															  includeReplicaIdentity);
 	List *justBeforeDropCommands = NIL;
 	List *attachPartitionCommands = NIL;
 
@@ -682,7 +685,6 @@ ConvertTable(TableConversionState *con)
 	}
 
 	/* set columnar options */
-#if HAS_TABLEAM
 	if (con->accessMethod == NULL && con->originalAccessMethod &&
 		strcmp(con->originalAccessMethod, "columnar") == 0)
 	{
@@ -702,7 +704,6 @@ ConvertTable(TableConversionState *con)
 
 		ExecuteQueryViaSPI(columnarOptionsSql, SPI_OK_SELECT);
 	}
-#endif
 
 	con->newRelationId = get_relname_relid(con->tempName, con->schemaId);
 
@@ -1128,13 +1129,28 @@ GetViewCreationCommandsOfTable(Oid relationId)
 		char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
 		bool isMatView = get_rel_relkind(viewOid) == RELKIND_MATVIEW;
 
-		appendStringInfo(query,
-						 "CREATE %s VIEW %s AS %s",
-						 isMatView ? "MATERIALIZED" : "",
-						 qualifiedViewName,
-						 viewDefinition);
+		/* here we need to get the access method of the view to recreate it */
+		char *accessMethodName = GetAccessMethodForMatViewIfExists(viewOid);
+
+		appendStringInfoString(query, "CREATE ");
+
+		if (isMatView)
+		{
+			appendStringInfoString(query, "MATERIALIZED ");
+		}
+
+		appendStringInfo(query, "VIEW %s ", qualifiedViewName);
+
+		if (accessMethodName)
+		{
+			appendStringInfo(query, "USING %s ", accessMethodName);
+		}
+
+		appendStringInfo(query, "AS %s", viewDefinition);
+
 		commands = lappend(commands, makeTableDDLCommandString(query->data));
 	}
+
 	return commands;
 }
 
@@ -1520,6 +1536,32 @@ CreateWorkerChangeSequenceDependencyCommand(char *sequenceSchemaName, char *sequ
 
 
 /*
+ * GetAccessMethodForMatViewIfExists returns if there's an access method
+ * set to the view with the given oid. Returns NULL otherwise.
+ */
+static char *
+GetAccessMethodForMatViewIfExists(Oid viewOid)
+{
+	char *accessMethodName = NULL;
+	Relation relation = try_relation_open(viewOid, AccessShareLock);
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errmsg("cannot complete operation "
+							   "because no such view exists")));
+	}
+
+	Oid accessMethodOid = relation->rd_rel->relam;
+	if (OidIsValid(accessMethodOid))
+	{
+		accessMethodName = get_am_name(accessMethodOid);
+	}
+	relation_close(relation, NoLock);
+
+	return accessMethodName;
+}
+
+
+/*
  * WillRecreateForeignKeyToReferenceTable checks if the table of relationId has any foreign
  * key to a reference table, if conversion will be cascaded to colocated table this function
  * also checks if any of the colocated tables have a foreign key to a reference table too
@@ -1646,8 +1688,23 @@ SwitchToSequentialAndLocalExecutionIfRelationNameTooLong(Oid relationId,
 		}
 
 		char *longestPartitionName = get_rel_name(longestNamePartitionId);
-		char *longestPartitionShardName = GetLongestShardName(longestNamePartitionId,
-															  longestPartitionName);
+		char *longestPartitionShardName = NULL;
+
+		/*
+		 * Use the shardId values of the partition if it is distributed, otherwise use
+		 * hypothetical values
+		 */
+		if (IsCitusTable(longestNamePartitionId) &&
+			ShardIntervalCount(longestNamePartitionId) > 0)
+		{
+			longestPartitionShardName =
+				GetLongestShardName(longestNamePartitionId, longestPartitionName);
+		}
+		else
+		{
+			longestPartitionShardName =
+				GetLongestShardNameForLocalPartition(relationId, longestPartitionName);
+		}
 
 		SwitchToSequentialAndLocalExecutionIfShardNameTooLong(longestPartitionName,
 															  longestPartitionShardName);
@@ -1698,4 +1755,17 @@ SwitchToSequentialAndLocalExecutionIfShardNameTooLong(char *relationName,
 	}
 
 	return false;
+}
+
+
+/*
+ * SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong is a wrapper for new
+ * partitions that will be distributed after attaching to a distributed partitioned table
+ */
+void
+SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(Oid parentRelationId,
+														  Oid partitionRelationId)
+{
+	SwitchToSequentialAndLocalExecutionIfRelationNameTooLong(
+		parentRelationId, get_rel_name(partitionRelationId));
 }

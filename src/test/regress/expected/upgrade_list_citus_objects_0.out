@@ -32,7 +32,7 @@ ORDER BY 1;
  function citus_add_inactive_node(text,integer,integer,noderole,name)
  function citus_add_local_table_to_metadata(regclass,boolean)
  function citus_add_node(text,integer,integer,noderole,name)
- function citus_add_rebalance_strategy(name,regproc,regproc,regproc,real,real)
+ function citus_add_rebalance_strategy(name,regproc,regproc,regproc,real,real,real)
  function citus_add_secondary_node(text,integer,text,integer,name)
  function citus_blocking_pids(integer)
  function citus_conninfo_cache_invalidate()
@@ -53,7 +53,7 @@ ORDER BY 1;
  function citus_extradata_container(internal)
  function citus_finish_pg_upgrade()
  function citus_get_active_worker_nodes()
- function citus_internal.columnar_ensure_objects_exist()
+ function citus_internal.downgrade_columnar_storage(regclass)
  function citus_internal.find_groupid_for_node(text,integer)
  function citus_internal.pg_dist_node_trigger_func()
  function citus_internal.pg_dist_rebalance_strategy_enterprise_check()
@@ -62,6 +62,7 @@ ORDER BY 1;
  function citus_internal.refresh_isolation_tester_prepared_statement()
  function citus_internal.replace_isolation_tester_func()
  function citus_internal.restore_isolation_tester_func()
+ function citus_internal.upgrade_columnar_storage(regclass)
  function citus_isolation_test_session_is_blocked(integer,integer[])
  function citus_json_concatenate(json,json)
  function citus_json_concatenate_final(json)
@@ -117,7 +118,7 @@ ORDER BY 1;
  function get_current_transaction_id()
  function get_global_active_transactions()
  function get_rebalance_progress()
- function get_rebalance_table_shards_plan(regclass,real,integer,bigint[],boolean,name)
+ function get_rebalance_table_shards_plan(regclass,real,integer,bigint[],boolean,name,real)
  function get_shard_id_for_distribution_column(regclass,"any")
  function isolate_tenant_to_new_shard(regclass,"any",text)
  function json_cat_agg(json)
@@ -239,5 +240,5 @@ ORDER BY 1;
  view citus_worker_stat_activity
  view pg_dist_shard_placement
  view time_partitions
-(223 rows)
+(224 rows)
 

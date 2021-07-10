@@ -27,6 +27,10 @@ extern bool EnableLocalReferenceForeignKeys;
 extern void SwitchToSequentialAndLocalExecutionIfRelationNameTooLong(Oid relationId,
 																	 char *
 																	 finalRelationName);
+extern void SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(Oid
+																	  parentRelationId,
+																	  Oid
+																	  partitionRelationId);
 
 
 /*
@@ -116,7 +120,7 @@ extern List * PreprocessClusterStmt(Node *node, const char *clusterCommand,
 									ProcessUtilityContext processUtilityContext);
 
 /* index.c */
-typedef void (*PGIndexProcessor)(Form_pg_index, List **);
+typedef void (*PGIndexProcessor)(Form_pg_index, List **, int);
 
 
 /* call.c */
@@ -144,6 +148,13 @@ extern List * PostprocessAlterCollationSchemaStmt(Node *stmt, const char *queryS
 extern char * GenerateBackupNameForCollationCollision(const ObjectAddress *address);
 extern ObjectAddress DefineCollationStmtObjectAddress(Node *stmt, bool missing_ok);
 extern List * PostprocessDefineCollationStmt(Node *stmt, const char *queryString);
+
+/* database.c - forward declarations */
+extern List * PreprocessAlterDatabaseOwnerStmt(Node *node, const char *queryString,
+											   ProcessUtilityContext processUtilityContext);
+extern List * PostprocessAlterDatabaseOwnerStmt(Node *node, const char *queryString);
+extern ObjectAddress AlterDatabaseOwnerObjectAddress(Node *node, bool missing_ok);
+extern List * DatabaseOwnerDDLCommands(const ObjectAddress *address);
 
 /* extension.c - forward declarations */
 extern bool IsDropCitusExtensionStmt(Node *parsetree);
@@ -196,6 +207,7 @@ extern bool AnyForeignKeyDependsOnIndex(Oid indexId);
 extern bool HasForeignKeyWithLocalTable(Oid relationId);
 extern bool HasForeignKeyToCitusLocalTable(Oid relationId);
 extern bool HasForeignKeyToReferenceTable(Oid relationOid);
+extern List * GetForeignKeysFromLocalTables(Oid relationId);
 extern bool TableReferenced(Oid relationOid);
 extern bool TableReferencing(Oid relationOid);
 extern bool ConstraintIsAUniquenessConstraint(char *inputConstaintName, Oid relationId);
@@ -206,6 +218,7 @@ extern bool ConstraintWithIdIsOfType(Oid constraintId, char targetConstraintType
 extern bool TableHasExternalForeignKeys(Oid relationId);
 extern List * GetForeignKeyOids(Oid relationId, int flags);
 extern Oid GetReferencedTableId(Oid foreignKeyId);
+extern Oid GetReferencingTableId(Oid foreignKeyId);
 extern bool RelationInvolvedInAnyNonInheritedForeignKeys(Oid relationId);
 
 
@@ -262,6 +275,7 @@ extern char * ChooseIndexName(const char *tabname, Oid namespaceId,
 							  bool primary, bool isconstraint);
 extern char * ChooseIndexNameAddition(List *colnames);
 extern List * ChooseIndexColumnNames(List *indexElems);
+extern LOCKMODE GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement);
 extern List * PreprocessReindexStmt(Node *ReindexStatement,
 									const char *ReindexCommand,
 									ProcessUtilityContext processUtilityContext);
@@ -273,7 +287,7 @@ extern List * PostprocessIndexStmt(Node *node,
 extern void ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement);
 extern void MarkIndexValid(IndexStmt *indexStmt);
 extern List * ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor
-											  pgIndexProcessor);
+											  pgIndexProcessor, int flags);
 
 /* objectaddress.c - forward declarations */
 extern ObjectAddress CreateExtensionStmtObjectAddress(Node *stmt, bool missing_ok);
@@ -331,6 +345,23 @@ extern List * PreprocessAlterSchemaRenameStmt(Node *node, const char *queryStrin
 extern ObjectAddress AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok);
 
 /* sequence.c - forward declarations */
+extern List * PreprocessAlterSequenceStmt(Node *node, const char *queryString,
+										  ProcessUtilityContext processUtilityContext);
+extern List * PreprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
+extern List * PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString);
+extern List * PreprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
+											   ProcessUtilityContext processUtilityContext);
+extern List * PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString);
+extern List * PreprocessDropSequenceStmt(Node *node, const char *queryString,
+										 ProcessUtilityContext processUtilityContext);
+extern List * PreprocessRenameSequenceStmt(Node *node, const char *queryString,
+										   ProcessUtilityContext processUtilityContext);
+extern ObjectAddress AlterSequenceStmtObjectAddress(Node *node, bool missing_ok);
+extern ObjectAddress AlterSequenceSchemaStmtObjectAddress(Node *node, bool missing_ok);
+extern ObjectAddress AlterSequenceOwnerStmtObjectAddress(Node *node, bool missing_ok);
+extern ObjectAddress RenameSequenceStmtObjectAddress(Node *node, bool missing_ok);
 extern void ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt);
 extern void ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt);
 

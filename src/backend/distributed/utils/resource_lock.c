@@ -97,10 +97,10 @@ PG_FUNCTION_INFO_V1(lock_relation_if_exists);
 Datum
 lock_shard_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	LOCKMODE lockMode = IntToLockMode(PG_GETARG_INT32(0));
 	ArrayType *shardIdArrayObject = PG_GETARG_ARRAYTYPE_P(1);
-
-	CheckCitusVersion(ERROR);
 
 	if (ARR_NDIM(shardIdArrayObject) == 0)
 	{
@@ -134,10 +134,10 @@ lock_shard_metadata(PG_FUNCTION_ARGS)
 Datum
 lock_shard_resources(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	LOCKMODE lockMode = IntToLockMode(PG_GETARG_INT32(0));
 	ArrayType *shardIdArrayObject = PG_GETARG_ARRAYTYPE_P(1);
-
-	CheckCitusVersion(ERROR);
 
 	if (ARR_NDIM(shardIdArrayObject) == 0)
 	{
@@ -384,6 +384,37 @@ SetLocktagForShardDistributionMetadata(int64 shardId, LOCKTAG *tag)
 		SET_LOCKTAG_COLOCATED_SHARDS_METADATA_RESOURCE(*tag, MyDatabaseId, colocationId,
 													   shardInterval->shardIndex);
 	}
+}
+
+
+/*
+ * LockPlacementCleanup takes an exclusive lock to ensure that only one process
+ * can cleanup placements at the same time.
+ */
+void
+LockPlacementCleanup(void)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = false;
+	SET_LOCKTAG_PLACEMENT_CLEANUP(tag);
+	(void) LockAcquire(&tag, ExclusiveLock, sessionLock, dontWait);
+}
+
+
+/*
+ * TryLockPlacementCleanup takes an exclusive lock to ensure that only one
+ * process can cleanup placements at the same time.
+ */
+bool
+TryLockPlacementCleanup(void)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = true;
+	SET_LOCKTAG_PLACEMENT_CLEANUP(tag);
+	bool lockAcquired = LockAcquire(&tag, ExclusiveLock, sessionLock, dontWait);
+	return lockAcquired;
 }
 
 

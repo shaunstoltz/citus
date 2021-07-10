@@ -2139,7 +2139,7 @@ ShardIntervalListHasLocalPlacements(List *shardIntervalList)
 	ShardInterval *shardInterval = NULL;
 	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		if (FindShardPlacementOnGroup(localGroupId, shardInterval->shardId) != NULL)
+		if (ActiveShardPlacementOnGroup(localGroupId, shardInterval->shardId) != NULL)
 		{
 			return true;
 		}
@@ -2228,7 +2228,7 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	if (cacheEntry->replicationModel == REPLICATION_MODEL_2PC ||
 		MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
 	{
-		CoordinatedTransactionShouldUse2PC();
+		Use2PCForCoordinatedTransaction();
 	}
 
 	/* define how tuples will be serialised */

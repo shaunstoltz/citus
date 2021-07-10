@@ -498,7 +498,7 @@ SELECT table_name::text, shard_count, access_method FROM public.citus_tables WHE
 
 \endif
 -- test with metadata sync
-SET citus.replication_model TO 'streaming';
+SET citus.shard_replication_factor TO 1;
 SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
  start_metadata_sync_to_node
 ---------------------------------------------------------------------
@@ -530,7 +530,6 @@ SELECT table_name, shard_count FROM public.citus_tables WHERE table_name::text =
  metadata_sync_table |           8
 (1 row)
 
-SET citus.replication_model TO DEFAULT;
 SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
  stop_metadata_sync_to_node
 ---------------------------------------------------------------------
@@ -915,6 +914,33 @@ NOTICE:  renaming the new table to alter_distributed_table.partition_lengths_123
  alter_distributed_table
 ---------------------------------------------------------------------
 
+(1 row)
+
+-- verify that alter_distributed_table doesn't change the access methods for the views on the table
+CREATE TABLE test_am_matview(a int);
+SELECT create_distributed_table('test_am_matview' ,'a', colocate_with:='none');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+CREATE MATERIALIZED VIEW test_mat_view_am USING COLUMNAR AS SELECT count(*), a FROM test_am_matview GROUP BY a ;
+SELECT alter_distributed_table('test_am_matview', shard_count:= 52);
+NOTICE:  creating a new table for alter_distributed_table.test_am_matview
+NOTICE:  moving the data of alter_distributed_table.test_am_matview
+NOTICE:  dropping the old alter_distributed_table.test_am_matview
+NOTICE:  drop cascades to materialized view test_mat_view_am
+CONTEXT:  SQL statement "DROP TABLE alter_distributed_table.test_am_matview CASCADE"
+NOTICE:  renaming the new table to alter_distributed_table.test_am_matview
+ alter_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT amname FROM pg_am WHERE oid IN (SELECT relam FROM pg_class WHERE relname ='test_mat_view_am');
+  amname
+---------------------------------------------------------------------
+ columnar
 (1 row)
 
 SET client_min_messages TO WARNING;

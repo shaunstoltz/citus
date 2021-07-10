@@ -240,6 +240,13 @@ static DistributeObjectOps Collation_Rename = {
 	.postprocess = NULL,
 	.address = RenameCollationStmtObjectAddress,
 };
+static DistributeObjectOps Database_AlterOwner = {
+	.deparse = DeparseAlterDatabaseOwnerStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessAlterDatabaseOwnerStmt,
+	.postprocess = PostprocessAlterDatabaseOwnerStmt,
+	.address = AlterDatabaseOwnerObjectAddress,
+};
 static DistributeObjectOps Extension_AlterObjectSchema = {
 	.deparse = DeparseAlterExtensionSchemaStmt,
 	.qualify = NULL,
@@ -359,6 +366,41 @@ static DistributeObjectOps Routine_AlterObjectDepends = {
 	.postprocess = NULL,
 	.address = AlterFunctionDependsStmtObjectAddress,
 };
+static DistributeObjectOps Sequence_Alter = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = PreprocessAlterSequenceStmt,
+	.postprocess = NULL,
+	.address = AlterSequenceStmtObjectAddress,
+};
+static DistributeObjectOps Sequence_AlterObjectSchema = {
+	.deparse = DeparseAlterSequenceSchemaStmt,
+	.qualify = QualifyAlterSequenceSchemaStmt,
+	.preprocess = PreprocessAlterSequenceSchemaStmt,
+	.postprocess = PostprocessAlterSequenceSchemaStmt,
+	.address = AlterSequenceSchemaStmtObjectAddress,
+};
+static DistributeObjectOps Sequence_AlterOwner = {
+	.deparse = DeparseAlterSequenceOwnerStmt,
+	.qualify = QualifyAlterSequenceOwnerStmt,
+	.preprocess = PreprocessAlterSequenceOwnerStmt,
+	.postprocess = PostprocessAlterSequenceOwnerStmt,
+	.address = AlterSequenceOwnerStmtObjectAddress,
+};
+static DistributeObjectOps Sequence_Drop = {
+	.deparse = DeparseDropSequenceStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessDropSequenceStmt,
+	.postprocess = NULL,
+	.address = NULL,
+};
+static DistributeObjectOps Sequence_Rename = {
+	.deparse = DeparseRenameSequenceStmt,
+	.qualify = QualifyRenameSequenceStmt,
+	.preprocess = PreprocessRenameSequenceStmt,
+	.postprocess = NULL,
+	.address = RenameSequenceStmtObjectAddress,
+};
 static DistributeObjectOps Trigger_AlterObjectDepends = {
 	.deparse = NULL,
 	.qualify = NULL,
@@ -453,7 +495,7 @@ static DistributeObjectOps Statistics_Rename = {
 	.address = NULL,
 };
 static DistributeObjectOps Table_AlterTable = {
-	.deparse = NULL,
+	.deparse = DeparseAlterTableStmt,
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTableStmt,
 	.postprocess = NULL,
@@ -621,6 +663,11 @@ GetDistributeObjectOps(Node *node)
 					return &Routine_AlterObjectSchema;
 				}
 
+				case OBJECT_SEQUENCE:
+				{
+					return &Sequence_AlterObjectSchema;
+				}
+
 				case OBJECT_STATISTIC_EXT:
 				{
 					return &Statistics_AlterObjectSchema;
@@ -656,6 +703,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_COLLATION:
 				{
 					return &Collation_AlterOwner;
+				}
+
+				case OBJECT_DATABASE:
+				{
+					return &Database_AlterOwner;
 				}
 
 				case OBJECT_FUNCTION:
@@ -705,6 +757,11 @@ GetDistributeObjectOps(Node *node)
 			return &Any_AlterRoleSet;
 		}
 
+		case T_AlterSeqStmt:
+		{
+			return &Sequence_Alter;
+		}
+
 #if PG_VERSION_NUM >= PG_VERSION_13
 		case T_AlterStatsStmt:
 		{
@@ -735,6 +792,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_INDEX:
 				{
 					return &Index_AlterTable;
+				}
+
+				case OBJECT_SEQUENCE:
+				{
+					return &Sequence_AlterOwner;
 				}
 
 				default:
@@ -861,6 +923,11 @@ GetDistributeObjectOps(Node *node)
 					return &Schema_Drop;
 				}
 
+				case OBJECT_SEQUENCE:
+				{
+					return &Sequence_Drop;
+				}
+
 				case OBJECT_STATISTIC_EXT:
 				{
 					return &Statistics_Drop;
@@ -953,6 +1020,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_SCHEMA:
 				{
 					return &Schema_Rename;
+				}
+
+				case OBJECT_SEQUENCE:
+				{
+					return &Sequence_Rename;
 				}
 
 				case OBJECT_STATISTIC_EXT:

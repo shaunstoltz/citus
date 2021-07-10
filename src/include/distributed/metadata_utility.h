@@ -22,6 +22,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/connection_management.h"
 #include "distributed/relay_utility.h"
 #include "utils/acl.h"
 #include "utils/relcache.h"
@@ -29,11 +30,15 @@
 
 /* total number of hash tokens (2^32) */
 #define HASH_TOKEN_COUNT INT64CONST(4294967296)
-#define SELECT_EXIST_QUERY "SELECT EXISTS (SELECT 1 FROM %s)"
+#define SELECT_TRUE_QUERY "SELECT TRUE FROM %s LIMIT 1"
 #define PG_TABLE_SIZE_FUNCTION "pg_table_size(%s)"
 #define PG_RELATION_SIZE_FUNCTION "pg_relation_size(%s)"
 #define PG_TOTAL_RELATION_SIZE_FUNCTION "pg_total_relation_size(%s)"
 #define CSTORE_TABLE_SIZE_FUNCTION "cstore_table_size(%s)"
+#define WORKER_PARTITIONED_TABLE_SIZE_FUNCTION "worker_partitioned_table_size(%s)"
+#define WORKER_PARTITIONED_RELATION_SIZE_FUNCTION "worker_partitioned_relation_size(%s)"
+#define WORKER_PARTITIONED_RELATION_TOTAL_SIZE_FUNCTION \
+	"worker_partitioned_relation_total_size(%s)"
 
 #define SHARD_SIZES_COLUMN_COUNT 2
 #define UPDATE_SHARD_STATISTICS_COLUMN_COUNT 4
@@ -177,8 +182,19 @@ typedef struct TableConversionReturn
 }TableConversionReturn;
 
 
-/* Config variable managed via guc.c */
-extern int ReplicationModel;
+/*
+ * Size query types for PG and Citus
+ * For difference details, please see:
+ * https://www.postgresql.org/docs/13/functions-admin.html#FUNCTIONS-ADMIN-DBSIZE
+ */
+typedef enum SizeQueryType
+{
+	RELATION_SIZE, /* pg_relation_size() */
+	TOTAL_RELATION_SIZE, /* pg_total_relation_size() */
+	TABLE_SIZE, /* pg_table_size() */
+	CSTORE_TABLE_SIZE /* cstore_table_size() */
+} SizeQueryType;
+
 
 /* Size functions */
 extern Datum citus_table_size(PG_FUNCTION_ARGS);
@@ -193,19 +209,21 @@ extern int ShardIntervalCount(Oid relationId);
 extern List * LoadShardList(Oid relationId);
 extern ShardInterval * CopyShardInterval(ShardInterval *srcInterval);
 extern uint64 ShardLength(uint64 shardId);
+extern bool NodeGroupHasLivePlacements(int32 groupId);
 extern bool NodeGroupHasShardPlacements(int32 groupId,
 										bool onlyConsiderActivePlacements);
 extern List * ActiveShardPlacementListOnGroup(uint64 shardId, int32 groupId);
 extern List * ActiveShardPlacementList(uint64 shardId);
+extern List * ShardPlacementListWithoutOrphanedPlacements(uint64 shardId);
 extern ShardPlacement * ActiveShardPlacement(uint64 shardId, bool missingOk);
 extern List * BuildShardPlacementList(ShardInterval *shardInterval);
 extern List * AllShardPlacementsOnNodeGroup(int32 groupId);
 extern List * AllShardPlacementsWithShardPlacementState(ShardState shardState);
 extern List * GroupShardPlacementsForTableOnGroup(Oid relationId, int32 groupId);
 extern StringInfo GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList,
-														char *sizeQuery);
+														SizeQueryType sizeQueryType,
+														bool optimizePartitionCalculations);
 extern List * RemoveCoordinatorPlacementIfNotSingleNode(List *placementList);
-extern ShardPlacement * ShardPlacementOnGroup(uint64 shardId, int groupId);
 
 /* Function declarations to modify shard and shard placement data */
 extern void InsertShardRow(Oid relationId, uint64 shardId, char storageType,
@@ -247,9 +265,9 @@ extern void EnsureFunctionOwner(Oid functionId);
 extern void EnsureSuperUser(void);
 extern void ErrorIfTableIsACatalogTable(Relation relation);
 extern void EnsureTableNotDistributed(Oid relationId);
-extern void EnsureReplicationSettings(Oid relationId, char replicationModel);
 extern void EnsureRelationExists(Oid relationId);
 extern bool RegularTable(Oid relationId);
+extern bool TableEmpty(Oid tableId);
 extern bool RelationUsesIdentityColumns(TupleDesc relationDesc);
 extern char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 extern uint64 GetFirstShardId(Oid relationId);
@@ -268,5 +286,15 @@ extern void GetIntervalTypeInfo(char partitionMethod, Var *partitionColumn,
 extern List * SendShardStatisticsQueriesInParallel(List *citusTableIds, bool
 												   useDistributedTransaction, bool
 												   useShardMinMaxQuery);
-
+extern bool GetNodeDiskSpaceStatsForConnection(MultiConnection *connection,
+											   uint64 *availableBytes,
+											   uint64 *totalBytes);
+extern void ExecuteQueryViaSPI(char *query, int SPIOK);
+extern void EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId);
+extern void AlterSequenceType(Oid seqOid, Oid typeOid);
+extern void MarkSequenceListDistributedAndPropagateDependencies(List *sequenceList);
+extern void MarkSequenceDistributedAndPropagateDependencies(Oid sequenceOid);
+extern void EnsureDistributedSequencesHaveOneType(Oid relationId,
+												  List *dependentSequenceList,
+												  List *attnumList);
 #endif   /* METADATA_UTILITY_H */

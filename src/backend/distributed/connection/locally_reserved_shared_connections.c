@@ -111,9 +111,9 @@ PG_FUNCTION_INFO_V1(citus_reserved_connection_stats);
 Datum
 citus_reserved_connection_stats(PG_FUNCTION_ARGS)
 {
-	TupleDesc tupleDescriptor = NULL;
-
 	CheckCitusVersion(ERROR);
+
+	TupleDesc tupleDescriptor = NULL;
 	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDescriptor);
 
 	StoreAllReservedConnections(tupleStore, tupleDescriptor);
@@ -377,7 +377,7 @@ EnsureConnectionPossibilityForNodeList(List *nodeList)
 /*
  * EnsureConnectionPossibilityForNode reserves a shared connection
  * counter per node in the nodeList unless:
- *  - Reservation is possible/allowed (see IsReservationPossible())
+ *  - Reservation is not possible/allowed (see IsReservationPossible())
  *  - there is at least one connection to the node so that we are guranteed
  *    to get a connection
  *  - An earlier call already reserved a connection (e.g., we allow only a

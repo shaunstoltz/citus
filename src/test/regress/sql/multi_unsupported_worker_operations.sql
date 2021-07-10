@@ -15,7 +15,6 @@ ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 150000;
 
 -- Prepare the environment
 SET citus.shard_replication_factor TO 1;
-SET citus.replication_model TO 'streaming';
 SET citus.shard_count TO 5;
 
 -- Create test tables
@@ -172,7 +171,8 @@ SELECT stop_metadata_sync_to_node('localhost', :worker_2_port);
 SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_port;
 \c - - - :worker_2_port
 SELECT worker_drop_distributed_table(logicalrelid::regclass::text) FROM pg_dist_partition;
-DELETE FROM pg_dist_node;
+SELECT count(*) FROM pg_dist_partition;
+SELECT count(*) FROM pg_dist_node;
 \c - - - :worker_1_port
 
 -- DROP TABLE
@@ -238,4 +238,3 @@ SELECT worker_drop_distributed_table(logicalrelid::regclass::text) FROM pg_dist_
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART :last_colocation_id;
 
 RESET citus.shard_replication_factor;
-RESET citus.replication_model;

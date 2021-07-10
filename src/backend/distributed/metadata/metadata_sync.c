@@ -25,6 +25,7 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_namespace.h"
@@ -48,6 +49,7 @@
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
 #include "distributed/version_compat.h"
+#include "executor/spi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
@@ -67,13 +69,13 @@ static List * GetDistributedTableDDLEvents(Oid relationId);
 static char * LocalGroupIdUpdateCommand(int32 groupId);
 static void UpdateDistNodeBoolAttr(const char *nodeName, int32 nodePort,
 								   int attrNum, bool value);
-static List * SequenceDDLCommandsForTable(Oid relationId);
 static List * SequenceDependencyCommandList(Oid relationId);
 static char * TruncateTriggerCreateCommand(Oid relationId);
 static char * SchemaOwnerName(Oid objectId);
 static bool HasMetadataWorkers(void);
 static List * DetachPartitionCommandList(void);
 static bool SyncMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
+static void DropMetadataSnapshotOnNode(WorkerNode *workerNode);
 static char * CreateSequenceDependencyCommand(Oid relationId, Oid sequenceId,
 											  char *columnName);
 static List * GenerateGrantOnSchemaQueriesFromAclItem(Oid schemaOid,
@@ -103,6 +105,8 @@ static bool got_SIGALRM = false;
 Datum
 start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
 
@@ -126,10 +130,10 @@ StartMetadataSyncToNode(const char *nodeNameString, int32 nodePort)
 	/* fail if metadata synchronization doesn't succeed */
 	bool raiseInterrupts = true;
 
+	CheckCitusVersion(ERROR);
 	EnsureCoordinator();
 	EnsureSuperUser();
 	EnsureModificationsCanRun();
-	CheckCitusVersion(ERROR);
 
 	PreventInTransactionBlock(true, "start_metadata_sync_to_node");
 
@@ -185,25 +189,55 @@ StartMetadataSyncToNode(const char *nodeNameString, int32 nodePort)
 Datum
 stop_metadata_sync_to_node(PG_FUNCTION_ARGS)
 {
-	text *nodeName = PG_GETARG_TEXT_P(0);
-	int32 nodePort = PG_GETARG_INT32(1);
-	char *nodeNameString = text_to_cstring(nodeName);
-
+	CheckCitusVersion(ERROR);
 	EnsureCoordinator();
 	EnsureSuperUser();
-	CheckCitusVersion(ERROR);
+	PreventInTransactionBlock(true, "stop_metadata_sync_to_node");
+
+	text *nodeName = PG_GETARG_TEXT_P(0);
+	int32 nodePort = PG_GETARG_INT32(1);
+	bool clearMetadata = PG_GETARG_BOOL(2);
+	char *nodeNameString = text_to_cstring(nodeName);
 
 	LockRelationOid(DistNodeRelationId(), ExclusiveLock);
 
-	WorkerNode *workerNode = FindWorkerNode(nodeNameString, nodePort);
+	WorkerNode *workerNode = FindWorkerNodeAnyCluster(nodeNameString, nodePort);
 	if (workerNode == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("node (%s,%d) does not exist", nodeNameString, nodePort)));
 	}
 
+	if (NodeIsCoordinator(workerNode))
+	{
+		ereport(NOTICE, (errmsg("node (%s,%d) is the coordinator and should have "
+								"metadata, skipping stopping the metadata sync",
+								nodeNameString, nodePort)));
+		PG_RETURN_VOID();
+	}
+
 	MarkNodeHasMetadata(nodeNameString, nodePort, false);
 	MarkNodeMetadataSynced(nodeNameString, nodePort, false);
+
+	if (clearMetadata)
+	{
+		if (NodeIsPrimary(workerNode))
+		{
+			ereport(NOTICE, (errmsg("dropping metadata on the node (%s,%d)",
+									nodeNameString, nodePort)));
+			DropMetadataSnapshotOnNode(workerNode);
+		}
+		else
+		{
+			/*
+			 * If this is a secondary node we can't actually clear metadata from it,
+			 * we assume the primary node is cleared.
+			 */
+			ereport(NOTICE, (errmsg("(%s,%d) is a secondary node: to clear the metadata,"
+									" you should clear metadata from the primary node",
+									nodeNameString, nodePort)));
+		}
+	}
 
 	PG_RETURN_VOID();
 }
@@ -320,46 +354,24 @@ SyncMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError)
 
 
 /*
- * SendOptionalCommandListToWorkerInTransaction sends the given command list to
- * the given worker in a single transaction. If any of the commands fail, it
- * rollbacks the transaction, and otherwise commits.
+ * DropMetadataSnapshotOnNode creates the queries which drop the metadata and sends them
+ * to the worker given as parameter.
  */
-bool
-SendOptionalCommandListToWorkerInTransaction(const char *nodeName, int32 nodePort,
-											 const char *nodeUser, List *commandList)
+static void
+DropMetadataSnapshotOnNode(WorkerNode *workerNode)
 {
-	int connectionFlags = FORCE_NEW_CONNECTION;
-	bool failed = false;
+	char *extensionOwner = CitusExtensionOwnerName();
 
-	MultiConnection *workerConnection = GetNodeUserDatabaseConnection(connectionFlags,
-																	  nodeName, nodePort,
-																	  nodeUser, NULL);
+	/* generate the queries which drop the metadata */
+	List *dropMetadataCommandList = MetadataDropCommands();
 
-	RemoteTransactionBegin(workerConnection);
+	dropMetadataCommandList = lappend(dropMetadataCommandList,
+									  LocalGroupIdUpdateCommand(0));
 
-	/* iterate over the commands and execute them in the same connection */
-	const char *commandString = NULL;
-	foreach_ptr(commandString, commandList)
-	{
-		if (ExecuteOptionalRemoteCommand(workerConnection, commandString, NULL) != 0)
-		{
-			failed = true;
-			break;
-		}
-	}
-
-	if (failed)
-	{
-		RemoteTransactionAbort(workerConnection);
-	}
-	else
-	{
-		RemoteTransactionCommit(workerConnection);
-	}
-
-	CloseConnection(workerConnection);
-
-	return !failed;
+	SendOptionalCommandListToWorkerInTransaction(workerNode->workerName,
+												 workerNode->workerPort,
+												 extensionOwner,
+												 dropMetadataCommandList);
 }
 
 
@@ -416,11 +428,9 @@ MetadataCreateCommands(void)
 			continue;
 		}
 
-		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
 		List *ddlCommandList = GetFullTableCreationCommands(relationId,
 															includeSequenceDefaults);
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
-		List *sequenceDependencyCommandList = SequenceDependencyCommandList(relationId);
 
 		/*
 		 * Tables might have dependencies on different objects, since we create shards for
@@ -430,6 +440,16 @@ MetadataCreateCommands(void)
 		ObjectAddressSet(tableAddress, RelationRelationId, relationId);
 		EnsureDependenciesExistOnAllNodes(&tableAddress);
 
+		/*
+		 * Ensure sequence dependencies and mark them as distributed
+		 */
+		List *attnumList = NIL;
+		List *dependentSequenceList = NIL;
+		GetDependentSequencesWithRelation(relationId, &attnumList,
+										  &dependentSequenceList, 0);
+		MarkSequenceListDistributedAndPropagateDependencies(dependentSequenceList);
+
+		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
 		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
 												  workerSequenceDDLCommands);
 
@@ -444,6 +464,9 @@ MetadataCreateCommands(void)
 
 		metadataSnapshotCommandList = lappend(metadataSnapshotCommandList,
 											  tableOwnerResetCommand);
+
+		List *sequenceDependencyCommandList = SequenceDependencyCommandList(
+			relationId);
 		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
 												  sequenceDependencyCommandList);
 	}
@@ -551,7 +574,8 @@ GetDistributedTableDDLEvents(Oid relationId)
 		}
 
 		/* command to associate sequences with table */
-		List *sequenceDependencyCommandList = SequenceDependencyCommandList(relationId);
+		List *sequenceDependencyCommandList = SequenceDependencyCommandList(
+			relationId);
 		commandList = list_concat(commandList, sequenceDependencyCommandList);
 	}
 
@@ -1084,11 +1108,15 @@ List *
 SequenceDDLCommandsForTable(Oid relationId)
 {
 	List *sequenceDDLList = NIL;
-	List *ownedSequences = GetSequencesOwnedByRelation(relationId);
+
+	List *attnumList = NIL;
+	List *dependentSequenceList = NIL;
+	GetDependentSequencesWithRelation(relationId, &attnumList, &dependentSequenceList, 0);
+
 	char *ownerName = TableOwner(relationId);
 
 	Oid sequenceOid = InvalidOid;
-	foreach_oid(sequenceOid, ownedSequences)
+	foreach_oid(sequenceOid, dependentSequenceList)
 	{
 		char *sequenceDef = pg_get_sequencedef_string(sequenceOid);
 		char *escapedSequenceDef = quote_literal_cstr(sequenceDef);
@@ -1114,6 +1142,182 @@ SequenceDDLCommandsForTable(Oid relationId)
 	}
 
 	return sequenceDDLList;
+}
+
+
+/*
+ * GetAttributeTypeOid returns the OID of the type of the attribute of
+ * provided relationId that has the provided attnum
+ */
+Oid
+GetAttributeTypeOid(Oid relationId, AttrNumber attnum)
+{
+	Oid resultOid = InvalidOid;
+
+	ScanKeyData key[2];
+
+	/* Grab an appropriate lock on the pg_attribute relation */
+	Relation attrel = table_open(AttributeRelationId, AccessShareLock);
+
+	/* Use the index to scan only system attributes of the target relation */
+	ScanKeyInit(&key[0],
+				Anum_pg_attribute_attrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_attribute_attnum,
+				BTLessEqualStrategyNumber, F_INT2LE,
+				Int16GetDatum(attnum));
+
+	SysScanDesc scan = systable_beginscan(attrel, AttributeRelidNumIndexId, true, NULL, 2,
+										  key);
+
+	HeapTuple attributeTuple;
+	while (HeapTupleIsValid(attributeTuple = systable_getnext(scan)))
+	{
+		Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(attributeTuple);
+		resultOid = att->atttypid;
+	}
+
+	systable_endscan(scan);
+	table_close(attrel, AccessShareLock);
+
+	return resultOid;
+}
+
+
+/*
+ * GetDependentSequencesWithRelation appends the attnum and id of sequences that
+ * have direct (owned sequences) or indirect dependency with the given relationId,
+ * to the lists passed as NIL initially.
+ * For both cases, we use the intermediate AttrDefault object from pg_depend.
+ * If attnum is specified, we only return the sequences related to that
+ * attribute of the relationId.
+ */
+void
+GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
+								  List **dependentSequenceList, AttrNumber attnum)
+{
+	Assert(*attnumList == NIL && *dependentSequenceList == NIL);
+
+	List *attrdefResult = NIL;
+	List *attrdefAttnumResult = NIL;
+	ScanKeyData key[3];
+	HeapTuple tup;
+
+	Relation depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relationId));
+	if (attnum)
+	{
+		ScanKeyInit(&key[2],
+					Anum_pg_depend_refobjsubid,
+					BTEqualStrategyNumber, F_INT4EQ,
+					Int32GetDatum(attnum));
+	}
+
+	SysScanDesc scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+										  NULL, attnum ? 3 : 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend deprec = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (deprec->classid == AttrDefaultRelationId &&
+			deprec->objsubid == 0 &&
+			deprec->refobjsubid != 0 &&
+			deprec->deptype == DEPENDENCY_AUTO)
+		{
+			attrdefResult = lappend_oid(attrdefResult, deprec->objid);
+			attrdefAttnumResult = lappend_int(attrdefAttnumResult, deprec->refobjsubid);
+		}
+	}
+
+	systable_endscan(scan);
+
+	table_close(depRel, AccessShareLock);
+
+	ListCell *attrdefOidCell = NULL;
+	ListCell *attrdefAttnumCell = NULL;
+	forboth(attrdefOidCell, attrdefResult, attrdefAttnumCell, attrdefAttnumResult)
+	{
+		Oid attrdefOid = lfirst_oid(attrdefOidCell);
+		AttrNumber attrdefAttnum = lfirst_int(attrdefAttnumCell);
+
+		List *sequencesFromAttrDef = GetSequencesFromAttrDef(attrdefOid);
+
+		/* to simplify and eliminate cases like "DEFAULT nextval('..') - nextval('..')" */
+		if (list_length(sequencesFromAttrDef) > 1)
+		{
+			if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+			{
+				ereport(ERROR, (errmsg(
+									"More than one sequence in a column default"
+									" is not supported for adding local tables to metadata")));
+			}
+			ereport(ERROR, (errmsg("More than one sequence in a column default"
+								   " is not supported for distribution")));
+		}
+
+		if (list_length(sequencesFromAttrDef) == 1)
+		{
+			*dependentSequenceList = list_concat(*dependentSequenceList,
+												 sequencesFromAttrDef);
+			*attnumList = lappend_int(*attnumList, attrdefAttnum);
+		}
+	}
+}
+
+
+/*
+ * GetSequencesFromAttrDef returns a list of sequence OIDs that have
+ * dependency with the given attrdefOid in pg_depend
+ */
+List *
+GetSequencesFromAttrDef(Oid attrdefOid)
+{
+	List *sequencesResult = NIL;
+	ScanKeyData key[2];
+	HeapTuple tup;
+
+	Relation depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(AttrDefaultRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(attrdefOid));
+
+	SysScanDesc scan = systable_beginscan(depRel, DependDependerIndexId, true,
+										  NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend deprec = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (deprec->refclassid == RelationRelationId &&
+			deprec->deptype == DEPENDENCY_NORMAL &&
+			get_rel_relkind(deprec->refobjid) == RELKIND_SEQUENCE)
+		{
+			sequencesResult = lappend_oid(sequencesResult, deprec->refobjid);
+		}
+	}
+
+	systable_endscan(scan);
+
+	table_close(depRel, AccessShareLock);
+
+	return sequencesResult;
 }
 
 

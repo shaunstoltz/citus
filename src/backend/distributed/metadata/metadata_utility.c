@@ -10,6 +10,8 @@
  *-------------------------------------------------------------------------
  */
 
+#include <sys/statvfs.h>
+
 #include "postgres.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -65,20 +67,23 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#define DISK_SPACE_FIELDS 2
 
 /* Local functions forward declarations */
 static uint64 * AllocateUint64(uint64 value);
 static void RecordDistributedRelationDependencies(Oid distributedRelationId);
 static GroupShardPlacement * TupleToGroupShardPlacement(TupleDesc tupleDesc,
 														HeapTuple heapTuple);
-static bool DistributedTableSize(Oid relationId, char *sizeQuery, bool failOnError,
-								 uint64 *tableSize);
+static bool DistributedTableSize(Oid relationId, SizeQueryType sizeQueryType,
+								 bool failOnError, uint64 *tableSize);
 static bool DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId,
-										 char *sizeQuery, bool failOnError,
+										 SizeQueryType sizeQueryType, bool failOnError,
 										 uint64 *tableSize);
 static List * ShardIntervalsOnWorkerGroup(WorkerNode *workerNode, Oid relationId);
 static char * GenerateShardStatisticsQueryForShardList(List *shardIntervalList, bool
 													   useShardMinMaxQuery);
+static char * GetWorkerPartitionedSizeUDFNameBySizeQueryType(SizeQueryType sizeQueryType);
+static char * GetSizeQueryBySizeQueryType(SizeQueryType sizeQueryType);
 static char * GenerateAllShardStatisticsQueryForNode(WorkerNode *workerNode,
 													 List *citusTableIds, bool
 													 useShardMinMaxQuery);
@@ -96,11 +101,136 @@ static void AppendShardSizeMinMaxQuery(StringInfo selectQuery, uint64 shardId,
 static void AppendShardSizeQuery(StringInfo selectQuery, ShardInterval *shardInterval,
 								 char *quotedShardName);
 
+static HeapTuple CreateDiskSpaceTuple(TupleDesc tupleDesc, uint64 availableBytes,
+									  uint64 totalBytes);
+static bool GetLocalDiskSpaceStats(uint64 *availableBytes, uint64 *totalBytes);
+
 /* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(citus_local_disk_space_stats);
 PG_FUNCTION_INFO_V1(citus_table_size);
 PG_FUNCTION_INFO_V1(citus_total_relation_size);
 PG_FUNCTION_INFO_V1(citus_relation_size);
 PG_FUNCTION_INFO_V1(citus_shard_sizes);
+
+
+/*
+ * CreateDiskSpaceTuple creates a tuple that is used as the return value
+ * for citus_local_disk_space_stats.
+ */
+static HeapTuple
+CreateDiskSpaceTuple(TupleDesc tupleDescriptor, uint64 availableBytes, uint64 totalBytes)
+{
+	Datum values[DISK_SPACE_FIELDS];
+	bool isNulls[DISK_SPACE_FIELDS];
+
+	/* form heap tuple for remote disk space statistics */
+	memset(values, 0, sizeof(values));
+	memset(isNulls, false, sizeof(isNulls));
+
+	values[0] = UInt64GetDatum(availableBytes);
+	values[1] = UInt64GetDatum(totalBytes);
+
+	HeapTuple diskSpaceTuple = heap_form_tuple(tupleDescriptor, values, isNulls);
+
+	return diskSpaceTuple;
+}
+
+
+/*
+ * citus_local_disk_space_stats returns total disk space and available disk
+ * space for the disk that contains PGDATA.
+ */
+Datum
+citus_local_disk_space_stats(PG_FUNCTION_ARGS)
+{
+	uint64 availableBytes = 0;
+	uint64 totalBytes = 0;
+
+	if (!GetLocalDiskSpaceStats(&availableBytes, &totalBytes))
+	{
+		ereport(WARNING, (errmsg("could not get disk space")));
+	}
+
+	TupleDesc tupleDescriptor = NULL;
+
+	TypeFuncClass resultTypeClass = get_call_result_type(fcinfo, NULL,
+														 &tupleDescriptor);
+	if (resultTypeClass != TYPEFUNC_COMPOSITE)
+	{
+		ereport(ERROR, (errmsg("return type must be a row type")));
+	}
+
+	HeapTuple diskSpaceTuple = CreateDiskSpaceTuple(tupleDescriptor, availableBytes,
+													totalBytes);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(diskSpaceTuple));
+}
+
+
+/*
+ * GetLocalDiskSpaceStats returns total and available disk space for the disk containing
+ * PGDATA (not considering tablespaces, quota).
+ */
+static bool
+GetLocalDiskSpaceStats(uint64 *availableBytes, uint64 *totalBytes)
+{
+	struct statvfs buffer;
+	if (statvfs(DataDir, &buffer) != 0)
+	{
+		return false;
+	}
+
+	/*
+	 * f_bfree: number of free blocks
+	 * f_frsize: fragment size, same as f_bsize usually
+	 * f_blocks: Size of fs in f_frsize units
+	 */
+	*availableBytes = buffer.f_bfree * buffer.f_frsize;
+	*totalBytes = buffer.f_blocks * buffer.f_frsize;
+
+	return true;
+}
+
+
+/*
+ * GetNodeDiskSpaceStatsForConnection fetches the disk space statistics for the node
+ * that is on the given connection, or returns false if unsuccessful.
+ */
+bool
+GetNodeDiskSpaceStatsForConnection(MultiConnection *connection, uint64 *availableBytes,
+								   uint64 *totalBytes)
+{
+	PGresult *result = NULL;
+
+	char *sizeQuery = "SELECT available_disk_size, total_disk_size "
+					  "FROM pg_catalog.citus_local_disk_space_stats()";
+
+
+	int queryResult = ExecuteOptionalRemoteCommand(connection, sizeQuery, &result);
+	if (queryResult != RESPONSE_OKAY || !IsResponseOK(result) || PQntuples(result) != 1)
+	{
+		ereport(WARNING, (errcode(ERRCODE_CONNECTION_FAILURE),
+						  errmsg("cannot get the disk space statistics for node %s:%d",
+								 connection->hostname, connection->port)));
+
+		PQclear(result);
+		ForgetResults(connection);
+
+		return false;
+	}
+
+	char *availableBytesString = PQgetvalue(result, 0, 0);
+	char *totalBytesString = PQgetvalue(result, 0, 1);
+
+	*availableBytes = SafeStringToUint64(availableBytesString);
+	*totalBytes = SafeStringToUint64(totalBytesString);
+
+	PQclear(result);
+	ForgetResults(connection);
+
+	return true;
+}
+
 
 /*
  * citus_shard_sizes returns all shard names and their sizes.
@@ -140,21 +270,21 @@ citus_shard_sizes(PG_FUNCTION_ARGS)
 Datum
 citus_total_relation_size(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 	bool failOnError = PG_GETARG_BOOL(1);
 
-	char *tableSizeFunction = PG_TOTAL_RELATION_SIZE_FUNCTION;
-
-	CheckCitusVersion(ERROR);
+	SizeQueryType sizeQueryType = TOTAL_RELATION_SIZE;
 
 	if (CStoreTable(relationId))
 	{
-		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+		sizeQueryType = CSTORE_TABLE_SIZE;
 	}
 
 	uint64 tableSize = 0;
 
-	if (!DistributedTableSize(relationId, tableSizeFunction, failOnError, &tableSize))
+	if (!DistributedTableSize(relationId, sizeQueryType, failOnError, &tableSize))
 	{
 		Assert(!failOnError);
 		PG_RETURN_NULL();
@@ -171,20 +301,20 @@ citus_total_relation_size(PG_FUNCTION_ARGS)
 Datum
 citus_table_size(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 	bool failOnError = true;
-	char *tableSizeFunction = PG_TABLE_SIZE_FUNCTION;
-
-	CheckCitusVersion(ERROR);
+	SizeQueryType sizeQueryType = TABLE_SIZE;
 
 	if (CStoreTable(relationId))
 	{
-		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+		sizeQueryType = CSTORE_TABLE_SIZE;
 	}
 
 	uint64 tableSize = 0;
 
-	if (!DistributedTableSize(relationId, tableSizeFunction, failOnError, &tableSize))
+	if (!DistributedTableSize(relationId, sizeQueryType, failOnError, &tableSize))
 	{
 		Assert(!failOnError);
 		PG_RETURN_NULL();
@@ -201,20 +331,20 @@ citus_table_size(PG_FUNCTION_ARGS)
 Datum
 citus_relation_size(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 	bool failOnError = true;
-	char *tableSizeFunction = PG_RELATION_SIZE_FUNCTION;
-
-	CheckCitusVersion(ERROR);
+	SizeQueryType sizeQueryType = RELATION_SIZE;
 
 	if (CStoreTable(relationId))
 	{
-		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+		sizeQueryType = CSTORE_TABLE_SIZE;
 	}
 
 	uint64 relationSize = 0;
 
-	if (!DistributedTableSize(relationId, tableSizeFunction, failOnError, &relationSize))
+	if (!DistributedTableSize(relationId, sizeQueryType, failOnError, &relationSize))
 	{
 		Assert(!failOnError);
 		PG_RETURN_NULL();
@@ -389,7 +519,8 @@ ReceiveShardNameAndSizeResults(List *connectionList, Tuplestorestate *tupleStore
  * it. Connection to each node has to be established to get the size of the table.
  */
 static bool
-DistributedTableSize(Oid relationId, char *sizeQuery, bool failOnError, uint64 *tableSize)
+DistributedTableSize(Oid relationId, SizeQueryType sizeQueryType, bool failOnError,
+					 uint64 *tableSize)
 {
 	int logLevel = WARNING;
 
@@ -430,7 +561,7 @@ DistributedTableSize(Oid relationId, char *sizeQuery, bool failOnError, uint64 *
 	{
 		uint64 relationSizeOnNode = 0;
 
-		bool gotSize = DistributedTableSizeOnWorker(workerNode, relationId, sizeQuery,
+		bool gotSize = DistributedTableSizeOnWorker(workerNode, relationId, sizeQueryType,
 													failOnError, &relationSizeOnNode);
 		if (!gotSize)
 		{
@@ -452,7 +583,8 @@ DistributedTableSize(Oid relationId, char *sizeQuery, bool failOnError, uint64 *
  * shard placement.
  */
 static bool
-DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId, char *sizeQuery,
+DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId,
+							 SizeQueryType sizeQueryType,
 							 bool failOnError, uint64 *tableSize)
 {
 	int logLevel = WARNING;
@@ -469,9 +601,15 @@ DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId, char *sizeQ
 
 	List *shardIntervalsOnNode = ShardIntervalsOnWorkerGroup(workerNode, relationId);
 
+	/*
+	 * We pass false here, because if we optimize this, we would include child tables.
+	 * But citus size functions shouldn't include them, like PG.
+	 */
+	bool optimizePartitionCalculations = false;
 	StringInfo tableSizeQuery = GenerateSizeQueryOnMultiplePlacements(
 		shardIntervalsOnNode,
-		sizeQuery);
+		sizeQueryType,
+		optimizePartitionCalculations);
 
 	MultiConnection *connection = GetNodeConnection(connectionFlag, workerNodeName,
 													workerNodePort);
@@ -506,7 +644,19 @@ DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId, char *sizeQ
 	StringInfo tableSizeStringInfo = (StringInfo) linitial(sizeList);
 	char *tableSizeString = tableSizeStringInfo->data;
 
-	*tableSize = SafeStringToUint64(tableSizeString);
+	if (strlen(tableSizeString) > 0)
+	{
+		*tableSize = SafeStringToUint64(tableSizeString);
+	}
+	else
+	{
+		/*
+		 * This means the shard is moved or dropped while citus_total_relation_size is
+		 * being executed. For this case we get an empty string as table size.
+		 * We can take that as zero to prevent any unnecessary errors.
+		 */
+		*tableSize = 0;
+	}
 
 	PQclear(result);
 	ClearResults(connection, failOnError);
@@ -591,12 +741,18 @@ ShardIntervalsOnWorkerGroup(WorkerNode *workerNode, Oid relationId)
 /*
  * GenerateSizeQueryOnMultiplePlacements generates a select size query to get
  * size of multiple tables. Note that, different size functions supported by PG
- * are also supported by this function changing the size query given as the
- * last parameter to function.  Format of sizeQuery is pg_*_size(%s). Examples
- * of it can be found in the coordinator_protocol.h
+ * are also supported by this function changing the size query type given as the
+ * last parameter to function. Depending on the sizeQueryType enum parameter, the
+ * generated query will call one of the functions: pg_relation_size,
+ * pg_total_relation_size, pg_table_size and cstore_table_size.
+ * This function uses UDFs named worker_partitioned_*_size for partitioned tables,
+ * if the parameter optimizePartitionCalculations is true. The UDF to be called is
+ * determined by the parameter sizeQueryType.
  */
 StringInfo
-GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList, char *sizeQuery)
+GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList,
+									  SizeQueryType sizeQueryType,
+									  bool optimizePartitionCalculations)
 {
 	StringInfo selectQuery = makeStringInfo();
 
@@ -605,6 +761,18 @@ GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList, char *sizeQuery)
 	ShardInterval *shardInterval = NULL;
 	foreach_ptr(shardInterval, shardIntervalList)
 	{
+		if (optimizePartitionCalculations && PartitionTable(shardInterval->relationId))
+		{
+			/*
+			 * Skip child tables of a partitioned table as they are already counted in
+			 * worker_partitioned_*_size UDFs, if optimizePartitionCalculations is true.
+			 * We don't expect this case to happen, since we don't send the child tables
+			 * to this function. Because they are all eliminated in
+			 * ColocatedNonPartitionShardIntervalList. Therefore we can't cover here with
+			 * a test currently. This is added for possible future usages.
+			 */
+			continue;
+		}
 		uint64 shardId = shardInterval->shardId;
 		Oid schemaId = get_rel_namespace(shardInterval->relationId);
 		char *schemaName = get_namespace_name(schemaId);
@@ -614,7 +782,17 @@ GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList, char *sizeQuery)
 		char *shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
 		char *quotedShardName = quote_literal_cstr(shardQualifiedName);
 
-		appendStringInfo(selectQuery, sizeQuery, quotedShardName);
+		if (optimizePartitionCalculations && PartitionedTable(shardInterval->relationId))
+		{
+			appendStringInfo(selectQuery, GetWorkerPartitionedSizeUDFNameBySizeQueryType(
+								 sizeQueryType), quotedShardName);
+		}
+		else
+		{
+			appendStringInfo(selectQuery, GetSizeQueryBySizeQueryType(sizeQueryType),
+							 quotedShardName);
+		}
+
 		appendStringInfo(selectQuery, " + ");
 	}
 
@@ -625,6 +803,79 @@ GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList, char *sizeQuery)
 	appendStringInfo(selectQuery, "0;");
 
 	return selectQuery;
+}
+
+
+/*
+ * GetWorkerPartitionedSizeUDFNameBySizeQueryType returns the corresponding worker
+ * partitioned size query for given query type.
+ * Errors out for an invalid query type.
+ * Currently this function is only called with the type TOTAL_RELATION_SIZE.
+ * The others are added for possible future usages. Since they are not used anywhere,
+ * currently we can't cover them with tests.
+ */
+static char *
+GetWorkerPartitionedSizeUDFNameBySizeQueryType(SizeQueryType sizeQueryType)
+{
+	switch (sizeQueryType)
+	{
+		case RELATION_SIZE:
+		{
+			return WORKER_PARTITIONED_RELATION_SIZE_FUNCTION;
+		}
+
+		case TOTAL_RELATION_SIZE:
+		{
+			return WORKER_PARTITIONED_RELATION_TOTAL_SIZE_FUNCTION;
+		}
+
+		case TABLE_SIZE:
+		{
+			return WORKER_PARTITIONED_TABLE_SIZE_FUNCTION;
+		}
+
+		default:
+		{
+			elog(ERROR, "Size query type couldn't be found.");
+		}
+	}
+}
+
+
+/*
+ * GetSizeQueryBySizeQueryType returns the corresponding size query for given query type.
+ * Errors out for an invalid query type.
+ */
+static char *
+GetSizeQueryBySizeQueryType(SizeQueryType sizeQueryType)
+{
+	switch (sizeQueryType)
+	{
+		case RELATION_SIZE:
+		{
+			return PG_RELATION_SIZE_FUNCTION;
+		}
+
+		case TOTAL_RELATION_SIZE:
+		{
+			return PG_TOTAL_RELATION_SIZE_FUNCTION;
+		}
+
+		case CSTORE_TABLE_SIZE:
+		{
+			return CSTORE_TABLE_SIZE_FUNCTION;
+		}
+
+		case TABLE_SIZE:
+		{
+			return PG_TABLE_SIZE_FUNCTION;
+		}
+
+		default:
+		{
+			elog(ERROR, "Size query type couldn't be found.");
+		}
+	}
 }
 
 
@@ -841,7 +1092,7 @@ TableShardReplicationFactor(Oid relationId)
 	{
 		uint64 shardId = shardInterval->shardId;
 
-		List *shardPlacementList = ShardPlacementList(shardId);
+		List *shardPlacementList = ShardPlacementListWithoutOrphanedPlacements(shardId);
 		uint32 shardPlacementCount = list_length(shardPlacementList);
 
 		/*
@@ -1050,6 +1301,26 @@ ShardLength(uint64 shardId)
 
 
 /*
+ * NodeGroupHasLivePlacements returns true if there is any placement
+ * on the given node group which is not a SHARD_STATE_TO_DELETE placement.
+ */
+bool
+NodeGroupHasLivePlacements(int32 groupId)
+{
+	List *shardPlacements = AllShardPlacementsOnNodeGroup(groupId);
+	GroupShardPlacement *placement = NULL;
+	foreach_ptr(placement, shardPlacements)
+	{
+		if (placement->shardState != SHARD_STATE_TO_DELETE)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+
+/*
  * NodeGroupHasShardPlacements returns whether any active shards are placed on the group
  */
 bool
@@ -1121,12 +1392,38 @@ List *
 ActiveShardPlacementList(uint64 shardId)
 {
 	List *activePlacementList = NIL;
-	List *shardPlacementList = ShardPlacementList(shardId);
+	List *shardPlacementList =
+		ShardPlacementListIncludingOrphanedPlacements(shardId);
 
 	ShardPlacement *shardPlacement = NULL;
 	foreach_ptr(shardPlacement, shardPlacementList)
 	{
 		if (shardPlacement->shardState == SHARD_STATE_ACTIVE)
+		{
+			activePlacementList = lappend(activePlacementList, shardPlacement);
+		}
+	}
+
+	return SortList(activePlacementList, CompareShardPlacementsByWorker);
+}
+
+
+/*
+ * ShardPlacementListWithoutOrphanedPlacements returns shard placements exluding
+ * the ones that are orphaned, because they are marked to be deleted at a later
+ * point (shardstate = 4).
+ */
+List *
+ShardPlacementListWithoutOrphanedPlacements(uint64 shardId)
+{
+	List *activePlacementList = NIL;
+	List *shardPlacementList =
+		ShardPlacementListIncludingOrphanedPlacements(shardId);
+
+	ShardPlacement *shardPlacement = NULL;
+	foreach_ptr(shardPlacement, shardPlacementList)
+	{
+		if (shardPlacement->shardState != SHARD_STATE_TO_DELETE)
 		{
 			activePlacementList = lappend(activePlacementList, shardPlacement);
 		}
@@ -1673,35 +1970,14 @@ UpdatePartitionShardPlacementStates(ShardPlacement *parentShardPlacement, char s
 			ColocatedShardIdInRelation(partitionOid, parentShardInterval->shardIndex);
 
 		ShardPlacement *partitionPlacement =
-			ShardPlacementOnGroup(partitionShardId, parentShardPlacement->groupId);
+			ShardPlacementOnGroupIncludingOrphanedPlacements(
+				parentShardPlacement->groupId, partitionShardId);
 
 		/* the partition should have a placement with the same group */
 		Assert(partitionPlacement != NULL);
 
 		UpdateShardPlacementState(partitionPlacement->placementId, shardState);
 	}
-}
-
-
-/*
- * ShardPlacementOnGroup gets a shardInterval and a groupId, returns a placement
- * of the shard on the given group. If no such placement exists, the function
- * return NULL.
- */
-ShardPlacement *
-ShardPlacementOnGroup(uint64 shardId, int groupId)
-{
-	List *placementList = ShardPlacementList(shardId);
-	ShardPlacement *placement = NULL;
-	foreach_ptr(placement, placementList)
-	{
-		if (placement->groupId == groupId)
-		{
-			return placement;
-		}
-	}
-
-	return NULL;
 }
 
 

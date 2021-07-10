@@ -34,6 +34,8 @@
 #include "utils/rel.h"
 
 #include "columnar/columnar.h"
+#include "columnar/columnar_storage.h"
+#include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
 
 typedef struct ChunkGroupReadState
@@ -62,17 +64,15 @@ typedef struct StripeReadState
 
 struct ColumnarReadState
 {
-	List *stripeList;
 	TupleDesc tupleDescriptor;
 	Relation relation;
 
-	int64 currentStripe; /* index of current stripe */
+	StripeMetadata *currentStripeMetadata;
 	StripeReadState *stripeReadState;
 
 	/*
-	 * List of Var pointers for columns in the query. We use this both for
-	 * getting vector of projected columns, and also when we want to build
-	 * base constraint to find selected row chunks.
+	 * Integer list of attribute numbers (1-indexed) for columns needed by the
+	 * query.
 	 */
 	List *projectedColumnList;
 
@@ -84,11 +84,23 @@ struct ColumnarReadState
 };
 
 /* static function declarations */
+static MemoryContext CreateStripeReadMemoryContext(void);
+static void ReadStripeRowByRowNumber(StripeReadState *stripeReadState,
+									 StripeMetadata *stripeMetadata,
+									 uint64 rowNumber, Datum *columnValues,
+									 bool *columnNulls);
+static void ReadChunkGroupRowByRowOffset(ChunkGroupReadState *chunkGroupReadState,
+										 StripeMetadata *stripeMetadata,
+										 uint64 stripeRowOffset, Datum *columnValues,
+										 bool *columnNulls);
+static bool StripeReadInProgress(ColumnarReadState *readState);
+static bool HasUnreadStripe(ColumnarReadState *readState);
 static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel,
 										 TupleDesc tupleDesc, List *projectedColumnList,
 										 List *whereClauseList, List *whereClauseVars,
 										 MemoryContext stripeReadContext);
 static void EndStripeRead(StripeReadState *stripeReadState);
+static void AdvanceStripeRead(ColumnarReadState *readState);
 static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 							  bool *columnNulls);
 static ChunkGroupReadState * BeginChunkGroupRead(StripeBuffers *stripeBuffers, int
@@ -139,32 +151,22 @@ static Datum ColumnDefaultValue(TupleConstr *tupleConstraints,
 /*
  * ColumnarBeginRead initializes a columnar read operation. This function returns a
  * read handle that's used during reading rows and finishing the read operation.
+ *
+ * projectedColumnList is an integer list of attribute numbers (1-indexed).
  */
 ColumnarReadState *
 ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 				  List *projectedColumnList, List *whereClauseList)
 {
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
-	StripeMetadata *stripeMetadata = NULL;
-
-	uint64 totalRowCount = 0;
-	foreach_ptr(stripeMetadata, stripeList)
-	{
-		totalRowCount += stripeMetadata->rowCount;
-	}
-
 	/*
 	 * We allocate all stripe specific data in the stripeReadContext, and reset
 	 * this memory context before loading a new stripe. This is to avoid memory
 	 * leaks.
 	 */
-	MemoryContext stripeReadContext = AllocSetContextCreate(CurrentMemoryContext,
-															"Stripe Read Memory Context",
-															ALLOCSET_DEFAULT_SIZES);
+	MemoryContext stripeReadContext = CreateStripeReadMemoryContext();
 
 	ColumnarReadState *readState = palloc0(sizeof(ColumnarReadState));
 	readState->relation = relation;
-	readState->stripeList = stripeList;
 	readState->projectedColumnList = projectedColumnList;
 	readState->whereClauseList = whereClauseList;
 	readState->whereClauseVars = GetClauseVars(whereClauseList, tupleDescriptor->natts);
@@ -172,34 +174,45 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	readState->tupleDescriptor = tupleDescriptor;
 	readState->stripeReadContext = stripeReadContext;
 	readState->stripeReadState = NULL;
+	readState->currentStripeMetadata = FindNextStripeByRowNumber(relation,
+																 COLUMNAR_INVALID_ROW_NUMBER,
+																 GetTransactionSnapshot());
 
 	return readState;
 }
 
 
 /*
+ * CreateStripeReadMemoryContext creates a memory context to be used when
+ * reading a stripe.
+ */
+static MemoryContext
+CreateStripeReadMemoryContext()
+{
+	return AllocSetContextCreate(CurrentMemoryContext, "Stripe Read Memory Context",
+								 ALLOCSET_DEFAULT_SIZES);
+}
+
+
+/*
  * ColumnarReadNextRow tries to read a row from the columnar table. On success, it sets
- * column values and nulls, and returns true. If there are no more rows to read,
- * the function returns false.
+ * column values, column nulls and rowNumber (if passed to be non-NULL), and returns true.
+ * If there are no more rows to read, the function returns false.
  */
 bool
-ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *columnNulls)
+ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *columnNulls,
+					uint64 *rowNumber)
 {
 	while (true)
 	{
-		if (readState->stripeReadState == NULL)
+		if (!StripeReadInProgress(readState))
 		{
-			uint32 stripeCount = list_length(readState->stripeList);
-
-			if (readState->currentStripe >= stripeCount)
+			if (!HasUnreadStripe(readState))
 			{
 				return false;
 			}
 
-			StripeMetadata *stripeMetadata = list_nth(readState->stripeList,
-													  readState->currentStripe);
-
-			readState->stripeReadState = BeginStripeRead(stripeMetadata,
+			readState->stripeReadState = BeginStripeRead(readState->currentStripeMetadata,
 														 readState->relation,
 														 readState->tupleDescriptor,
 														 readState->projectedColumnList,
@@ -210,20 +223,139 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 
 		if (!ReadStripeNextRow(readState->stripeReadState, columnValues, columnNulls))
 		{
-			readState->chunkGroupsFiltered +=
-				readState->stripeReadState->chunkGroupsFiltered;
-			readState->currentStripe++;
-			EndStripeRead(readState->stripeReadState);
-			readState->stripeReadState = NULL;
-			MemoryContextReset(readState->stripeReadContext);
-
+			AdvanceStripeRead(readState);
 			continue;
+		}
+
+		if (rowNumber)
+		{
+			*rowNumber = readState->currentStripeMetadata->firstRowNumber +
+						 readState->stripeReadState->currentRow - 1;
 		}
 
 		return true;
 	}
 
 	return false;
+}
+
+
+/*
+ * ColumnarReadRowByRowNumber reads row with rowNumber from given relation
+ * into columnValues and columnNulls, and returns true. If no such row
+ * exists, then returns false.
+ */
+bool
+ColumnarReadRowByRowNumber(Relation relation, uint64 rowNumber,
+						   List *neededColumnList, Datum *columnValues,
+						   bool *columnNulls, Snapshot snapshot)
+{
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(relation, rowNumber, snapshot);
+	if (stripeMetadata == NULL)
+	{
+		/* no such row exists */
+		return false;
+	}
+
+	TupleDesc relationTupleDesc = RelationGetDescr(relation);
+	List *whereClauseList = NIL;
+	List *whereClauseVars = NIL;
+	MemoryContext stripeReadContext = CreateStripeReadMemoryContext();
+	StripeReadState *stripeReadState = BeginStripeRead(stripeMetadata,
+													   relation,
+													   relationTupleDesc,
+													   neededColumnList,
+													   whereClauseList,
+													   whereClauseVars,
+													   stripeReadContext);
+
+	ReadStripeRowByRowNumber(stripeReadState, stripeMetadata, rowNumber,
+							 columnValues, columnNulls);
+
+	EndStripeRead(stripeReadState);
+	MemoryContextReset(stripeReadContext);
+
+	return true;
+}
+
+
+/*
+ * ReadStripeRowByRowNumber reads row with rowNumber from given
+ * stripeReadState into columnValues and columnNulls.
+ * Errors out if no such row exists in the stripe being read.
+ */
+static void
+ReadStripeRowByRowNumber(StripeReadState *stripeReadState,
+						 StripeMetadata *stripeMetadata,
+						 uint64 rowNumber, Datum *columnValues,
+						 bool *columnNulls)
+{
+	if (rowNumber < stripeMetadata->firstRowNumber)
+	{
+		/* not expected but be on the safe side */
+		ereport(ERROR, (errmsg("row offset cannot be negative")));
+	}
+
+	/* find the exact chunk group to be read */
+	uint64 stripeRowOffset = rowNumber - stripeMetadata->firstRowNumber;
+	stripeReadState->chunkGroupIndex = stripeRowOffset /
+									   stripeMetadata->chunkGroupRowCount;
+	stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
+		stripeReadState->stripeBuffers,
+		stripeReadState->chunkGroupIndex,
+		stripeReadState->tupleDescriptor,
+		stripeReadState->projectedColumnList,
+		stripeReadState->stripeReadContext);
+
+	ReadChunkGroupRowByRowOffset(stripeReadState->chunkGroupReadState,
+								 stripeMetadata, stripeRowOffset,
+								 columnValues, columnNulls);
+
+	EndChunkGroupRead(stripeReadState->chunkGroupReadState);
+	stripeReadState->chunkGroupReadState = NULL;
+}
+
+
+/*
+ * ReadChunkGroupRowByRowOffset reads row with stripeRowOffset from given
+ * chunkGroupReadState into columnValues and columnNulls.
+ * Errors out if no such row exists in the chunk group being read.
+ */
+static void
+ReadChunkGroupRowByRowOffset(ChunkGroupReadState *chunkGroupReadState,
+							 StripeMetadata *stripeMetadata,
+							 uint64 stripeRowOffset, Datum *columnValues,
+							 bool *columnNulls)
+{
+	/* set the exact row number to be read from given chunk roup */
+	chunkGroupReadState->currentRow = stripeRowOffset %
+									  stripeMetadata->chunkGroupRowCount;
+	if (!ReadChunkGroupNextRow(chunkGroupReadState, columnValues, columnNulls))
+	{
+		/* not expected but be on the safe side */
+		ereport(ERROR, (errmsg("could not find the row in stripe")));
+	}
+}
+
+
+/*
+ * StripeReadInProgress returns true if we already started reading a stripe.
+ */
+static bool
+StripeReadInProgress(ColumnarReadState *readState)
+{
+	return readState->stripeReadState != NULL;
+}
+
+
+/*
+ * HasUnreadStripe returns true if we still have stripes to read during current
+ * read operation.
+ */
+static bool
+HasUnreadStripe(ColumnarReadState *readState)
+{
+	return readState->currentStripeMetadata != NULL;
 }
 
 
@@ -235,7 +367,9 @@ void
 ColumnarRescan(ColumnarReadState *readState)
 {
 	readState->stripeReadState = NULL;
-	readState->currentStripe = 0;
+	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
+																 COLUMNAR_INVALID_ROW_NUMBER,
+																 GetTransactionSnapshot());
 	readState->chunkGroupsFiltered = 0;
 }
 
@@ -247,7 +381,11 @@ void
 ColumnarEndRead(ColumnarReadState *readState)
 {
 	MemoryContextDelete(readState->stripeReadContext);
-	list_free_deep(readState->stripeList);
+	if (readState->currentStripeMetadata)
+	{
+		pfree(readState->currentStripeMetadata);
+	}
+
 	pfree(readState);
 }
 
@@ -296,6 +434,29 @@ static void
 EndStripeRead(StripeReadState *stripeReadState)
 {
 	pfree(stripeReadState);
+}
+
+
+/*
+ * AdvanceStripeRead updates chunkGroupsFiltered and sets
+ * currentStripeMetadata for next stripe read.
+ */
+static void
+AdvanceStripeRead(ColumnarReadState *readState)
+{
+	readState->chunkGroupsFiltered +=
+		readState->stripeReadState->chunkGroupsFiltered;
+
+	uint64 lastReadRowNumber =
+		StripeGetHighestRowNumber(readState->currentStripeMetadata);
+
+	EndStripeRead(readState->stripeReadState);
+
+	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
+																 lastReadRowNumber,
+																 GetTransactionSnapshot());
+	readState->stripeReadState = NULL;
+	MemoryContextReset(readState->stripeReadContext);
 }
 
 
@@ -415,12 +576,14 @@ ReadChunkGroupNextRow(ChunkGroupReadState *chunkGroupReadState, Datum *columnVal
 	 */
 	memset(columnNulls, true, sizeof(bool) * chunkGroupReadState->columnCount);
 
-	Var *projectedColumn = NULL;
-	foreach_ptr(projectedColumn, chunkGroupReadState->projectedColumnList)
+	int attno;
+	foreach_int(attno, chunkGroupReadState->projectedColumnList)
 	{
 		const ChunkData *chunkGroupData = chunkGroupReadState->chunkGroupData;
 		const int rowIndex = chunkGroupReadState->currentRow;
-		uint32 columnIndex = projectedColumn->varattno - 1;
+
+		/* attno is 1-indexed; existsArray is 0-indexed */
+		const uint32 columnIndex = attno - 1;
 
 		if (chunkGroupData->existsArray[columnIndex][rowIndex])
 		{
@@ -620,8 +783,12 @@ LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 	{
 		ColumnChunkSkipNode *chunkSkipNode = &chunkSkipNodeArray[chunkIndex];
 		uint64 existsOffset = stripeOffset + chunkSkipNode->existsChunkOffset;
-		StringInfo rawExistsBuffer = ReadFromSmgr(relation, existsOffset,
-												  chunkSkipNode->existsLength);
+		StringInfo rawExistsBuffer = makeStringInfo();
+
+		enlargeStringInfo(rawExistsBuffer, chunkSkipNode->existsLength);
+		rawExistsBuffer->len = chunkSkipNode->existsLength;
+		ColumnarStorageRead(relation, existsOffset, rawExistsBuffer->data,
+							chunkSkipNode->existsLength);
 
 		chunkBuffersArray[chunkIndex]->existsBuffer = rawExistsBuffer;
 	}
@@ -632,8 +799,12 @@ LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 		ColumnChunkSkipNode *chunkSkipNode = &chunkSkipNodeArray[chunkIndex];
 		CompressionType compressionType = chunkSkipNode->valueCompressionType;
 		uint64 valueOffset = stripeOffset + chunkSkipNode->valueChunkOffset;
-		StringInfo rawValueBuffer = ReadFromSmgr(relation, valueOffset,
-												 chunkSkipNode->valueLength);
+		StringInfo rawValueBuffer = makeStringInfo();
+
+		enlargeStringInfo(rawValueBuffer, chunkSkipNode->valueLength);
+		rawValueBuffer->len = chunkSkipNode->valueLength;
+		ColumnarStorageRead(relation, valueOffset, rawValueBuffer->data,
+							chunkSkipNode->valueLength);
 
 		chunkBuffersArray[chunkIndex]->valueBuffer = rawValueBuffer;
 		chunkBuffersArray[chunkIndex]->valueCompressionType = compressionType;
@@ -1010,12 +1181,12 @@ static bool *
 ProjectedColumnMask(uint32 columnCount, List *projectedColumnList)
 {
 	bool *projectedColumnMask = palloc0(columnCount * sizeof(bool));
-	ListCell *columnCell = NULL;
+	int attno;
 
-	foreach(columnCell, projectedColumnList)
+	foreach_int(attno, projectedColumnList)
 	{
-		Var *column = (Var *) lfirst(columnCell);
-		uint32 columnIndex = column->varattno - 1;
+		/* attno is 1-indexed; projectedColumnMask is 0-indexed */
+		int columnIndex = attno - 1;
 		projectedColumnMask[columnIndex] = true;
 	}
 
@@ -1221,31 +1392,4 @@ ColumnDefaultValue(TupleConstr *tupleConstraints, Form_pg_attribute attributeFor
 						errhint("Expression is either mutable or "
 								"does not evaluate to constant value")));
 	}
-}
-
-
-StringInfo
-ReadFromSmgr(Relation rel, uint64 offset, uint32 size)
-{
-	StringInfo resultBuffer = makeStringInfo();
-	uint64 read = 0;
-
-	enlargeStringInfo(resultBuffer, size);
-	resultBuffer->len = size;
-
-	while (read < size)
-	{
-		SmgrAddr addr = logical_to_smgr(offset + read);
-
-		Buffer buffer = ReadBuffer(rel, addr.blockno);
-		Page page = BufferGetPage(buffer);
-		PageHeader phdr = (PageHeader) page;
-
-		uint32 to_read = Min(size - read, phdr->pd_upper - addr.offset);
-		memcpy_s(resultBuffer->data + read, size - read, page + addr.offset, to_read);
-		ReleaseBuffer(buffer);
-		read += to_read;
-	}
-
-	return resultBuffer;
 }

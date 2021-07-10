@@ -1174,7 +1174,8 @@ HasComplexRangeTableType(Query *queryTree)
 		 */
 		if (rangeTableEntry->rtekind != RTE_RELATION &&
 			rangeTableEntry->rtekind != RTE_SUBQUERY &&
-			rangeTableEntry->rtekind != RTE_FUNCTION)
+			rangeTableEntry->rtekind != RTE_FUNCTION &&
+			rangeTableEntry->rtekind != RTE_VALUES)
 		{
 			hasComplexRangeTableType = true;
 		}
@@ -1529,6 +1530,7 @@ MultiTableNodeList(List *tableEntryList, List *rangeTableList)
 		tableNode->partitionColumn = partitionColumn;
 		tableNode->alias = rangeTableEntry->alias;
 		tableNode->referenceNames = rangeTableEntry->eref;
+		tableNode->includePartitions = GetOriginalInh(rangeTableEntry);
 
 		tableNodeList = lappend(tableNodeList, tableNode);
 	}

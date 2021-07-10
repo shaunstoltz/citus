@@ -45,6 +45,7 @@
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/log_utils.h"
 #include "distributed/pg_dist_partition.h"
@@ -738,6 +739,8 @@ BaseRangeTableList(MultiNode *multiNode)
 				rangeTableEntry->eref = multiTable->referenceNames;
 				rangeTableEntry->alias = multiTable->alias;
 				rangeTableEntry->relid = multiTable->relationId;
+				rangeTableEntry->inh = multiTable->includePartitions;
+
 				SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_RELATION, NULL, NULL,
 									 list_make1_int(multiTable->rangeTableId),
 									 NIL, NIL, NIL, NIL);
@@ -1463,6 +1466,7 @@ ConstructCallingRTE(RangeTblEntry *rangeTableEntry, List *dependentJobList)
 		callingRTE->rtekind = RTE_RELATION;
 		callingRTE->eref = rangeTableEntry->eref;
 		callingRTE->relid = rangeTableEntry->relid;
+		callingRTE->inh = rangeTableEntry->inh;
 	}
 	else if (rangeTableKind == CITUS_RTE_REMOTE_QUERY)
 	{
@@ -2763,8 +2767,10 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 static bool
 CoPlacedShardIntervals(ShardInterval *firstInterval, ShardInterval *secondInterval)
 {
-	List *firstShardPlacementList = ShardPlacementList(firstInterval->shardId);
-	List *secondShardPlacementList = ShardPlacementList(secondInterval->shardId);
+	List *firstShardPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+		firstInterval->shardId);
+	List *secondShardPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+		secondInterval->shardId);
 	ListCell *firstShardPlacementCell = NULL;
 	ListCell *secondShardPlacementCell = NULL;
 

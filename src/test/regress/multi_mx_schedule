@@ -22,6 +22,7 @@ test: multi_test_catalog_views
 
 # the following test has to be run sequentially
 test: multi_mx_create_table
+test: start_stop_metadata_sync
 test: multi_mx_hide_shard_names
 test: multi_mx_add_coordinator
 test: multi_mx_modifications_to_reference_tables
@@ -53,6 +54,9 @@ test: multi_mx_reference_table
 test: multi_mx_insert_select_repartition
 test: locally_execute_intermediate_results
 test: multi_mx_alter_distributed_table
+
+# should be executed sequentially because it modifies metadata
+test: local_shard_execution_dropped_column
 
 # test that no tests leaked intermediate results. This should always be last
 test: ensure_no_intermediate_data_leak
