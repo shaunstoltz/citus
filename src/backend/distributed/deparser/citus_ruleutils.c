@@ -207,10 +207,13 @@ pg_get_sequencedef_string(Oid sequenceRelationId)
 
 	/* build our DDL command */
 	char *qualifiedSequenceName = generate_qualified_relation_name(sequenceRelationId);
+	char *typeName = format_type_be(pgSequenceForm->seqtypid);
 
 	char *sequenceDef = psprintf(CREATE_SEQUENCE_COMMAND, qualifiedSequenceName,
+								 typeName,
 								 pgSequenceForm->seqincrement, pgSequenceForm->seqmin,
 								 pgSequenceForm->seqmax, pgSequenceForm->seqstart,
+								 pgSequenceForm->seqcache,
 								 pgSequenceForm->seqcycle ? "" : "NO ");
 
 	return sequenceDef;
@@ -882,12 +885,13 @@ pg_get_indexclusterdef_string(Oid indexRelationId)
 	/* check if the table is clustered on this index */
 	if (indexForm->indisclustered)
 	{
-		char *tableName = generate_relation_name(tableRelationId, NIL);
+		char *qualifiedRelationName =
+			generate_qualified_relation_name(tableRelationId);
 		char *indexName = get_rel_name(indexRelationId); /* needs to be quoted */
 
 		initStringInfo(&buffer);
 		appendStringInfo(&buffer, "ALTER TABLE %s CLUSTER ON %s",
-						 tableName, quote_identifier(indexName));
+						 qualifiedRelationName, quote_identifier(indexName));
 	}
 
 	ReleaseSysCache(indexTuple);
