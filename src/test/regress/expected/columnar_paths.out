@@ -4,6 +4,8 @@ CREATE TABLE full_correlated (a int, b text, c int, d int) USING columnar;
 INSERT INTO full_correlated SELECT i, i::text FROM generate_series(1, 1000000) i;
 CREATE INDEX full_correlated_btree ON full_correlated (a);
 ANALYZE full_correlated;
+-- Prevent qual pushdown from competing with index scans.
+SET columnar.enable_qual_pushdown = false;
 SELECT columnar_test_helpers.uses_index_scan (
 $$
 SELECT a FROM full_correlated WHERE a=200;
@@ -241,6 +243,7 @@ WHERE ct_1.a < 3000;
    CTE cte
      ->  Custom Scan (ColumnarScan) on full_correlated
            Filter: (a > 1)
+           Columnar Projected Columns: a, d
    ->  Nested Loop Left Join
          ->  Hash Join
                Hash Cond: (cte.d = ht_1.a)
@@ -253,7 +256,7 @@ WHERE ct_1.a < 3000;
                                  Index Cond: (a = ct_1.d)
          ->  Index Only Scan using heap_table_btree on heap_table ht_2
                Index Cond: (a = ct_1.c)
-(16 rows)
+(17 rows)
 
 -- same query but columnar custom scan is disabled
 BEGIN;
@@ -297,6 +300,7 @@ WHERE w2.a = 123;
    Merge Cond: (w2.d = w1.a)
    CTE w
      ->  Custom Scan (ColumnarScan) on full_correlated
+           Columnar Projected Columns: a, b, c, d
    ->  Sort
          Sort Key: w2.d
          ->  CTE Scan on w w2
@@ -305,7 +309,7 @@ WHERE w2.a = 123;
          ->  Sort
                Sort Key: w1.a
                ->  CTE Scan on w w1
-(12 rows)
+(13 rows)
 
 -- use index
 EXPLAIN (COSTS OFF) WITH w AS NOT MATERIALIZED (SELECT * FROM full_correlated)
@@ -344,6 +348,7 @@ LIMIT 100;
                                        Sort Key: full_correlated.b DESC
                                        ->  Custom Scan (ColumnarScan) on full_correlated
                                              Filter: (a > 2)
+                                             Columnar Projected Columns: a, b
                      ->  Materialize
                            ->  Limit
                                  ->  GroupAggregate
@@ -361,7 +366,7 @@ LIMIT 100;
                                              Filter: (sum(full_correlated_2.a) > 10)
                                              ->  Index Scan using full_correlated_btree on full_correlated full_correlated_2
                                                    Index Cond: (a > 2)
-(31 rows)
+(32 rows)
 
 DROP INDEX full_correlated_btree;
 CREATE INDEX full_correlated_hash ON full_correlated USING hash(a);
@@ -569,5 +574,54 @@ BEGIN;
 (1 row)
 
 ROLLBACK;
+SET columnar.enable_qual_pushdown TO DEFAULT;
+BEGIN;
+SET LOCAL columnar.stripe_row_limit = 2000;
+SET LOCAL columnar.chunk_group_row_limit = 1000;
+CREATE TABLE correlated(x int) using columnar;
+INSERT INTO correlated
+  SELECT g FROM generate_series(1,100000) g;
+CREATE TABLE uncorrelated(x int) using columnar;
+INSERT INTO uncorrelated
+  SELECT (g * 19) % 100000 FROM generate_series(1,100000) g;
+COMMIT;
+CREATE INDEX correlated_idx ON correlated(x);
+CREATE INDEX uncorrelated_idx ON uncorrelated(x);
+ANALYZE correlated, uncorrelated;
+-- should choose chunk group filtering; selective and correlated
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT * FROM correlated WHERE x = 78910;
+                            QUERY PLAN
+---------------------------------------------------------------------
+ Custom Scan (ColumnarScan) on correlated (actual rows=1 loops=1)
+   Filter: (x = 78910)
+   Rows Removed by Filter: 999
+   Columnar Projected Columns: x
+   Columnar Chunk Group Filters: (x = 78910)
+   Columnar Chunk Groups Removed by Filter: 99
+(6 rows)
+
+SELECT * FROM correlated WHERE x = 78910;
+   x
+---------------------------------------------------------------------
+ 78910
+(1 row)
+
+-- should choose index scan; selective but uncorrelated
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT * FROM uncorrelated WHERE x = 78910;
+                                   QUERY PLAN
+---------------------------------------------------------------------
+ Index Only Scan using uncorrelated_idx on uncorrelated (actual rows=1 loops=1)
+   Index Cond: (x = 78910)
+   Heap Fetches: 1
+(3 rows)
+
+SELECT * FROM uncorrelated WHERE x = 78910;
+   x
+---------------------------------------------------------------------
+ 78910
+(1 row)
+
 SET client_min_messages TO WARNING;
 DROP SCHEMA columnar_paths CASCADE;

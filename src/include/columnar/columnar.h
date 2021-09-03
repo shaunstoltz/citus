@@ -213,13 +213,15 @@ extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 											 TupleDesc tupleDescriptor,
 											 List *projectedColumnList,
 											 List *qualConditions,
-											 MemoryContext scanContext);
+											 MemoryContext scanContext,
+											 Snapshot snaphot,
+											 bool snapshotRegisteredByUs);
 extern bool ColumnarReadNextRow(ColumnarReadState *state, Datum *columnValues,
 								bool *columnNulls, uint64 *rowNumber);
-extern void ColumnarRescan(ColumnarReadState *readState);
+extern void ColumnarRescan(ColumnarReadState *readState, List *scanQual);
 extern bool ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 									   uint64 rowNumber, Datum *columnValues,
-									   bool *columnNulls, Snapshot snapshot);
+									   bool *columnNulls);
 extern void ColumnarEndRead(ColumnarReadState *state);
 extern void ColumnarResetRead(ColumnarReadState *readState);
 extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
@@ -244,10 +246,12 @@ extern bool IsColumnarTableAmTable(Oid relationId);
 extern void DeleteMetadataRows(RelFileNode relfilenode);
 extern uint64 ColumnarMetadataNewStorageId(void);
 extern uint64 GetHighestUsedAddress(RelFileNode relfilenode);
-extern StripeMetadata ReserveStripe(Relation rel, uint64 size,
-									uint64 rowCount, uint64 columnCount,
-									uint64 chunkCount, uint64 chunkGroupRowCount,
-									uint64 stripeFirstRowNumber);
+extern EmptyStripeReservation * ReserveEmptyStripe(Relation rel, uint64 columnCount,
+												   uint64 chunkGroupRowCount,
+												   uint64 stripeRowCount);
+extern StripeMetadata * CompleteStripeReservation(Relation rel, uint64 stripeId,
+												  uint64 sizeBytes, uint64 rowCount,
+												  uint64 chunkCount);
 extern void SaveStripeSkipList(RelFileNode relfilenode, uint64 stripe,
 							   StripeSkipList *stripeSkipList,
 							   TupleDesc tupleDescriptor);
@@ -255,11 +259,16 @@ extern void SaveChunkGroups(RelFileNode relfilenode, uint64 stripe,
 							List *chunkGroupRowCounts);
 extern StripeSkipList * ReadStripeSkipList(RelFileNode relfilenode, uint64 stripe,
 										   TupleDesc tupleDescriptor,
-										   uint32 chunkCount);
+										   uint32 chunkCount,
+										   Snapshot snapshot);
 extern StripeMetadata * FindNextStripeByRowNumber(Relation relation, uint64 rowNumber,
 												  Snapshot snapshot);
 extern StripeMetadata * FindStripeByRowNumber(Relation relation, uint64 rowNumber,
 											  Snapshot snapshot);
+extern StripeMetadata * FindStripeWithMatchingFirstRowNumber(Relation relation,
+															 uint64 rowNumber,
+															 Snapshot snapshot);
+extern bool StripeIsFlushed(StripeMetadata *stripeMetadata);
 extern uint64 StripeGetHighestRowNumber(StripeMetadata *stripeMetadata);
 extern StripeMetadata * FindStripeWithHighestRowNumber(Relation relation,
 													   Snapshot snapshot);

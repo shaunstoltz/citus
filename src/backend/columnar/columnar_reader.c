@@ -38,6 +38,10 @@
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
 
+#define UNEXPECTED_STRIPE_READ_ERR_MSG \
+	"attempted to read an unexpected stripe while reading columnar " \
+	"table %s, stripe with id=" UINT64_FORMAT " is not flushed"
+
 typedef struct ChunkGroupReadState
 {
 	int64 currentRow;
@@ -88,6 +92,9 @@ struct ColumnarReadState
 	 * itself.
 	 */
 	MemoryContext scanContext;
+
+	Snapshot snapshot;
+	bool snapshotRegisteredByUs;
 };
 
 /* static function declarations */
@@ -109,8 +116,10 @@ static bool HasUnreadStripe(ColumnarReadState *readState);
 static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel,
 										 TupleDesc tupleDesc, List *projectedColumnList,
 										 List *whereClauseList, List *whereClauseVars,
-										 MemoryContext stripeReadContext);
+										 MemoryContext stripeReadContext,
+										 Snapshot snapshot);
 static void AdvanceStripeRead(ColumnarReadState *readState);
+static bool SnapshotMightSeeUnflushedStripes(Snapshot snapshot);
 static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 							  bool *columnNulls);
 static ChunkGroupReadState * BeginChunkGroupRead(StripeBuffers *stripeBuffers, int
@@ -128,7 +137,8 @@ static StripeBuffers * LoadFilteredStripeBuffers(Relation relation,
 												 List *projectedColumnList,
 												 List *whereClauseList,
 												 List *whereClauseVars,
-												 int64 *chunkGroupsFiltered);
+												 int64 *chunkGroupsFiltered,
+												 Snapshot snapshot);
 static ColumnBuffers * LoadColumnBuffers(Relation relation,
 										 ColumnChunkSkipNode *chunkSkipNodeArray,
 										 uint32 chunkCount, uint64 stripeOffset,
@@ -167,7 +177,8 @@ static Datum ColumnDefaultValue(TupleConstr *tupleConstraints,
 ColumnarReadState *
 ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 				  List *projectedColumnList, List *whereClauseList,
-				  MemoryContext scanContext)
+				  MemoryContext scanContext, Snapshot snapshot,
+				  bool snapshotRegisteredByUs)
 {
 	/*
 	 * We allocate all stripe specific data in the stripeReadContext, and reset
@@ -187,8 +198,10 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	readState->stripeReadState = NULL;
 	readState->currentStripeMetadata = FindNextStripeByRowNumber(relation,
 																 COLUMNAR_INVALID_ROW_NUMBER,
-																 GetTransactionSnapshot());
+																 snapshot);
 	readState->scanContext = scanContext;
+	readState->snapshot = snapshot;
+	readState->snapshotRegisteredByUs = snapshotRegisteredByUs;
 
 	return readState;
 }
@@ -230,7 +243,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 														 readState->projectedColumnList,
 														 readState->whereClauseList,
 														 readState->whereClauseVars,
-														 readState->stripeReadContext);
+														 readState->stripeReadContext,
+														 readState->snapshot);
 		}
 
 		if (!ReadStripeNextRow(readState->stripeReadState, columnValues, columnNulls))
@@ -260,17 +274,30 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 bool
 ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 						   uint64 rowNumber, Datum *columnValues,
-						   bool *columnNulls, Snapshot snapshot)
+						   bool *columnNulls)
 {
 	if (!ColumnarReadIsCurrentStripe(readState, rowNumber))
 	{
 		Relation columnarRelation = readState->relation;
+		Snapshot snapshot = readState->snapshot;
 		StripeMetadata *stripeMetadata = FindStripeByRowNumber(columnarRelation,
 															   rowNumber, snapshot);
 		if (stripeMetadata == NULL)
 		{
 			/* no such row exists */
 			return false;
+		}
+
+		if (!StripeIsFlushed(stripeMetadata))
+		{
+			/*
+			 * Callers are expected to skip stripes that are not flushed to
+			 * disk yet or should wait for the writer xact to commit or abort,
+			 * but let's be on the safe side.
+			 */
+			ereport(ERROR, (errmsg(UNEXPECTED_STRIPE_READ_ERR_MSG,
+								   RelationGetRelationName(columnarRelation),
+								   stripeMetadata->id)));
 		}
 
 		/* do the cleanup before reading a new stripe */
@@ -286,7 +313,8 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 readState->projectedColumnList,
 													 whereClauseList,
 													 whereClauseVars,
-													 stripeReadContext);
+													 stripeReadContext,
+													 snapshot);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -439,16 +467,17 @@ HasUnreadStripe(ColumnarReadState *readState)
  * the beginning again
  */
 void
-ColumnarRescan(ColumnarReadState *readState)
+ColumnarRescan(ColumnarReadState *readState, List *scanQual)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->scanContext);
 
 	ColumnarResetRead(readState);
 	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
 																 COLUMNAR_INVALID_ROW_NUMBER,
-																 GetTransactionSnapshot());
+																 readState->snapshot);
 	readState->chunkGroupsFiltered = 0;
 
+	readState->whereClauseList = copyObject(scanQual);
 	MemoryContextSwitchTo(oldContext);
 }
 
@@ -459,6 +488,15 @@ ColumnarRescan(ColumnarReadState *readState)
 void
 ColumnarEndRead(ColumnarReadState *readState)
 {
+	if (readState->snapshotRegisteredByUs)
+	{
+		/*
+		 * init_columnar_read_state created a new snapshot and registered it,
+		 * so now forget it.
+		 */
+		UnregisterSnapshot(readState->snapshot);
+	}
+
 	MemoryContextDelete(readState->stripeReadContext);
 	if (readState->currentStripeMetadata)
 	{
@@ -493,7 +531,7 @@ ColumnarResetRead(ColumnarReadState *readState)
 static StripeReadState *
 BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDesc,
 				List *projectedColumnList, List *whereClauseList, List *whereClauseVars,
-				MemoryContext stripeReadContext)
+				MemoryContext stripeReadContext, Snapshot snapshot)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(stripeReadContext);
 
@@ -513,7 +551,8 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 															   whereClauseList,
 															   whereClauseVars,
 															   &stripeReadState->
-															   chunkGroupsFiltered);
+															   chunkGroupsFiltered,
+															   snapshot);
 
 	stripeReadState->rowCount = stripeReadState->stripeBuffers->rowCount;
 
@@ -540,11 +579,63 @@ AdvanceStripeRead(ColumnarReadState *readState)
 		StripeGetHighestRowNumber(readState->currentStripeMetadata);
 	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
 																 lastReadRowNumber,
-																 GetTransactionSnapshot());
+																 readState->snapshot);
+
+	if (readState->currentStripeMetadata &&
+		!StripeIsFlushed(readState->currentStripeMetadata) &&
+		!SnapshotMightSeeUnflushedStripes(readState->snapshot))
+	{
+		/*
+		 * To be on the safe side, error out if we don't expect to encounter
+		 * with an un-flushed stripe. Otherwise, we will skip such stripes
+		 * until finding a flushed one.
+		 */
+		ereport(ERROR, (errmsg(UNEXPECTED_STRIPE_READ_ERR_MSG,
+							   RelationGetRelationName(readState->relation),
+							   readState->currentStripeMetadata->id)));
+	}
+
+	while (readState->currentStripeMetadata &&
+		   !StripeIsFlushed(readState->currentStripeMetadata))
+	{
+		readState->currentStripeMetadata =
+			FindNextStripeByRowNumber(readState->relation,
+									  readState->currentStripeMetadata->firstRowNumber,
+									  readState->snapshot);
+	}
+
 	readState->stripeReadState = NULL;
 	MemoryContextReset(readState->stripeReadContext);
 
 	MemoryContextSwitchTo(oldContext);
+}
+
+
+/*
+ * SnapshotMightSeeUnflushedStripes returns true if given snapshot is
+ * expected to see un-flushed stripes either because of other backends'
+ * pending writes or aborted transactions.
+ */
+static bool
+SnapshotMightSeeUnflushedStripes(Snapshot snapshot)
+{
+	if (snapshot == InvalidSnapshot)
+	{
+		return false;
+	}
+
+	switch (snapshot->snapshot_type)
+	{
+		case SNAPSHOT_ANY:
+		case SNAPSHOT_DIRTY:
+		case SNAPSHOT_NON_VACUUMABLE:
+		{
+			return true;
+		}
+
+		default:
+			return false;
+	}
 }
 
 
@@ -792,7 +883,7 @@ static StripeBuffers *
 LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
 						  List *whereClauseList, List *whereClauseVars,
-						  int64 *chunkGroupsFiltered)
+						  int64 *chunkGroupsFiltered, Snapshot snapshot)
 {
 	uint32 columnIndex = 0;
 	uint32 columnCount = tupleDescriptor->natts;
@@ -802,7 +893,8 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 	StripeSkipList *stripeSkipList = ReadStripeSkipList(relation->rd_node,
 														stripeMetadata->id,
 														tupleDescriptor,
-														stripeMetadata->chunkCount);
+														stripeMetadata->chunkCount,
+														snapshot);
 
 	bool *selectedChunkMask = SelectedChunkMask(stripeSkipList, whereClauseList,
 												whereClauseVars, chunkGroupsFiltered);

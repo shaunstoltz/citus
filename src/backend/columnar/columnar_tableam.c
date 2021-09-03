@@ -227,8 +227,6 @@ columnar_beginscan_extended(Relation relation, Snapshot snapshot,
 			 "cannot read from table when there is unflushed data in upper transactions");
 	}
 
-	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
-
 	MemoryContextSwitchTo(oldContext);
 
 	return ((TableScanDesc) scan);
@@ -253,13 +251,56 @@ CreateColumnarScanMemoryContext(void)
  */
 static ColumnarReadState *
 init_columnar_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_needed,
-						 List *scanQual, MemoryContext scanContext)
+						 List *scanQual, MemoryContext scanContext, Snapshot snapshot)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(scanContext);
 
+	Oid relfilenode = relation->rd_node.relNode;
+	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
+
+	bool snapshotRegisteredByUs = false;
+	if (snapshot != InvalidSnapshot && IsMVCCSnapshot(snapshot))
+	{
+		/*
+		 * If we flushed any pending writes, then we should guarantee that
+		 * those writes are visible to us too. For this reason, if given
+		 * snapshot is an MVCC snapshot, then we set its curcid to current
+		 * command id.
+		 *
+		 * For simplicity, we do that even if we didn't flush any writes
+		 * since we don't see any problem with that.
+		 *
+		 * XXX: We should either not update cid if we are executing a FETCH
+		 * (from cursor) command, or we should have a better way to deal with
+		 * pending writes, see the discussion in
+		 * https://github.com/citusdata/citus/issues/5231.
+		 */
+		PushCopiedSnapshot(snapshot);
+
+		/* now our snapshot is the active one */
+		UpdateActiveSnapshotCommandId();
+		snapshot = GetActiveSnapshot();
+		RegisterSnapshot(snapshot);
+
+		/*
+		 * To be able to use UpdateActiveSnapshotCommandId, we pushed the
+		 * copied snapshot to the stack. However, we don't need to keep it
+		 * there since we will anyway rely on ColumnarReadState->snapshot
+		 * during read operation.
+		 *
+		 * Note that since we registered the snapshot already, we guarantee
+		 * that PopActiveSnapshot won't free it.
+		 */
+		PopActiveSnapshot();
+
+		/* not forget to unregister it when finishing read operation */
+		snapshotRegisteredByUs = true;
+	}
+
 	List *neededColumnList = NeededColumnsList(tupdesc, attr_needed);
 	ColumnarReadState *readState = ColumnarBeginRead(relation, tupdesc, neededColumnList,
-													 scanQual, scanContext);
+													 scanQual, scanContext, snapshot,
+													 snapshotRegisteredByUs);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -289,9 +330,13 @@ columnar_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 				bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
 	ColumnarScanDesc scan = (ColumnarScanDesc) sscan;
+
+	/* XXX: hack to pass in new quals that aren't actually scan keys */
+	List *scanQual = (List *) key;
+
 	if (scan->cs_readState != NULL)
 	{
-		ColumnarRescan(scan->cs_readState);
+		ColumnarRescan(scan->cs_readState, scanQual);
 	}
 }
 
@@ -309,7 +354,7 @@ columnar_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlo
 		scan->cs_readState =
 			init_columnar_read_state(scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
 									 scan->attr_needed, scan->scanQual,
-									 scan->scanContext);
+									 scan->scanContext, scan->cs_base.rs_snapshot);
 	}
 
 	ExecClearTuple(slot);
@@ -429,8 +474,6 @@ columnar_index_fetch_begin(Relation rel)
 					"upper transactions");
 	}
 
-	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
-
 	MemoryContext scanContext = CreateColumnarScanMemoryContext();
 	MemoryContext oldContext = MemoryContextSwitchTo(scanContext);
 
@@ -503,14 +546,49 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 		scan->cs_readState = init_columnar_read_state(columnarRelation,
 													  slot->tts_tupleDescriptor,
 													  attr_needed, scanQual,
-													  scan->scanContext);
+													  scan->scanContext,
+													  snapshot);
 	}
 
 	uint64 rowNumber = tid_to_row_number(*tid);
-	if (!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber, slot->tts_values,
-									slot->tts_isnull, snapshot))
+	StripeMetadata *stripeMetadata =
+		FindStripeWithMatchingFirstRowNumber(columnarRelation, rowNumber, snapshot);
+	if (!stripeMetadata)
 	{
+		/* it is certain that tuple with rowNumber doesn't exist */
 		return false;
+	}
+
+	if (StripeIsFlushed(stripeMetadata) &&
+		!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber,
+									slot->tts_values, slot->tts_isnull))
+	{
+		/*
+		 * FindStripeWithMatchingFirstRowNumber doesn't verify upper row
+		 * number boundary of found stripe. For this reason, we didn't
+		 * certainly know if given row number belongs to one of the stripes.
+		 */
+		return false;
+	}
+
+	if (!StripeIsFlushed(stripeMetadata))
+	{
+		/*
+		 * We only expect to see un-flushed stripes when checking against
+		 * constraint violation. In that case, indexAM provides dirty
+		 * snapshot to index_fetch_tuple callback.
+		 */
+		Assert(snapshot->snapshot_type == SNAPSHOT_DIRTY);
+
+		/*
+		 * Stripe that "might" contain the tuple with rowNumber is not
+		 * flushed yet. Here we set all attributes of given tupleslot to NULL
+		 * before returning true and expect the indexAM callback that called
+		 * us --possibly to check against constraint violation-- blocks until
+		 * writer transaction commits or aborts, without requiring us to fill
+		 * the tupleslot properly.
+		 */
+		memset(slot->tts_isnull, true, slot->tts_nvalid);
 	}
 
 	slot->tts_tableOid = RelationGetRelid(columnarRelation);
@@ -550,7 +628,9 @@ static bool
 columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 								  Snapshot snapshot)
 {
-	return true;
+	uint64 rowNumber = tid_to_row_number(slot->tts_tid);
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(rel, rowNumber, snapshot);
+	return stripeMetadata != NULL;
 }
 
 
@@ -800,10 +880,13 @@ columnar_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	/* no quals for table rewrite */
 	List *scanQual = NIL;
 
+	/* use SnapshotAny when re-writing table as heapAM does */
+	Snapshot snapshot = SnapshotAny;
+
 	MemoryContext scanContext = CreateColumnarScanMemoryContext();
 	ColumnarReadState *readState = init_columnar_read_state(OldHeap, sourceDesc,
 															attr_needed, scanQual,
-															scanContext);
+															scanContext, snapshot);
 
 	Datum *values = palloc0(sourceDesc->natts * sizeof(Datum));
 	bool *nulls = palloc0(sourceDesc->natts * sizeof(bool));
@@ -911,7 +994,8 @@ LogRelationStats(Relation rel, int elevel)
 		StripeMetadata *stripe = lfirst(stripeMetadataCell);
 		StripeSkipList *skiplist = ReadStripeSkipList(relfilenode, stripe->id,
 													  RelationGetDescr(rel),
-													  stripe->chunkCount);
+													  stripe->chunkCount,
+													  GetTransactionSnapshot());
 		for (uint32 column = 0; column < skiplist->columnCount; column++)
 		{
 			bool attrDropped = tupdesc->attrs[column].attisdropped;
@@ -1347,7 +1431,8 @@ ColumnarGetHighestItemPointer(Relation relation, Snapshot snapshot)
 {
 	StripeMetadata *stripeWithHighestRowNumber =
 		FindStripeWithHighestRowNumber(relation, snapshot);
-	if (stripeWithHighestRowNumber == NULL)
+	if (stripeWithHighestRowNumber == NULL ||
+		StripeGetHighestRowNumber(stripeWithHighestRowNumber) == 0)
 	{
 		/* table is empty according to our snapshot */
 		ItemPointerData invalidItemPtr;
@@ -1762,9 +1847,8 @@ columnar_tableam_finish()
  * Get the number of chunks filtered out during the given scan.
  */
 int64
-ColumnarScanChunkGroupsFiltered(TableScanDesc scanDesc)
+ColumnarScanChunkGroupsFiltered(ColumnarScanDesc columnarScanDesc)
 {
-	ColumnarScanDesc columnarScanDesc = (ColumnarScanDesc) scanDesc;
 	ColumnarReadState *readState = columnarScanDesc->cs_readState;
 
 	/* readState is initialized lazily */
