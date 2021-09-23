@@ -272,5 +272,99 @@ REINDEX TABLE dist_part_table;
 -- but we support REINDEXing partitions
 REINDEX TABLE dist_part_table_1;
 
+-- test if we error with CTEs with search clauses
+CREATE TABLE graph0(f INT, t INT, label TEXT);
+SELECT create_distributed_table('graph0', 'f');
+
+INSERT INTO graph0 VALUES (1, 2, 'arc 1 -> 2'),
+    (1, 3, 'arc 1 -> 3'), (2, 3, 'arc 2 -> 3'),
+    (1, 4, 'arc 1 -> 4'), (4, 5, 'arc 4 -> 5');
+
+WITH RECURSIVE search_graph(f, t, label) AS (
+    SELECT * FROM graph0 g WHERE f = 1
+    UNION ALL
+    SELECT g.*
+        FROM graph0 g, search_graph sg
+        WHERE g.f = sg.t and  g.f = 1
+) SEARCH DEPTH FIRST BY f, t SET seq
+SELECT * FROM search_graph ORDER BY seq;
+
+WITH RECURSIVE search_graph(f, t, label) AS (
+    SELECT * FROM graph0 g WHERE f = 1
+    UNION ALL
+    SELECT g.*
+        FROM graph0 g, search_graph sg
+        WHERE g.f = sg.t and  g.f = 1
+) SEARCH DEPTH FIRST BY f, t SET seq
+DELETE FROM graph0 WHERE t IN (SELECT t FROM search_graph ORDER BY seq);
+
+CREATE TABLE graph1(f INT, t INT, label TEXT);
+SELECT create_reference_table('graph1');
+
+INSERT INTO graph1 VALUES (1, 2, 'arc 1 -> 2'),
+    (1, 3, 'arc 1 -> 3'), (2, 3, 'arc 2 -> 3'),
+    (1, 4, 'arc 1 -> 4'), (4, 5, 'arc 4 -> 5');
+
+WITH RECURSIVE search_graph(f, t, label) AS (
+    SELECT * FROM graph1 g WHERE f = 1
+    UNION ALL
+    SELECT g.*
+        FROM graph1 g, search_graph sg
+        WHERE g.f = sg.t and  g.f = 1
+) SEARCH DEPTH FIRST BY f, t SET seq
+SELECT * FROM search_graph ORDER BY seq;
+
+WITH RECURSIVE search_graph(f, t, label) AS (
+    SELECT * FROM graph1 g WHERE f = 1
+    UNION ALL
+    SELECT g.*
+        FROM graph1 g, search_graph sg
+        WHERE g.f = sg.t and  g.f = 1
+) SEARCH DEPTH FIRST BY f, t SET seq
+DELETE FROM graph1 WHERE t IN (SELECT t FROM search_graph ORDER BY seq);
+
+
+SELECT * FROM (
+    WITH RECURSIVE search_graph(f, t, label) AS (
+        SELECT *
+        FROM graph0 g
+        WHERE f = 1
+        UNION ALL SELECT g.*
+        FROM graph0 g, search_graph sg
+        WHERE g.f = sg.t AND g.f = 1
+    ) SEARCH DEPTH FIRST BY f, t SET seq
+    SELECT * FROM search_graph ORDER BY seq
+) as foo;
+
+--
+-- https://github.com/citusdata/citus/issues/5258
+--
+CREATE TABLE nummultirange_test (nmr NUMMULTIRANGE) USING columnar;
+INSERT INTO nummultirange_test VALUES('{}');
+INSERT INTO nummultirange_test VALUES('{[,)}');
+INSERT INTO nummultirange_test VALUES('{[3,]}');
+INSERT INTO nummultirange_test VALUES('{[, 5)}');
+INSERT INTO nummultirange_test VALUES(nummultirange());
+INSERT INTO nummultirange_test VALUES(nummultirange(variadic '{}'::numrange[]));
+INSERT INTO nummultirange_test VALUES(nummultirange(numrange(1.1, 2.2)));
+INSERT INTO nummultirange_test VALUES('{empty}');
+INSERT INTO nummultirange_test VALUES(nummultirange(numrange(1.7, 1.7, '[]'), numrange(1.7, 1.9)));
+INSERT INTO nummultirange_test VALUES(nummultirange(numrange(1.7, 1.7, '[]'), numrange(1.9, 2.1)));
+
+create table nummultirange_test2(nmr nummultirange) USING columnar;
+INSERT INTO nummultirange_test2 VALUES('{[, 5)}');
+INSERT INTO nummultirange_test2 VALUES(nummultirange(numrange(1.1, 2.2)));
+INSERT INTO nummultirange_test2 VALUES(nummultirange(numrange(1.1, 2.2)));
+INSERT INTO nummultirange_test2 VALUES(nummultirange(numrange(1.1, 2.2,'()')));
+INSERT INTO nummultirange_test2 VALUES('{}');
+select * from nummultirange_test2 where nmr = '{}';
+select * from nummultirange_test2 where nmr = nummultirange(numrange(1.1, 2.2));
+select * from nummultirange_test2 where nmr = nummultirange(numrange(1.1, 2.3));
+
+set enable_nestloop=t;
+set enable_hashjoin=f;
+set enable_mergejoin=f;
+select * from nummultirange_test natural join nummultirange_test2 order by nmr;
+
 set client_min_messages to error;
 drop schema pg14 cascade;

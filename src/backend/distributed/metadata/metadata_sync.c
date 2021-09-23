@@ -497,7 +497,7 @@ MetadataCreateCommands(void)
 	List *propagatedTableList = NIL;
 	bool includeNodesFromOtherClusters = true;
 	List *workerNodeList = ReadDistNode(includeNodesFromOtherClusters);
-	bool includeSequenceDefaults = true;
+	IncludeSequenceDefaults includeSequenceDefaults = WORKER_NEXTVAL_SEQUENCE_DEFAULTS;
 
 	/* make sure we have deterministic output for our tests */
 	workerNodeList = SortList(workerNodeList, CompareWorkerNodes);
@@ -651,7 +651,7 @@ GetDistributedTableDDLEvents(Oid relationId)
 	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
 	List *commandList = NIL;
-	bool includeSequenceDefaults = true;
+	IncludeSequenceDefaults includeSequenceDefaults = WORKER_NEXTVAL_SEQUENCE_DEFAULTS;
 
 	/* if the table is owned by an extension we only propagate pg_dist_* records */
 	bool tableOwnedByExtension = IsTableOwnedByExtension(relationId);
@@ -1287,14 +1287,10 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 		/* to simplify and eliminate cases like "DEFAULT nextval('..') - nextval('..')" */
 		if (list_length(sequencesFromAttrDef) > 1)
 		{
-			if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
-			{
-				ereport(ERROR, (errmsg(
-									"More than one sequence in a column default"
-									" is not supported for adding local tables to metadata")));
-			}
-			ereport(ERROR, (errmsg("More than one sequence in a column default"
-								   " is not supported for distribution")));
+			ereport(ERROR, (errmsg(
+								"More than one sequence in a column default"
+								" is not supported for distribution "
+								"or for adding local tables to metadata")));
 		}
 
 		if (list_length(sequencesFromAttrDef) == 1)
@@ -2065,6 +2061,8 @@ ShouldInitiateMetadataSync(bool *lockFailure)
 Datum
 citus_internal_add_partition_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	PG_ENSURE_ARGNOTNULL(0, "relation");
 	Oid relationId = PG_GETARG_OID(0);
 
@@ -2215,6 +2213,8 @@ EnsurePartitionMetadataIsSane(Oid relationId, char distributionMethod, int coloc
 Datum
 citus_internal_add_shard_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	PG_ENSURE_ARGNOTNULL(0, "relation");
 	Oid relationId = PG_GETARG_OID(0);
 
@@ -2430,6 +2430,8 @@ EnsureShardMetadataIsSane(Oid relationId, int64 shardId, char storageType,
 Datum
 citus_internal_add_placement_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	int64 shardId = PG_GETARG_INT64(0);
 	int32 shardState = PG_GETARG_INT32(1);
 	int64 shardLength = PG_GETARG_INT64(2);
@@ -2541,6 +2543,8 @@ ShouldSkipMetadataChecks(void)
 Datum
 citus_internal_update_placement_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	int64 shardId = PG_GETARG_INT64(0);
 	int32 sourceGroupId = PG_GETARG_INT32(1);
 	int32 targetGroupId = PG_GETARG_INT32(2);
@@ -2606,6 +2610,8 @@ citus_internal_update_placement_metadata(PG_FUNCTION_ARGS)
 Datum
 citus_internal_delete_shard_metadata(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	int64 shardId = PG_GETARG_INT64(0);
 
 	if (!ShouldSkipMetadataChecks())
@@ -2644,6 +2650,8 @@ citus_internal_delete_shard_metadata(PG_FUNCTION_ARGS)
 Datum
 citus_internal_update_relation_colocation(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+
 	Oid relationId = PG_GETARG_OID(0);
 	uint32 tagetColocationId = PG_GETARG_UINT32(1);
 

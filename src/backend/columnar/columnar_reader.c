@@ -19,6 +19,7 @@
 #include "safe_lib.h"
 
 #include "access/nbtree.h"
+#include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "commands/defrem.h"
 #include "distributed/listutils.h"
@@ -178,7 +179,7 @@ ColumnarReadState *
 ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 				  List *projectedColumnList, List *whereClauseList,
 				  MemoryContext scanContext, Snapshot snapshot,
-				  bool snapshotRegisteredByUs)
+				  bool randomAccess)
 {
 	/*
 	 * We allocate all stripe specific data in the stripeReadContext, and reset
@@ -196,14 +197,107 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	readState->tupleDescriptor = tupleDescriptor;
 	readState->stripeReadContext = stripeReadContext;
 	readState->stripeReadState = NULL;
-	readState->currentStripeMetadata = FindNextStripeByRowNumber(relation,
-																 COLUMNAR_INVALID_ROW_NUMBER,
-																 snapshot);
 	readState->scanContext = scanContext;
+
+	/*
+	 * Note that ColumnarReadFlushPendingWrites might update those two by
+	 * registering a new snapshot.
+	 */
 	readState->snapshot = snapshot;
-	readState->snapshotRegisteredByUs = snapshotRegisteredByUs;
+	readState->snapshotRegisteredByUs = false;
+
+	if (!randomAccess)
+	{
+		/*
+		 * When doing random access (i.e.: index scan), we don't need to flush
+		 * pending writes until we need to read them.
+		 * columnar_index_fetch_tuple would do so when needed.
+		 */
+		ColumnarReadFlushPendingWrites(readState);
+
+		/*
+		 * AdvanceStripeRead sets currentStripeMetadata for the first stripe
+		 * to read if not doing random access. Otherwise, reader (i.e.:
+		 * ColumnarReadRowByRowNumber) would already decide the stripe to read
+		 * on-the-fly.
+		 *
+		 * Moreover, Since we don't flush pending writes for random access,
+		 * AdvanceStripeRead might encounter with stripe metadata entries due
+		 * to current transaction's pending writes even when using an MVCC
+		 * snapshot, but AdvanceStripeRead would throw an error for that.
+		 * Note that this is not the case with for plain table scan methods
+		 * (i.e.: SeqScan and Columnar CustomScan).
+		 *
+		 * For those reasons, we don't call AdvanceStripeRead if we will do
+		 * random access.
+		 */
+		AdvanceStripeRead(readState);
+	}
 
 	return readState;
+}
+
+
+/*
+ * ColumnarReadFlushPendingWrites flushes pending writes for read operation
+ * and sets a new (registered) snapshot if necessary.
+ *
+ * If it sets a new snapshot, then sets snapshotRegisteredByUs to true to
+ * indicate that caller should unregister the snapshot after finishing read
+ * operation.
+ *
+ * Note that this function assumes that readState's relation and snapshot
+ * fields are already set.
+ */
+void
+ColumnarReadFlushPendingWrites(ColumnarReadState *readState)
+{
+	Assert(!readState->snapshotRegisteredByUs);
+
+	Oid relfilenode = readState->relation->rd_node.relNode;
+	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
+
+	if (readState->snapshot == InvalidSnapshot || !IsMVCCSnapshot(readState->snapshot))
+	{
+		return;
+	}
+
+	/*
+	 * If we flushed any pending writes, then we should guarantee that
+	 * those writes are visible to us too. For this reason, if given
+	 * snapshot is an MVCC snapshot, then we set its curcid to current
+	 * command id.
+	 *
+	 * For simplicity, we do that even if we didn't flush any writes
+	 * since we don't see any problem with that.
+	 *
+	 * XXX: We should either not update cid if we are executing a FETCH
+	 * (from cursor) command, or we should have a better way to deal with
+	 * pending writes, see the discussion in
+	 * https://github.com/citusdata/citus/issues/5231.
+	 */
+	PushCopiedSnapshot(readState->snapshot);
+
+	/* now our snapshot is the active one */
+	UpdateActiveSnapshotCommandId();
+	Snapshot newSnapshot = GetActiveSnapshot();
+	RegisterSnapshot(newSnapshot);
+
+	/*
+	 * To be able to use UpdateActiveSnapshotCommandId, we pushed the
+	 * copied snapshot to the stack. However, we don't need to keep it
+	 * there since we will anyway rely on ColumnarReadState->snapshot
+	 * during read operation.
+	 *
+	 * Note that since we registered the snapshot already, we guarantee
+	 * that PopActiveSnapshot won't free it.
+	 */
+	PopActiveSnapshot();
+
+	readState->snapshot = newSnapshot;
+
+	/* not forget to unregister it when finishing read operation */
+	readState->snapshotRegisteredByUs = true;
 }
 
 
@@ -267,6 +361,27 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 
 
 /*
+ * ColumnarReadRowByRowNumberOrError is a wrapper around
+ * ColumnarReadRowByRowNumber that throws an error if tuple
+ * with rowNumber does not exist.
+ */
+void
+ColumnarReadRowByRowNumberOrError(ColumnarReadState *readState,
+								  uint64 rowNumber, Datum *columnValues,
+								  bool *columnNulls)
+{
+	if (!ColumnarReadRowByRowNumber(readState, rowNumber,
+									columnValues, columnNulls))
+	{
+		ereport(ERROR, (errmsg("cannot read from columnar table %s, tuple with "
+							   "row number " UINT64_FORMAT " does not exist",
+							   RelationGetRelationName(readState->relation),
+							   rowNumber)));
+	}
+}
+
+
+/*
  * ColumnarReadRowByRowNumber reads row with rowNumber from given relation
  * into columnValues and columnNulls, and returns true. If no such row
  * exists, then returns false.
@@ -288,7 +403,7 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 			return false;
 		}
 
-		if (!StripeIsFlushed(stripeMetadata))
+		if (StripeWriteState(stripeMetadata) != STRIPE_WRITE_FLUSHED)
 		{
 			/*
 			 * Callers are expected to skip stripes that are not flushed to
@@ -472,9 +587,10 @@ ColumnarRescan(ColumnarReadState *readState, List *scanQual)
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->scanContext);
 
 	ColumnarResetRead(readState);
-	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
-																 COLUMNAR_INVALID_ROW_NUMBER,
-																 readState->snapshot);
+
+	/* set currentStripeMetadata for the first stripe to read */
+	AdvanceStripeRead(readState);
+
 	readState->chunkGroupsFiltered = 0;
 
 	readState->whereClauseList = copyObject(scanQual);
@@ -572,17 +688,23 @@ AdvanceStripeRead(ColumnarReadState *readState)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->scanContext);
 
-	readState->chunkGroupsFiltered +=
-		readState->stripeReadState->chunkGroupsFiltered;
+	/* if not read any stripes yet, start from the first one .. */
+	uint64 lastReadRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
+	if (StripeReadInProgress(readState))
+	{
+		/* .. otherwise, continue with the next stripe */
+		lastReadRowNumber = StripeGetHighestRowNumber(readState->currentStripeMetadata);
 
-	uint64 lastReadRowNumber =
-		StripeGetHighestRowNumber(readState->currentStripeMetadata);
+		readState->chunkGroupsFiltered +=
+			readState->stripeReadState->chunkGroupsFiltered;
+	}
+
 	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
 																 lastReadRowNumber,
 																 readState->snapshot);
 
 	if (readState->currentStripeMetadata &&
-		!StripeIsFlushed(readState->currentStripeMetadata) &&
+		StripeWriteState(readState->currentStripeMetadata) != STRIPE_WRITE_FLUSHED &&
 		!SnapshotMightSeeUnflushedStripes(readState->snapshot))
 	{
 		/*
@@ -596,7 +718,7 @@ AdvanceStripeRead(ColumnarReadState *readState)
 	}
 
 	while (readState->currentStripeMetadata &&
-		   !StripeIsFlushed(readState->currentStripeMetadata))
+		   StripeWriteState(readState->currentStripeMetadata) != STRIPE_WRITE_FLUSHED)
 	{
 		readState->currentStripeMetadata =
 			FindNextStripeByRowNumber(readState->relation,

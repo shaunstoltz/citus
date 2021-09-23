@@ -111,9 +111,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM columnar_table WHERE a=6456;
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT a FROM columnar_table WHERE a=6456;
-                          QUERY PLAN
+                       QUERY PLAN
 ---------------------------------------------------------------------
- Index Only Scan using columnar_table_a_idx on columnar_table
+ Index Scan using columnar_table_a_idx on columnar_table
    Index Cond: (a = 6456)
 (2 rows)
 
@@ -183,9 +183,9 @@ EXPLAIN (COSTS OFF) SELECT b FROM columnar_table WHERE b = 30000;
 
 -- can use index scan
 EXPLAIN (COSTS OFF) SELECT b FROM columnar_table WHERE b = 30001;
-                          QUERY PLAN
+                       QUERY PLAN
 ---------------------------------------------------------------------
- Index Only Scan using columnar_table_b_idx on columnar_table
+ Index Scan using columnar_table_b_idx on columnar_table
    Index Cond: (b = 30001)
 (2 rows)
 
@@ -343,9 +343,9 @@ SELECT pg_total_relation_size ('unique_a') * 1.5 <
 DROP INDEX unique_a;
 -- should use index only scan since unique_a_include_b_c_d includes column "b" too
 EXPLAIN (COSTS OFF) SELECT b FROM include_test WHERE a = 500;
-                          QUERY PLAN
+                       QUERY PLAN
 ---------------------------------------------------------------------
- Index Only Scan using unique_a_include_b_c_d on include_test
+ Index Scan using unique_a_include_b_c_d on include_test
    Index Cond: (a = 500)
 (2 rows)
 
@@ -448,16 +448,10 @@ ERROR:  unsupported access method for the index on columnar table brin_summarize
 CREATE TABLE parallel_scan_test(a int) USING columnar WITH ( parallel_workers = 2 );
 INSERT INTO parallel_scan_test SELECT i FROM generate_series(1,10) i;
 CREATE INDEX ON parallel_scan_test (a);
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
 VACUUM FULL parallel_scan_test;
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
 REINDEX TABLE parallel_scan_test;
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
 CREATE INDEX CONCURRENTLY ON parallel_scan_test (a);
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
 REINDEX TABLE CONCURRENTLY parallel_scan_test;
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
-NOTICE:  falling back to serial index build since parallel scan on columnar tables is not supported
 -- test with different data types & indexAM's --
 CREATE TABLE hash_text(a INT, b TEXT) USING columnar;
 INSERT INTO hash_text SELECT i, (i*2)::TEXT FROM generate_series(1, 10) i;
@@ -542,5 +536,173 @@ SELECT sum(a)>-1 FROM revisit_same_cgroup WHERE b = '1';
  t
 (1 row)
 
+CREATE TABLE aborted_write_test (a INT PRIMARY KEY) USING columnar;
+ALTER TABLE aborted_write_test SET (parallel_workers = 0);
+INSERT INTO aborted_write_test VALUES (16999);
+INSERT INTO aborted_write_test VALUES (16999);
+ERROR:  duplicate key value violates unique constraint "aborted_write_test_pkey"
+DETAIL:  Key (a)=(16999) already exists.
+-- since second INSERT already failed, should not throw a "duplicate key" error
+REINDEX TABLE aborted_write_test;
+BEGIN;
+  ALTER TABLE columnar.stripe SET (autovacuum_enabled = false);
+  ALTER TABLE columnar.chunk SET (autovacuum_enabled = false);
+  ALTER TABLE columnar.chunk_group SET (autovacuum_enabled = false);
+  DROP TABLE aborted_write_test;
+  TRUNCATE columnar.stripe, columnar.chunk, columnar.chunk_group;
+  CREATE TABLE aborted_write_test (a INT) USING columnar;
+  SAVEPOINT svpt;
+    INSERT INTO aborted_write_test SELECT i FROM generate_series(1, 2) i;
+    -- force flush write state
+    SELECT FROM aborted_write_test;
+--
+(2 rows)
+
+  ROLLBACK TO SAVEPOINT svpt;
+  -- Already disabled autovacuum for all three metadata tables.
+  -- Here we truncate columnar.chunk and columnar.chunk_group but not
+  -- columnar.stripe to make sure that we properly handle dead tuples
+  -- in columnar.stripe, i.e. stripe metadata entries for aborted
+  -- transactions.
+  TRUNCATE columnar.chunk, columnar.chunk_group;
+  CREATE INDEX ON aborted_write_test (a);
+ROLLBACK;
+create table events (event_id bigserial, event_time timestamptz default now(), payload text) using columnar;
+BEGIN;
+  -- this wouldn't flush any data
+  insert into events (payload) select 'hello-'||s from generate_series(1, 10) s;
+  -- Since table is large enough, normally postgres would prefer using
+  -- parallel workers when building the index.
+  --
+  -- However, before starting to build the index, we will first flush
+  -- the writes of above INSERT and this would try to update the stripe
+  -- reservation entry in columnar.stripe when doing that.
+  --
+  -- However, updating a tuple during a parallel operation is not allowed
+  -- by postgres and throws an error. For this reason, here we don't expect
+  -- following commnad to fail since we prevent using parallel workers for
+  -- columnar tables.
+  SET LOCAL force_parallel_mode = regress;
+  SET LOCAL min_parallel_table_scan_size = 1;
+  SET LOCAL parallel_tuple_cost = 0;
+  SET LOCAL max_parallel_workers = 4;
+  SET LOCAL max_parallel_workers_per_gather = 4;
+  create index on events (event_id);
+COMMIT;
+CREATE TABLE pending_index_scan(i INT UNIQUE) USING columnar;
+BEGIN;
+  INSERT INTO pending_index_scan SELECT generate_series(1,100);
+  -- test index scan when there are pending writes
+  SET LOCAL enable_seqscan TO OFF;
+  SET LOCAL columnar.enable_custom_scan TO OFF;
+  SELECT COUNT(*)=100 FROM pending_index_scan ;
+ ?column?
+---------------------------------------------------------------------
+ t
+(1 row)
+
+COMMIT;
+-- show that we don't flush single-tuple stripes due to aborted writes ...
+create table uniq(i int unique) using columnar;
+-- a) when table has a unique:
+begin;
+  insert into uniq select generate_series(1,100);
+  -- i) abort before flushing
+rollback;
+insert into uniq select generate_series(1,100);
+SELECT COUNT(*)=1 FROM columnar.stripe cs
+WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ ?column?
+---------------------------------------------------------------------
+ t
+(1 row)
+
+TRUNCATE uniq;
+begin;
+  insert into uniq select generate_series(1,100);
+  -- ii) abort after flushing
+  SELECT count(*) FROM uniq;
+ count
+---------------------------------------------------------------------
+   100
+(1 row)
+
+rollback;
+insert into uniq select generate_series(1,100);
+SELECT COUNT(*)=1 FROM columnar.stripe cs
+WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ ?column?
+---------------------------------------------------------------------
+ t
+(1 row)
+
+TRUNCATE uniq;
+-- b) when table has a primary key:
+begin;
+  insert into uniq select generate_series(1,100);
+  -- i) abort before flushing
+rollback;
+insert into uniq select generate_series(1,100);
+SELECT COUNT(*)=1 FROM columnar.stripe cs
+WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ ?column?
+---------------------------------------------------------------------
+ t
+(1 row)
+
+TRUNCATE uniq;
+begin;
+  insert into uniq select generate_series(1,100);
+  -- ii) abort after flushing
+  SELECT count(*) FROM uniq;
+ count
+---------------------------------------------------------------------
+   100
+(1 row)
+
+rollback;
+insert into uniq select generate_series(1,100);
+SELECT COUNT(*)=1 FROM columnar.stripe cs
+WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ ?column?
+---------------------------------------------------------------------
+ t
+(1 row)
+
+TRUNCATE uniq;
+begin;
+  SAVEPOINT svpt;
+    insert into uniq select generate_series(1,100);
+  ROLLBACK TO SAVEPOINT svpt;
+  -- Since we rollbacked the writes in the upper transaction, we don't need
+  -- to flush pending writes for uniquenes check when inserting the same
+  -- values. So the following insert should just work.
+  insert into uniq select generate_series(1,100);
+  -- didn't flush anything yet, but should see the in progress stripe-write
+  SELECT stripe_num, first_row_number, row_count FROM columnar.stripe cs
+  WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ stripe_num | first_row_number | row_count
+---------------------------------------------------------------------
+          2 |           150001 |         0
+(1 row)
+
+commit;
+-- should have completed the stripe reservation
+SELECT stripe_num, first_row_number, row_count FROM columnar.stripe cs
+WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+ stripe_num | first_row_number | row_count
+---------------------------------------------------------------------
+          2 |           150001 |       100
+(1 row)
+
+TRUNCATE uniq;
+begin;
+    insert into uniq select generate_series(1,100);
+    SAVEPOINT svpt;
+  -- cannot verify unique constraint when there are pending writes in
+  -- the upper transaction
+  insert into uniq select generate_series(1,100);
+ERROR:  cannot read from index when there is unflushed data in upper transactions
+rollback;
 SET client_min_messages TO WARNING;
 DROP SCHEMA columnar_indexes CASCADE;

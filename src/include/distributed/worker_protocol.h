@@ -35,7 +35,6 @@
 #define JOB_SCHEMA_PREFIX "pg_merge_job_"
 #define TASK_FILE_PREFIX "task_"
 #define TASK_TABLE_PREFIX "task_"
-#define TABLE_FILE_PREFIX "table_"
 #define PARTITION_FILE_PREFIX "p_"
 #define ATTEMPT_FILE_SUFFIX ".attempt"
 #define MERGE_TABLE_SUFFIX "_merge"
@@ -163,5 +162,7 @@ extern Datum worker_find_block_local_path(PG_FUNCTION_ARGS);
 /* Function declaration for calculating hashed value */
 extern Datum worker_hash(PG_FUNCTION_ARGS);
 
+/* Function declaration for calculating nextval() in worker */
+extern Datum worker_nextval(PG_FUNCTION_ARGS);
 
 #endif   /* WORKER_PROTOCOL_H */

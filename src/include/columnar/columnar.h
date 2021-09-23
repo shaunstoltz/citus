@@ -179,6 +179,27 @@ typedef struct StripeBuffers
 } StripeBuffers;
 
 
+/* return value of StripeWriteState to decide stripe write state */
+typedef enum StripeWriteStateEnum
+{
+	/* stripe write is flushed to disk, so it's readable */
+	STRIPE_WRITE_FLUSHED,
+
+	/*
+	 * Writer transaction did abort either before inserting into
+	 * columnar.stripe or after.
+	 */
+	STRIPE_WRITE_ABORTED,
+
+	/*
+	 * Writer transaction is still in-progress. Note that it is not certain
+	 * if it is being written by current backend's current transaction or
+	 * another backend.
+	 */
+	STRIPE_WRITE_IN_PROGRESS
+} StripeWriteStateEnum;
+
+
 /* ColumnarReadState represents state of a columnar scan. */
 struct ColumnarReadState;
 typedef struct ColumnarReadState ColumnarReadState;
@@ -209,22 +230,32 @@ extern bool ContainsPendingWrites(ColumnarWriteState *state);
 extern MemoryContext ColumnarWritePerTupleContext(ColumnarWriteState *state);
 
 /* Function declarations for reading from columnar table */
+
+/* functions applicable for both sequential and random access */
 extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 											 TupleDesc tupleDescriptor,
 											 List *projectedColumnList,
 											 List *qualConditions,
 											 MemoryContext scanContext,
 											 Snapshot snaphot,
-											 bool snapshotRegisteredByUs);
+											 bool randomAccess);
+extern void ColumnarReadFlushPendingWrites(ColumnarReadState *readState);
+extern void ColumnarEndRead(ColumnarReadState *state);
+extern void ColumnarResetRead(ColumnarReadState *readState);
+
+/* functions only applicable for sequential access */
 extern bool ColumnarReadNextRow(ColumnarReadState *state, Datum *columnValues,
 								bool *columnNulls, uint64 *rowNumber);
+extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
 extern void ColumnarRescan(ColumnarReadState *readState, List *scanQual);
+
+/* functions only applicable for random access */
+extern void ColumnarReadRowByRowNumberOrError(ColumnarReadState *readState,
+											  uint64 rowNumber, Datum *columnValues,
+											  bool *columnNulls);
 extern bool ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 									   uint64 rowNumber, Datum *columnValues,
 									   bool *columnNulls);
-extern void ColumnarEndRead(ColumnarReadState *state);
-extern void ColumnarResetRead(ColumnarReadState *readState);
-extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
 
 /* Function declarations for common functions */
 extern FmgrInfo * GetFunctionInfoOrNull(Oid typeId, Oid accessMethodId,
@@ -268,7 +299,7 @@ extern StripeMetadata * FindStripeByRowNumber(Relation relation, uint64 rowNumbe
 extern StripeMetadata * FindStripeWithMatchingFirstRowNumber(Relation relation,
 															 uint64 rowNumber,
 															 Snapshot snapshot);
-extern bool StripeIsFlushed(StripeMetadata *stripeMetadata);
+extern StripeWriteStateEnum StripeWriteState(StripeMetadata *stripeMetadata);
 extern uint64 StripeGetHighestRowNumber(StripeMetadata *stripeMetadata);
 extern StripeMetadata * FindStripeWithHighestRowNumber(Relation relation,
 													   Snapshot snapshot);

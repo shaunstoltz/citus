@@ -316,3 +316,132 @@ select filtered_row_count('execute foo(3)');
 select filtered_row_count('execute foo(3)');
 select filtered_row_count('execute foo(3)');
 drop table columnar_prepared_stmt;
+
+--
+-- https://github.com/citusdata/citus/issues/5258
+--
+set default_table_access_method to columnar;
+CREATE TABLE atest1 ( a int, b text );
+CREATE TABLE atest2 (col1 varchar(10), col2 boolean);
+
+INSERT INTO atest1 VALUES (1, 'one');
+SELECT * FROM atest1; -- ok
+SELECT * FROM atest2; -- ok
+INSERT INTO atest1 VALUES (2, 'two'); -- ok
+INSERT INTO atest1 SELECT 1, b FROM atest1; -- ok
+
+SELECT * FROM atest2 WHERE ( col1 IN ( SELECT b FROM atest1 ) );
+
+CREATE TABLE t1 (name TEXT, n INTEGER);
+CREATE TABLE t2 (name TEXT, n INTEGER);
+CREATE TABLE t3 (name TEXT, n INTEGER);
+
+INSERT INTO t1 VALUES ( 'bb', 11 );
+INSERT INTO t2 VALUES ( 'bb', 12 );
+INSERT INTO t2 VALUES ( 'cc', 22 );
+INSERT INTO t2 VALUES ( 'ee', 42 );
+INSERT INTO t3 VALUES ( 'bb', 13 );
+INSERT INTO t3 VALUES ( 'cc', 23 );
+INSERT INTO t3 VALUES ( 'dd', 33 );
+
+SELECT * FROM
+(SELECT name, n as s1_n, 1 as s1_1 FROM t1) as s1
+NATURAL INNER JOIN
+(SELECT name, n as s2_n, 2 as s2_2 FROM t2) as s2
+NATURAL INNER JOIN
+(SELECT name, n as s3_n, 3 as s3_2 FROM t3) s3;
+
+CREATE TABLE numrange_test (nr NUMRANGE);
+INSERT INTO numrange_test VALUES('[,)');
+INSERT INTO numrange_test VALUES('[3,]');
+INSERT INTO numrange_test VALUES('[, 5)');
+INSERT INTO numrange_test VALUES(numrange(1.1, 2.2));
+INSERT INTO numrange_test VALUES('empty');
+INSERT INTO numrange_test VALUES(numrange(1.7, 1.7, '[]'));
+
+create table numrange_test2(nr numrange);
+INSERT INTO numrange_test2 VALUES('[, 5)');
+INSERT INTO numrange_test2 VALUES(numrange(1.1, 2.2));
+INSERT INTO numrange_test2 VALUES(numrange(1.1, 2.2));
+INSERT INTO numrange_test2 VALUES(numrange(1.1, 2.2,'()'));
+INSERT INTO numrange_test2 VALUES('empty');
+
+set enable_nestloop=t;
+set enable_hashjoin=f;
+set enable_mergejoin=f;
+select * from numrange_test natural join numrange_test2 order by nr;
+
+DROP TABLE atest1, atest2, t1, t2, t3, numrange_test, numrange_test2;
+
+set default_table_access_method to default;
+
+set columnar.planner_debug_level to notice;
+
+BEGIN;
+  SET LOCAL columnar.stripe_row_limit = 2000;
+  SET LOCAL columnar.chunk_group_row_limit = 1000;
+  create table pushdown_test (a int, b int) using columnar;
+  insert into pushdown_test values (generate_series(1, 200000));
+COMMIT;
+
+SET columnar.max_custom_scan_paths TO 50;
+SET columnar.qual_pushdown_correlation_threshold TO 0.0;
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test WHERE a = 204356 or a = 104356 or a = 76556;
+SELECT sum(a) FROM pushdown_test WHERE a = 204356 or a = 104356 or a = 76556;
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test WHERE a = 194356 or a = 104356 or a = 76556;
+SELECT sum(a) FROM pushdown_test WHERE a = 194356 or a = 104356 or a = 76556;
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test WHERE a = 204356 or a > a*-1 + b;
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test where (a > 1000 and a < 10000) or (a > 20000 and a < 50000);
+SELECT sum(a) FROM pushdown_test where (a > 1000 and a < 10000) or (a > 20000 and a < 50000);
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test where (a > random() and a < 2*a) or (a > 100);
+SELECT sum(a) FROM pushdown_test where (a > random() and a < 2*a) or (a > 100);
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test where (a > random() and a <= 2000) or (a > 200000-1010);
+SELECT sum(a) FROM pushdown_test where (a > random() and a <= 2000) or (a > 200000-1010);
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test where
+(
+  a > random()
+  and
+  (
+    (a < 200 and a not in (select a from pushdown_test)) or
+    (a > 1000 and a < 2000)
+  )
+)
+or
+(a > 200000-2010);
+SELECT sum(a) FROM pushdown_test where
+(
+  a > random()
+  and
+  (
+    (a < 200 and a not in (select a from pushdown_test)) or
+    (a > 1000 and a < 2000)
+  )
+)
+or
+(a > 200000-2010);
+
+create function stable_1(arg int) returns int language plpgsql STRICT IMMUTABLE as
+$$ BEGIN RETURN 1+arg; END; $$;
+
+EXPLAIN (analyze on, costs off, timing off, summary off)
+SELECT sum(a) FROM pushdown_test where (a = random() and a < stable_1(a) and a < stable_1(6000));
+SELECT sum(a) FROM pushdown_test where (a = random() and a < stable_1(a) and a < stable_1(6000));
+
+RESET columnar.max_custom_scan_paths;
+RESET columnar.qual_pushdown_correlation_threshold;
+RESET columnar.planner_debug_level;
+DROP TABLE pushdown_test;

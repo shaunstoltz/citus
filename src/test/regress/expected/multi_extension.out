@@ -750,6 +750,41 @@ SELECT * FROM multi_extension.print_extension_changes();
                     | view public.citus_tables
 (2 rows)
 
+-- not print "HINT: " to hide current lib version
+\set VERBOSITY terse
+CREATE TABLE columnar_table(a INT, b INT) USING columnar;
+SET citus.enable_version_checks TO ON;
+-- all should throw an error due to version mismatch
+VACUUM FULL columnar_table;
+ERROR:  loaded Citus library version differs from installed extension version
+INSERT INTO columnar_table SELECT i FROM generate_series(1, 10) i;
+ERROR:  loaded Citus library version differs from installed extension version
+VACUUM columnar_table;
+WARNING:  loaded Citus library version differs from installed extension version
+TRUNCATE columnar_table;
+ERROR:  loaded Citus library version differs from installed extension version
+DROP TABLE columnar_table;
+ERROR:  loaded Citus library version differs from installed extension version
+CREATE INDEX ON columnar_table (a);
+ERROR:  loaded Citus library version differs from installed extension version
+SELECT alter_columnar_table_set('columnar_table', compression => 'pglz');
+ERROR:  loaded Citus library version differs from installed extension version
+SELECT alter_columnar_table_reset('columnar_table');
+ERROR:  loaded Citus library version differs from installed extension version
+INSERT INTO columnar_table SELECT * FROM columnar_table;
+ERROR:  loaded Citus library version differs from installed extension version
+SELECT 1 FROM columnar_table; -- columnar custom scan
+ERROR:  loaded Citus library version differs from installed extension version
+SET columnar.enable_custom_scan TO OFF;
+SELECT 1 FROM columnar_table; -- seq scan
+ERROR:  loaded Citus library version differs from installed extension version
+CREATE TABLE new_columnar_table (a int) USING columnar;
+ERROR:  loaded Citus library version differs from installed extension version
+-- do cleanup for the rest of the tests
+SET citus.enable_version_checks TO OFF;
+DROP TABLE columnar_table;
+RESET columnar.enable_custom_scan;
+\set VERBOSITY default
 -- Test downgrade to 10.0-4 from 10.1-1
 ALTER EXTENSION citus UPDATE TO '10.1-1';
 ALTER EXTENSION citus UPDATE TO '10.0-4';
@@ -810,7 +845,24 @@ SELECT * FROM multi_extension.print_extension_changes();
                                                             | function drop_old_time_partitions(regclass,timestamp with time zone)
                                                             | function get_missing_time_partition_ranges(regclass,interval,timestamp with time zone,timestamp with time zone) TABLE(partition_name text, range_from_value text, range_to_value text)
                                                             | function stop_metadata_sync_to_node(text,integer,boolean) void
-(15 rows)
+                                                            | function worker_nextval(regclass) integer
+(16 rows)
+
+-- Test downgrade to 10.2-1 from 10.2-2
+ALTER EXTENSION citus UPDATE TO '10.2-2';
+ALTER EXTENSION citus UPDATE TO '10.2-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
+
+-- Snapshot of state at 10.2-2
+ALTER EXTENSION citus UPDATE TO '10.2-2';
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
 
 DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 -- show running version

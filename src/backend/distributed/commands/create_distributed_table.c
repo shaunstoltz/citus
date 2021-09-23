@@ -126,6 +126,7 @@ static void DoCopyFromLocalTableIntoShards(Relation distributedRelation,
 										   DestReceiver *copyDest,
 										   TupleTableSlot *slot,
 										   EState *estate);
+static void ErrorIfTemporaryTable(Oid relationId);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
@@ -329,6 +330,7 @@ EnsureCitusTableCanBeCreated(Oid relationOid)
 	EnsureCoordinator();
 	EnsureRelationExists(relationOid);
 	EnsureTableOwner(relationOid);
+	ErrorIfTemporaryTable(relationOid);
 
 	/*
 	 * We should do this check here since the codes in the following lines rely
@@ -554,11 +556,16 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	{
 		List *partitionList = PartitionList(relationId);
 		Oid partitionRelationId = InvalidOid;
+		Oid namespaceId = get_rel_namespace(relationId);
+		char *schemaName = get_namespace_name(namespaceId);
+		char *relationName = get_rel_name(relationId);
+		char *parentRelationName = quote_qualified_identifier(schemaName, relationName);
+
 		foreach_oid(partitionRelationId, partitionList)
 		{
 			CreateDistributedTable(partitionRelationId, distributionColumn,
 								   distributionMethod, shardCount, false,
-								   colocateWithTableName, viaDeprecatedAPI);
+								   parentRelationName, viaDeprecatedAPI);
 		}
 	}
 
@@ -1163,6 +1170,20 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 
 	ErrorIfUnsupportedPolicy(relation);
 	relation_close(relation, NoLock);
+}
+
+
+/*
+ * ErrorIfTemporaryTable errors out if the given table is a temporary table.
+ */
+static void
+ErrorIfTemporaryTable(Oid relationId)
+{
+	if (get_rel_persistence(relationId) == RELPERSISTENCE_TEMP)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot distribute a temporary table")));
+	}
 }
 
 

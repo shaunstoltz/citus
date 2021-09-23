@@ -26,6 +26,17 @@ typedef struct StripeMetadata
 	uint64 rowCount;
 	uint64 id;
 	uint64 firstRowNumber;
+
+	/* see StripeWriteState */
+	bool aborted;
+
+	/*
+	 * If write operation is in-progress (i.e. StripeWriteState returned
+	 * STRIPE_WRITE_IN_PROGRESS), then insertedByCurrentXact is used to
+	 * distinguish whether it's being written by current transaction or
+	 * not.
+	 */
+	bool insertedByCurrentXact;
 } StripeMetadata;
 
 /*
