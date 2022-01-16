@@ -443,16 +443,20 @@ push(@pgOptions, "wal_receiver_status_interval=1");
 # src/backend/replication/logical/launcher.c.
 push(@pgOptions, "wal_retrieve_retry_interval=1000");
 
-# disable compute_query_id so that we don't get Query Identifiers
-# in explain outputs
 if ($majorversion >= "14") {
+    # disable compute_query_id so that we don't get Query Identifiers
+    # in explain outputs
     push(@pgOptions, "compute_query_id=off");
+
+    # reduce test flappiness and different PG14 plans
+    if (!$vanillatest) {
+        push(@pgOptions, "enable_incremental_sort=off");
+    }
 }
 
 # Citus options set for the tests
 push(@pgOptions, "citus.shard_count=4");
 push(@pgOptions, "citus.max_adaptive_executor_pool_size=4");
-push(@pgOptions, "citus.shard_max_size=1500kB");
 push(@pgOptions, "citus.defer_shard_delete_interval=-1");
 push(@pgOptions, "citus.repartition_join_bucket_count_per_node=2");
 push(@pgOptions, "citus.sort_returning='on'");
@@ -920,14 +924,6 @@ if (!$conninfo)
                     '-c', "CREATE FOREIGN DATA WRAPPER $fdw HANDLER $fdws{$fdw};")) == 0
                 or die "Could not create foreign data wrapper $fdw on worker";
         }
-
-        foreach my $fdwServer (keys %fdwServers)
-        {
-            system(catfile($bindir, "psql"),
-                    ('-X', '-h', $host, '-p', $port, '-U', $user, "-d", "regression",
-                    '-c', "CREATE SERVER $fdwServer FOREIGN DATA WRAPPER $fdwServers{$fdwServer};")) == 0
-                or die "Could not create server $fdwServer on worker";
-        }
     }
 }
 else
@@ -953,14 +949,6 @@ else
                 ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbname,
                     '-c', "SELECT run_command_on_workers('CREATE FOREIGN DATA WRAPPER $fdw HANDLER $fdws{$fdw};');")) == 0
             or die "Could not create foreign data wrapper $fdw on worker";
-    }
-
-    foreach my $fdwServer (keys %fdwServers)
-    {
-        system(catfile($bindir, "psql"),
-                ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbname,
-                    '-c', "SELECT run_command_on_workers('CREATE SERVER $fdwServer FOREIGN DATA WRAPPER $fdwServers{$fdwServer};');")) == 0
-            or die "Could not create server $fdwServer on worker";
     }
 }
 

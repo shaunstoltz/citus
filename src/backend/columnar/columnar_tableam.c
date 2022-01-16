@@ -32,6 +32,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
+#include "safe_lib.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/bufmgr.h"
@@ -48,16 +49,12 @@
 #include "utils/relcache.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
-
 #include "columnar/columnar.h"
 #include "columnar/columnar_customscan.h"
 #include "columnar/columnar_storage.h"
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
-#include "distributed/commands.h"
-#include "distributed/commands/utility_hook.h"
 #include "distributed/listutils.h"
-#include "distributed/metadata_cache.h"
 
 /*
  * Timing parameters for truncate locking heuristics.
@@ -85,7 +82,6 @@ typedef struct ColumnarScanDescData
 	List *scanQual;
 } ColumnarScanDescData;
 
-typedef struct ColumnarScanDescData *ColumnarScanDesc;
 
 /*
  * IndexFetchColumnarData is the scan state passed between index_fetch_begin,
@@ -105,6 +101,8 @@ typedef struct IndexFetchColumnarData
 	MemoryContext scanContext;
 } IndexFetchColumnarData;
 
+
+ColumnarTableSetOptions_hook_type ColumnarTableSetOptions_hook = NULL;
 
 static object_access_hook_type PrevObjectAccessHook = NULL;
 static ProcessUtility_hook_type PrevProcessUtilityHook = NULL;
@@ -2097,7 +2095,9 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 		IndexStmt *indexStmt = (IndexStmt *) parsetree;
 
 		Relation rel = relation_openrv(indexStmt->relation,
-									   GetCreateIndexRelationLockMode(indexStmt));
+									   indexStmt->concurrent ? ShareUpdateExclusiveLock :
+									   ShareLock);
+
 		if (rel->rd_tableam == GetColumnarTableAmRoutine())
 		{
 			CheckCitusVersion(ERROR);
@@ -2300,121 +2300,6 @@ ColumnarCheckLogicalReplication(Relation rel)
 
 
 /*
- * CitusCreateAlterColumnarTableSet generates a portable
- */
-static char *
-CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
-								 const ColumnarOptions *options)
-{
-	StringInfoData buf = { 0 };
-	initStringInfo(&buf);
-
-	appendStringInfo(&buf,
-					 "SELECT alter_columnar_table_set(%s, "
-					 "chunk_group_row_limit => %d, "
-					 "stripe_row_limit => %lu, "
-					 "compression_level => %d, "
-					 "compression => %s);",
-					 quote_literal_cstr(qualifiedRelationName),
-					 options->chunkRowCount,
-					 options->stripeRowCount,
-					 options->compressionLevel,
-					 quote_literal_cstr(CompressionTypeStr(options->compressionType)));
-
-	return buf.data;
-}
-
-
-/*
- * GetTableDDLCommandColumnar is an internal function used to turn a
- * ColumnarTableDDLContext stored on the context of a TableDDLCommandFunction into a sql
- * command that will be executed against a table. The resulting command will set the
- * options of the table to the same options as the relation on the coordinator.
- */
-static char *
-GetTableDDLCommandColumnar(void *context)
-{
-	ColumnarTableDDLContext *tableDDLContext = (ColumnarTableDDLContext *) context;
-
-	char *qualifiedShardName = quote_qualified_identifier(tableDDLContext->schemaName,
-														  tableDDLContext->relationName);
-
-	return CitusCreateAlterColumnarTableSet(qualifiedShardName,
-											&tableDDLContext->options);
-}
-
-
-/*
- * GetShardedTableDDLCommandColumnar is an internal function used to turn a
- * ColumnarTableDDLContext stored on the context of a TableDDLCommandFunction into a sql
- * command that will be executed against a shard. The resulting command will set the
- * options of the shard to the same options as the relation the shard is based on.
- */
-char *
-GetShardedTableDDLCommandColumnar(uint64 shardId, void *context)
-{
-	ColumnarTableDDLContext *tableDDLContext = (ColumnarTableDDLContext *) context;
-
-	/*
-	 * AppendShardId is destructive of the original cahr *, given we want to serialize
-	 * more than once we copy it before appending the shard id.
-	 */
-	char *relationName = pstrdup(tableDDLContext->relationName);
-	AppendShardIdToName(&relationName, shardId);
-
-	char *qualifiedShardName = quote_qualified_identifier(tableDDLContext->schemaName,
-														  relationName);
-
-	return CitusCreateAlterColumnarTableSet(qualifiedShardName,
-											&tableDDLContext->options);
-}
-
-
-/*
- * ColumnarGetCustomTableOptionsDDL returns a TableDDLCommand representing a command that
- * will apply the passed columnar options to the relation identified by relationId on a
- * new table or shard.
- */
-static TableDDLCommand *
-ColumnarGetCustomTableOptionsDDL(char *schemaName, char *relationName,
-								 ColumnarOptions options)
-{
-	ColumnarTableDDLContext *context = (ColumnarTableDDLContext *) palloc0(
-		sizeof(ColumnarTableDDLContext));
-
-	/* build the context */
-	context->schemaName = schemaName;
-	context->relationName = relationName;
-	context->options = options;
-
-	/* create TableDDLCommand based on the context build above */
-	return makeTableDDLCommandFunction(
-		GetTableDDLCommandColumnar,
-		GetShardedTableDDLCommandColumnar,
-		context);
-}
-
-
-/*
- * ColumnarGetTableOptionsDDL returns a TableDDLCommand representing a command that will
- * apply the columnar options currently applicable to the relation identified by
- * relationId on a new table or shard.
- */
-TableDDLCommand *
-ColumnarGetTableOptionsDDL(Oid relationId)
-{
-	Oid namespaceId = get_rel_namespace(relationId);
-	char *schemaName = get_namespace_name(namespaceId);
-	char *relationName = get_rel_name(relationId);
-
-	ColumnarOptions options = { 0 };
-	ReadColumnarOptions(relationId, &options);
-
-	return ColumnarGetCustomTableOptionsDDL(schemaName, relationName, options);
-}
-
-
-/*
  * alter_columnar_table_set is a UDF exposed in postgres to change settings on a columnar
  * table. Calling this function on a non-columnar table gives an error.
  *
@@ -2523,18 +2408,9 @@ alter_columnar_table_set(PG_FUNCTION_ARGS)
 								options.compressionLevel)));
 	}
 
-	if (EnableDDLPropagation && IsCitusTable(relationId))
+	if (ColumnarTableSetOptions_hook != NULL)
 	{
-		/* when a columnar table is distributed update all settings on the shards */
-		Oid namespaceId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(namespaceId);
-		char *relationName = get_rel_name(relationId);
-		TableDDLCommand *command = ColumnarGetCustomTableOptionsDDL(schemaName,
-																	relationName,
-																	options);
-		DDLJob *ddljob = CreateCustomDDLTaskList(relationId, command);
-
-		ExecuteDistributedDDLJob(ddljob);
+		ColumnarTableSetOptions_hook(relationId, options);
 	}
 
 	SetColumnarOptions(relationId, &options);
@@ -2619,18 +2495,9 @@ alter_columnar_table_reset(PG_FUNCTION_ARGS)
 								columnar_compression_level)));
 	}
 
-	if (EnableDDLPropagation && IsCitusTable(relationId))
+	if (ColumnarTableSetOptions_hook != NULL)
 	{
-		/* when a columnar table is distributed update all settings on the shards */
-		Oid namespaceId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(namespaceId);
-		char *relationName = get_rel_name(relationId);
-		TableDDLCommand *command = ColumnarGetCustomTableOptionsDDL(schemaName,
-																	relationName,
-																	options);
-		DDLJob *ddljob = CreateCustomDDLTaskList(relationId, command);
-
-		ExecuteDistributedDDLJob(ddljob);
+		ColumnarTableSetOptions_hook(relationId, options);
 	}
 
 	SetColumnarOptions(relationId, &options);
@@ -2661,7 +2528,7 @@ upgrade_columnar_storage(PG_FUNCTION_ARGS)
 	 * ACCESS EXCLUSIVE LOCK is not required by the low-level routines, so we
 	 * can take only an ACCESS SHARE LOCK. But all access to non-current
 	 * columnar tables will fail anyway, so it's better to take ACCESS
-	 * EXLUSIVE LOCK now.
+	 * EXCLUSIVE LOCK now.
 	 */
 	Relation rel = table_open(relid, AccessExclusiveLock);
 	if (!IsColumnarTableAmTable(relid))
@@ -2697,7 +2564,7 @@ downgrade_columnar_storage(PG_FUNCTION_ARGS)
 	 * ACCESS EXCLUSIVE LOCK is not required by the low-level routines, so we
 	 * can take only an ACCESS SHARE LOCK. But all access to non-current
 	 * columnar tables will fail anyway, so it's better to take ACCESS
-	 * EXLUSIVE LOCK now.
+	 * EXCLUSIVE LOCK now.
 	 */
 	Relation rel = table_open(relid, AccessExclusiveLock);
 	if (!IsColumnarTableAmTable(relid))

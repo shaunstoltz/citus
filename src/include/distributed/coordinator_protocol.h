@@ -21,6 +21,7 @@
 #include "nodes/pg_list.h"
 #include "distributed/metadata_utility.h"
 
+#include "columnar/columnar.h"
 
 /*
  * In our distributed database, we need a mechanism to make remote procedure
@@ -50,9 +51,6 @@
 #define TRANSFER_MODE_AUTOMATIC 'a'
 #define TRANSFER_MODE_FORCE_LOGICAL 'l'
 #define TRANSFER_MODE_BLOCK_WRITES 'b'
-
-/* Name of columnar foreign data wrapper */
-#define CSTORE_FDW_NAME "cstore_fdw"
 
 #define SHARDID_SEQUENCE_NAME "pg_dist_shardid_seq"
 #define PLACEMENTID_SEQUENCE_NAME "pg_dist_placement_placementid_seq"
@@ -184,6 +182,17 @@ struct TableDDLCommand
 	};
 };
 
+/*
+ * ColumnarTableDDLContext holds the instance variable for the TableDDLCommandFunction
+ * instance described below.
+ */
+typedef struct ColumnarTableDDLContext
+{
+	char *schemaName;
+	char *relationName;
+	ColumnarOptions options;
+} ColumnarTableDDLContext;
+
 /* make functions for TableDDLCommand */
 extern TableDDLCommand * makeTableDDLCommandString(char *commandStr);
 extern TableDDLCommand * makeTableDDLCommandFunction(TableDDLFunction function,
@@ -193,13 +202,16 @@ extern TableDDLCommand * makeTableDDLCommandFunction(TableDDLFunction function,
 
 extern char * GetShardedTableDDLCommand(TableDDLCommand *command, uint64 shardId,
 										char *schemaName);
+extern char * GetShardedTableDDLCommandColumnar(uint64 shardId, void *context);
 extern char * GetTableDDLCommand(TableDDLCommand *command);
+extern TableDDLCommand * ColumnarGetCustomTableOptionsDDL(char *schemaName,
+														  char *relationName,
+														  ColumnarOptions options);
 
 
 /* Config variables managed via guc.c */
 extern int ShardCount;
 extern int ShardReplicationFactor;
-extern int ShardMaxSize;
 extern int ShardPlacementPolicy;
 extern int NextShardId;
 extern int NextPlacementId;
@@ -208,7 +220,6 @@ extern int NextPlacementId;
 extern bool IsCoordinator(void);
 
 /* Function declarations local to the distributed module */
-extern bool CStoreTable(Oid relationId);
 extern uint64 GetNextShardId(void);
 extern uint64 GetNextPlacementId(void);
 extern Oid ResolveRelationId(text *relationName, bool missingOk);
@@ -268,9 +279,7 @@ extern Datum master_stage_shard_placement_row(PG_FUNCTION_ARGS);
 
 /* Function declarations to help with data staging and deletion */
 extern Datum master_create_empty_shard(PG_FUNCTION_ARGS);
-extern Datum master_append_table_to_shard(PG_FUNCTION_ARGS);
 extern Datum master_update_shard_statistics(PG_FUNCTION_ARGS);
-extern Datum master_apply_delete_command(PG_FUNCTION_ARGS);
 extern Datum master_drop_sequences(PG_FUNCTION_ARGS);
 extern Datum master_modify_multiple_shards(PG_FUNCTION_ARGS);
 extern Datum lock_relation_if_exists(PG_FUNCTION_ARGS);

@@ -63,6 +63,7 @@ typedef struct TransactionProperties
 
 extern int MultiShardConnectionType;
 extern bool WritableStandbyCoordinator;
+extern bool AllowModificationsFromWorkersToReplicatedTables;
 extern bool ForceMaxQueryParallelization;
 extern int MaxAdaptiveExecutorPoolSize;
 extern int ExecutorSlowStartInterval;
@@ -142,11 +143,14 @@ extern void SetLocalForceMaxQueryParallelization(void);
 extern void SortTupleStore(CitusScanState *scanState);
 extern bool DistributedPlanModifiesDatabase(DistributedPlan *plan);
 extern bool ReadOnlyTask(TaskType taskType);
+extern bool TaskListCannotBeExecutedInTransaction(List *taskList);
 extern void ExtractParametersFromParamList(ParamListInfo paramListInfo,
 										   Oid **parameterTypes,
 										   const char ***parameterValues, bool
 										   useOriginalCustomTypeOids);
 extern ParamListInfo ExecutorBoundParams(void);
+extern void EnsureRemoteTaskExecutionAllowed(void);
+extern bool InTaskExecution(void);
 
 
 #endif /* MULTI_EXECUTOR_H */

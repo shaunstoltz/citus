@@ -16,6 +16,7 @@
 #include "distributed/transaction_management.h"
 #include "distributed/remote_transaction.h"
 #include "lib/ilist.h"
+#include "pg_config.h"
 #include "portability/instr_time.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -56,19 +57,32 @@ enum MultiConnectionMode
 	OUTSIDE_TRANSACTION = 1 << 4,
 
 	/*
+	 * All metadata changes should go through the same connection, otherwise
+	 * self-deadlocks are possible. That is because the same metadata (e.g.,
+	 * metadata includes the distributed table on the workers) can be modified
+	 * accross multiple connections.
+	 *
+	 * With this flag, we guarantee that there is a single metadata connection.
+	 * But note that this connection can be used for any other operation.
+	 * In other words, this connection is not exclusively reserved for metadata
+	 * operations.
+	 */
+	REQUIRE_METADATA_CONNECTION = 1 << 5,
+
+	/*
 	 * Some connections are optional such as when adaptive executor is executing
 	 * a multi-shard command and requires the second (or further) connections
 	 * per node. In that case, the connection manager may decide not to allow the
 	 * connection.
 	 */
-	OPTIONAL_CONNECTION = 1 << 5,
+	OPTIONAL_CONNECTION = 1 << 6,
 
 	/*
 	 * When this flag is passed, via connection throttling, the connection
 	 * establishments may be suspended until a connection slot is available to
 	 * the remote host.
 	 */
-	WAIT_FOR_CONNECTION = 1 << 6
+	WAIT_FOR_CONNECTION = 1 << 7
 };
 
 
@@ -132,6 +146,12 @@ typedef struct MultiConnection
 
 	/* is the connection currently in use, and shouldn't be used by anything else */
 	bool claimedExclusively;
+
+	/*
+	 * Should be used to access/modify metadata. See REQUIRE_METADATA_CONNECTION for
+	 * the details.
+	 */
+	bool useForMetadataOperations;
 
 	/* time connection establishment was started, for timeout and executor stats */
 	instr_time connectionEstablishmentStart;
@@ -264,5 +284,7 @@ extern void MarkConnectionConnected(MultiConnection *connection);
 extern double MillisecondsPassedSince(instr_time moment);
 extern long MillisecondsToTimeout(instr_time start, long msAfterStart);
 
+#if PG_VERSION_NUM < 140000
 extern void WarmUpConnParamsHash(void);
+#endif
 #endif /* CONNECTION_MANAGMENT_H */

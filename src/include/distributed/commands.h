@@ -21,6 +21,8 @@
 #include "tcop/utility.h"
 
 
+extern bool AddAllLocalTablesToMetadata;
+
 /* controlled via GUC, should be accessed via EnableLocalReferenceForeignKeys() */
 extern bool EnableLocalReferenceForeignKeys;
 
@@ -46,6 +48,7 @@ extern void SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(Oid
  * postprocess: executed after standard_ProcessUtility.
  * address: return an ObjectAddress for the subject of the statement.
  *          2nd parameter is missing_ok.
+ * markDistribued: true if the object will be distributed.
  *
  * preprocess/postprocess return a List of DDLJobs.
  */
@@ -56,6 +59,7 @@ typedef struct DistributeObjectOps
 	List * (*preprocess)(Node *, const char *, ProcessUtilityContext);
 	List * (*postprocess)(Node *, const char *);
 	ObjectAddress (*address)(Node *, bool);
+	bool markDistributed;
 } DistributeObjectOps;
 
 #define CITUS_TRUNCATE_TRIGGER_NAME "citus_truncate_trigger"
@@ -220,6 +224,34 @@ extern List * GetForeignKeyOids(Oid relationId, int flags);
 extern Oid GetReferencedTableId(Oid foreignKeyId);
 extern Oid GetReferencingTableId(Oid foreignKeyId);
 extern bool RelationInvolvedInAnyNonInheritedForeignKeys(Oid relationId);
+
+/* foreign_server.c - forward declarations */
+extern List * PreprocessCreateForeignServerStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
+extern List * PreprocessAlterForeignServerStmt(Node *node, const char *queryString,
+											   ProcessUtilityContext processUtilityContext);
+extern List * PreprocessRenameForeignServerStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
+extern List * PreprocessAlterForeignServerOwnerStmt(Node *node, const char *queryString,
+													ProcessUtilityContext
+													processUtilityContext);
+extern List * PreprocessDropForeignServerStmt(Node *node, const char *queryString,
+											  ProcessUtilityContext
+											  processUtilityContext);
+extern List * PostprocessCreateForeignServerStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterForeignServerOwnerStmt(Node *node, const char *queryString);
+extern ObjectAddress CreateForeignServerStmtObjectAddress(Node *node, bool missing_ok);
+extern ObjectAddress AlterForeignServerOwnerStmtObjectAddress(Node *node, bool
+															  missing_ok);
+extern List * GetForeignServerCreateDDLCommand(Oid serverId);
+
+
+/* foreign_table.c - forward declarations */
+extern List * PreprocessAlterForeignTableSchemaStmt(Node *node, const char *queryString,
+													ProcessUtilityContext
+													processUtilityContext);
 
 
 /* function.c - forward declarations */
@@ -414,6 +446,7 @@ extern Node * SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTa
 extern bool IsAlterTableRenameStmt(RenameStmt *renameStmt);
 extern void ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement);
 extern void PostprocessAlterTableStmt(AlterTableStmt *pStmt);
+extern void FixAlterTableStmtIndexNames(AlterTableStmt *pStmt);
 extern void ErrorUnsupportedAlterTableAddColumn(Oid relationId, AlterTableCmd *command,
 												Constraint *constraint);
 extern void ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
@@ -423,6 +456,7 @@ extern ObjectAddress AlterTableSchemaStmtObjectAddress(Node *stmt,
 													   bool missing_ok);
 extern List * MakeNameListFromRangeVar(const RangeVar *rel);
 extern Oid GetSequenceOid(Oid relationId, AttrNumber attnum);
+extern bool ConstrTypeUsesIndex(ConstrType constrType);
 
 
 /* truncate.c - forward declarations */
@@ -470,6 +504,9 @@ extern List * CreateFunctionDDLCommandsIdempotent(const ObjectAddress *functionA
 extern char * GetFunctionDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace);
 extern char * GenerateBackupNameForProcCollision(const ObjectAddress *address);
 extern ObjectWithArgs * ObjectWithArgsFromOid(Oid funcOid);
+extern void UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
+										   int *distribution_argument_index,
+										   int *colocationId);
 
 /* vacuum.c - forward declarations */
 extern void PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand);
@@ -478,7 +515,6 @@ extern void PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumComm
 extern List * GetExplicitTriggerCommandList(Oid relationId);
 extern HeapTuple GetTriggerTupleById(Oid triggerId, bool missingOk);
 extern List * GetExplicitTriggerIdList(Oid relationId);
-extern Oid get_relation_trigger_oid_compat(HeapTuple heapTuple);
 extern List * PostprocessCreateTriggerStmt(Node *node, const char *queryString);
 extern ObjectAddress CreateTriggerStmtObjectAddress(Node *node, bool missingOk);
 extern void CreateTriggerEventExtendNames(CreateTrigStmt *createTriggerStmt,
@@ -502,7 +538,8 @@ extern Oid GetTriggerFunctionId(Oid triggerId);
 /* cascade_table_operation_for_connected_relations.c */
 
 /*
- * Flags that can be passed to CascadeOperationForConnectedRelations to specify
+ * Flags that can be passed to CascadeOperationForFkeyConnectedRelations, and
+ * CascadeOperationForRelationIdList to specify
  * citus table function to be executed in cascading mode.
  */
 typedef enum CascadeOperationType
@@ -512,15 +549,22 @@ typedef enum CascadeOperationType
 	/* execute UndistributeTable on each relation */
 	CASCADE_FKEY_UNDISTRIBUTE_TABLE = 1 << 1,
 
-	/* execute CreateCitusLocalTable on each relation */
-	CASCADE_FKEY_ADD_LOCAL_TABLE_TO_METADATA = 1 << 2,
+	/* execute CreateCitusLocalTable on each relation, with autoConverted = false */
+	CASCADE_USER_ADD_LOCAL_TABLE_TO_METADATA = 1 << 2,
+
+	/* execute CreateCitusLocalTable on each relation, with autoConverted = true */
+	CASCADE_AUTO_ADD_LOCAL_TABLE_TO_METADATA = 1 << 3,
 } CascadeOperationType;
 
-extern void CascadeOperationForConnectedRelations(Oid relationId, LOCKMODE relLockMode,
-												  CascadeOperationType
-												  cascadeOperationType);
+extern void CascadeOperationForFkeyConnectedRelations(Oid relationId,
+													  LOCKMODE relLockMode,
+													  CascadeOperationType
+													  cascadeOperationType);
+extern void CascadeOperationForRelationIdList(List *relationIdList, LOCKMODE lockMode,
+											  CascadeOperationType cascadeOperationType);
 extern void ErrorIfAnyPartitionRelationInvolvedInNonInheritedFKey(List *relationIdList);
 extern bool RelationIdListHasReferenceTable(List *relationIdList);
+extern List * GetFKeyCreationCommandsForRelationIdList(List *relationIdList);
 extern void DropRelationForeignKeys(Oid relationId, int flags);
 extern void SetLocalEnableLocalReferenceForeignKeys(bool state);
 extern void ExecuteAndLogUtilityCommandList(List *ddlCommandList);
@@ -529,14 +573,16 @@ extern void ExecuteForeignKeyCreateCommandList(List *ddlCommandList,
 											   bool skip_validation);
 
 /* create_citus_local_table.c */
-extern void CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys);
+extern void CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys,
+								  bool autoConverted);
 extern List * GetExplicitIndexOidList(Oid relationId);
 
 extern bool ShouldPropagateSetCommand(VariableSetStmt *setStmt);
 extern void PostprocessVariableSetStmt(VariableSetStmt *setStmt, const char *setCommand);
 
-/* create_citus_local_table.c */
-
-extern void CreateCitusLocalTable(Oid relationId, bool cascade);
+extern void CreateCitusLocalTablePartitionOf(CreateStmt *createStatement,
+											 Oid relationId, Oid parentRelationId);
+extern void UpdateAutoConvertedForConnectedRelations(List *relationId, bool
+													 autoConverted);
 
 #endif /*CITUS_COMMANDS_H */

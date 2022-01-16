@@ -267,15 +267,13 @@ ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 
 		ErrorIfIllegallyChangingKnownShard(relationId);
 
-		char relationKind = get_rel_relkind(relationId);
-		if (IsCitusTable(relationId) &&
-			relationKind == RELKIND_FOREIGN_TABLE)
+		if (IsCitusTable(relationId) && IsForeignTable(relationId))
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("truncating distributed foreign tables is "
 								   "currently unsupported"),
-							errhint("Use citus_drop_all_shards to remove "
-									"foreign table's shards.")));
+							errhint("Consider undistributing table before TRUNCATE, "
+									"and then distribute or add to metadata again")));
 		}
 	}
 }
@@ -424,7 +422,7 @@ AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
 	const char *lockModeText = LockModeToLockModeText(lockMode);
 
 	/*
-	 * We want to acquire locks in the same order accross the nodes.
+	 * We want to acquire locks in the same order across the nodes.
 	 * Although relation ids may change, their ordering will not.
 	 */
 	relationIdList = SortList(relationIdList, CompareOids);

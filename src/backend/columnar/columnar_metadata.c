@@ -42,7 +42,6 @@
 #include "commands/defrem.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
-#include "distributed/metadata_cache.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -335,8 +334,13 @@ DeleteColumnarTableOptions(Oid regclass, bool missingOk)
 	 */
 	Assert(!IsBinaryUpgrade);
 
-	Relation columnarOptions = relation_open(ColumnarOptionsRelationId(),
-											 RowExclusiveLock);
+	Relation columnarOptions = try_relation_open(ColumnarOptionsRelationId(),
+												 RowExclusiveLock);
+	if (columnarOptions == NULL)
+	{
+		/* extension has been dropped */
+		return false;
+	}
 
 	/* find existing item to remove */
 	ScanKeyData scanKey[1] = { 0 };

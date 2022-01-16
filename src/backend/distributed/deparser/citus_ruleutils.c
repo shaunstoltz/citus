@@ -77,7 +77,6 @@
 
 static void deparse_index_columns(StringInfo buffer, List *indexParameterList,
 								  List *deparseContext);
-static void AppendOptionListToString(StringInfo stringData, List *options);
 static void AppendStorageParametersToString(StringInfo stringBuffer,
 											List *optionList);
 static void simple_quote_literal(StringInfo buf, const char *val);
@@ -756,10 +755,15 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 	{
 		appendStringInfoString(buffer, "INCLUDE (");
 		deparse_index_columns(buffer, indexStmt->indexIncludingParams, deparseContext);
-		appendStringInfoChar(buffer, ')');
+		appendStringInfoString(buffer, ") ");
 	}
 
-	AppendStorageParametersToString(buffer, indexStmt->options);
+	if (indexStmt->options != NIL)
+	{
+		appendStringInfoString(buffer, "WITH (");
+		AppendStorageParametersToString(buffer, indexStmt->options);
+		appendStringInfoString(buffer, ") ");
+	}
 
 	if (indexStmt->whereClause != NULL)
 	{
@@ -958,8 +962,9 @@ deparse_index_columns(StringInfo buffer, List *indexParameterList, List *deparse
 		/* Commit on postgres: 911e70207703799605f5a0e8aad9f06cff067c63*/
 		if (indexElement->opclassopts != NIL)
 		{
-			ereport(ERROR, errmsg(
-						"citus currently doesn't support operator class parameters in indexes"));
+			appendStringInfoString(buffer, "(");
+			AppendStorageParametersToString(buffer, indexElement->opclassopts);
+			appendStringInfoString(buffer, ") ");
 		}
 #endif
 
@@ -1050,7 +1055,7 @@ generate_qualified_relation_name(Oid relid)
  * AppendOptionListToString converts the option list to its textual format, and
  * appends this text to the given string buffer.
  */
-static void
+void
 AppendOptionListToString(StringInfo stringBuffer, List *optionList)
 {
 	if (optionList != NIL)
@@ -1091,13 +1096,6 @@ AppendStorageParametersToString(StringInfo stringBuffer, List *optionList)
 	ListCell *optionCell = NULL;
 	bool firstOptionPrinted = false;
 
-	if (optionList == NIL)
-	{
-		return;
-	}
-
-	appendStringInfo(stringBuffer, " WITH (");
-
 	foreach(optionCell, optionList)
 	{
 		DefElem *option = (DefElem *) lfirst(optionCell);
@@ -1114,8 +1112,6 @@ AppendStorageParametersToString(StringInfo stringBuffer, List *optionList)
 						 quote_identifier(optionName),
 						 quote_literal_cstr(optionValue));
 	}
-
-	appendStringInfo(stringBuffer, ")");
 }
 
 

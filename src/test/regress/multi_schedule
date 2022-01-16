@@ -1,6 +1,8 @@
+test: multi_test_helpers multi_test_helpers_superuser
 test: multi_cluster_management
-test: multi_test_helpers multi_test_helpers_superuser multi_create_fdw
+test: multi_create_fdw
 test: multi_test_catalog_views
+test: replicated_table_disable_node
 
 # ----------
 # The following distributed tests depend on creating a partitioned table and
@@ -48,9 +50,9 @@ test: union_pushdown
 test: set_operation_and_local_tables
 
 test: subqueries_deep subquery_view subquery_partitioning subqueries_not_supported
-test: subquery_in_targetlist subquery_in_where subquery_complex_target_list
+test: subquery_in_targetlist subquery_in_where subquery_complex_target_list subquery_append
 test: subquery_prepared_statements
-test: non_colocated_leaf_subquery_joins non_colocated_subquery_joins non_colocated_join_order
+test: non_colocated_leaf_subquery_joins non_colocated_subquery_joins
 test: cte_inline recursive_view_local_table values
 test: pg13 pg12
 # run pg14 sequentially as it syncs metadata
@@ -64,7 +66,7 @@ test: multi_deparse_shard_query multi_distributed_transaction_id intermediate_re
 test: multi_explain hyperscale_tutorial partitioned_intermediate_results distributed_intermediate_results multi_real_time_transaction
 test: multi_basic_queries cross_join multi_complex_expressions multi_subquery multi_subquery_complex_queries multi_subquery_behavioral_analytics
 test: multi_subquery_complex_reference_clause multi_subquery_window_functions multi_view multi_sql_function multi_prepare_sql
-test: sql_procedure multi_function_in_join row_types materialized_view undistribute_table
+test: sql_procedure multi_function_in_join row_types materialized_view
 test: multi_subquery_in_where_reference_clause adaptive_executor propagate_set_commands geqo
 # this should be run alone as it gets too many clients
 test: join_pushdown
@@ -88,7 +90,10 @@ test: multi_dropped_column_aliases foreign_key_restriction_enforcement
 test: binary_protocol
 test: alter_table_set_access_method
 test: alter_distributed_table
-test: issue_5248
+test: issue_5248 issue_5099
+test: object_propagation_debug
+test: undistribute_table
+
 
 # ---------
 # test that no tests leaked intermediate results. This should always be last
@@ -100,3 +105,4 @@ test: ensure_no_intermediate_data_leak
 # in the shared memory
 # --------
 test: ensure_no_shared_connection_leak
+test: check_mx

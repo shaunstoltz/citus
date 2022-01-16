@@ -33,7 +33,9 @@
 #include "access/attnum.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#if PG_VERSION_NUM < 140000
 #include "access/xact.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "commands/dbcommands.h"
@@ -44,15 +46,19 @@
 #include "distributed/commands.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/commands/utility_hook.h" /* IWYU pragma: keep */
+#include "distributed/coordinator_protocol.h"
 #include "distributed/deparser.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/maintenanced.h"
-#include "distributed/coordinator_protocol.h"
+#include "distributed/multi_partitioning_utils.h"
+#if PG_VERSION_NUM < 140000
 #include "distributed/metadata_cache.h"
+#endif
 #include "distributed/metadata_sync.h"
+#include "distributed/metadata/distobject.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
 #include "distributed/multi_physical_planner.h"
@@ -61,6 +67,7 @@
 #include "distributed/transmit.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_transaction.h"
+#include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
@@ -88,13 +95,19 @@ static void ProcessUtilityInternal(PlannedStmt *pstmt,
 								   struct QueryEnvironment *queryEnv,
 								   DestReceiver *dest,
 								   QueryCompletionCompat *completionTag);
+#if PG_VERSION_NUM >= 140000
+static void set_indexsafe_procflags(void);
+#endif
 static char * SetSearchPathToCurrentSearchPathCommand(void);
 static char * CurrentSearchPath(void);
 static void IncrementUtilityHookCountersIfNecessary(Node *parsetree);
 static void PostStandardProcessUtility(Node *parsetree);
 static void DecrementUtilityHookCountersIfNecessary(Node *parsetree);
 static bool IsDropSchemaOrDB(Node *parsetree);
-static bool ShouldUndistributeCitusLocalTables(void);
+static bool ShouldCheckUndistributeCitusLocalTables(void);
+static bool ShouldAddNewTableToMetadata(Node *parsetree);
+static bool ServerUsesPostgresFDW(char *serverName);
+static void ErrorIfOptionListHasNoTableName(List *optionList);
 
 
 /*
@@ -221,10 +234,20 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 										   params, queryEnv, dest, completionTag);
 
 			StoredProcedureLevel -= 1;
+
+			if (InDelegatedProcedureCall && StoredProcedureLevel == 0)
+			{
+				InDelegatedProcedureCall = false;
+			}
 		}
 		PG_CATCH();
 		{
 			StoredProcedureLevel -= 1;
+
+			if (InDelegatedProcedureCall && StoredProcedureLevel == 0)
+			{
+				InDelegatedProcedureCall = false;
+			}
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -270,11 +293,33 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 			 * can happen due to various kinds of drop commands, we immediately
 			 * undistribute them at the end of the command.
 			 */
-			if (ShouldUndistributeCitusLocalTables())
+			if (ShouldCheckUndistributeCitusLocalTables())
 			{
 				UndistributeDisconnectedCitusLocalTables();
 			}
 			ResetConstraintDropped();
+
+			if (context == PROCESS_UTILITY_TOPLEVEL &&
+				ShouldAddNewTableToMetadata(parsetree))
+			{
+				/*
+				 * Here we need to increment command counter so that next command
+				 * can see the new table.
+				 */
+				CommandCounterIncrement();
+				CreateStmt *createTableStmt = (CreateStmt *) parsetree;
+				Oid relationId = RangeVarGetRelid(createTableStmt->relation,
+												  NoLock, false);
+
+				/*
+				 * Here we set autoConverted to false, since the user explicitly
+				 * wants these tables to be added to metadata, by setting the
+				 * GUC use_citus_managed_tables to true.
+				 */
+				bool autoConverted = false;
+				bool cascade = true;
+				CreateCitusLocalTable(relationId, cascade, autoConverted);
+			}
 		}
 
 		UtilityHookLevel--;
@@ -362,7 +407,10 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		parsetree = ProcessCreateSubscriptionStmt(createSubStmt);
 	}
 
-	/* process SET LOCAL stmts of allowed GUCs in multi-stmt xacts */
+	/*
+	 * Process SET LOCAL and SET TRANSACTION statements in multi-statement
+	 * transactions.
+	 */
 	if (IsA(parsetree, VariableSetStmt))
 	{
 		VariableSetStmt *setStmt = (VariableSetStmt *) parsetree;
@@ -634,6 +682,29 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		PostprocessCreateTableStmt(createStatement, queryString);
 	}
 
+	if (IsA(parsetree, CreateForeignTableStmt))
+	{
+		CreateForeignTableStmt *createForeignTableStmt =
+			(CreateForeignTableStmt *) parsetree;
+
+		CreateStmt *createTableStmt = (CreateStmt *) (&createForeignTableStmt->base);
+
+		/*
+		 * Error out with a hint if the foreign table is using postgres_fdw and
+		 * the option table_name is not provided.
+		 * Citus relays all the Citus local foreign table logic to the placement of the
+		 * Citus local table. If table_name is NOT provided, Citus would try to talk to
+		 * the foreign postgres table over the shard's table name, which would not exist
+		 * on the remote server.
+		 */
+		if (ServerUsesPostgresFDW(createForeignTableStmt->servername))
+		{
+			ErrorIfOptionListHasNoTableName(createForeignTableStmt->options);
+		}
+
+		PostprocessCreateTableStmt(createTableStmt, queryString);
+	}
+
 	/* after local command has completed, finish by executing worker DDLJobs, if any */
 	if (ddlJobs != NIL)
 	{
@@ -646,6 +717,17 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		foreach_ptr(ddlJob, ddlJobs)
 		{
 			ExecuteDistributedDDLJob(ddlJob);
+		}
+
+		if (IsA(parsetree, AlterTableStmt))
+		{
+			/*
+			 * This postprocess needs to be done after the distributed ddl jobs have
+			 * been executed in the workers, hence is separate from PostprocessAlterTableStmt.
+			 * We might have wrong index names generated on indexes of shards of partitions,
+			 * so we perform the relevant checks and index renaming here.
+			 */
+			FixAlterTableStmtIndexNames(castNode(AlterTableStmt, parsetree));
 		}
 
 		/*
@@ -661,6 +743,37 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 				/* no failures during CONCURRENTLY, mark the index as valid */
 				MarkIndexValid(indexStmt);
 			}
+
+			/*
+			 * We make sure schema name is not null in the PreprocessIndexStmt.
+			 */
+			Oid schemaId = get_namespace_oid(indexStmt->relation->schemaname, true);
+			Oid relationId = get_relname_relid(indexStmt->relation->relname, schemaId);
+
+			/*
+			 * If this a partitioned table, and CREATE INDEX was not run with ONLY,
+			 * we have wrong index names generated on indexes of shards of
+			 * partitions of this table, so we should fix them.
+			 */
+			if (IsCitusTable(relationId) && PartitionedTable(relationId) &&
+				indexStmt->relation->inh)
+			{
+				/* only fix this specific index */
+				Oid indexRelationId =
+					get_relname_relid(indexStmt->idxname, schemaId);
+
+				FixPartitionShardIndexNames(relationId, indexRelationId);
+			}
+		}
+
+		/*
+		 * Since we must have objects on workers before distributing them,
+		 * mark object distributed as the last step.
+		 */
+		if (ops && ops->markDistributed)
+		{
+			ObjectAddress address = GetObjectAddressFromParseTree(parsetree, false);
+			MarkObjectDistributed(&address);
 		}
 	}
 
@@ -686,7 +799,8 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 /*
  * UndistributeDisconnectedCitusLocalTables undistributes citus local tables that
  * are not connected to any reference tables via their individual foreign key
- * subgraphs.
+ * subgraphs. Note that this function undistributes only the auto-converted tables,
+ * i.e the ones that are converted by Citus by cascading through foreign keys.
  */
 void
 UndistributeDisconnectedCitusLocalTables(void)
@@ -713,7 +827,14 @@ UndistributeDisconnectedCitusLocalTables(void)
 		}
 		ReleaseSysCache(heapTuple);
 
-		if (ConnectedToReferenceTableViaFKey(citusLocalTableId))
+		if (PartitionTable(citusLocalTableId))
+		{
+			/* we skip here, we'll undistribute from the parent if necessary */
+			UnlockRelationOid(citusLocalTableId, lockMode);
+			continue;
+		}
+
+		if (!ShouldUndistributeCitusLocalTable(citusLocalTableId))
 		{
 			/* still connected to a reference table, skip it */
 			UnlockRelationOid(citusLocalTableId, lockMode);
@@ -744,11 +865,11 @@ UndistributeDisconnectedCitusLocalTables(void)
 
 
 /*
- * ShouldUndistributeCitusLocalTables returns true if we might need to check
- * citus local tables for their connectivity to reference tables.
+ * ShouldCheckUndistributeCitusLocalTables returns true if we might need to check
+ * citus local tables for undistributing automatically.
  */
 static bool
-ShouldUndistributeCitusLocalTables(void)
+ShouldCheckUndistributeCitusLocalTables(void)
 {
 	if (!ConstraintDropped)
 	{
@@ -799,6 +920,104 @@ ShouldUndistributeCitusLocalTables(void)
 	}
 
 	return true;
+}
+
+
+/*
+ * ShouldAddNewTableToMetadata takes a Node* and returns true if we need to add a
+ * newly created table to metadata, false otherwise.
+ * This function checks whether the given Node* is a CREATE TABLE statement.
+ * For partitions and temporary tables, ShouldAddNewTableToMetadata returns false.
+ * For other tables created, returns true, if we are on a coordinator that is added
+ * as worker, and ofcourse, if the GUC use_citus_managed_tables is set to on.
+ */
+static bool
+ShouldAddNewTableToMetadata(Node *parsetree)
+{
+	CreateStmt *createTableStmt;
+
+	if (IsA(parsetree, CreateStmt))
+	{
+		createTableStmt = (CreateStmt *) parsetree;
+	}
+	else if (IsA(parsetree, CreateForeignTableStmt))
+	{
+		CreateForeignTableStmt *createForeignTableStmt =
+			(CreateForeignTableStmt *) parsetree;
+		createTableStmt = (CreateStmt *) &(createForeignTableStmt->base);
+	}
+	else
+	{
+		/* if the command is not CREATE [FOREIGN] TABLE, we can early return false */
+		return false;
+	}
+
+	if (createTableStmt->relation->relpersistence == RELPERSISTENCE_TEMP ||
+		createTableStmt->partbound != NULL)
+	{
+		/*
+		 * Shouldn't add table to metadata if it's a temp table, or a partition.
+		 * Creating partitions of a table that is added to metadata is already handled.
+		 */
+		return false;
+	}
+
+	if (AddAllLocalTablesToMetadata && !IsBinaryUpgrade &&
+		IsCoordinator() && CoordinatorAddedAsWorkerNode())
+	{
+		/*
+		 * We have verified that the GUC is set to true, and we are not upgrading,
+		 * and we are on the coordinator that is added as worker node.
+		 * So return true here, to add this newly created table to metadata.
+		 */
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * ServerUsesPostgresFDW gets a foreign server name and returns true if the FDW that
+ * the server depends on is postgres_fdw. Returns false otherwise.
+ */
+static bool
+ServerUsesPostgresFDW(char *serverName)
+{
+	ForeignServer *server = GetForeignServerByName(serverName, false);
+	ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+
+	if (strcmp(fdw->fdwname, "postgres_fdw") == 0)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * ErrorIfOptionListHasNoTableName gets an option list (DefElem) and errors out
+ * if the list does not contain a table_name element.
+ */
+static void
+ErrorIfOptionListHasNoTableName(List *optionList)
+{
+	char *table_nameString = "table_name";
+	DefElem *option = NULL;
+	foreach_ptr(option, optionList)
+	{
+		char *optionName = option->defname;
+		if (strcmp(optionName, table_nameString) == 0)
+		{
+			return;
+		}
+	}
+
+	ereport(ERROR, (errmsg(
+						"table_name option must be provided when using postgres_fdw with Citus"),
+					errhint("Provide the option \"table_name\" with value target table's"
+							" name")));
 }
 
 
@@ -874,7 +1093,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 
 	bool localExecutionSupported = true;
 
-	if (!ddlJob->concurrentIndexCmd)
+	if (!TaskListCannotBeExecutedInTransaction(ddlJob->taskList))
 	{
 		if (shouldSyncMetadata)
 		{
@@ -891,9 +1110,9 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 				SendCommandToWorkersWithMetadata(setSearchPathCommand);
 			}
 
-			if (ddlJob->commandString != NULL)
+			if (ddlJob->metadataSyncCommand != NULL)
 			{
-				SendCommandToWorkersWithMetadata((char *) ddlJob->commandString);
+				SendCommandToWorkersWithMetadata((char *) ddlJob->metadataSyncCommand);
 			}
 		}
 
@@ -906,9 +1125,35 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 		/*
 		 * Start a new transaction to make sure CONCURRENTLY commands
 		 * on localhost do not block waiting for this transaction to finish.
+		 *
+		 * In addition to doing that, we also need to tell other backends
+		 * --including the ones spawned for connections opened to localhost to
+		 * build indexes on shards of this relation-- that concurrent index
+		 * builds can safely ignore us.
+		 *
+		 * Normally, DefineIndex() only does that if index doesn't have any
+		 * predicates (i.e.: where clause) and no index expressions at all.
+		 * However, now that we already called standard process utility,
+		 * index build on the shell table is finished anyway.
+		 *
+		 * The reason behind doing so is that we cannot guarantee not
+		 * grabbing any snapshots via adaptive executor, and the backends
+		 * creating indexes on local shards (if any) might block on waiting
+		 * for current xact of the current backend to finish, which would
+		 * cause self deadlocks that are not detectable.
 		 */
 		if (ddlJob->startNewTransaction)
 		{
+#if PG_VERSION_NUM < 140000
+
+			/*
+			 * Older versions of postgres doesn't have PROC_IN_SAFE_IC flag
+			 * so we cannot use set_indexsafe_procflags in those versions.
+			 *
+			 * For this reason, we do our best to ensure not grabbing any
+			 * snapshots later in the executor.
+			 */
+
 			/*
 			 * If cache is not populated, system catalog lookups will cause
 			 * the xmin of current backend to change. Then the last phase
@@ -929,14 +1174,45 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 			 * will already be in the hash table, hence we won't be holding any snapshots.
 			 */
 			WarmUpConnParamsHash();
+#endif
+
+			/*
+			 * Since it is not certain whether the code-path that we followed
+			 * until reaching here caused grabbing any snapshots or not, we
+			 * need to pop the active snapshot if we had any, to ensure not
+			 * leaking any snapshots.
+			 *
+			 * For example, EnsureCoordinator might return without grabbing
+			 * any snapshots if we didn't receive any invalidation messages
+			 * but the otherwise is also possible.
+			 */
+			if (ActiveSnapshotSet())
+			{
+				PopActiveSnapshot();
+			}
+
 			CommitTransactionCommand();
 			StartTransactionCommand();
+
+#if PG_VERSION_NUM >= 140000
+
+			/*
+			 * Tell other backends to ignore us, even if we grab any
+			 * snapshots via adaptive executor.
+			 */
+			set_indexsafe_procflags();
+
+			/*
+			 * We should not have any CREATE INDEX commands go through the
+			 * local backend as we signaled other backends that this backend
+			 * is executing a "safe" index command (PROC_IN_SAFE_IC), which
+			 * is NOT true, we are only faking postgres based on the reasoning
+			 * given above.
+			 */
+			Assert(localExecutionSupported == false);
+#endif
 		}
 
-		/* save old commit protocol to restore at xact end */
-		Assert(SavedMultiShardCommitProtocol == COMMIT_PROTOCOL_BARE);
-		SavedMultiShardCommitProtocol = MultiShardCommitProtocol;
-		MultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
 		MemoryContext savedContext = CurrentMemoryContext;
 
 		PG_TRY();
@@ -957,7 +1233,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 					commandList = lappend(commandList, setSearchPathCommand);
 				}
 
-				commandList = lappend(commandList, (char *) ddlJob->commandString);
+				commandList = lappend(commandList, (char *) ddlJob->metadataSyncCommand);
 
 				SendBareCommandListToMetadataWorkers(commandList);
 			}
@@ -995,6 +1271,33 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 		PG_END_TRY();
 	}
 }
+
+
+#if PG_VERSION_NUM >= 140000
+
+/*
+ * set_indexsafe_procflags sets PROC_IN_SAFE_IC flag in MyProc->statusFlags.
+ *
+ * The flag is reset automatically at transaction end, so it must be set
+ * for each transaction.
+ *
+ * Copied from pg/src/backend/commands/indexcmds.c
+ * Also see pg commit c98763bf51bf610b3ee7e209fc76c3ff9a6b3163.
+ */
+static void
+set_indexsafe_procflags(void)
+{
+	Assert(MyProc->xid == InvalidTransactionId &&
+		   MyProc->xmin == InvalidTransactionId);
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyProc->statusFlags |= PROC_IN_SAFE_IC;
+	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+	LWLockRelease(ProcArrayLock);
+}
+
+
+#endif
 
 
 /*
@@ -1037,8 +1340,7 @@ CreateCustomDDLTaskList(Oid relationId, TableDDLCommand *command)
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	ddlJob->targetRelationId = relationId;
-	ddlJob->concurrentIndexCmd = false;
-	ddlJob->commandString = GetTableDDLCommand(command);
+	ddlJob->metadataSyncCommand = GetTableDDLCommand(command);
 	ddlJob->taskList = taskList;
 
 	return ddlJob;
@@ -1288,8 +1590,7 @@ NodeDDLTaskList(TargetWorkerSet targets, List *commands)
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	ddlJob->targetRelationId = InvalidOid;
-	ddlJob->concurrentIndexCmd = false;
-	ddlJob->commandString = NULL;
+	ddlJob->metadataSyncCommand = NULL;
 	ddlJob->taskList = list_make1(task);
 
 	return list_make1(ddlJob);
@@ -1315,4 +1616,27 @@ bool
 DropSchemaOrDBInProgress(void)
 {
 	return activeDropSchemaOrDBs > 0;
+}
+
+
+/*
+ * ColumnarTableSetOptionsHook propagates columnar table options to shards, if
+ * necessary.
+ */
+void
+ColumnarTableSetOptionsHook(Oid relationId, ColumnarOptions options)
+{
+	if (EnableDDLPropagation && IsCitusTable(relationId))
+	{
+		/* when a columnar table is distributed update all settings on the shards */
+		Oid namespaceId = get_rel_namespace(relationId);
+		char *schemaName = get_namespace_name(namespaceId);
+		char *relationName = get_rel_name(relationId);
+		TableDDLCommand *command = ColumnarGetCustomTableOptionsDDL(schemaName,
+																	relationName,
+																	options);
+		DDLJob *ddljob = CreateCustomDDLTaskList(relationId, command);
+
+		ExecuteDistributedDDLJob(ddljob);
+	}
 }

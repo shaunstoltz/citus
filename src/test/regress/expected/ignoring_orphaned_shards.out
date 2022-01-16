@@ -129,6 +129,7 @@ SELECT * FROM create_distributed_table('rep1', 'id');
 -- Add the coordinator, so we can have a replicated shard
 SELECT 1 FROM citus_add_node('localhost', :master_port, 0);
 NOTICE:  Replicating reference table "ref" to the node localhost:xxxxx
+NOTICE:  localhost:xxxxx is the coordinator and already contains metadata, skipping syncing the metadata
  ?column?
 ---------------------------------------------------------------------
         1
@@ -249,10 +250,16 @@ SET LOCAL citus.log_local_commands TO ON;
 INSERT INTO rep1 VALUES (1);
 NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;SELECT assign_distributed_transaction_id(xx, xx, 'xxxxxxx');
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+NOTICE:  issuing SELECT lock_shard_resources(3, ARRAY[92448300])
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;SELECT assign_distributed_transaction_id(xx, xx, 'xxxxxxx');
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing INSERT INTO ignoring_orphaned_shards.rep1_92448300 (id) VALUES (1)
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  executing the command locally: INSERT INTO ignoring_orphaned_shards.rep1_92448300 (id) VALUES (1)
 ROLLBACK;
+NOTICE:  issuing ROLLBACK
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing ROLLBACK
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 -- Cause the orphaned shard to be local
@@ -278,9 +285,11 @@ SET LOCAL citus.log_local_commands TO ON;
 INSERT INTO rep1 VALUES (1);
 NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;SELECT assign_distributed_transaction_id(xx, xx, 'xxxxxxx');
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
-NOTICE:  issuing INSERT INTO ignoring_orphaned_shards.rep1_92448300 (id) VALUES (1)
+NOTICE:  issuing SELECT lock_shard_resources(3, ARRAY[92448300])
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;SELECT assign_distributed_transaction_id(xx, xx, 'xxxxxxx');
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+NOTICE:  issuing INSERT INTO ignoring_orphaned_shards.rep1_92448300 (id) VALUES (1)
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing INSERT INTO ignoring_orphaned_shards.rep1_92448300 (id) VALUES (1)
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
@@ -324,6 +333,9 @@ SELECT create_distributed_table('range2', 'id', 'range');
 (1 row)
 
 CALL public.create_range_partitioned_shards('range2', '{0,3}','{2,5}');
+-- Mark tables co-located
+UPDATE pg_dist_partition SET colocationid = 30001
+WHERE logicalrelid = 'range1'::regclass OR logicalrelid = 'range2'::regclass;
 -- Move shard placement and DON'T clean it up, now range1 and range2 are
 -- colocated, but only range2 has an orphaned shard.
 SELECT citus_move_shard_placement(92448600, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'block_writes');
@@ -339,7 +351,7 @@ SELECT shardid, shardstate, nodeport FROM pg_dist_shard_placement WHERE shardid 
  92448600 |          1 |    57637
 (2 rows)
 
--- Make sure that tables are detected as colocated
+-- Make sure co-located join works
 SELECT * FROM range1 JOIN range2 ON range1.id = range2.id;
  id | id
 ---------------------------------------------------------------------

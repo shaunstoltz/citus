@@ -153,8 +153,8 @@ SELECT find_shard_interval_index(1300016);
 
 -- check external colocation API
 
-SELECT count(*) FROM pg_dist_partition WHERE colocationid = 4;
-DELETE FROM pg_dist_colocation WHERE colocationid = 4;
+SELECT count(*) FROM pg_dist_partition WHERE colocationid IN (4, 5);
+DELETE FROM pg_dist_colocation WHERE colocationid IN (4, 5);
 
 SET citus.shard_count = 2;
 
@@ -201,10 +201,6 @@ SELECT create_distributed_table('table_append', 'id', 'append');
 
 CREATE TABLE table_range ( id int );
 SELECT create_distributed_table('table_range', 'id', 'range');
-
--- test foreign table creation
-CREATE FOREIGN TABLE table3_groupD ( id int ) SERVER fake_fdw_server;
-SELECT create_distributed_table('table3_groupD', 'id');
 
 -- check metadata
 SELECT * FROM pg_dist_colocation
@@ -290,8 +286,8 @@ CREATE TABLE table_bigint ( id bigint );
 SELECT create_distributed_table('table_bigint', 'id', colocate_with => 'table1_groupE');
 -- check worker table schemas
 \c - - - :worker_1_port
-SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table3_groupE_1300062'::regclass;
-SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_colocation.table4_groupE_1300064'::regclass;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table3_groupE_1300054'::regclass;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_colocation.table4_groupE_1300056'::regclass;
 
 \c - - - :master_port
 SET citus.next_shard_id TO 1300080;
@@ -553,5 +549,3 @@ DROP TABLE range_table;
 DROP TABLE none;
 DROP TABLE ref;
 DROP TABLE local_table;
-
-

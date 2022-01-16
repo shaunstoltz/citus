@@ -4,6 +4,9 @@ SELECT citus.clear_network_traffic();
 SET citus.shard_count = 2;
 SET citus.shard_replication_factor = 2;
 
+-- this test is designed such that no modification lock is acquired
+SET citus.allow_modifications_from_workers_to_replicated_tables TO false;
+
 CREATE TABLE select_test (key int, value text);
 SELECT create_distributed_table('select_test', 'key');
 
@@ -14,21 +17,17 @@ SELECT citus.mitmproxy('conn.onQuery(query="^SELECT").kill()');
 SELECT * FROM select_test WHERE key = 3;
 SELECT * FROM select_test WHERE key = 3;
 
--- kill after first SELECT; txn should work (though placement marked bad)
+-- kill after first SELECT; txn should fail as INSERT triggers
+-- 2PC (and placementis not marked bad)
 SELECT citus.mitmproxy('conn.onQuery(query="^SELECT").kill()');
 
 BEGIN;
 INSERT INTO select_test VALUES (3, 'more data');
 SELECT * FROM select_test WHERE key = 3;
-INSERT INTO select_test VALUES (3, 'even more data');
-SELECT * FROM select_test WHERE key = 3;
 COMMIT;
 
--- some clean up
-UPDATE pg_dist_shard_placement SET shardstate = 1
-WHERE shardid IN (
-  SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'select_test'::regclass
-);
+SELECT citus.mitmproxy('conn.allow()');
+
 TRUNCATE select_test;
 
 -- now the same tests with query cancellation
@@ -53,6 +52,8 @@ SELECT DISTINCT shardstate FROM  pg_dist_shard_placement
 WHERE shardid IN (
   SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'select_test'::regclass
 );
+
+SELECT citus.mitmproxy('conn.allow()');
 TRUNCATE select_test;
 
 -- cancel the second query
@@ -66,7 +67,7 @@ INSERT INTO select_test VALUES (3, 'even more data');
 SELECT * FROM select_test WHERE key = 3;
 COMMIT;
 
--- error after second SELECT; txn should work (though placement marked bad)
+-- error after second SELECT; txn should fails the transaction
 SELECT citus.mitmproxy('conn.onQuery(query="^SELECT").after(1).reset()');
 
 BEGIN;

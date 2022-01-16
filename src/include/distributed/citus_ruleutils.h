@@ -48,6 +48,9 @@ extern const char * RoleSpecString(RoleSpec *spec, bool withQuoteIdentifier);
 
 /* Function declarations for version dependent PostgreSQL ruleutils functions */
 extern void pg_get_query_def(Query *query, StringInfo buffer);
+bool get_merged_argument_list(CallStmt *stmt, List **mergedNamedArgList,
+							  Oid **mergedNamedArgTypes, List **mergedArgumentList,
+							  int *totalArguments);
 char * pg_get_rule_expr(Node *expression);
 extern void deparse_shard_query(Query *query, Oid distrelid, int64 shardid,
 								StringInfo buffer);
@@ -62,6 +65,7 @@ extern char * generate_relation_name(Oid relid, List *namespaces);
 extern char * generate_qualified_relation_name(Oid relid);
 extern char * generate_operator_name(Oid operid, Oid arg1, Oid arg2);
 extern List * getOwnedSequences_internal(Oid relid, AttrNumber attnum, char deptype);
+extern void AppendOptionListToString(StringInfo stringData, List *options);
 
 
 #endif /* CITUS_RULEUTILS_H */

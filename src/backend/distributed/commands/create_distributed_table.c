@@ -113,6 +113,8 @@ static void EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMe
 static bool ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod, bool
 									viaDeprecatedAPI);
 static void EnsureCitusTableCanBeCreated(Oid relationOid);
+static void EnsureSequenceExistOnMetadataWorkersForRelation(Oid relationId,
+															Oid sequenceOid);
 static List * GetFKeyCreationCommandsRelationInvolvedWithTableType(Oid relationId,
 																   int tableTypeFlag);
 static Oid DropFKeysAndUndistributeTable(Oid relationId);
@@ -127,6 +129,7 @@ static void DoCopyFromLocalTableIntoShards(Relation distributedRelation,
 										   TupleTableSlot *slot,
 										   EState *estate);
 static void ErrorIfTemporaryTable(Oid relationId);
+static void ErrorIfForeignTable(Oid relationOid);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
@@ -331,6 +334,7 @@ EnsureCitusTableCanBeCreated(Oid relationOid)
 	EnsureRelationExists(relationOid);
 	EnsureTableOwner(relationOid);
 	ErrorIfTemporaryTable(relationOid);
+	ErrorIfForeignTable(relationOid);
 
 	/*
 	 * We should do this check here since the codes in the following lines rely
@@ -483,9 +487,12 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	bool localTableEmpty = TableEmpty(relationId);
 	Oid colocatedTableId = ColocatedTableId(colocationId);
 
+	/* setting to false since this flag is only valid for citus local tables */
+	bool autoConverted = false;
+
 	/* create an entry for distributed table in pg_dist_partition */
 	InsertIntoPgDistPartition(relationId, distributionMethod, distributionColumn,
-							  colocationId, replicationModel);
+							  colocationId, replicationModel, autoConverted);
 
 	/*
 	 * Ensure that the sequences used in column defaults of the table
@@ -533,10 +540,11 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 		if (ClusterHasKnownMetadataWorkers())
 		{
 			/*
-			 * Ensure sequence dependencies and mark them as distributed
+			 * Ensure both sequence and its' dependencies and mark them as distributed
 			 * before creating table metadata on workers
 			 */
-			MarkSequenceListDistributedAndPropagateDependencies(dependentSequenceList);
+			MarkSequenceListDistributedAndPropagateWithDependencies(relationId,
+																	dependentSequenceList);
 		}
 
 		CreateTableMetadataOnWorkers(relationId);
@@ -662,39 +670,65 @@ AlterSequenceType(Oid seqOid, Oid typeOid)
 		SetDefElemArg(alterSequenceStatement, "as", asTypeNode);
 		ParseState *pstate = make_parsestate(NULL);
 		AlterSequence(pstate, alterSequenceStatement);
+		CommandCounterIncrement();
 	}
 }
 
 
 /*
- * MarkSequenceListDistributedAndPropagateDependencies ensures dependencies
- * for the given sequence list exist on all nodes and marks the sequences
- * as distributed.
+ * MarkSequenceListDistributedAndPropagateWithDependencies ensures sequences and their
+ * dependencies for the given sequence list exist on all nodes and marks them as distributed.
  */
 void
-MarkSequenceListDistributedAndPropagateDependencies(List *sequenceList)
+MarkSequenceListDistributedAndPropagateWithDependencies(Oid relationId,
+														List *sequenceList)
 {
 	Oid sequenceOid = InvalidOid;
 	foreach_oid(sequenceOid, sequenceList)
 	{
-		MarkSequenceDistributedAndPropagateDependencies(sequenceOid);
+		MarkSequenceDistributedAndPropagateWithDependencies(relationId, sequenceOid);
 	}
 }
 
 
 /*
- * MarkSequenceDistributedAndPropagateDependencies ensures dependencies
- * for the given sequence exist on all nodes and marks the sequence
- * as distributed.
+ * MarkSequenceDistributedAndPropagateWithDependencies ensures sequence and its'
+ * dependencies for the given sequence exist on all nodes and marks them as distributed.
  */
 void
-MarkSequenceDistributedAndPropagateDependencies(Oid sequenceOid)
+MarkSequenceDistributedAndPropagateWithDependencies(Oid relationId, Oid sequenceOid)
 {
 	/* get sequence address */
 	ObjectAddress sequenceAddress = { 0 };
 	ObjectAddressSet(sequenceAddress, RelationRelationId, sequenceOid);
 	EnsureDependenciesExistOnAllNodes(&sequenceAddress);
+	EnsureSequenceExistOnMetadataWorkersForRelation(relationId, sequenceOid);
 	MarkObjectDistributed(&sequenceAddress);
+}
+
+
+/*
+ * EnsureSequenceExistOnMetadataWorkersForRelation ensures sequence for the given relation
+ * exist on each worker node with metadata.
+ */
+static void
+EnsureSequenceExistOnMetadataWorkersForRelation(Oid relationId, Oid sequenceOid)
+{
+	Assert(ShouldSyncTableMetadata(relationId));
+
+	char *ownerName = TableOwner(relationId);
+	List *sequenceDDLList = DDLCommandsForSequence(sequenceOid, ownerName);
+
+	/* prevent recursive propagation */
+	SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
+
+	const char *sequenceCommand = NULL;
+	foreach_ptr(sequenceCommand, sequenceDDLList)
+	{
+		SendCommandToWorkersWithMetadata(sequenceCommand);
+	}
+
+	SendCommandToWorkersWithMetadata(ENABLE_DDL_PROPAGATION);
 }
 
 
@@ -1692,13 +1726,11 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 	ExprContext *econtext = GetPerTupleExprContext(estate);
 	econtext->ecxt_scantuple = slot;
 
-	bool stopOnFailure = true;
 	DestReceiver *copyDest =
 		(DestReceiver *) CreateCitusCopyDestReceiver(distributedRelationId,
 													 columnNameList,
 													 partitionColumnIndex,
-													 estate, stopOnFailure,
-													 NULL);
+													 estate, NULL);
 
 	/* initialise state for writing to shards, we'll open connections on demand */
 	copyDest->rStartup(copyDest, 0, tupleDescriptor);
@@ -1849,4 +1881,23 @@ DistributionColumnUsesGeneratedStoredColumn(TupleDesc relationDesc,
 	}
 
 	return false;
+}
+
+
+/*
+ * ErrorIfForeignTable errors out if the relation with given relationOid
+ * is a foreign table.
+ */
+static void
+ErrorIfForeignTable(Oid relationOid)
+{
+	if (IsForeignTable(relationOid))
+	{
+		char *relname = get_rel_name(relationOid);
+		char *qualifiedRelname = generate_qualified_relation_name(relationOid);
+		ereport(ERROR, (errmsg("foreign tables cannot be distributed"),
+						(errhint("Can add foreign table \"%s\" to metadata by running: "
+								 "SELECT citus_add_local_table_to_metadata($$%s$$);",
+								 relname, qualifiedRelname))));
+	}
 }

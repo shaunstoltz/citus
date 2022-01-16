@@ -36,6 +36,7 @@
 #include "distributed/version_compat.h"
 #include "distributed/worker_log_messages.h"
 #include "mb/pg_wchar.h"
+#include "pg_config.h"
 #include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "utils/hsearch.h"
@@ -56,6 +57,7 @@ static int ConnectionHashCompare(const void *a, const void *b, Size keysize);
 static void StartConnectionEstablishment(MultiConnection *connectionn,
 										 ConnectionHashKey *key);
 static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
+static void ErrorIfMultipleMetadataConnectionExists(dlist_head *connections);
 static void FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry);
 static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit);
 static bool ShouldShutdownConnection(MultiConnection *connection, const int
@@ -329,6 +331,12 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 			return connection;
 		}
 	}
+	else if (flags & REQUIRE_METADATA_CONNECTION)
+	{
+		/* FORCE_NEW_CONNECTION and REQUIRE_METADATA_CONNECTION are incompatible */
+		ereport(ERROR, (errmsg("metadata connections cannot be forced to open "
+							   "a new connection")));
+	}
 
 
 	/*
@@ -389,6 +397,12 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 
 	ResetShardPlacementAssociation(connection);
 
+
+	if ((flags & REQUIRE_METADATA_CONNECTION))
+	{
+		connection->useForMetadataOperations = true;
+	}
+
 	/* fully initialized the connection, record it */
 	connection->initilizationState = POOL_STATE_INITIALIZED;
 
@@ -405,8 +419,9 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 static MultiConnection *
 FindAvailableConnection(dlist_head *connections, uint32 flags)
 {
-	dlist_iter iter;
+	List *metadataConnectionCandidateList = NIL;
 
+	dlist_iter iter;
 	dlist_foreach(iter, connections)
 	{
 		MultiConnection *connection =
@@ -429,12 +444,18 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 			continue;
 		}
 
-		if (connection->forceCloseAtTransactionEnd)
+		if (connection->forceCloseAtTransactionEnd &&
+			!connection->remoteTransaction.beginSent)
 		{
 			/*
-			 * This is a connection that should be closed, probabably because
-			 * of old connection options. So we ignore it. It will
-			 * automatically be closed at the end of the transaction.
+			 * This is a connection that should be closed, probably because
+			 * of old connection options or removing a node. This will
+			 * automatically be closed at the end of the transaction. But, if we are still
+			 * inside a transaction, we should keep using this connection as long as a remote
+			 * transaction is in progress over the connection. The main use for this case
+			 * is having some commands inside a transaction block after removing nodes. And, we
+			 * currently allow very limited operations after removing a node inside a
+			 * transaction block (e.g., no placement access can happen).
 			 */
 			continue;
 		}
@@ -448,10 +469,77 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 			continue;
 		}
 
+		if ((flags & REQUIRE_METADATA_CONNECTION) &&
+			!connection->useForMetadataOperations)
+		{
+			/*
+			 * The caller requested a metadata connection, and this is not the
+			 * metadata connection. Still, this is a candidate for becoming a
+			 * metadata connection.
+			 */
+			metadataConnectionCandidateList =
+				lappend(metadataConnectionCandidateList, connection);
+			continue;
+		}
+
 		return connection;
 	}
 
+	if ((flags & REQUIRE_METADATA_CONNECTION) &&
+		list_length(metadataConnectionCandidateList) > 0)
+	{
+		/*
+		 * Caller asked a metadata connection, and we couldn't find a connection
+		 * that has already been used for metadata operations.
+		 *
+		 * So, we pick the first connection as the metadata connection.
+		 */
+		MultiConnection *metadataConnection =
+			linitial(metadataConnectionCandidateList);
+
+		Assert(!metadataConnection->claimedExclusively);
+
+		/* remember that we use this connection for metadata operations */
+		metadataConnection->useForMetadataOperations = true;
+
+		/*
+		 * We cannot have multiple metadata connections. If we see
+		 * this error, it is likely that there is a bug in connection
+		 * management.
+		 */
+		ErrorIfMultipleMetadataConnectionExists(connections);
+
+		return metadataConnection;
+	}
+
 	return NULL;
+}
+
+
+/*
+ * ErrorIfMultipleMetadataConnectionExists throws an error if the
+ * input connection dlist contains more than one metadata connections.
+ */
+static void
+ErrorIfMultipleMetadataConnectionExists(dlist_head *connections)
+{
+	bool foundMetadataConnection = false;
+	dlist_iter iter;
+	dlist_foreach(iter, connections)
+	{
+		MultiConnection *connection =
+			dlist_container(MultiConnection, connectionNode, iter.cur);
+
+		if (connection->useForMetadataOperations)
+		{
+			if (foundMetadataConnection)
+			{
+				ereport(ERROR, (errmsg("cannot have multiple metadata connections")));
+			}
+
+			foundMetadataConnection = true;
+		}
+	}
 }
 
 
@@ -948,7 +1036,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		if (eventCount == 0)
 		{
 			/*
-			 * timeout has occured on waitset, double check the timeout since
+			 * timeout has occurred on waitset, double check the timeout since
 			 * connectionStart and if passed close all non-finished connections
 			 */
 
@@ -1155,6 +1243,8 @@ StartConnectionEstablishment(MultiConnection *connection, ConnectionHashKey *key
 }
 
 
+#if PG_VERSION_NUM < 140000
+
 /*
  * WarmUpConnParamsHash warms up the ConnParamsHash by loading all the
  * conn params for active primary nodes.
@@ -1174,6 +1264,9 @@ WarmUpConnParamsHash(void)
 		FindOrCreateConnParamsEntry(&key);
 	}
 }
+
+
+#endif
 
 
 /*

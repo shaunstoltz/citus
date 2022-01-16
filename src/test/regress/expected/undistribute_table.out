@@ -128,23 +128,6 @@ SELECT undistribute_table('referencing_table');
 ERROR:  cannot complete operation because table referencing_table has a foreign key
 HINT:  Use cascade option to undistribute all the relations involved in a foreign key relationship with undistribute_table.referencing_table by executing SELECT undistribute_table($$undistribute_table.referencing_table$$, cascade_via_foreign_keys=>true)
 DROP TABLE referenced_table, referencing_table;
--- test distributed foreign tables
--- we expect errors
-CREATE FOREIGN TABLE foreign_table (
-  id bigint not null,
-  full_name text not null default ''
-) SERVER fake_fdw_server OPTIONS (encoding 'utf-8', compression 'true');
-SELECT create_distributed_table('foreign_table', 'id');
-NOTICE:  foreign-data wrapper "fake_fdw" does not have an extension defined
-NOTICE:  foreign-data wrapper "fake_fdw" does not have an extension defined
- create_distributed_table
----------------------------------------------------------------------
-
-(1 row)
-
-SELECT undistribute_table('foreign_table');
-ERROR:  cannot complete operation because it is a foreign table
-DROP FOREIGN TABLE foreign_table;
 -- test partitioned tables
 CREATE TABLE partitioned_table (id INT, a INT) PARTITION BY RANGE (id);
 CREATE TABLE partitioned_table_1_5 PARTITION OF partitioned_table FOR VALUES FROM (1) TO (5);
@@ -164,7 +147,7 @@ SELECT logicalrelid FROM pg_dist_partition WHERE logicalrelid::regclass::text LI
  partitioned_table_6_10
 (3 rows)
 
-SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relname LIKE 'partitioned\_table%'$$);
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relname SIMILAR TO 'partitioned\_table%\d{3,}'$$);
  run_command_on_workers
 ---------------------------------------------------------------------
  (localhost,57637,t,6)
@@ -225,7 +208,7 @@ SELECT logicalrelid FROM pg_dist_partition WHERE logicalrelid::regclass::text LI
 ---------------------------------------------------------------------
 (0 rows)
 
-SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relname LIKE 'partitioned\_table%'$$);
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relname SIMILAR TO 'partitioned\_table%\d{3,}'$$);
  run_command_on_workers
 ---------------------------------------------------------------------
  (localhost,57637,t,0)

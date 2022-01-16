@@ -67,6 +67,7 @@
 	(strncmp(arg, prefix, strlen(prefix)) == 0)
 
 /* forward declaration for helper functions*/
+static void ErrorIfAnyNodeDoesNotHaveMetadata(void);
 static char * GetAggregateDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace);
 static char * GetFunctionAlterOwnerCommand(const RegProcedure funcOid);
 static int GetDistributionArgIndex(Oid functionOid, char *distributionArgumentName,
@@ -76,13 +77,10 @@ static int GetFunctionColocationId(Oid functionOid, char *colocateWithName, Oid
 static void EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid
 												  distributionColumnType, Oid
 												  sourceRelationId);
-static void UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
-										   int *distribution_argument_index,
-										   int *colocationId);
 static void EnsureSequentialModeForFunctionDDL(void);
-static void TriggerSyncMetadataToPrimaryNodes(void);
 static bool ShouldPropagateCreateFunction(CreateFunctionStmt *stmt);
 static bool ShouldPropagateAlterFunction(const ObjectAddress *address);
+static bool ShouldAddFunctionSignature(FunctionParameterMode mode);
 static ObjectAddress FunctionToObjectAddress(ObjectType objectType,
 											 ObjectWithArgs *objectWithArgs,
 											 bool missing_ok);
@@ -188,13 +186,21 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	const char *createFunctionSQL = GetFunctionDDLCommand(funcOid, true);
 	const char *alterFunctionOwnerSQL = GetFunctionAlterOwnerCommand(funcOid);
 	initStringInfo(&ddlCommand);
-	appendStringInfo(&ddlCommand, "%s;%s", createFunctionSQL, alterFunctionOwnerSQL);
+	appendStringInfo(&ddlCommand, "%s;%s;%s;%s", DISABLE_OBJECT_PROPAGATION,
+					 createFunctionSQL, alterFunctionOwnerSQL, ENABLE_OBJECT_PROPAGATION);
 	SendCommandToWorkersAsUser(NON_COORDINATOR_NODES, CurrentUserName(), ddlCommand.data);
 
 	MarkObjectDistributed(&functionAddress);
 
 	if (distributionArgumentName != NULL)
 	{
+		/*
+		 * Prior to Citus 11, this code was triggering metadata
+		 * syncing. However, with Citus 11+, we expect the metadata
+		 * has already been synced.
+		 */
+		ErrorIfAnyNodeDoesNotHaveMetadata();
+
 		DistributeFunctionWithDistributionArgument(funcOid, distributionArgumentName,
 												   distributionArgumentOid,
 												   colocateWithTableName,
@@ -207,10 +213,45 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	}
 	else if (colocatedWithReferenceTable)
 	{
+		/*
+		 * Prior to Citus 11, this code was triggering metadata
+		 * syncing. However, with Citus 11+, we expect the metadata
+		 * has already been synced.
+		 */
+		ErrorIfAnyNodeDoesNotHaveMetadata();
+
 		DistributeFunctionColocatedWithReferenceTable(&functionAddress);
 	}
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * ErrorIfAnyNodeDoesNotHaveMetadata throws error if any
+ * of the worker nodes does not have the metadata.
+ */
+static void
+ErrorIfAnyNodeDoesNotHaveMetadata(void)
+{
+	List *workerNodeList =
+		ActivePrimaryNonCoordinatorNodeList(ShareLock);
+
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
+	{
+		if (!workerNode->hasMetadata)
+		{
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cannot process the distributed function "
+								   "since the node %s:%d does not have metadata "
+								   "synced and this command requires all the nodes "
+								   "have the metadata sycned", workerNode->workerName,
+								   workerNode->workerPort),
+							errhint("To sync the metadata execute: "
+									"SELECT enable_citus_mx_for_pre_citus11();")));
+		}
+	}
 }
 
 
@@ -239,13 +280,6 @@ DistributeFunctionWithDistributionArgument(RegProcedure funcOid,
 	/* record the distribution argument and colocationId */
 	UpdateFunctionDistributionInfo(functionAddress, &distributionArgumentIndex,
 								   &colocationId);
-
-	/*
-	 * Once we have at least one distributed function/procedure with distribution
-	 * argument, we sync the metadata to nodes so that the function/procedure
-	 * delegation can be handled locally on the nodes.
-	 */
-	TriggerSyncMetadataToPrimaryNodes();
 }
 
 
@@ -260,7 +294,7 @@ DistributeFunctionColocatedWithDistributedTable(RegProcedure funcOid,
 {
 	/*
 	 * cannot provide colocate_with without distribution_arg_name when the function
-	 * is not collocated with a reference table
+	 * is not colocated with a reference table
 	 */
 	if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
 	{
@@ -294,13 +328,6 @@ DistributeFunctionColocatedWithReferenceTable(const ObjectAddress *functionAddre
 	int *distributionArgumentIndex = NULL;
 	UpdateFunctionDistributionInfo(functionAddress, distributionArgumentIndex,
 								   &colocationId);
-
-	/*
-	 * Once we have at least one distributed function/procedure that reads
-	 * from a reference table, we sync the metadata to nodes so that the
-	 * function/procedure delegation can be handled locally on the nodes.
-	 */
-	TriggerSyncMetadataToPrimaryNodes();
 }
 
 
@@ -564,8 +591,9 @@ EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid distributionColumnTyp
 /*
  * UpdateFunctionDistributionInfo gets object address of a function and
  * updates its distribution_argument_index and colocationId in pg_dist_object.
+ * Then update pg_dist_object on nodes with metadata if object propagation is on.
  */
-static void
+void
 UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 							   int *distribution_argument_index,
 							   int *colocationId)
@@ -638,6 +666,37 @@ UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 	systable_endscan(scanDescriptor);
 
 	table_close(pgDistObjectRel, NoLock);
+
+	if (EnableDependencyCreation)
+	{
+		List *objectAddressList = list_make1((ObjectAddress *) distAddress);
+		List *distArgumentIndexList = NIL;
+		List *colocationIdList = NIL;
+
+		if (distribution_argument_index == NULL)
+		{
+			distArgumentIndexList = list_make1_int(INVALID_DISTRIBUTION_ARGUMENT_INDEX);
+		}
+		else
+		{
+			distArgumentIndexList = list_make1_int(*distribution_argument_index);
+		}
+
+		if (colocationId == NULL)
+		{
+			colocationIdList = list_make1_int(INVALID_COLOCATION_ID);
+		}
+		else
+		{
+			colocationIdList = list_make1_int(*colocationId);
+		}
+
+		char *workerPgDistObjectUpdateCommand =
+			MarkObjectsDistributedCreateCommand(objectAddressList,
+												distArgumentIndexList,
+												colocationIdList);
+		SendCommandToWorkersWithMetadata(workerPgDistObjectUpdateCommand);
+	}
 }
 
 
@@ -1089,47 +1148,6 @@ EnsureSequentialModeForFunctionDDL(void)
 
 
 /*
- * TriggerSyncMetadataToPrimaryNodes iterates over the active primary nodes,
- * and triggers the metadata syncs if the node has not the metadata. Later,
- * maintenance daemon will sync the metadata to nodes.
- */
-static void
-TriggerSyncMetadataToPrimaryNodes(void)
-{
-	List *workerList = ActivePrimaryNonCoordinatorNodeList(ShareLock);
-	bool triggerMetadataSync = false;
-
-	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerList)
-	{
-		/* if already has metadata, no need to do it again */
-		if (!workerNode->hasMetadata)
-		{
-			/*
-			 * Let the maintanince deamon do the hard work of syncing the metadata. We prefer
-			 * this because otherwise node activation might fail withing transaction blocks.
-			 */
-			LockRelationOid(DistNodeRelationId(), ExclusiveLock);
-			SetWorkerColumnLocalOnly(workerNode, Anum_pg_dist_node_hasmetadata,
-									 BoolGetDatum(true));
-
-			triggerMetadataSync = true;
-		}
-		else if (!workerNode->metadataSynced)
-		{
-			triggerMetadataSync = true;
-		}
-	}
-
-	/* let the maintanince deamon know about the metadata sync */
-	if (triggerMetadataSync)
-	{
-		TriggerMetadataSyncOnCommit();
-	}
-}
-
-
-/*
  * ShouldPropagateCreateFunction tests if we need to propagate a CREATE FUNCTION
  * statement. We only propagate replace's of distributed functions to keep the function on
  * the workers in sync with the one on the coordinator.
@@ -1298,7 +1316,11 @@ CreateFunctionStmtObjectAddress(Node *node, bool missing_ok)
 	FunctionParameter *funcParam = NULL;
 	foreach_ptr(funcParam, stmt->parameters)
 	{
-		objectWithArgs->objargs = lappend(objectWithArgs->objargs, funcParam->argType);
+		if (ShouldAddFunctionSignature(funcParam->mode))
+		{
+			objectWithArgs->objargs = lappend(objectWithArgs->objargs,
+											  funcParam->argType);
+		}
 	}
 
 	return FunctionToObjectAddress(objectType, objectWithArgs, missing_ok);
@@ -1487,7 +1509,7 @@ PreprocessDropFunctionStmt(Node *node, const char *queryString,
 	{
 		/*
 		 * extensions should be created separately on the workers, types cascading from an
-		 * extension should therefor not be propagated here.
+		 * extension should therefore not be propagated here.
 		 */
 		return NIL;
 	}
@@ -1588,7 +1610,7 @@ PreprocessAlterFunctionDependsStmt(Node *node, const char *queryString,
 	{
 		/*
 		 * extensions should be created separately on the workers, types cascading from an
-		 * extension should therefor not be propagated here.
+		 * extension should therefore not be propagated here.
 		 */
 		return NIL;
 	}
@@ -1855,8 +1877,7 @@ ObjectWithArgsFromOid(Oid funcOid)
 
 	for (int i = 0; i < numargs; i++)
 	{
-		if (argModes == NULL ||
-			argModes[i] != PROARGMODE_OUT || argModes[i] != PROARGMODE_TABLE)
+		if (argModes == NULL || ShouldAddFunctionSignature(argModes[i]))
 		{
 			objargs = lappend(objargs, makeTypeNameFromOid(argTypes[i], -1));
 		}
@@ -1866,6 +1887,35 @@ ObjectWithArgsFromOid(Oid funcOid)
 	ReleaseSysCache(proctup);
 
 	return objectWithArgs;
+}
+
+
+/*
+ * ShouldAddFunctionSignature takes a FunctionParameterMode and returns true if it should
+ * be included in the function signature. Returns false otherwise.
+ */
+static bool
+ShouldAddFunctionSignature(FunctionParameterMode mode)
+{
+	/* only input parameters should be added to the generated signature */
+	switch (mode)
+	{
+		case FUNC_PARAM_IN:
+		case FUNC_PARAM_INOUT:
+		case FUNC_PARAM_VARIADIC:
+		{
+			return true;
+		}
+
+		case FUNC_PARAM_OUT:
+		case FUNC_PARAM_TABLE:
+		{
+			return false;
+		}
+
+		default:
+			return true;
+	}
 }
 
 

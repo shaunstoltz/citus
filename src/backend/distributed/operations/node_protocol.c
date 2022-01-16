@@ -64,12 +64,9 @@
 #include "utils/ruleutils.h"
 #include "utils/varlena.h"
 
-#include "columnar/columnar_tableam.h"
-
 /* Shard related configuration */
 int ShardCount = 32;
 int ShardReplicationFactor = 1; /* desired replication factor for shards */
-int ShardMaxSize = 1048576;     /* maximum size in KB one shard can grow to */
 int ShardPlacementPolicy = SHARD_PLACEMENT_ROUND_ROBIN;
 int NextShardId = 0;
 int NextPlacementId = 0;
@@ -81,6 +78,10 @@ static void GatherIndexAndConstraintDefinitionListExcludingReplicaIdentity(Form_
 																		   int indexFlags);
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
 
+static char * CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
+											   const ColumnarOptions *options);
+static char * GetTableDDLCommandColumnar(void *context);
+static TableDDLCommand * ColumnarGetTableOptionsDDL(Oid relationId);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_get_table_metadata);
@@ -95,100 +96,13 @@ PG_FUNCTION_INFO_V1(master_stage_shard_placement_row);
 
 
 /*
- * master_get_table_metadata takes in a relation name, and returns partition
- * related metadata for the relation. These metadata are grouped and returned in
- * a tuple, and are used by the caller when creating new shards. The function
- * errors if given relation does not exist, or is not partitioned.
+ * master_get_table_metadata is a deprecated UDF.
  */
 Datum
 master_get_table_metadata(PG_FUNCTION_ARGS)
 {
-	CheckCitusVersion(ERROR);
-
-	text *relationName = PG_GETARG_TEXT_P(0);
-	Oid relationId = ResolveRelationId(relationName, false);
-
-	Datum partitionKeyExpr = 0;
-	Datum partitionKey = 0;
-	TupleDesc metadataDescriptor = NULL;
-	Datum values[TABLE_METADATA_FIELDS];
-	bool isNulls[TABLE_METADATA_FIELDS];
-
-	/* find partition tuple for partitioned relation */
-	CitusTableCacheEntry *partitionEntry = GetCitusTableCacheEntry(relationId);
-
-	/* create tuple descriptor for return value */
-	TypeFuncClass resultTypeClass = get_call_result_type(fcinfo, NULL,
-														 &metadataDescriptor);
-	if (resultTypeClass != TYPEFUNC_COMPOSITE)
-	{
-		ereport(ERROR, (errmsg("return type must be a row type")));
-	}
-
-	/* form heap tuple for table metadata */
-	memset(values, 0, sizeof(values));
-	memset(isNulls, false, sizeof(isNulls));
-
-	char *partitionKeyString = partitionEntry->partitionKeyString;
-
-	/* reference tables do not have partition key */
-	if (partitionKeyString == NULL)
-	{
-		partitionKey = PointerGetDatum(NULL);
-		isNulls[3] = true;
-	}
-	else
-	{
-		/* get decompiled expression tree for partition key */
-		partitionKeyExpr =
-			PointerGetDatum(cstring_to_text(partitionEntry->partitionKeyString));
-		partitionKey = DirectFunctionCall2(pg_get_expr, partitionKeyExpr,
-										   ObjectIdGetDatum(relationId));
-	}
-
-	uint64 shardMaxSizeInBytes = (int64) ShardMaxSize * 1024L;
-
-	/* get storage type */
-	char shardStorageType = ShardStorageType(relationId);
-
-	values[0] = ObjectIdGetDatum(relationId);
-	values[1] = shardStorageType;
-	values[2] = partitionEntry->partitionMethod;
-	values[3] = partitionKey;
-	values[4] = Int32GetDatum(ShardReplicationFactor);
-	values[5] = Int64GetDatum(shardMaxSizeInBytes);
-	values[6] = Int32GetDatum(ShardPlacementPolicy);
-
-	HeapTuple metadataTuple = heap_form_tuple(metadataDescriptor, values, isNulls);
-	Datum metadataDatum = HeapTupleGetDatum(metadataTuple);
-
-	PG_RETURN_DATUM(metadataDatum);
-}
-
-
-/*
- * CStoreTable returns true if the given relationId belongs to a foreign cstore
- * table, otherwise it returns false.
- */
-bool
-CStoreTable(Oid relationId)
-{
-	bool cstoreTable = false;
-
-	char relationKind = get_rel_relkind(relationId);
-	if (relationKind == RELKIND_FOREIGN_TABLE)
-	{
-		ForeignTable *foreignTable = GetForeignTable(relationId);
-		ForeignServer *server = GetForeignServer(foreignTable->serverid);
-		ForeignDataWrapper *foreignDataWrapper = GetForeignDataWrapper(server->fdwid);
-
-		if (strncmp(foreignDataWrapper->fdwname, CSTORE_FDW_NAME, NAMEDATALEN) == 0)
-		{
-			cstoreTable = true;
-		}
-	}
-
-	return cstoreTable;
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("master_get_table_metadata is deprecated")));
 }
 
 
@@ -662,22 +576,6 @@ GetPreLoadTableCreationCommands(Oid relationId,
 
 	PushOverrideEmptySearchPath(CurrentMemoryContext);
 
-	/* if foreign table, fetch extension and server definitions */
-	char tableType = get_rel_relkind(relationId);
-	if (tableType == RELKIND_FOREIGN_TABLE)
-	{
-		char *extensionDef = pg_get_extensiondef_string(relationId);
-		char *serverDef = pg_get_serverdef_string(relationId);
-
-		if (extensionDef != NULL)
-		{
-			tableDDLEventList = lappend(tableDDLEventList,
-										makeTableDDLCommandString(extensionDef));
-		}
-		tableDDLEventList = lappend(tableDDLEventList,
-									makeTableDDLCommandString(serverDef));
-	}
-
 	/* fetch table schema and column option definitions */
 	char *tableSchemaDef = pg_get_tableschemadef_string(relationId,
 														includeSequenceDefaults,
@@ -907,15 +805,7 @@ ShardStorageType(Oid relationId)
 	}
 	else if (relationType == RELKIND_FOREIGN_TABLE)
 	{
-		bool cstoreTable = CStoreTable(relationId);
-		if (cstoreTable)
-		{
-			shardStorageType = SHARD_STORAGE_COLUMNAR;
-		}
-		else
-		{
-			shardStorageType = SHARD_STORAGE_FOREIGN;
-		}
+		shardStorageType = SHARD_STORAGE_FOREIGN;
 	}
 	else
 	{
@@ -1113,4 +1003,119 @@ GetTableDDLCommand(TableDDLCommand *command)
 
 	/* unreachable: compiler should warn/error when not all cases are covered above */
 	ereport(ERROR, (errmsg("unsupported TableDDLCommand: %d", command->type)));
+}
+
+
+/*
+ * CitusCreateAlterColumnarTableSet generates a portable
+ */
+static char *
+CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
+								 const ColumnarOptions *options)
+{
+	StringInfoData buf = { 0 };
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf,
+					 "SELECT alter_columnar_table_set(%s, "
+					 "chunk_group_row_limit => %d, "
+					 "stripe_row_limit => %lu, "
+					 "compression_level => %d, "
+					 "compression => %s);",
+					 quote_literal_cstr(qualifiedRelationName),
+					 options->chunkRowCount,
+					 options->stripeRowCount,
+					 options->compressionLevel,
+					 quote_literal_cstr(CompressionTypeStr(options->compressionType)));
+
+	return buf.data;
+}
+
+
+/*
+ * GetTableDDLCommandColumnar is an internal function used to turn a
+ * ColumnarTableDDLContext stored on the context of a TableDDLCommandFunction into a sql
+ * command that will be executed against a table. The resulting command will set the
+ * options of the table to the same options as the relation on the coordinator.
+ */
+static char *
+GetTableDDLCommandColumnar(void *context)
+{
+	ColumnarTableDDLContext *tableDDLContext = (ColumnarTableDDLContext *) context;
+
+	char *qualifiedShardName = quote_qualified_identifier(tableDDLContext->schemaName,
+														  tableDDLContext->relationName);
+
+	return CitusCreateAlterColumnarTableSet(qualifiedShardName,
+											&tableDDLContext->options);
+}
+
+
+/*
+ * GetShardedTableDDLCommandColumnar is an internal function used to turn a
+ * ColumnarTableDDLContext stored on the context of a TableDDLCommandFunction into a sql
+ * command that will be executed against a shard. The resulting command will set the
+ * options of the shard to the same options as the relation the shard is based on.
+ */
+char *
+GetShardedTableDDLCommandColumnar(uint64 shardId, void *context)
+{
+	ColumnarTableDDLContext *tableDDLContext = (ColumnarTableDDLContext *) context;
+
+	/*
+	 * AppendShardId is destructive of the original cahr *, given we want to serialize
+	 * more than once we copy it before appending the shard id.
+	 */
+	char *relationName = pstrdup(tableDDLContext->relationName);
+	AppendShardIdToName(&relationName, shardId);
+
+	char *qualifiedShardName = quote_qualified_identifier(tableDDLContext->schemaName,
+														  relationName);
+
+	return CitusCreateAlterColumnarTableSet(qualifiedShardName,
+											&tableDDLContext->options);
+}
+
+
+/*
+ * ColumnarGetCustomTableOptionsDDL returns a TableDDLCommand representing a command that
+ * will apply the passed columnar options to the relation identified by relationId on a
+ * new table or shard.
+ */
+TableDDLCommand *
+ColumnarGetCustomTableOptionsDDL(char *schemaName, char *relationName,
+								 ColumnarOptions options)
+{
+	ColumnarTableDDLContext *context = (ColumnarTableDDLContext *) palloc0(
+		sizeof(ColumnarTableDDLContext));
+
+	/* build the context */
+	context->schemaName = schemaName;
+	context->relationName = relationName;
+	context->options = options;
+
+	/* create TableDDLCommand based on the context build above */
+	return makeTableDDLCommandFunction(
+		GetTableDDLCommandColumnar,
+		GetShardedTableDDLCommandColumnar,
+		context);
+}
+
+
+/*
+ * ColumnarGetTableOptionsDDL returns a TableDDLCommand representing a command that will
+ * apply the columnar options currently applicable to the relation identified by
+ * relationId on a new table or shard.
+ */
+static TableDDLCommand *
+ColumnarGetTableOptionsDDL(Oid relationId)
+{
+	Oid namespaceId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(namespaceId);
+	char *relationName = get_rel_name(relationId);
+
+	ColumnarOptions options = { 0 };
+	ReadColumnarOptions(relationId, &options);
+
+	return ColumnarGetCustomTableOptionsDDL(schemaName, relationName, options);
 }

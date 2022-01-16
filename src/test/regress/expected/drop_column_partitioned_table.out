@@ -2,12 +2,6 @@ CREATE SCHEMA drop_column_partitioned_table;
 SET search_path TO drop_column_partitioned_table;
 SET citus.shard_replication_factor TO 1;
 SET citus.next_shard_id TO 2580000;
-SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
- start_metadata_sync_to_node
----------------------------------------------------------------------
-
-(1 row)
-
 -- create a partitioned table with some columns that
 -- are going to be dropped within the tests
 CREATE TABLE sensors(
@@ -130,7 +124,8 @@ FROM
 WHERE
 	logicalrelid IN ('sensors'::regclass, 'sensors_2000'::regclass,
 					 'sensors_2001'::regclass, 'sensors_2002'::regclass,
-					 'sensors_2003'::regclass, 'sensors_2004'::regclass);
+					 'sensors_2003'::regclass, 'sensors_2004'::regclass)
+ORDER BY 1,2;
  logicalrelid | column_to_column_name
 ---------------------------------------------------------------------
  sensors      | measureid
@@ -152,7 +147,7 @@ WITH
 	all_shardids AS (SELECT * FROM sensors_shardid UNION SELECT * FROM sensors_2000_shardid UNION
 					 SELECT * FROM sensors_2001_shardid UNION SELECT * FROM sensors_2002_shardid
 					 UNION SELECT * FROM sensors_2003_shardid UNION SELECT * FROM sensors_2004_shardid)
-SELECT logicalrelid, shardid, shardminvalue, shardmaxvalue FROM pg_dist_shard WHERE shardid IN (SELECT * FROM all_shardids);
+SELECT logicalrelid, shardid, shardminvalue, shardmaxvalue FROM pg_dist_shard WHERE shardid IN (SELECT * FROM all_shardids) ORDER BY 1,2,3,4;
  logicalrelid | shardid | shardminvalue | shardmaxvalue
 ---------------------------------------------------------------------
  sensors      | 2580001 | -1073741824   | -1
@@ -363,7 +358,8 @@ FROM
 WHERE
 	logicalrelid IN ('sensors'::regclass, 'sensors_2000'::regclass,
 					 'sensors_2001'::regclass, 'sensors_2002'::regclass,
-					 'sensors_2003'::regclass, 'sensors_2004'::regclass);
+					 'sensors_2003'::regclass, 'sensors_2004'::regclass)
+ORDER BY 1,2;
  logicalrelid | column_to_column_name
 ---------------------------------------------------------------------
  sensors      | measureid
@@ -383,7 +379,8 @@ FROM
 WHERE
 	logicalrelid IN ('sensors'::regclass, 'sensors_2000'::regclass,
 					 'sensors_2001'::regclass, 'sensors_2002'::regclass,
-					 'sensors_2003'::regclass, 'sensors_2004'::regclass);
+					 'sensors_2003'::regclass, 'sensors_2004'::regclass)
+ORDER BY 1,2;
  logicalrelid | column_to_column_name
 ---------------------------------------------------------------------
  sensors      | measureid
@@ -397,9 +394,3 @@ WHERE
 \c - - - :master_port
 SET client_min_messages TO WARNING;
 DROP SCHEMA drop_column_partitioned_table CASCADE;
-SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
- stop_metadata_sync_to_node
----------------------------------------------------------------------
-
-(1 row)
-

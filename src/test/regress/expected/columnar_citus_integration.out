@@ -259,7 +259,7 @@ NOTICE:  renaming the new table to columnar_citus_integration.table_option
 (1 row)
 
 SELECT * FROM pg_dist_partition WHERE logicalrelid = 'table_option'::regclass;
- logicalrelid | partmethod | partkey | colocationid | repmodel
+ logicalrelid | partmethod | partkey | colocationid | repmodel | autoconverted
 ---------------------------------------------------------------------
 (0 rows)
 
@@ -578,7 +578,7 @@ NOTICE:  renaming the new table to columnar_citus_integration.table_option
 (1 row)
 
 SELECT * FROM pg_dist_partition WHERE logicalrelid = 'table_option'::regclass;
- logicalrelid | partmethod | partkey | colocationid | repmodel
+ logicalrelid | partmethod | partkey | colocationid | repmodel | autoconverted
 ---------------------------------------------------------------------
 (0 rows)
 
@@ -817,7 +817,7 @@ NOTICE:  renaming the new table to columnar_citus_integration.table_option_refer
 (1 row)
 
 SELECT * FROM pg_dist_partition WHERE logicalrelid = 'table_option_reference'::regclass;
- logicalrelid | partmethod | partkey | colocationid | repmodel
+ logicalrelid | partmethod | partkey | colocationid | repmodel | autoconverted
 ---------------------------------------------------------------------
 (0 rows)
 
@@ -831,6 +831,7 @@ DROP TABLE table_option_reference, table_option_reference_2;
 SET citus.shard_replication_factor TO 1;
 -- test options on a citus local table
 SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
+NOTICE:  localhost:xxxxx is the coordinator and already contains metadata, skipping syncing the metadata
  ?column?
 ---------------------------------------------------------------------
         1
@@ -1050,7 +1051,7 @@ NOTICE:  renaming the new table to columnar_citus_integration.table_option_citus
 (1 row)
 
 SELECT * FROM pg_dist_partition WHERE logicalrelid = 'table_option_citus_local'::regclass;
- logicalrelid | partmethod | partkey | colocationid | repmodel
+ logicalrelid | partmethod | partkey | colocationid | repmodel | autoconverted
 ---------------------------------------------------------------------
 (0 rows)
 

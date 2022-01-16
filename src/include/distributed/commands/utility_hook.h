@@ -18,6 +18,7 @@
 #include "tcop/utility.h"
 
 #include "distributed/coordinator_protocol.h"
+#include "distributed/function_call_delegation.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_transaction.h"
 
@@ -37,6 +38,7 @@ extern bool EnableAlterRolePropagation;
 extern bool EnableAlterRoleSetPropagation;
 extern bool EnableAlterDatabaseOwner;
 extern int UtilityHookLevel;
+extern bool InDelegatedProcedureCall;
 
 
 /*
@@ -48,7 +50,6 @@ extern int UtilityHookLevel;
 typedef struct DDLJob
 {
 	Oid targetRelationId;      /* oid of the target distributed relation */
-	bool concurrentIndexCmd;   /* related to a CONCURRENTLY index command? */
 
 	/*
 	 * Whether to commit and start a new transaction before sending commands
@@ -58,7 +59,12 @@ typedef struct DDLJob
 	 */
 	bool startNewTransaction;
 
-	const char *commandString; /* initial (coordinator) DDL command string */
+	/*
+	 * Command to run in MX nodes when metadata is synced
+	 * This is usually the initial (coordinator) DDL command string
+	 */
+	const char *metadataSyncCommand;
+
 	List *taskList;            /* worker DDL tasks to execute */
 } DDLJob;
 
@@ -87,6 +93,7 @@ extern void UndistributeDisconnectedCitusLocalTables(void);
 extern void NotifyUtilityHookConstraintDropped(void);
 extern void ResetConstraintDropped(void);
 extern void ExecuteDistributedDDLJob(DDLJob *ddlJob);
+extern void ColumnarTableSetOptionsHook(Oid relationId, ColumnarOptions options);
 
 /* forward declarations for sending custom commands to a distributed table */
 extern DDLJob * CreateCustomDDLTaskList(Oid relationId, TableDDLCommand *command);

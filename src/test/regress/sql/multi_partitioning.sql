@@ -487,7 +487,7 @@ SELECT right(table_name, 7)::int as shardid, * FROM (
 				table_name, constraint_name, constraint_type
 			FROM information_schema.table_constraints
 			WHERE
-				table_name LIKE 'partitioning_hash_test%' AND
+				table_name SIMILAR TO 'partitioning_hash_test%\d{2,}' AND
 				constraint_type = 'FOREIGN KEY'
 			ORDER BY 1, 2, 3
 			) q
@@ -565,7 +565,7 @@ UPDATE partitioning_test SET time = '2010-10-10' WHERE id = 25;
 -- see the data is updated
 SELECT * FROM partitioning_test WHERE id = 25 ORDER BY 1;
 
--- perform operations on partition and partioned tables together
+-- perform operations on partition and partitioned tables together
 INSERT INTO partitioning_test VALUES(26, '2010-02-02', 26);
 INSERT INTO partitioning_test_2010 VALUES(26, '2010-02-02', 26);
 COPY partitioning_test FROM STDIN WITH CSV;
@@ -1785,6 +1785,61 @@ ROLLBACK;
 
 DROP TABLE pi_table;
 
+-- 6) test with citus local table
+select 1 from citus_add_node('localhost', :master_port, groupid=>0);
+CREATE TABLE date_partitioned_citus_local_table(
+ measureid integer,
+ eventdate date,
+ measure_data jsonb) PARTITION BY RANGE(eventdate);
+
+SELECT citus_add_local_table_to_metadata('date_partitioned_citus_local_table');
+
+-- test interval must be multiple days for date partitioned table
+SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '6 hours', '2022-01-01', '2021-01-01');
+SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '1 week 1 day 1 hour', '2022-01-01', '2021-01-01');
+
+-- test with various intervals
+BEGIN;
+  SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '1 day', '2021-02-01', '2021-01-01');
+  SELECT * FROM time_partitions WHERE parent_table = 'date_partitioned_citus_local_table'::regclass ORDER BY 3;
+ROLLBACK;
+
+BEGIN;
+  SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '1 week', '2022-01-01', '2021-01-01');
+  SELECT * FROM time_partitions WHERE parent_table = 'date_partitioned_citus_local_table'::regclass ORDER BY 3;
+ROLLBACK;
+
+set client_min_messages to error;
+DROP TABLE date_partitioned_citus_local_table;
+-- also test with foreign key
+CREATE TABLE date_partitioned_citus_local_table(
+ measureid integer,
+ eventdate date,
+ measure_data jsonb, PRIMARY KEY (measureid, eventdate)) PARTITION BY RANGE(eventdate);
+
+SELECT citus_add_local_table_to_metadata('date_partitioned_citus_local_table');
+
+-- test interval must be multiple days for date partitioned table
+SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '1 day', '2021-02-01', '2021-01-01');
+
+CREATE TABLE date_partitioned_citus_local_table_2(
+ measureid integer,
+ eventdate date,
+ measure_data jsonb, PRIMARY KEY (measureid, eventdate)) PARTITION BY RANGE(eventdate);
+
+SELECT citus_add_local_table_to_metadata('date_partitioned_citus_local_table_2');
+ALTER TABLE date_partitioned_citus_local_table_2 ADD CONSTRAINT fkey_1 FOREIGN KEY (measureid, eventdate) REFERENCES date_partitioned_citus_local_table(measureid, eventdate);
+SELECT create_time_partitions('date_partitioned_citus_local_table_2', INTERVAL '1 day', '2021-02-01', '2021-01-01');
+-- after the above work, these should also work for creating new partitions
+BEGIN;
+  SELECT create_time_partitions('date_partitioned_citus_local_table', INTERVAL '1 day', '2021-03-01', '2021-02-01');
+  SELECT * FROM time_partitions WHERE parent_table = 'date_partitioned_citus_local_table'::regclass ORDER BY 3;
+ROLLBACK;
+BEGIN;
+  SELECT create_time_partitions('date_partitioned_citus_local_table_2', INTERVAL '1 day', '2021-03-01', '2021-02-01');
+  SELECT * FROM time_partitions WHERE parent_table = 'date_partitioned_citus_local_table'::regclass ORDER BY 3;
+ROLLBACK;
+set client_min_messages to notice;
 -- c) test drop_old_time_partitions
 -- 1) test with date partitioned table
 CREATE TABLE date_partitioned_table_to_exp (event_date date, event int) partition by range (event_date);
@@ -1858,6 +1913,33 @@ SELECT partition FROM time_partitions WHERE parent_table = '"test !/ \n _dist_12
 \set VERBOSITY default
 DROP TABLE "test !/ \n _dist_123_table_exp";
 
+-- 4) test with citus local tables
+CREATE TABLE date_partitioned_table_to_exp (event_date date, event int) partition by range (event_date);
+SELECT citus_add_local_table_to_metadata('date_partitioned_table_to_exp');
+
+CREATE TABLE date_partitioned_table_to_exp_d00 PARTITION OF date_partitioned_table_to_exp FOR VALUES FROM ('2000-01-01') TO ('2009-12-31');
+CREATE TABLE date_partitioned_table_to_exp_d10 PARTITION OF date_partitioned_table_to_exp FOR VALUES FROM ('2010-01-01') TO ('2019-12-31');
+CREATE TABLE date_partitioned_table_to_exp_d20 PARTITION OF date_partitioned_table_to_exp FOR VALUES FROM ('2020-01-01') TO ('2029-12-31');
+
+\set VERBOSITY terse
+
+-- expire no partitions
+CALL drop_old_time_partitions('date_partitioned_table_to_exp', '1999-01-01');
+SELECT partition FROM time_partitions WHERE parent_table = 'date_partitioned_table_to_exp'::regclass ORDER BY partition::text;
+
+-- expire 2 old partitions
+CALL drop_old_time_partitions('date_partitioned_table_to_exp', '2021-01-01');
+SELECT partition FROM time_partitions WHERE parent_table = 'date_partitioned_table_to_exp'::regclass ORDER BY partition::text;
+
+\set VERBOSITY default
+set client_min_messages to error;
+DROP TABLE date_partitioned_table_to_exp;
+DROP TABLE date_partitioned_citus_local_table CASCADE;
+DROP TABLE date_partitioned_citus_local_table_2;
+set client_min_messages to notice;
+
+SELECT citus_remove_node('localhost', :master_port);
+
 -- d) invalid tables for helper UDFs
 CREATE TABLE multiple_partition_column_table(
   event_id bigserial,
@@ -1886,6 +1968,38 @@ SELECT create_time_partitions('non_partitioned_table', INTERVAL '1 month', now()
 CALL drop_old_time_partitions('non_partitioned_table', now());
 DROP TABLE non_partitioned_table;
 
+-- https://github.com/citusdata/citus/issues/4962
+SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
+SET citus.shard_replication_factor TO 1;
+SET citus.next_shard_id TO 361168;
+CREATE TABLE part_table_with_very_long_name (
+    dist_col integer,
+    long_named_integer_col integer,
+    long_named_part_col timestamp
+) PARTITION BY RANGE (long_named_part_col);
+
+CREATE TABLE part_table_with_long_long_long_long_name
+PARTITION OF part_table_with_very_long_name
+FOR VALUES FROM ('2010-01-01') TO ('2015-01-01');
+
+SELECT create_distributed_table('part_table_with_very_long_name', 'dist_col');
+
+CREATE INDEX ON part_table_with_very_long_name
+USING btree (long_named_integer_col, long_named_part_col);
+
+-- index is created
+SELECT tablename, indexname FROM pg_indexes
+WHERE schemaname = 'partitioning_schema' AND tablename ilike '%part_table_with_%' ORDER BY 1, 2;
+
+-- should work properly - no names clashes
+SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
+
+\c - - - :worker_1_port
+-- check that indexes are named properly
+SELECT tablename, indexname FROM pg_indexes
+WHERE schemaname = 'partitioning_schema' AND tablename ilike '%part_table_with_%' ORDER BY 1, 2;
+
+\c - - - :master_port
 DROP SCHEMA partitioning_schema CASCADE;
 RESET search_path;
 DROP TABLE IF EXISTS

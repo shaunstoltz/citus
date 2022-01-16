@@ -24,11 +24,12 @@
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/deparser.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distribution_column.h"
+#include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
-#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
@@ -53,18 +54,31 @@
 /* controlled via GUC, should be accessed via GetEnableLocalReferenceForeignKeys() */
 bool EnableLocalReferenceForeignKeys = true;
 
-
 /* Local functions forward declarations for unsupported command checks */
 static void PostprocessCreateTableStmtForeignKeys(CreateStmt *createStatement);
 static void PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement,
 												  const char *queryString);
+static void PreprocessAttachPartitionToCitusTable(Oid parentRelationId,
+												  Oid partitionRelationId);
+static void PreprocessAttachCitusPartitionToCitusTable(Oid parentCitusRelationId,
+													   Oid partitionRelationId);
+static void DistributePartitionUsingParent(Oid parentRelationId,
+										   Oid partitionRelationId);
+static void ErrorIfMultiLevelPartitioning(Oid parentRelationId, Oid partitionRelationId);
+static void ErrorIfAttachCitusTableToPgLocalTable(Oid parentRelationId,
+												  Oid partitionRelationId);
 static bool AlterTableDefinesFKeyBetweenPostgresAndNonDistTable(
 	AlterTableStmt *alterTableStatement);
+static bool ShouldMarkConnectedRelationsNotAutoConverted(Oid leftRelationId,
+														 Oid rightRelationId);
 static bool RelationIdListContainsCitusTableType(List *relationIdList,
 												 CitusTableType citusTableType);
 static bool RelationIdListContainsPostgresTable(List *relationIdList);
 static void ConvertPostgresLocalTablesToCitusLocalTables(
 	AlterTableStmt *alterTableStatement);
+static bool RangeVarListHasLocalRelationConvertedByUser(List *relationRangeVarList,
+														AlterTableStmt *
+														alterTableStatement);
 static int CompareRangeVarsByOid(const void *leftElement, const void *rightElement);
 static List * GetAlterTableAddFKeyRightRelationIdList(
 	AlterTableStmt *alterTableStatement);
@@ -78,10 +92,6 @@ static List * GetRelationIdListFromRangeVarList(List *rangeVarList, LOCKMODE loc
 static bool AlterTableCommandTypeIsTrigger(AlterTableType alterTableType);
 static bool AlterTableDropsForeignKey(AlterTableStmt *alterTableStatement);
 static void ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement);
-static void ErrorIfCitusLocalTablePartitionCommand(AlterTableCmd *alterTableCmd,
-												   Oid parentRelationId);
-static Oid GetPartitionCommandChildRelationId(AlterTableCmd *alterTableCmd,
-											  bool missingOk);
 static List * InterShardDDLTaskList(Oid leftRelationId, Oid rightRelationId,
 									const char *commandString);
 static bool AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
@@ -360,6 +370,13 @@ PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
 	 */
 	if (IsCitusTable(parentRelationId))
 	{
+		if (IsCitusTableType(parentRelationId, CITUS_LOCAL_TABLE))
+		{
+			CreateCitusLocalTablePartitionOf(createStatement, relationId,
+											 parentRelationId);
+			return;
+		}
+
 		Var *parentDistributionColumn = DistPartitionKeyOrError(parentRelationId);
 		char parentDistributionMethod = DISTRIBUTE_BY_HASH;
 		char *parentRelationName = generate_qualified_relation_name(parentRelationId);
@@ -417,54 +434,207 @@ PreprocessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement,
 			 * and want to ensure we acquire the locks in the same order with Postgres
 			 */
 			LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-			Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+			Oid parentRelationId = AlterTableLookupRelation(alterTableStatement,
+															lockmode);
 			PartitionCmd *partitionCommand = (PartitionCmd *) alterTableCommand->def;
 			bool partitionMissingOk = false;
 			Oid partitionRelationId = RangeVarGetRelid(partitionCommand->name, lockmode,
 													   partitionMissingOk);
 
-			/*
-			 * If user first distributes the table then tries to attach it to non
-			 * distributed table, we error out.
-			 */
-			if (!IsCitusTable(relationId) &&
-				IsCitusTable(partitionRelationId))
+			if (!IsCitusTable(parentRelationId))
 			{
-				char *parentRelationName = get_rel_name(relationId);
+				/*
+				 * If the parent is a regular Postgres table, but the partition is a
+				 * Citus table, we error out.
+				 */
+				ErrorIfAttachCitusTableToPgLocalTable(parentRelationId,
+													  partitionRelationId);
 
-				ereport(ERROR, (errmsg("non-distributed tables cannot have "
-									   "distributed partitions"),
-								errhint("Distribute the partitioned table \"%s\" "
-										"instead", parentRelationName)));
+				/*
+				 * If both the parent and the child table are Postgres tables,
+				 * we can just skip preprocessing this command.
+				 */
+				continue;
 			}
 
-			/* if parent of this table is distributed, distribute this table too */
-			if (IsCitusTable(relationId) &&
-				!IsCitusTable(partitionRelationId))
-			{
-				Var *distributionColumn = DistPartitionKeyOrError(relationId);
-				char *distributionColumnName = ColumnToColumnName(relationId,
-																  nodeToString(
-																	  distributionColumn));
-				distributionColumn = FindColumnWithNameOnTargetRelation(relationId,
-																		distributionColumnName,
-																		partitionRelationId);
+			/* Citus doesn't support multi-level partitioned tables */
+			ErrorIfMultiLevelPartitioning(parentRelationId, partitionRelationId);
 
-				char distributionMethod = DISTRIBUTE_BY_HASH;
-				char *parentRelationName = generate_qualified_relation_name(relationId);
-				bool viaDeprecatedAPI = false;
-
-				SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(
-					relationId, partitionRelationId);
-
-				CreateDistributedTable(partitionRelationId, distributionColumn,
-									   distributionMethod, ShardCount, false,
-									   parentRelationName, viaDeprecatedAPI);
-			}
+			/* attaching to a Citus table */
+			PreprocessAttachPartitionToCitusTable(parentRelationId, partitionRelationId);
 		}
 	}
 
 	return NIL;
+}
+
+
+/*
+ * PreprocessAttachPartitionToCitusTable takes a parent relation, which is a Citus table,
+ * and a partition to be attached to it.
+ * If the partition table is a regular Postgres table:
+ * - Converts the partition to Citus Local Table, if the parent is a Citus Local Table.
+ * - Distributes the partition, if the parent is a distributed table.
+ * If not, calls PreprocessAttachCitusPartitionToCitusTable to attach given partition to
+ * the parent relation.
+ */
+static void
+PreprocessAttachPartitionToCitusTable(Oid parentRelationId, Oid partitionRelationId)
+{
+	Assert(IsCitusTable(parentRelationId));
+
+	/* reference tables cannot be partitioned */
+	Assert(!IsCitusTableType(parentRelationId, REFERENCE_TABLE));
+
+	/* if parent of this table is distributed, distribute this table too */
+	if (!IsCitusTable(partitionRelationId))
+	{
+		if (IsCitusTableType(parentRelationId, CITUS_LOCAL_TABLE))
+		{
+			/*
+			 * We pass the cascade option as false, since Citus Local Table partitions
+			 * cannot have non-inherited foreign keys.
+			 */
+			bool cascadeViaForeignKeys = false;
+			CitusTableCacheEntry *entry = GetCitusTableCacheEntry(parentRelationId);
+			bool autoConverted = entry->autoConverted;
+			CreateCitusLocalTable(partitionRelationId, cascadeViaForeignKeys,
+								  autoConverted);
+		}
+		else if (IsCitusTableType(parentRelationId, DISTRIBUTED_TABLE))
+		{
+			DistributePartitionUsingParent(parentRelationId, partitionRelationId);
+		}
+	}
+	else
+	{
+		/* both the parent and child are Citus tables */
+		PreprocessAttachCitusPartitionToCitusTable(parentRelationId, partitionRelationId);
+	}
+}
+
+
+/*
+ * PreprocessAttachCitusPartitionToCitusTable takes a parent relation, and a partition
+ * to be attached to it. Both of them are Citus tables.
+ * Errors out if the partition is a reference table.
+ * Errors out if the partition is distributed and the parent is a Citus Local Table.
+ * Distributes the partition, if it's a Citus Local Table, and the parent is distributed.
+ */
+static void
+PreprocessAttachCitusPartitionToCitusTable(Oid parentCitusRelationId, Oid
+										   partitionRelationId)
+{
+	if (IsCitusTableType(partitionRelationId, REFERENCE_TABLE))
+	{
+		ereport(ERROR, (errmsg("partitioned reference tables are not supported")));
+	}
+	else if (IsCitusTableType(partitionRelationId, DISTRIBUTED_TABLE) &&
+			 IsCitusTableType(parentCitusRelationId, CITUS_LOCAL_TABLE))
+	{
+		ereport(ERROR, (errmsg("non-distributed partitioned tables cannot have "
+							   "distributed partitions")));
+	}
+	else if (IsCitusTableType(partitionRelationId, CITUS_LOCAL_TABLE) &&
+			 IsCitusTableType(parentCitusRelationId, DISTRIBUTED_TABLE))
+	{
+		/* if the parent is a distributed table, distribute the partition too */
+		DistributePartitionUsingParent(parentCitusRelationId, partitionRelationId);
+	}
+	else if (IsCitusTableType(partitionRelationId, CITUS_LOCAL_TABLE) &&
+			 IsCitusTableType(parentCitusRelationId, CITUS_LOCAL_TABLE))
+	{
+		/*
+		 * We should ensure that the partition relation has no foreign keys,
+		 * as Citus Local Table partitions can only have inherited foreign keys.
+		 */
+		if (TableHasExternalForeignKeys(partitionRelationId))
+		{
+			ereport(ERROR, (errmsg("partition local tables added to citus metadata "
+								   "cannot have non-inherited foreign keys")));
+		}
+	}
+
+	/*
+	 * We don't need to add other cases here, like distributed - distributed and
+	 * citus_local - citus_local, as PreprocessAlterTableStmt and standard process
+	 * utility would do the work to attach partitions to shell and shard relations.
+	 */
+}
+
+
+/*
+ * DistributePartitionUsingParent takes a parent and a partition relation and
+ * distributes the partition, using the same distribution column as the parent.
+ * It creates a *hash* distributed table by default, as partitioned tables can only be
+ * distributed by hash.
+ */
+static void
+DistributePartitionUsingParent(Oid parentCitusRelationId, Oid partitionRelationId)
+{
+	Var *distributionColumn = DistPartitionKeyOrError(parentCitusRelationId);
+	char *distributionColumnName =
+		ColumnToColumnName(parentCitusRelationId,
+						   nodeToString(distributionColumn));
+	distributionColumn =
+		FindColumnWithNameOnTargetRelation(parentCitusRelationId,
+										   distributionColumnName,
+										   partitionRelationId);
+
+	char distributionMethod = DISTRIBUTE_BY_HASH;
+	char *parentRelationName = generate_qualified_relation_name(parentCitusRelationId);
+	bool viaDeprecatedAPI = false;
+
+	SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(
+		parentCitusRelationId, partitionRelationId);
+
+	CreateDistributedTable(partitionRelationId, distributionColumn,
+						   distributionMethod, ShardCount, false,
+						   parentRelationName, viaDeprecatedAPI);
+}
+
+
+/*
+ * ErrorIfMultiLevelPartitioning takes a parent, and a partition relation to be attached
+ * and errors out if the partition is also a partitioned table, which means we are
+ * trying to build a multi-level partitioned table.
+ */
+static void
+ErrorIfMultiLevelPartitioning(Oid parentRelationId, Oid partitionRelationId)
+{
+	if (PartitionedTable(partitionRelationId))
+	{
+		char *relationName = get_rel_name(partitionRelationId);
+		char *parentRelationName = get_rel_name(parentRelationId);
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("Citus doesn't support multi-level "
+							   "partitioned tables"),
+						errdetail("Relation \"%s\" is partitioned table "
+								  "itself and it is also partition of "
+								  "relation \"%s\".",
+								  relationName, parentRelationName)));
+	}
+}
+
+
+/*
+ * ErrorIfAttachCitusTableToPgLocalTable takes a parent, and a partition relation
+ * to be attached. Errors out if the partition is a Citus table, and the parent is a
+ * regular Postgres table.
+ */
+static void
+ErrorIfAttachCitusTableToPgLocalTable(Oid parentRelationId, Oid partitionRelationId)
+{
+	if (!IsCitusTable(parentRelationId) &&
+		IsCitusTable(partitionRelationId))
+	{
+		char *parentRelationName = get_rel_name(parentRelationId);
+
+		ereport(ERROR, (errmsg("non-citus partitioned tables cannot have "
+							   "citus table partitions"),
+						errhint("Distribute the partitioned table \"%s\" "
+								"instead, or add it to metadata", parentRelationName)));
+	}
 }
 
 
@@ -477,7 +647,7 @@ List *
 PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TABLE);
+	Assert(stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_FOREIGN_TABLE);
 
 	/*
 	 * We will let Postgres deal with missing_ok
@@ -696,6 +866,14 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 				rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
 												   alterTableStatement->missing_ok);
 
+				if (processUtilityContext != PROCESS_UTILITY_SUBCOMMAND &&
+					ShouldMarkConnectedRelationsNotAutoConverted(leftRelationId,
+																 rightRelationId))
+				{
+					List *relationList = list_make2_oid(leftRelationId, rightRelationId);
+					UpdateAutoConvertedForConnectedRelations(relationList, false);
+				}
+
 				/*
 				 * Foreign constraint validations will be done in workers. If we do not
 				 * set this flag, PostgreSQL tries to do additional checking when we drop
@@ -875,7 +1053,8 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 				 */
 				Assert(IsCitusTable(rightRelationId));
 			}
-			else if (attachedRelationKind == RELKIND_RELATION)
+			else if (attachedRelationKind == RELKIND_RELATION ||
+					 attachedRelationKind == RELKIND_FOREIGN_TABLE)
 			{
 				Assert(list_length(commandList) <= 1);
 
@@ -933,7 +1112,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 	/* fill them here as it is possible to use them in some conditional blocks below */
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	ddlJob->targetRelationId = leftRelationId;
-	ddlJob->concurrentIndexCmd = false;
 
 	const char *sqlForTaskList = alterTableCommand;
 	if (deparseAT)
@@ -942,7 +1120,7 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 		sqlForTaskList = DeparseTreeNode((Node *) newStmt);
 	}
 
-	ddlJob->commandString = useInitialDDLCommandString ? alterTableCommand : NULL;
+	ddlJob->metadataSyncCommand = useInitialDDLCommandString ? alterTableCommand : NULL;
 
 	if (OidIsValid(rightRelationId))
 	{
@@ -1010,6 +1188,31 @@ AlterTableDefinesFKeyBetweenPostgresAndNonDistTable(AlterTableStmt *alterTableSt
 
 
 /*
+ * ShouldMarkConnectedRelationsNotAutoConverted takes two relations.
+ * If both of them are Citus Local Tables, and one of them is auto-converted while the
+ * other one is not; then it returns true. False otherwise.
+ */
+static bool
+ShouldMarkConnectedRelationsNotAutoConverted(Oid leftRelationId, Oid rightRelationId)
+{
+	if (!IsCitusTableType(leftRelationId, CITUS_LOCAL_TABLE))
+	{
+		return false;
+	}
+
+	if (!IsCitusTableType(rightRelationId, CITUS_LOCAL_TABLE))
+	{
+		return false;
+	}
+
+	CitusTableCacheEntry *entryLeft = GetCitusTableCacheEntry(leftRelationId);
+	CitusTableCacheEntry *entryRight = GetCitusTableCacheEntry(rightRelationId);
+
+	return entryLeft->autoConverted != entryRight->autoConverted;
+}
+
+
+/*
  * RelationIdListContainsCitusTableType returns true if given relationIdList
  * contains a citus table with given type.
  */
@@ -1067,6 +1270,9 @@ ConvertPostgresLocalTablesToCitusLocalTables(AlterTableStmt *alterTableStatement
 	 * table to a citus local table.
 	 */
 	relationRangeVarList = SortList(relationRangeVarList, CompareRangeVarsByOid);
+	bool containsAnyUserConvertedLocalRelation =
+		RangeVarListHasLocalRelationConvertedByUser(relationRangeVarList,
+													alterTableStatement);
 
 	/*
 	 * Here we should operate on RangeVar objects since relations oid's would
@@ -1087,14 +1293,32 @@ ConvertPostgresLocalTablesToCitusLocalTables(AlterTableStmt *alterTableStatement
 			 */
 			continue;
 		}
+		else if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+		{
+			CitusTableCacheEntry *entry = GetCitusTableCacheEntry(relationId);
+			if (!entry->autoConverted)
+			{
+				/*
+				 * This citus local table is already added to the metadata
+				 * by the user, so no further operation needed.
+				 */
+				continue;
+			}
+			else if (!containsAnyUserConvertedLocalRelation)
+			{
+				/*
+				 * We are safe to skip this relation because none of the citus local
+				 * tables involved are manually added to the metadata by the user.
+				 * This implies that all the Citus local tables involved are marked
+				 * as autoConverted = true and there is no chance to update
+				 * autoConverted = false.
+				 */
+				continue;
+			}
+		}
 		else if (IsCitusTable(relationId))
 		{
-			/*
-			 * relationRangeVarList has also reference and citus local tables
-			 * involved in this ADD FOREIGN KEY command. Moreover, even if
-			 * relationId was belonging to a postgres  local table initially,
-			 * we might had already converted it to a citus local table by cascading.
-			 */
+			/* we can directly skip for table types other than citus local tables */
 			continue;
 		}
 
@@ -1113,7 +1337,41 @@ ConvertPostgresLocalTablesToCitusLocalTables(AlterTableStmt *alterTableStatement
 		PG_TRY();
 		{
 			bool cascade = true;
-			CreateCitusLocalTable(relationId, cascade);
+
+			/*
+			 * Without this check, we would be erroring out in CreateCitusLocalTable
+			 * for this case anyway. The purpose of this check&error is to provide
+			 * a more meaningful message for the user.
+			 */
+			if (PartitionTable(relationId))
+			{
+				ereport(ERROR, (errmsg("cannot build foreign key between"
+									   " reference table and a partition"),
+								errhint("Try using parent table: %s",
+										get_rel_name(PartitionParentOid(relationId)))));
+			}
+			else
+			{
+				/*
+				 * There might be two scenarios:
+				 *
+				 *   a) A user created foreign key from a reference table
+				 *      to Postgres local table(s) or Citus local table(s)
+				 *      where all of the citus local tables involved are auto
+				 *      converted. In that case, we mark the new table as auto
+				 *      converted as well.
+				 *
+				 *   b) A user created foreign key from a reference table
+				 *      to Postgres local table(s) or Citus local table(s)
+				 *      where at least one of the citus local tables
+				 *      involved is not auto converted. In that case, we mark
+				 *      this new Citus local table as autoConverted = false
+				 *      as well. Because our logic is to keep all the connected
+				 *      Citus local tables to have the same autoConverted value.
+				 */
+				bool autoConverted = containsAnyUserConvertedLocalRelation ? false : true;
+				CreateCitusLocalTable(relationId, cascade, autoConverted);
+			}
 		}
 		PG_CATCH();
 		{
@@ -1135,6 +1393,43 @@ ConvertPostgresLocalTablesToCitusLocalTables(AlterTableStmt *alterTableStatement
 		}
 		PG_END_TRY();
 	}
+}
+
+
+/*
+ * RangeVarListHasLocalRelationConvertedByUser takes a list of relations and returns true
+ * if any of these relations is marked as auto-converted = false. Returns true otherwise.
+ * This function also takes the current alterTableStatement command, to obtain the
+ * necessary locks.
+ */
+static bool
+RangeVarListHasLocalRelationConvertedByUser(List *relationRangeVarList,
+											AlterTableStmt *alterTableStatement)
+{
+	RangeVar *relationRangeVar;
+	foreach_ptr(relationRangeVar, relationRangeVarList)
+	{
+		/*
+		 * Here we iterate the relation list, and if at least one of the relations
+		 * is marked as not-auto-converted, we should mark all of them as
+		 * not-auto-converted. In that case, we return true here.
+		 */
+		List *commandList = alterTableStatement->cmds;
+		LOCKMODE lockMode = AlterTableGetLockLevel(commandList);
+		bool missingOk = alterTableStatement->missing_ok;
+		Oid relationId = RangeVarGetRelid(relationRangeVar, lockMode, missingOk);
+		if (OidIsValid(relationId) && IsCitusTable(relationId) &&
+			IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+		{
+			CitusTableCacheEntry *entry = GetCitusTableCacheEntry(relationId);
+			if (!entry->autoConverted)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 
@@ -1331,6 +1626,18 @@ AlterTableCommandTypeIsTrigger(AlterTableType alterTableType)
 
 
 /*
+ * ConstrTypeUsesIndex returns true if the given constraint type uses an index
+ */
+bool
+ConstrTypeUsesIndex(ConstrType constrType)
+{
+	return constrType == CONSTR_PRIMARY ||
+		   constrType == CONSTR_UNIQUE ||
+		   constrType == CONSTR_EXCLUSION;
+}
+
+
+/*
  * AlterTableDropsForeignKey returns true if the given AlterTableStmt drops
  * a foreign key. False otherwise.
  */
@@ -1454,7 +1761,7 @@ PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
 							   ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TABLE);
+	Assert(stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_FOREIGN_TABLE);
 
 	if (stmt->relation == NULL)
 	{
@@ -1478,12 +1785,12 @@ PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
 	{
 		return NIL;
 	}
+
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	QualifyTreeNode((Node *) stmt);
 	ddlJob->targetRelationId = relationId;
-	ddlJob->concurrentIndexCmd = false;
-	ddlJob->commandString = DeparseTreeNode((Node *) stmt);
-	ddlJob->taskList = DDLTaskList(relationId, ddlJob->commandString);
+	ddlJob->metadataSyncCommand = DeparseTreeNode((Node *) stmt);
+	ddlJob->taskList = DDLTaskList(relationId, ddlJob->metadataSyncCommand);
 	return list_make1(ddlJob);
 }
 
@@ -1748,8 +2055,8 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 									ClusterHasKnownMetadataWorkers())
 								{
 									needMetadataSyncForNewSequences = true;
-									MarkSequenceDistributedAndPropagateDependencies(
-										seqOid);
+									MarkSequenceDistributedAndPropagateWithDependencies(
+										relationId, seqOid);
 									alterTableDefaultNextvalCmd =
 										GetAddColumnWithNextvalDefaultCmd(seqOid,
 																		  relationId,
@@ -1789,7 +2096,8 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 						ClusterHasKnownMetadataWorkers())
 					{
 						needMetadataSyncForNewSequences = true;
-						MarkSequenceDistributedAndPropagateDependencies(seqOid);
+						MarkSequenceDistributedAndPropagateWithDependencies(relationId,
+																			seqOid);
 						alterTableDefaultNextvalCmd = GetAlterColumnWithNextvalDefaultCmd(
 							seqOid, relationId, command->name);
 					}
@@ -1800,21 +2108,8 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 	if (needMetadataSyncForNewSequences)
 	{
-		List *sequenceCommandList = NIL;
-
-		/* commands to create sequences */
-		List *sequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
-		sequenceCommandList = list_concat(sequenceCommandList, sequenceDDLCommands);
-
 		/* prevent recursive propagation */
 		SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
-
-		/* send the commands one by one */
-		const char *sequenceCommand = NULL;
-		foreach_ptr(sequenceCommand, sequenceCommandList)
-		{
-			SendCommandToWorkersWithMetadata(sequenceCommand);
-		}
 
 		/*
 		 * It's easy to retrieve the sequence id to create the proper commands
@@ -1827,6 +2122,73 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 		SendCommandToWorkersWithMetadata(alterTableDefaultNextvalCmd);
 
 		SendCommandToWorkersWithMetadata(ENABLE_DDL_PROPAGATION);
+	}
+}
+
+
+/*
+ * FixAlterTableStmtIndexNames runs after the ALTER TABLE command
+ * has already run on the coordinator, and also after the distributed DDL
+ * Jobs have been executed on the workers.
+ *
+ * We might have wrong index names generated on indexes of shards of partitions,
+ * see https://github.com/citusdata/citus/pull/5397 for the details. So we
+ * perform the relevant checks and index renaming here.
+ */
+void
+FixAlterTableStmtIndexNames(AlterTableStmt *alterTableStatement)
+{
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	if (!(OidIsValid(relationId) && IsCitusTable(relationId) &&
+		  PartitionedTable(relationId)))
+	{
+		/* we are only interested in partitioned Citus tables */
+		return;
+	}
+
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
+	{
+		AlterTableType alterTableType = command->subtype;
+
+		/*
+		 * If this a partitioned table, and the constraint type uses an index
+		 * UNIQUE, PRIMARY KEY, EXCLUDE constraint,
+		 * we have wrong index names generated on indexes of shards of
+		 * partitions of this table, so we should fix them
+		 */
+		Constraint *constraint = (Constraint *) command->def;
+		if (alterTableType == AT_AddConstraint &&
+			ConstrTypeUsesIndex(constraint->contype))
+		{
+			bool missingOk = false;
+			const char *constraintName = constraint->conname;
+			Oid constraintId =
+				get_relation_constraint_oid(relationId, constraintName, missingOk);
+
+			/* fix only the relevant index */
+			Oid parentIndexOid = get_constraint_index(constraintId);
+
+			FixPartitionShardIndexNames(relationId, parentIndexOid);
+		}
+		/*
+		 * If this is an ALTER TABLE .. ATTACH PARTITION command
+		 * we have wrong index names generated on indexes of shards of
+		 * the current partition being attached, so we should fix them
+		 */
+		else if (alterTableType == AT_AttachPartition)
+		{
+			PartitionCmd *partitionCommand = (PartitionCmd *) command->def;
+			bool partitionMissingOk = false;
+			Oid partitionRelationId =
+				RangeVarGetRelid(partitionCommand->name, lockmode,
+								 partitionMissingOk);
+			Oid parentIndexOid = InvalidOid;     /* fix all the indexes */
+
+			FixPartitionShardIndexNames(partitionRelationId, parentIndexOid);
+		}
 	}
 }
 
@@ -2477,7 +2839,17 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 											"separately.")));
 				}
 
-				ErrorIfCitusLocalTablePartitionCommand(command, relationId);
+				if (IsCitusTableType(partitionRelationId, CITUS_LOCAL_TABLE) ||
+					IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+				{
+					/*
+					 * Citus Local Tables cannot be colocated with other tables.
+					 * If either of two relations is not a Citus Local Table, then we
+					 * don't need to check colocation since CreateCitusLocalTable would
+					 * anyway throw an error.
+					 */
+					break;
+				}
 
 				if (IsCitusTable(partitionRelationId) &&
 					!TablesColocated(relationId, partitionRelationId))
@@ -2521,7 +2893,6 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 										   "unsupported.")));
 				}
 				#endif
-				ErrorIfCitusLocalTablePartitionCommand(command, relationId);
 
 				break;
 			}
@@ -2554,6 +2925,7 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 			case AT_SetNotNull:
 			case AT_ReplicaIdentity:
+			case AT_ChangeOwner:
 			case AT_ValidateConstraint:
 			case AT_DropConstraint: /* we do the check for invalidation in AlterTableDropsForeignKey */
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -2580,6 +2952,16 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				break;
 			}
 
+			case AT_GenericOptions:
+			{
+				if (IsForeignTable(relationId))
+				{
+					break;
+				}
+			}
+
+			/* fallthrough */
+
 			default:
 			{
 				ereport(ERROR,
@@ -2593,52 +2975,6 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 			}
 		}
 	}
-}
-
-
-/*
- * ErrorIfCitusLocalTablePartitionCommand errors out if given alter table subcommand is
- * an ALTER TABLE ATTACH / DETACH PARTITION command run for a citus local table.
- */
-static void
-ErrorIfCitusLocalTablePartitionCommand(AlterTableCmd *alterTableCmd, Oid parentRelationId)
-{
-	AlterTableType alterTableType = alterTableCmd->subtype;
-	if (alterTableType != AT_AttachPartition && alterTableType != AT_DetachPartition)
-	{
-		return;
-	}
-
-	bool missingOK = false;
-	Oid childRelationId = GetPartitionCommandChildRelationId(alterTableCmd, missingOK);
-	if (!IsCitusTableType(parentRelationId, CITUS_LOCAL_TABLE) &&
-		!IsCitusTableType(childRelationId, CITUS_LOCAL_TABLE))
-	{
-		return;
-	}
-
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cannot execute ATTACH/DETACH PARTITION command as "
-						   "local tables added to metadata cannot be involved in "
-						   "partition relationships with other tables")));
-}
-
-
-/*
- * GetPartitionCommandChildRelationId returns child relationId for given
- * ALTER TABLE ATTACH / DETACH PARTITION subcommand.
- */
-static Oid
-GetPartitionCommandChildRelationId(AlterTableCmd *alterTableCmd, bool missingOk)
-{
-	AlterTableType alterTableType PG_USED_FOR_ASSERTS_ONLY = alterTableCmd->subtype;
-	Assert(alterTableType == AT_AttachPartition || alterTableType == AT_DetachPartition);
-
-	PartitionCmd *partitionCommand = (PartitionCmd *) alterTableCmd->def;
-	RangeVar *childRelationRangeVar = partitionCommand->name;
-	Oid childRelationId = RangeVarGetRelid(childRelationRangeVar, AccessExclusiveLock,
-										   missingOk);
-	return childRelationId;
 }
 
 
@@ -3001,7 +3337,7 @@ ObjectAddress
 AlterTableSchemaStmtObjectAddress(Node *node, bool missing_ok)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TABLE);
+	Assert(stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_FOREIGN_TABLE);
 
 	const char *tableName = stmt->relation->relname;
 	Oid tableOid = InvalidOid;

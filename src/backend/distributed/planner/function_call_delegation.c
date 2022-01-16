@@ -58,6 +58,10 @@ struct ParamWalkerContext
 static bool contain_param_walker(Node *node, void *context);
 
 
+/* global variable keeping track of whether we are in a delegated function call */
+bool InDelegatedFunctionCall = false;
+
+
 /*
  * contain_param_walker scans node for Param nodes.
  * Ignore the return value, instead check context afterwards.
@@ -112,9 +116,9 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 	}
 
 	int32 localGroupId = GetLocalGroupId();
-	if (localGroupId != COORDINATOR_GROUP_ID || localGroupId == GROUP_ID_UPGRADING)
+	if (localGroupId == GROUP_ID_UPGRADING)
 	{
-		/* do not delegate from workers, or while upgrading */
+		/* do not delegate while upgrading */
 		return NULL;
 	}
 
@@ -209,6 +213,27 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 		ereport(DEBUG4, (errmsg("function is distributed")));
 	}
 
+	if (IsCitusInitiatedRemoteBackend())
+	{
+		/*
+		 * We are planning a call to a distributed function within a Citus backend,
+		 * that means that this is the delegated call.
+		 */
+		InDelegatedFunctionCall = true;
+		return NULL;
+	}
+
+	if (localGroupId != COORDINATOR_GROUP_ID)
+	{
+		/*
+		 * We are calling a distributed function on a worker node. We currently
+		 * only delegate from the coordinator.
+		 *
+		 * TODO: remove this restriction.
+		 */
+		return NULL;
+	}
+
 	/*
 	 * Cannot delegate functions for INSERT ... SELECT func(), since they require
 	 * coordinated transactions.
@@ -265,7 +290,8 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 	}
 	else
 	{
-		placement = ShardPlacementForFunctionColocatedWithDistTable(procedure, funcExpr,
+		placement = ShardPlacementForFunctionColocatedWithDistTable(procedure,
+																	funcExpr->args,
 																	partitionColumn,
 																	distTable,
 																	planContext->plan);
@@ -346,19 +372,19 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
  */
 ShardPlacement *
 ShardPlacementForFunctionColocatedWithDistTable(DistObjectCacheEntry *procedure,
-												FuncExpr *funcExpr,
+												List *argumentList,
 												Var *partitionColumn,
 												CitusTableCacheEntry *cacheEntry,
 												PlannedStmt *plan)
 {
 	if (procedure->distributionArgIndex < 0 ||
-		procedure->distributionArgIndex >= list_length(funcExpr->args))
+		procedure->distributionArgIndex >= list_length(argumentList))
 	{
 		ereport(DEBUG1, (errmsg("cannot push down invalid distribution_argument_index")));
 		return NULL;
 	}
 
-	Node *partitionValueNode = (Node *) list_nth(funcExpr->args,
+	Node *partitionValueNode = (Node *) list_nth(argumentList,
 												 procedure->distributionArgIndex);
 	partitionValueNode = strip_implicit_coercions(partitionValueNode);
 

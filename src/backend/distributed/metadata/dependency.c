@@ -101,7 +101,7 @@ typedef struct DependencyDefinition
 		/*
 		 * address is used for dependencies that are artificially added during the
 		 * chasing. Since they are added by citus code we assume the dependency needs to
-		 * be chased anyway, ofcourse it will only actually be chased if the object is a
+		 * be chased anyway, of course it will only actually be chased if the object is a
 		 * supported object by citus
 		 */
 		ObjectAddress address;
@@ -200,6 +200,31 @@ GetDependenciesForObject(const ObjectAddress *target)
 	RecurseObjectDependencies(*target,
 							  &ExpandCitusSupportedTypes,
 							  &FollowNewSupportedDependencies,
+							  &ApplyAddToDependencyList,
+							  &collector);
+
+	return collector.dependencyList;
+}
+
+
+/*
+ * GetAllDependenciesForObject returns a list of all the ObjectAddresses to be
+ * created in order before the target object could safely be created on a
+ * worker. As a caller, you probably need GetDependenciesForObject() which
+ * eliminates already distributed objects from the returned list.
+ *
+ * Some of the object might already be created on a worker. It should be created
+ * in an idempotent way.
+ */
+List *
+GetAllDependenciesForObject(const ObjectAddress *target)
+{
+	ObjectAddressCollector collector = { 0 };
+	InitObjectAddressCollector(&collector);
+
+	RecurseObjectDependencies(*target,
+							  &ExpandCitusSupportedTypes,
+							  &FollowAllSupportedDependencies,
 							  &ApplyAddToDependencyList,
 							  &collector);
 
@@ -587,6 +612,11 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			return true;
 		}
 
+		case OCLASS_FOREIGN_SERVER:
+		{
+			return true;
+		}
+
 		case OCLASS_ROLE:
 		{
 			/*
@@ -763,7 +793,7 @@ FollowNewSupportedDependencies(ObjectAddressCollector *collector,
 
 	/*
 	 * If the object is already distributed it is not a `new` object that needs to be
-	 * distributed before we create a dependant object
+	 * distributed before we create a dependent object
 	 */
 	if (IsObjectDistributed(&address))
 	{

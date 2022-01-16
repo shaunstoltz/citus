@@ -368,7 +368,7 @@ UndistributeTable(TableConversionParameters *params)
 		EnsureTableNotReferencing(params->relationId, UNDISTRIBUTE_TABLE);
 		EnsureTableNotReferenced(params->relationId, UNDISTRIBUTE_TABLE);
 	}
-	EnsureTableNotForeign(params->relationId);
+
 	EnsureTableNotPartition(params->relationId);
 
 	if (PartitionedTable(params->relationId))
@@ -527,8 +527,8 @@ ConvertTable(TableConversionState *con)
 		 * Acquire ExclusiveLock as UndistributeTable does in order to
 		 * make sure that no modifications happen on the relations.
 		 */
-		CascadeOperationForConnectedRelations(con->relationId, ExclusiveLock,
-											  CASCADE_FKEY_UNDISTRIBUTE_TABLE);
+		CascadeOperationForFkeyConnectedRelations(con->relationId, ExclusiveLock,
+												  CASCADE_FKEY_UNDISTRIBUTE_TABLE);
 
 		/*
 		 * Undistributed every foreign key connected relation in our foreign key
@@ -994,8 +994,7 @@ EnsureTableNotReferenced(Oid relationId, char conversionType)
 void
 EnsureTableNotForeign(Oid relationId)
 {
-	char relationKind = get_rel_relkind(relationId);
-	if (relationKind == RELKIND_FOREIGN_TABLE)
+	if (IsForeignTable(relationId))
 	{
 		ereport(ERROR, (errmsg("cannot complete operation "
 							   "because it is a foreign table")));
@@ -1063,7 +1062,7 @@ CreateTableConversion(TableConversionParameters *params)
 		BuildDistributionKeyFromColumnName(relation, con->distributionColumn);
 
 	con->originalAccessMethod = NULL;
-	if (!PartitionedTable(con->relationId))
+	if (!PartitionedTable(con->relationId) && !IsForeignTable(con->relationId))
 	{
 		HeapTuple amTuple = SearchSysCache1(AMOID, ObjectIdGetDatum(
 												relation->rd_rel->relam));
@@ -1190,7 +1189,7 @@ CreateDistributedTableLike(TableConversionState *con)
 		 * at this moment, but that's going to be the table in pg_dist_partition.
 		 */
 		Oid parentRelationId = PartitionParentOid(originalRelationId);
-		Var *parentDistKey = DistPartitionKey(parentRelationId);
+		Var *parentDistKey = DistPartitionKeyOrError(parentRelationId);
 		char *parentDistKeyColumnName =
 			ColumnToColumnName(parentRelationId, nodeToString(parentDistKey));
 
@@ -1223,7 +1222,10 @@ CreateCitusTableLike(TableConversionState *con)
 	}
 	else if (IsCitusTableType(con->relationId, CITUS_LOCAL_TABLE))
 	{
-		CreateCitusLocalTable(con->newRelationId, false);
+		CitusTableCacheEntry *entry = GetCitusTableCacheEntry(con->relationId);
+		bool autoConverted = entry->autoConverted;
+		bool cascade = false;
+		CreateCitusLocalTable(con->newRelationId, cascade, autoConverted);
 
 		/*
 		 * creating Citus local table adds a shell table on top
@@ -1302,7 +1304,7 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 
 	StringInfo query = makeStringInfo();
 
-	if (!PartitionedTable(sourceId))
+	if (!PartitionedTable(sourceId) && !IsForeignTable(sourceId))
 	{
 		if (!suppressNoticeMessages)
 		{
@@ -1369,6 +1371,21 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 															schemaName, targetName);
 			SendCommandToWorkersWithMetadata(workerChangeSequenceDependencyCommand);
 		}
+		else if (ShouldSyncTableMetadata(sourceId))
+		{
+			/*
+			 * We are converting a citus local table to a distributed/reference table,
+			 * so we should prevent dropping the sequence on the table. Otherwise, we'd
+			 * lose track of the previous changes in the sequence.
+			 */
+			StringInfo command = makeStringInfo();
+
+			appendStringInfo(command,
+							 "SELECT pg_catalog.worker_drop_sequence_dependency('%s');",
+							 quote_qualified_identifier(schemaName, sourceName));
+
+			SendCommandToWorkersWithMetadata(command->data);
+		}
 	}
 
 	char *justBeforeDropCommand = NULL;
@@ -1384,7 +1401,8 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 	}
 
 	resetStringInfo(query);
-	appendStringInfo(query, "DROP TABLE %s CASCADE",
+	appendStringInfo(query, "DROP %sTABLE %s CASCADE",
+					 IsForeignTable(sourceId) ? "FOREIGN " : "",
 					 quote_qualified_identifier(schemaName, sourceName));
 	ExecuteQueryViaSPI(query->data, SPI_OK_UTILITY);
 
