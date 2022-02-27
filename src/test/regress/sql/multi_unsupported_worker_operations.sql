@@ -51,6 +51,7 @@ SELECT * FROM mx_table ORDER BY col_1;
 \c - - - :worker_1_port
 
 -- this function is dropped in Citus10, added here for tests
+SET citus.enable_metadata_sync TO OFF;
 CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
                                                                       distribution_column text,
                                                                       distribution_method citus.distribution_type)
@@ -68,6 +69,7 @@ CREATE OR REPLACE FUNCTION pg_catalog.master_create_worker_shards(table_name tex
     RETURNS void
     AS 'citus', $$master_create_worker_shards$$
     LANGUAGE C STRICT;
+RESET citus.enable_metadata_sync;
 
 CREATE TABLE mx_table_worker(col_1 text);
 
@@ -164,7 +166,6 @@ SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_port;
 SELECT stop_metadata_sync_to_node('localhost', :worker_2_port);
 SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_port;
 \c - - - :worker_2_port
-SELECT worker_drop_distributed_table(logicalrelid::regclass::text) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'mx\_%table%';
 SELECT count(*) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'mx\_%table%';
 SELECT count(*) FROM pg_dist_node;
 \c - - - :worker_1_port

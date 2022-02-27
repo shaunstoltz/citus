@@ -32,11 +32,13 @@
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/relation_access_tracking.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/function_call_delegation.h"
 #include "executor/execdebug.h"
 #include "commands/copy.h"
 #include "nodes/execnodes.h"
@@ -80,6 +82,7 @@ int ExecutorLevel = 0;
 
 /* local function forward declarations */
 static Relation StubRelation(TupleDesc tupleDescriptor);
+static char * GetObjectTypeString(ObjectType objType);
 static bool AlterTableConstraintCheck(QueryDesc *queryDesc);
 static List * FindCitusCustomScanStates(PlanState *planState);
 static bool CitusCustomScanStateWalker(PlanState *planState,
@@ -234,7 +237,17 @@ CitusExecutorRun(QueryDesc *queryDesc,
 			 * transactions.
 			 */
 			CitusTableCacheFlushInvalidatedEntries();
+			InTopLevelDelegatedFunctionCall = false;
 		}
+
+		/*
+		 * Within a 2PC, when a function is delegated to a remote node, we pin
+		 * the distribution argument as the shard key for all the SQL in the
+		 * function's block. The restriction is imposed to not to access other
+		 * nodes from the current node, and violate the transactional integrity
+		 * of the 2PC. Now that the query is ending, reset the shard key to NULL.
+		 */
+		CheckAndResetAllowedShardKeyValueIfNeeded();
 	}
 	PG_CATCH();
 	{
@@ -245,6 +258,17 @@ CitusExecutorRun(QueryDesc *queryDesc,
 
 		executorBoundParams = savedBoundParams;
 		ExecutorLevel--;
+
+		if (ExecutorLevel == 0 && PlannerLevel == 0)
+		{
+			InTopLevelDelegatedFunctionCall = false;
+		}
+
+		/*
+		 * In case of an exception, reset the pinned shard-key, for more
+		 * details see the function header.
+		 */
+		CheckAndResetAllowedShardKeyValueIfNeeded();
 
 		PG_RE_THROW();
 	}
@@ -673,6 +697,103 @@ SetLocalMultiShardModifyModeToSequential()
 
 
 /*
+ * EnsureSequentialMode makes sure that the current transaction is already in
+ * sequential mode, or can still safely be put in sequential mode, it errors if that is
+ * not possible. The error contains information for the user to retry the transaction with
+ * sequential mode set from the beginning.
+ *
+ * Takes an ObjectType to use in the error/debug messages.
+ */
+void
+EnsureSequentialMode(ObjectType objType)
+{
+	char *objTypeString = GetObjectTypeString(objType);
+
+	if (ParallelQueryExecutedInTransaction())
+	{
+		ereport(ERROR, (errmsg("cannot run %s command because there was a "
+							   "parallel operation on a distributed table in the "
+							   "transaction", objTypeString),
+						errdetail("When running command on/for a distributed %s, Citus "
+								  "needs to perform all operations over a single "
+								  "connection per node to ensure consistency.",
+								  objTypeString),
+						errhint("Try re-running the transaction with "
+								"\"SET LOCAL citus.multi_shard_modify_mode TO "
+								"\'sequential\';\"")));
+	}
+
+	ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
+					 errdetail(
+						 "A command for a distributed %s is run. To make sure subsequent "
+						 "commands see the %s correctly we need to make sure to "
+						 "use only one connection for all future commands",
+						 objTypeString, objTypeString)));
+
+	SetLocalMultiShardModifyModeToSequential();
+}
+
+
+/*
+ * GetObjectTypeString takes an ObjectType and returns the string version of it.
+ * We (for now) call this function only in EnsureSequentialMode, and use the returned
+ * string to generate error/debug messages.
+ *
+ * If GetObjectTypeString gets called with an ObjectType that is not in the switch
+ * statement, the function will return the string "object", and emit a debug message.
+ * In that case, make sure you've added the newly supported type to the switch statement.
+ */
+static char *
+GetObjectTypeString(ObjectType objType)
+{
+	switch (objType)
+	{
+		case OBJECT_COLLATION:
+		{
+			return "collation";
+		}
+
+		case OBJECT_DATABASE:
+		{
+			return "database";
+		}
+
+		case OBJECT_EXTENSION:
+		{
+			return "extension";
+		}
+
+		case OBJECT_FUNCTION:
+		{
+			return "function";
+		}
+
+		case OBJECT_SCHEMA:
+		{
+			return "schema";
+		}
+
+		case OBJECT_TSCONFIGURATION:
+		{
+			return "text search configuration";
+		}
+
+		case OBJECT_TYPE:
+		{
+			return "type";
+		}
+
+		default:
+		{
+			ereport(DEBUG1, (errmsg("unsupported object type"),
+							 errdetail("Please add string conversion for the object.")));
+			return "object";
+		}
+	}
+}
+
+
+/*
  * AlterTableConstraintCheck returns if the given query is an ALTER TABLE
  * constraint check query.
  *
@@ -760,7 +881,7 @@ InTaskExecution(void)
 	 * is considered a task execution, but an exception is when we
 	 * are in a delegated function/procedure call.
 	 */
-	return IsCitusInitiatedRemoteBackend() &&
-		   !InDelegatedFunctionCall &&
+	return IsCitusInternalBackend() &&
+		   !InTopLevelDelegatedFunctionCall &&
 		   !InDelegatedProcedureCall;
 }

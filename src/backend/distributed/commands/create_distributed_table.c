@@ -60,6 +60,7 @@
 #include "distributed/remote_commands.h"
 #include "distributed/shared_library_init.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_transaction.h"
 #include "distributed/version_compat.h"
 #include "executor/executor.h"
@@ -113,8 +114,9 @@ static void EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMe
 static bool ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod, bool
 									viaDeprecatedAPI);
 static void EnsureCitusTableCanBeCreated(Oid relationOid);
-static void EnsureSequenceExistOnMetadataWorkersForRelation(Oid relationId,
-															Oid sequenceOid);
+static void EnsureDistributedSequencesHaveOneType(Oid relationId,
+												  List *dependentSequenceList,
+												  List *attnumList);
 static List * GetFKeyCreationCommandsRelationInvolvedWithTableType(Oid relationId,
 																   int tableTypeFlag);
 static Oid DropFKeysAndUndistributeTable(Oid relationId);
@@ -157,29 +159,13 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	char *colocateWithTableName = NULL;
 	bool viaDeprecatedAPI = true;
 
-	/*
-	 * Lock target relation with an exclusive lock - there's no way to make
-	 * sense of this table until we've committed, and we don't want multiple
-	 * backends manipulating this relation.
-	 */
-	Relation relation = try_relation_open(relationId, ExclusiveLock);
-
-	if (relation == NULL)
-	{
-		ereport(ERROR, (errmsg("could not create distributed table: "
-							   "relation does not exist")));
-	}
-
 	char *distributionColumnName = text_to_cstring(distributionColumnText);
-	Var *distributionColumn = BuildDistributionKeyFromColumnName(relation,
-																 distributionColumnName);
-	Assert(distributionColumn != NULL);
+	Assert(distributionColumnName != NULL);
+
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
-	CreateDistributedTable(relationId, distributionColumn, distributionMethod,
+	CreateDistributedTable(relationId, distributionColumnName, distributionMethod,
 						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
-
-	relation_close(relation, NoLock);
 
 	PG_RETURN_VOID();
 }
@@ -247,9 +233,8 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	relation_close(relation, NoLock);
 
 	char *distributionColumnName = text_to_cstring(distributionColumnText);
-	Var *distributionColumn = BuildDistributionKeyFromColumnName(relation,
-																 distributionColumnName);
-	Assert(distributionColumn != NULL);
+	Assert(distributionColumnName != NULL);
+
 	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
 
 	if (shardCount < 1 || shardCount > MAX_SHARD_COUNT)
@@ -259,7 +244,7 @@ create_distributed_table(PG_FUNCTION_ARGS)
 							   shardCount, MAX_SHARD_COUNT)));
 	}
 
-	CreateDistributedTable(relationId, distributionColumn, distributionMethod,
+	CreateDistributedTable(relationId, distributionColumnName, distributionMethod,
 						   shardCount, shardCountIsStrict, colocateWithTableName,
 						   viaDeprecatedAPI);
 
@@ -279,7 +264,7 @@ create_reference_table(PG_FUNCTION_ARGS)
 	Oid relationId = PG_GETARG_OID(0);
 
 	char *colocateWithTableName = NULL;
-	Var *distributionColumn = NULL;
+	char *distributionColumnName = NULL;
 
 	bool viaDeprecatedAPI = false;
 
@@ -315,7 +300,7 @@ create_reference_table(PG_FUNCTION_ARGS)
 						errdetail("There are no active worker nodes.")));
 	}
 
-	CreateDistributedTable(relationId, distributionColumn, DISTRIBUTE_BY_NONE,
+	CreateDistributedTable(relationId, distributionColumnName, DISTRIBUTE_BY_NONE,
 						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
 	PG_RETURN_VOID();
 }
@@ -326,6 +311,7 @@ create_reference_table(PG_FUNCTION_ARGS)
  * - we are on the coordinator
  * - the current user is the owner of the table
  * - relation kind is supported
+ * - relation is not a shard
  */
 static void
 EnsureCitusTableCanBeCreated(Oid relationOid)
@@ -342,6 +328,14 @@ EnsureCitusTableCanBeCreated(Oid relationOid)
 	 * will be performed in CreateDistributedTable.
 	 */
 	EnsureRelationKindSupported(relationOid);
+
+	/*
+	 * When coordinator is added to the metadata, or on the workers,
+	 * some of the relations of the coordinator node may/will be shards.
+	 * We disallow creating distributed tables from shard relations, by
+	 * erroring out here.
+	 */
+	ErrorIfRelationIsAKnownShard(relationOid);
 }
 
 
@@ -374,9 +368,10 @@ EnsureRelationExists(Oid relationId)
  * day, once we deprecate master_create_distribute_table completely.
  */
 void
-CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributionMethod,
-					   int shardCount, bool shardCountIsStrict,
-					   char *colocateWithTableName, bool viaDeprecatedAPI)
+CreateDistributedTable(Oid relationId, char *distributionColumnName,
+					   char distributionMethod, int shardCount,
+					   bool shardCountIsStrict, char *colocateWithTableName,
+					   bool viaDeprecatedAPI)
 {
 	/*
 	 * EnsureTableNotDistributed errors out when relation is a citus table but
@@ -432,6 +427,14 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 		DropFKeysRelationInvolvedWithTableType(relationId, INCLUDE_LOCAL_TABLES);
 	}
 
+	LockRelationOid(relationId, ExclusiveLock);
+
+	/*
+	 * Ensure that the sequences used in column defaults of the table
+	 * have proper types
+	 */
+	EnsureRelationHasCompatibleSequenceTypes(relationId);
+
 	/*
 	 * distributed tables might have dependencies on different objects, since we create
 	 * shards for a distributed table via multiple sessions these objects will be created
@@ -446,23 +449,9 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 												   colocateWithTableName,
 												   viaDeprecatedAPI);
 
-
-	/*
-	 * Due to dropping columns, the parent's distribution key may not match the
-	 * partition's distribution key. The input distributionColumn belongs to
-	 * the parent. That's why we override the distribution column of partitions
-	 * here. See issue #5123 for details.
-	 */
-	if (PartitionTable(relationId))
-	{
-		Oid parentRelationId = PartitionParentOid(relationId);
-		char *distributionColumnName =
-			ColumnToColumnName(parentRelationId, nodeToString(distributionColumn));
-
-		distributionColumn =
-			FindColumnWithNameOnTargetRelation(parentRelationId, distributionColumnName,
-											   relationId);
-	}
+	Var *distributionColumn = BuildDistributionKeyFromColumnName(relationId,
+																 distributionColumnName,
+																 ExclusiveLock);
 
 	/*
 	 * ColocationIdForNewTable assumes caller acquires lock on relationId. In our case,
@@ -493,16 +482,6 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	/* create an entry for distributed table in pg_dist_partition */
 	InsertIntoPgDistPartition(relationId, distributionMethod, distributionColumn,
 							  colocationId, replicationModel, autoConverted);
-
-	/*
-	 * Ensure that the sequences used in column defaults of the table
-	 * have proper types
-	 */
-	List *attnumList = NIL;
-	List *dependentSequenceList = NIL;
-	GetDependentSequencesWithRelation(relationId, &attnumList, &dependentSequenceList, 0);
-	EnsureDistributedSequencesHaveOneType(relationId, dependentSequenceList,
-										  attnumList);
 
 	/* foreign tables do not support TRUNCATE trigger */
 	if (RegularTable(relationId))
@@ -537,17 +516,7 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 
 	if (ShouldSyncTableMetadata(relationId))
 	{
-		if (ClusterHasKnownMetadataWorkers())
-		{
-			/*
-			 * Ensure both sequence and its' dependencies and mark them as distributed
-			 * before creating table metadata on workers
-			 */
-			MarkSequenceListDistributedAndPropagateWithDependencies(relationId,
-																	dependentSequenceList);
-		}
-
-		CreateTableMetadataOnWorkers(relationId);
+		SyncCitusTableMetadata(relationId);
 	}
 
 	/*
@@ -571,7 +540,7 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 
 		foreach_oid(partitionRelationId, partitionList)
 		{
-			CreateDistributedTable(partitionRelationId, distributionColumn,
+			CreateDistributedTable(partitionRelationId, distributionColumnName,
 								   distributionMethod, shardCount, false,
 								   parentRelationName, viaDeprecatedAPI);
 		}
@@ -605,11 +574,15 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
  * If any other distributed table uses the input sequence, it checks whether
  * the types of the columns using the sequence match. If they don't, it errors out.
  * Otherwise, the condition is ensured.
+ * Since the owner of the sequence may not distributed yet, it should be added
+ * explicitly.
  */
 void
-EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId)
+EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId, Oid ownerRelationId)
 {
 	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
+	citusTableIdList = list_append_unique_oid(citusTableIdList, ownerRelationId);
+
 	Oid citusTableId = InvalidOid;
 	foreach_oid(citusTableId, citusTableIdList)
 	{
@@ -676,59 +649,18 @@ AlterSequenceType(Oid seqOid, Oid typeOid)
 
 
 /*
- * MarkSequenceListDistributedAndPropagateWithDependencies ensures sequences and their
- * dependencies for the given sequence list exist on all nodes and marks them as distributed.
+ * EnsureRelationHasCompatibleSequenceTypes ensures that sequences used for columns
+ * of the table have compatible types both with the column type on that table and
+ * all other distributed tables' columns they have used for
  */
 void
-MarkSequenceListDistributedAndPropagateWithDependencies(Oid relationId,
-														List *sequenceList)
+EnsureRelationHasCompatibleSequenceTypes(Oid relationId)
 {
-	Oid sequenceOid = InvalidOid;
-	foreach_oid(sequenceOid, sequenceList)
-	{
-		MarkSequenceDistributedAndPropagateWithDependencies(relationId, sequenceOid);
-	}
-}
+	List *attnumList = NIL;
+	List *dependentSequenceList = NIL;
 
-
-/*
- * MarkSequenceDistributedAndPropagateWithDependencies ensures sequence and its'
- * dependencies for the given sequence exist on all nodes and marks them as distributed.
- */
-void
-MarkSequenceDistributedAndPropagateWithDependencies(Oid relationId, Oid sequenceOid)
-{
-	/* get sequence address */
-	ObjectAddress sequenceAddress = { 0 };
-	ObjectAddressSet(sequenceAddress, RelationRelationId, sequenceOid);
-	EnsureDependenciesExistOnAllNodes(&sequenceAddress);
-	EnsureSequenceExistOnMetadataWorkersForRelation(relationId, sequenceOid);
-	MarkObjectDistributed(&sequenceAddress);
-}
-
-
-/*
- * EnsureSequenceExistOnMetadataWorkersForRelation ensures sequence for the given relation
- * exist on each worker node with metadata.
- */
-static void
-EnsureSequenceExistOnMetadataWorkersForRelation(Oid relationId, Oid sequenceOid)
-{
-	Assert(ShouldSyncTableMetadata(relationId));
-
-	char *ownerName = TableOwner(relationId);
-	List *sequenceDDLList = DDLCommandsForSequence(sequenceOid, ownerName);
-
-	/* prevent recursive propagation */
-	SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
-
-	const char *sequenceCommand = NULL;
-	foreach_ptr(sequenceCommand, sequenceDDLList)
-	{
-		SendCommandToWorkersWithMetadata(sequenceCommand);
-	}
-
-	SendCommandToWorkersWithMetadata(ENABLE_DDL_PROPAGATION);
+	GetDependentSequencesWithRelation(relationId, &attnumList, &dependentSequenceList, 0);
+	EnsureDistributedSequencesHaveOneType(relationId, dependentSequenceList, attnumList);
 }
 
 
@@ -737,7 +669,7 @@ EnsureSequenceExistOnMetadataWorkersForRelation(Oid relationId, Oid sequenceOid)
  * in which the sequence is used as default is supported for each sequence in input
  * dependentSequenceList, and then alters the sequence type if not the same with the column type.
  */
-void
+static void
 EnsureDistributedSequencesHaveOneType(Oid relationId, List *dependentSequenceList,
 									  List *attnumList)
 {
@@ -753,7 +685,7 @@ EnsureDistributedSequencesHaveOneType(Oid relationId, List *dependentSequenceLis
 		 * that sequence is supported
 		 */
 		Oid seqTypId = GetAttributeTypeOid(relationId, attnum);
-		EnsureSequenceTypeSupported(sequenceOid, seqTypId);
+		EnsureSequenceTypeSupported(sequenceOid, seqTypId, relationId);
 
 		/*
 		 * Alter the sequence's data type in the coordinator if needed.
@@ -1074,7 +1006,13 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 
 	EnsureTableNotDistributed(relationId);
 	EnsureLocalTableEmptyIfNecessary(relationId, distributionMethod, viaDeprecatedAPI);
-	EnsureRelationHasNoTriggers(relationId);
+
+	/* user really wants triggers? */
+	if (!EnableUnsafeTriggers)
+	{
+		EnsureRelationHasNoTriggers(relationId);
+	}
+
 
 	/* we assume callers took necessary locks */
 	Relation relation = relation_open(relationId, NoLock);
@@ -1396,11 +1334,11 @@ EnsureRelationHasNoTriggers(Oid relationId)
 
 		Assert(relationName != NULL);
 		ereport(ERROR, (errmsg("cannot distribute relation \"%s\" because it has "
-							   "triggers ", relationName),
-						errdetail("Citus does not support distributing tables with "
-								  "triggers."),
-						errhint("Drop all the triggers on \"%s\" and retry.",
-								relationName)));
+							   "triggers and \"citus.enable_unsafe_triggers\" is "
+							   "set to \"false\"", relationName),
+						errhint("Consider setting \"citus.enable_unsafe_triggers\" "
+								"to \"true\", or drop all the triggers on \"%s\" "
+								"and retry.", relationName)));
 	}
 }
 
@@ -1539,19 +1477,7 @@ CanUseExclusiveConnections(Oid relationId, bool localTableEmpty)
 	bool shouldRunSequential = MultiShardConnectionType == SEQUENTIAL_CONNECTION ||
 							   hasForeignKeyToReferenceTable;
 
-	if (!localTableEmpty && shouldRunSequential)
-	{
-		char *relationName = get_rel_name(relationId);
-
-		ereport(ERROR, (errmsg("cannot distribute \"%s\" in sequential mode "
-							   "because it is not empty", relationName),
-						errhint("If you have manually set "
-								"citus.multi_shard_modify_mode to 'sequential', "
-								"try with 'parallel' option. If that is not the "
-								"case, try distributing local tables when they "
-								"are empty.")));
-	}
-	else if (shouldRunSequential && ParallelQueryExecutedInTransaction())
+	if (shouldRunSequential && ParallelQueryExecutedInTransaction())
 	{
 		/*
 		 * We decided to use sequential execution. It's either because relation

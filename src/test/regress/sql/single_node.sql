@@ -7,6 +7,9 @@ SET citus.next_shard_id TO 90630500;
 -- Ensure tuple data in explain analyze output is the same on all PG versions
 SET citus.enable_binary_protocol = TRUE;
 
+-- do not cache any connections for now, will enable it back soon
+ALTER SYSTEM SET citus.max_cached_conns_per_worker TO 0;
+
 -- adding the coordinator as inactive is disallowed
 SELECT 1 FROM master_add_inactive_node('localhost', :master_port, groupid => 0);
 
@@ -24,6 +27,32 @@ SELECT 1 FROM master_remove_node('localhost', :master_port);
 SELECT count(*) FROM pg_dist_node;
 
 -- there are no workers now, but we should still be able to create Citus tables
+
+-- force local execution when creating the index
+ALTER SYSTEM SET citus.local_shared_pool_size TO -1;
+
+-- Postmaster might not ack SIGHUP signal sent by pg_reload_conf() immediately,
+-- so we need to sleep for some amount of time to do our best to ensure that
+-- postmaster reflects GUC changes.
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+
+CREATE TABLE failover_to_local (a int);
+SELECT create_distributed_table('failover_to_local', 'a', shard_count=>32);
+
+CREATE INDEX CONCURRENTLY ON failover_to_local(a);
+
+-- reset global GUC changes
+ALTER SYSTEM RESET citus.local_shared_pool_size;
+ALTER SYSTEM RESET citus.max_cached_conns_per_worker;
+SELECT pg_reload_conf();
+
+SET client_min_messages TO WARNING;
+DROP TABLE failover_to_local;
+RESET client_min_messages;
+
+-- so that we don't have to update rest of the test output
+SET citus.next_shard_id TO 90630500;
 
 CREATE TABLE ref(x int, y int);
 SELECT create_reference_table('ref');
@@ -72,7 +101,7 @@ BEGIN;
 	-- it'd spawn a bg worker targeting this node
 	-- and that changes the connection count specific tests
 	-- here
-	SET LOCAL citus.enable_metadata_sync_by_default TO OFF;
+	SET LOCAL citus.enable_metadata_sync TO OFF;
 	-- cannot add workers with specific IP as long as I have a placeholder coordinator record
 	SELECT 1 FROM master_add_node('127.0.0.1', :worker_1_port);
 COMMIT;
@@ -82,7 +111,7 @@ BEGIN;
 	-- it'd spawn a bg worker targeting this node
 	-- and that changes the connection count specific tests
 	-- here
-	SET LOCAL citus.enable_metadata_sync_by_default TO OFF;
+	SET LOCAL citus.enable_metadata_sync TO OFF;
 	-- adding localhost workers is ok
 	SELECT 1 FROM master_add_node('localhost', :worker_1_port);
 COMMIT;
@@ -98,7 +127,7 @@ BEGIN;
 	-- it'd spawn a bg worker targeting this node
 	-- and that changes the connection count specific tests
 	-- here
-	SET LOCAL citus.enable_metadata_sync_by_default TO OFF;
+	SET LOCAL citus.enable_metadata_sync TO OFF;
 	-- adding workers with specific IP is ok now
 	SELECT 1 FROM master_add_node('127.0.0.1', :worker_1_port);
 COMMIT;
@@ -988,8 +1017,21 @@ RESET citus.enable_manual_changes_to_shards ;
 TRUNCATE TABLE test_disabling_drop_and_truncate_102040;
 DROP TABLE test_disabling_drop_and_truncate_102040;
 
-RESET citus.shard_replication_factor;
 DROP TABLE test_disabling_drop_and_truncate;
+
+-- test creating distributed or reference tables from shards
+CREATE TABLE test_creating_distributed_relation_table_from_shard (a int);
+SELECT create_distributed_table('test_creating_distributed_relation_table_from_shard', 'a');
+
+-- these should error because shards cannot be used to:
+-- create distributed table
+SELECT create_distributed_table('test_creating_distributed_relation_table_from_shard_102044', 'a');
+
+-- create reference table
+SELECT create_reference_table('test_creating_distributed_relation_table_from_shard_102044');
+
+RESET citus.shard_replication_factor;
+DROP TABLE test_creating_distributed_relation_table_from_shard;
 
 -- lets flush the copy often to make sure everyhing is fine
 SET citus.local_copy_flush_threshold TO 1;

@@ -108,7 +108,7 @@
  * showing the initiator_node_id we expand it to initiator_node_host and
  * initiator_node_port.
  */
-#define CITUS_DIST_STAT_ACTIVITY_QUERY_COLS 23
+#define CITUS_DIST_STAT_ACTIVITY_QUERY_COLS 24
 #define CITUS_DIST_STAT_ADDITIONAL_COLS 3
 #define CITUS_DIST_STAT_ACTIVITY_COLS \
 	CITUS_DIST_STAT_ACTIVITY_QUERY_COLS + CITUS_DIST_STAT_ADDITIONAL_COLS
@@ -147,14 +147,19 @@ SELECT \
 	pg_stat_activity.backend_xid, \
 	pg_stat_activity.backend_xmin, \
 	pg_stat_activity.query, \
-	pg_stat_activity.backend_type \
+	pg_stat_activity.backend_type, \
+	dist_txs.global_pid \
 FROM \
 	pg_stat_activity \
 	INNER JOIN \
-	get_all_active_transactions() AS dist_txs(database_id, process_id, initiator_node_identifier, worker_query, transaction_number, transaction_stamp) \
+	get_all_active_transactions() AS dist_txs(database_id, process_id, initiator_node_identifier, worker_query, transaction_number, transaction_stamp, global_pid) \
 	ON pg_stat_activity.pid = dist_txs.process_id \
 WHERE \
-	dist_txs.worker_query = false;"
+	backend_type = 'client backend' \
+	AND \
+	worker_query = False \
+	AND \
+	pg_stat_activity.query NOT ILIKE '%stat_activity%';"
 
 #define CITUS_WORKER_STAT_ACTIVITY_QUERY \
 	"\
@@ -181,14 +186,15 @@ SELECT \
 	pg_stat_activity.backend_xid, \
 	pg_stat_activity.backend_xmin, \
 	pg_stat_activity.query, \
-	pg_stat_activity.backend_type \
+	pg_stat_activity.backend_type, \
+	dist_txs.global_id \
 FROM \
 	pg_stat_activity \
-	LEFT JOIN \
-	get_all_active_transactions() AS dist_txs(database_id, process_id, initiator_node_identifier, worker_query, transaction_number, transaction_stamp) \
+	JOIN \
+	get_all_active_transactions() AS dist_txs(database_id, process_id, initiator_node_identifier, worker_query, transaction_number, transaction_stamp, global_id) \
 	ON pg_stat_activity.pid = dist_txs.process_id \
 WHERE \
-	pg_stat_activity.application_name = 'citus' \
+	worker_query = True \
 	AND \
 	pg_stat_activity.query NOT ILIKE '%stat_activity%';"
 
@@ -223,6 +229,7 @@ typedef struct CitusDistStat
 	TransactionId backend_xmin;
 	text *query;
 	text *backend_type;
+	uint64 global_pid;
 } CitusDistStat;
 
 
@@ -501,6 +508,7 @@ ParseCitusDistStat(PGresult *result, int64 rowIndex)
 	citusDistStat->backend_xmin = ParseXIDField(result, rowIndex, 20);
 	citusDistStat->query = ParseTextField(result, rowIndex, 21);
 	citusDistStat->backend_type = ParseTextField(result, rowIndex, 22);
+	citusDistStat->global_pid = ParseIntField(result, rowIndex, 23);
 
 	return citusDistStat;
 }
@@ -530,32 +538,34 @@ ReplaceInitiatorNodeIdentifier(int initiator_node_identifier,
 	 *     transaction. However, we cannot know which node has initiated
 	 *     the worker query.
 	 */
-	if (initiator_node_identifier > 0)
-	{
-		bool nodeExists = false;
-
-		initiatorWorkerNode = PrimaryNodeForGroup(initiator_node_identifier, &nodeExists);
-
-		/* a query should run on an existing node */
-		Assert(nodeExists);
-		if (initiatorWorkerNode == NULL)
-		{
-			ereport(ERROR, (errmsg("no primary node found for group %d",
-								   initiator_node_identifier)));
-		}
-		citusDistStat->master_query_host_name =
-			cstring_to_text(initiatorWorkerNode->workerName);
-		citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
-	}
-	else if (initiator_node_identifier == 0 && IsCoordinator())
+	if (initiator_node_identifier == GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA &&
+		IsCoordinator())
 	{
 		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
 		citusDistStat->master_query_host_port = PostPortNumber;
 	}
-	else if (initiator_node_identifier == 0)
+	else if (initiator_node_identifier == GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA)
 	{
 		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
 		citusDistStat->master_query_host_port = 0;
+	}
+	else if (initiator_node_identifier > 0)
+	{
+		/* a query should run on an existing node, but lets be defensive */
+		bool missingOk = true;
+		initiatorWorkerNode = FindNodeWithNodeId(initiator_node_identifier, missingOk);
+
+		if (initiatorWorkerNode)
+		{
+			citusDistStat->master_query_host_name =
+				cstring_to_text(initiatorWorkerNode->workerName);
+			citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
+		}
+		else
+		{
+			citusDistStat->master_query_host_name = NULL;
+			citusDistStat->master_query_host_port = 0;
+		}
 	}
 	else
 	{
@@ -688,6 +698,7 @@ HeapTupleToCitusDistStat(HeapTuple result, TupleDesc rowDescriptor)
 	citusDistStat->backend_xmin = ParseXIDFieldFromHeapTuple(result, rowDescriptor, 21);
 	citusDistStat->query = ParseTextFieldFromHeapTuple(result, rowDescriptor, 22);
 	citusDistStat->backend_type = ParseTextFieldFromHeapTuple(result, rowDescriptor, 23);
+	citusDistStat->global_pid = ParseIntFieldFromHeapTuple(result, rowDescriptor, 24);
 
 	return citusDistStat;
 }
@@ -1097,6 +1108,8 @@ ReturnCitusDistStats(List *citusStatsList, FunctionCallInfo fcinfo)
 		{
 			nulls[25] = true;
 		}
+
+		values[26] = Int32GetDatum(citusDistStat->global_pid);
 
 		tuplestore_putvalues(tupleStore, tupleDesc, values, nulls);
 	}

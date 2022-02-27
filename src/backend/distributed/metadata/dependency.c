@@ -37,6 +37,7 @@
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/version_compat.h"
 #include "miscadmin.h"
 #include "utils/fmgroids.h"
@@ -120,9 +121,12 @@ typedef struct ViewDependencyNode
 }ViewDependencyNode;
 
 
-static List * GetRelationTriggerFunctionDepencyList(Oid relationId);
+static List * GetRelationSequenceDependencyList(Oid relationId);
+static List * GetRelationTriggerFunctionDependencyList(Oid relationId);
 static List * GetRelationStatsSchemaDependencyList(Oid relationId);
+static List * GetRelationIndicesDependencyList(Oid relationId);
 static DependencyDefinition * CreateObjectAddressDependencyDef(Oid classId, Oid objectId);
+static List * CreateObjectAddressDependencyDefList(Oid classId, List *objectIdList);
 static ObjectAddress DependencyDefinitionObjectAddress(DependencyDefinition *definition);
 
 /* forward declarations for functions to interact with the ObjectAddressCollector */
@@ -152,6 +156,8 @@ static bool FollowAllSupportedDependencies(ObjectAddressCollector *collector,
 										   DependencyDefinition *definition);
 static bool FollowNewSupportedDependencies(ObjectAddressCollector *collector,
 										   DependencyDefinition *definition);
+static bool FollowAllDependencies(ObjectAddressCollector *collector,
+								  DependencyDefinition *definition);
 static void ApplyAddToDependencyList(ObjectAddressCollector *collector,
 									 DependencyDefinition *definition);
 static List * ExpandCitusSupportedTypes(ObjectAddressCollector *collector,
@@ -208,13 +214,40 @@ GetDependenciesForObject(const ObjectAddress *target)
 
 
 /*
- * GetAllDependenciesForObject returns a list of all the ObjectAddresses to be
- * created in order before the target object could safely be created on a
- * worker. As a caller, you probably need GetDependenciesForObject() which
- * eliminates already distributed objects from the returned list.
+ * GetAllSupportedDependenciesForObject returns a list of all the ObjectAddresses to be
+ * created in order before the target object could safely be created on a worker, if all
+ * dependent objects are distributable. As a caller, you probably need to use
+ * GetDependenciesForObject() which eliminates already distributed objects from the returned
+ * list.
  *
  * Some of the object might already be created on a worker. It should be created
  * in an idempotent way.
+ */
+List *
+GetAllSupportedDependenciesForObject(const ObjectAddress *target)
+{
+	ObjectAddressCollector collector = { 0 };
+	InitObjectAddressCollector(&collector);
+
+	RecurseObjectDependencies(*target,
+							  &ExpandCitusSupportedTypes,
+							  &FollowAllSupportedDependencies,
+							  &ApplyAddToDependencyList,
+							  &collector);
+
+	return collector.dependencyList;
+}
+
+
+/*
+ * GetAllDependenciesForObject returns a list of all the dependent objects of the given
+ * object irrespective of whether the dependent object is supported by Citus or not, if
+ * the object can be found as dependency with RecurseObjectDependencies and
+ * ExpandCitusSupportedTypes.
+ *
+ * This function will be used to provide meaningful error messages if any dependent
+ * object for a given object is not supported. If you want to create dependencies for
+ * an object, you probably need to use GetDependenciesForObject().
  */
 List *
 GetAllDependenciesForObject(const ObjectAddress *target)
@@ -224,7 +257,7 @@ GetAllDependenciesForObject(const ObjectAddress *target)
 
 	RecurseObjectDependencies(*target,
 							  &ExpandCitusSupportedTypes,
-							  &FollowAllSupportedDependencies,
+							  &FollowAllDependencies,
 							  &ApplyAddToDependencyList,
 							  &collector);
 
@@ -555,7 +588,7 @@ IsObjectAddressCollected(ObjectAddress findAddress,
 bool
 SupportedDependencyByCitus(const ObjectAddress *address)
 {
-	if (!EnableDependencyCreation)
+	if (!EnableMetadataSync)
 	{
 		/*
 		 * If the user has disabled object propagation we need to fall back to the legacy
@@ -636,6 +669,11 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			return true;
 		}
 
+		case OCLASS_TSCONFIG:
+		{
+			return true;
+		}
+
 		case OCLASS_TYPE:
 		{
 			switch (get_typtype(address->objectId))
@@ -670,11 +708,22 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 
 		case OCLASS_CLASS:
 		{
+			char relKind = get_rel_relkind(address->objectId);
+
 			/*
 			 * composite types have a reference to a relation of composite type, we need
 			 * to follow those to get the dependencies of type fields.
+			 *
+			 * As we also handle tables as objects as well, follow dependencies
+			 * for tables.
 			 */
-			if (get_rel_relkind(address->objectId) == RELKIND_COMPOSITE_TYPE)
+			if (relKind == RELKIND_COMPOSITE_TYPE ||
+				relKind == RELKIND_RELATION ||
+				relKind == RELKIND_PARTITIONED_TABLE ||
+				relKind == RELKIND_FOREIGN_TABLE ||
+				relKind == RELKIND_SEQUENCE ||
+				relKind == RELKIND_INDEX ||
+				relKind == RELKIND_PARTITIONED_INDEX)
 			{
 				return true;
 			}
@@ -884,10 +933,61 @@ FollowAllSupportedDependencies(ObjectAddressCollector *collector,
 
 
 /*
- * ApplyAddToDependencyList is an apply function for RecurseObjectDependencies that will collect
- * all the ObjectAddresses for pg_depend entries to the context. The context here is
- * assumed to be a (ObjectAddressCollector *) to the location where all ObjectAddresses
- * will be collected.
+ * FollowAllDependencies applies filters on pg_depend entries to follow the dependency
+ * tree of objects in depth first order. We will visit all objects irrespective of it is
+ * supported by Citus or not.
+ */
+static bool
+FollowAllDependencies(ObjectAddressCollector *collector,
+					  DependencyDefinition *definition)
+{
+	if (definition->mode == DependencyPgDepend)
+	{
+		/*
+		 *  For dependencies found in pg_depend:
+		 *
+		 *  Follow only normal and extension dependencies. The latter is used to reach the
+		 *  extensions, the objects that directly depend on the extension are eliminated
+		 *  during the "apply" phase.
+		 *
+		 *  Other dependencies are internal dependencies and managed by postgres.
+		 */
+		if (definition->data.pg_depend.deptype != DEPENDENCY_NORMAL &&
+			definition->data.pg_depend.deptype != DEPENDENCY_EXTENSION)
+		{
+			return false;
+		}
+	}
+
+	/* rest of the tests are to see if we want to follow the actual dependency */
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
+
+	/*
+	 * If the object is already in our dependency list we do not have to follow any
+	 * further
+	 */
+	if (IsObjectAddressCollected(address, collector))
+	{
+		return false;
+	}
+
+	if (CitusExtensionObject(&address))
+	{
+		/* following citus extension could complicate role management */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * ApplyAddToDependencyList is an apply function for RecurseObjectDependencies that will
+ * collect all the ObjectAddresses for pg_depend entries to the context, except it is
+ * extension owned one.
+ *
+ * The context here is assumed to be a (ObjectAddressCollector *) to the location where
+ * all ObjectAddresses will be collected.
  */
 static void
 ApplyAddToDependencyList(ObjectAddressCollector *collector,
@@ -971,7 +1071,7 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 			 */
 			Oid relationId = target.objectId;
 			List *triggerFunctionDepencyList =
-				GetRelationTriggerFunctionDepencyList(relationId);
+				GetRelationTriggerFunctionDependencyList(relationId);
 			result = list_concat(result, triggerFunctionDepencyList);
 
 			/*
@@ -984,6 +1084,26 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 			List *statisticsSchemaDependencyList =
 				GetRelationStatsSchemaDependencyList(relationId);
 			result = list_concat(result, statisticsSchemaDependencyList);
+
+			/*
+			 * Get the dependent sequences for tables (both as serial columns and
+			 * columns have nextval with existing sequences) and expand dependency list
+			 * with them.
+			 */
+			List *sequenceDependencyList = GetRelationSequenceDependencyList(relationId);
+
+			result = list_concat(result, sequenceDependencyList);
+
+			/*
+			 * Tables could have indexes. Indexes themself could have dependencies that
+			 * need to be propagated. eg. TEXT SEARCH CONFIGRUATIONS. Here we add the
+			 * addresses of all indices to the list of objects to vist, as to make sure we
+			 * create all objects required by the indices before we create the table
+			 * including indices.
+			 */
+
+			List *indexDependencyList = GetRelationIndicesDependencyList(relationId);
+			result = list_concat(result, indexDependencyList);
 		}
 
 		default:
@@ -997,33 +1117,64 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 
 
 /*
+ * GetRelationSequenceDependencyList returns the sequence dependency definition
+ * list for the given relation.
+ */
+static List *
+GetRelationSequenceDependencyList(Oid relationId)
+{
+	List *attnumList = NIL;
+	List *dependentSequenceList = NIL;
+
+	GetDependentSequencesWithRelation(relationId, &attnumList, &dependentSequenceList, 0);
+	List *sequenceDependencyDefList =
+		CreateObjectAddressDependencyDefList(RelationRelationId, dependentSequenceList);
+
+	return sequenceDependencyDefList;
+}
+
+
+/*
  * GetRelationStatsSchemaDependencyList returns a list of DependencyDefinition
  * objects for the schemas that statistics' of the relation with relationId depends.
  */
 static List *
 GetRelationStatsSchemaDependencyList(Oid relationId)
 {
-	List *dependencyList = NIL;
-
 	List *schemaIds = GetExplicitStatisticsSchemaIdList(relationId);
-	Oid schemaId = InvalidOid;
-	foreach_oid(schemaId, schemaIds)
-	{
-		DependencyDefinition *dependency =
-			CreateObjectAddressDependencyDef(NamespaceRelationId, schemaId);
-		dependencyList = lappend(dependencyList, dependency);
-	}
 
-	return dependencyList;
+	return CreateObjectAddressDependencyDefList(NamespaceRelationId, schemaIds);
 }
 
 
 /*
- * GetRelationTriggerFunctionDepencyList returns a list of DependencyDefinition
+ * CollectIndexOids implements PGIndexProcessor to create a list of all index oids
+ */
+static void
+CollectIndexOids(Form_pg_index formPgIndex, List **oids, int flags)
+{
+	*oids = lappend_oid(*oids, formPgIndex->indexrelid);
+}
+
+
+/*
+ * GetRelationIndicesDependencyList creates a list of ObjectAddressDependencies for the
+ * indexes on a given relation.
+ */
+static List *
+GetRelationIndicesDependencyList(Oid relationId)
+{
+	List *indexIds = ExecuteFunctionOnEachTableIndex(relationId, CollectIndexOids, 0);
+	return CreateObjectAddressDependencyDefList(RelationRelationId, indexIds);
+}
+
+
+/*
+ * GetRelationTriggerFunctionDependencyList returns a list of DependencyDefinition
  * objects for the functions that triggers of the relation with relationId depends.
  */
 static List *
-GetRelationTriggerFunctionDepencyList(Oid relationId)
+GetRelationTriggerFunctionDependencyList(Oid relationId)
 {
 	List *dependencyList = NIL;
 
@@ -1053,6 +1204,27 @@ CreateObjectAddressDependencyDef(Oid classId, Oid objectId)
 	dependency->mode = DependencyObjectAddress;
 	ObjectAddressSet(dependency->data.address, classId, objectId);
 	return dependency;
+}
+
+
+/*
+ * CreateObjectAddressDependencyDefList is a wrapper function for
+ * CreateObjectAddressDependencyDef to operate on a list of relation oids,
+ * instead of a single oid.
+ */
+static List *
+CreateObjectAddressDependencyDefList(Oid classId, List *objectIdList)
+{
+	List *dependencyList = NIL;
+	Oid objectId = InvalidOid;
+	foreach_oid(objectId, objectIdList)
+	{
+		DependencyDefinition *dependency =
+			CreateObjectAddressDependencyDef(classId, objectId);
+		dependencyList = lappend(dependencyList, dependency);
+	}
+
+	return dependencyList;
 }
 
 

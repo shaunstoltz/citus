@@ -23,17 +23,6 @@
 
 
 /*
- * CitusInitiatedBackend keeps some information about the backends that are
- * initiated by Citus.
- */
-typedef struct CitusInitiatedBackend
-{
-	int initiatorNodeIdentifier;
-	bool transactionOriginator;
-} CitusInitiatedBackend;
-
-
-/*
  * Each backend's active distributed transaction information is tracked via
  * BackendData in shared memory.
  *
@@ -50,7 +39,8 @@ typedef struct BackendData
 	Oid userId;
 	slock_t mutex;
 	bool cancelledDueToDeadlock;
-	CitusInitiatedBackend citusBackend;
+	uint64 globalPID;
+	bool distributedCommandOriginator;
 	DistributedTransactionId transactionId;
 } BackendData;
 
@@ -61,8 +51,15 @@ extern void InitializeBackendData(void);
 extern void LockBackendSharedMemory(LWLockMode lockMode);
 extern void UnlockBackendSharedMemory(void);
 extern void UnSetDistributedTransactionId(void);
+extern void UnSetGlobalPID(void);
 extern void AssignDistributedTransactionId(void);
-extern void MarkCitusInitiatedCoordinatorBackend(void);
+extern void AssignGlobalPID(void);
+extern uint64 GetGlobalPID(void);
+extern void OverrideBackendDataDistributedCommandOriginator(bool
+															distributedCommandOriginator);
+extern uint64 ExtractGlobalPID(char *applicationName);
+extern int ExtractNodeIdFromGlobalPID(uint64 globalPID, bool missingOk);
+extern int ExtractProcessIdFromGlobalPID(uint64 globalPID);
 extern void GetBackendDataForProc(PGPROC *proc, BackendData *result);
 extern void CancelTransactionDueToDeadlock(PGPROC *proc);
 extern bool MyBackendGotCancelledDueToDeadlock(bool clearState);
@@ -72,5 +69,12 @@ extern LocalTransactionId GetMyProcLocalTransactionId(void);
 extern int GetAllActiveClientBackendCount(void);
 extern void IncrementClientBackendCounter(void);
 extern void DecrementClientBackendCounter(void);
+
+extern bool ExecuteRemoteQueryOrCommand(char *nodeName, uint32 nodePort,
+										char *queryString, StringInfo queryResultString,
+										bool reportResultError);
+
+#define INVALID_CITUS_INTERNAL_BACKEND_GPID 0
+#define GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA 99999999
 
 #endif /* BACKEND_DATA_H */

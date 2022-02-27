@@ -14,7 +14,7 @@ WHERE refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
   AND deptype = 'e'
   AND e.extname='citus'
 ORDER BY 1;
-                                                   description
+                                                       description
 ---------------------------------------------------------------------
  access method columnar
  event trigger citus_cascade_to_partition
@@ -69,11 +69,13 @@ ORDER BY 1;
  function citus_internal.replace_isolation_tester_func()
  function citus_internal.restore_isolation_tester_func()
  function citus_internal.upgrade_columnar_storage(regclass)
- function citus_internal_add_object_metadata(text,text[],text[],integer,integer)
+ function citus_internal_add_object_metadata(text,text[],text[],integer,integer,boolean)
  function citus_internal_add_partition_metadata(regclass,"char",text,integer,"char")
  function citus_internal_add_placement_metadata(bigint,integer,bigint,integer,bigint)
  function citus_internal_add_shard_metadata(regclass,bigint,"char",text,text)
  function citus_internal_delete_shard_metadata(bigint)
+ function citus_internal_global_blocked_processes()
+ function citus_internal_local_blocked_processes()
  function citus_internal_update_placement_metadata(bigint,integer,integer)
  function citus_internal_update_relation_colocation(oid,integer)
  function citus_isolation_test_session_is_blocked(integer,integer[])
@@ -97,7 +99,9 @@ ORDER BY 1;
  function citus_shard_allowed_on_node_true(bigint,integer)
  function citus_shard_cost_1(bigint)
  function citus_shard_cost_by_disk_size(bigint)
+ function citus_shard_indexes_on_worker()
  function citus_shard_sizes()
+ function citus_shards_on_worker()
  function citus_stat_statements()
  function citus_stat_statements_reset()
  function citus_table_is_visible(oid)
@@ -118,7 +122,7 @@ ORDER BY 1;
  function coord_combine_agg(oid,cstring,anyelement)
  function coord_combine_agg_ffunc(internal,oid,cstring,anyelement)
  function coord_combine_agg_sfunc(internal,oid,cstring,anyelement)
- function create_distributed_function(regprocedure,text,text)
+ function create_distributed_function(regprocedure,text,text,boolean)
  function create_distributed_table(regclass,text,citus.distribution_type,text,integer)
  function create_intermediate_result(text,text)
  function create_reference_table(regclass)
@@ -170,6 +174,8 @@ ORDER BY 1;
  function master_update_shard_statistics(bigint)
  function master_update_table_statistics(regclass)
  function notify_constraint_dropped()
+ function pg_cancel_backend(bigint)
+ function pg_terminate_backend(bigint, bigint)
  function poolinfo_valid(text)
  function read_intermediate_result(text,citus_copy_format)
  function read_intermediate_results(text[],citus_copy_format)
@@ -201,10 +207,12 @@ ORDER BY 1;
  function worker_cleanup_job_schema_cache()
  function worker_create_or_alter_role(text,text,text)
  function worker_create_or_replace_object(text)
+ function worker_create_or_replace_object(text[])
  function worker_create_schema(bigint,text)
  function worker_create_truncate_trigger(regclass)
  function worker_drop_distributed_table(text)
  function worker_drop_sequence_dependency(text)
+ function worker_drop_shell_table(text)
  function worker_fetch_foreign_file(text,text,bigint,text[],integer[])
  function worker_fetch_partition_file(bigint,integer,integer,integer,text,integer)
  function worker_fix_partition_shard_index_names(regclass,text,text)
@@ -217,7 +225,7 @@ ORDER BY 1;
  function worker_partial_agg(oid,anyelement)
  function worker_partial_agg_ffunc(internal)
  function worker_partial_agg_sfunc(internal,oid,anyelement)
- function worker_partition_query_result(text,text,integer,citus.distribution_type,text[],text[],boolean)
+ function worker_partition_query_result(text,text,integer,citus.distribution_type,text[],text[],boolean,boolean,boolean)
  function worker_partitioned_relation_size(regclass)
  function worker_partitioned_relation_total_size(regclass)
  function worker_partitioned_table_size(regclass)
@@ -264,5 +272,5 @@ ORDER BY 1;
  view citus_worker_stat_activity
  view pg_dist_shard_placement
  view time_partitions
-(248 rows)
+(256 rows)
 

@@ -267,13 +267,17 @@ ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 
 		ErrorIfIllegallyChangingKnownShard(relationId);
 
-		if (IsCitusTable(relationId) && IsForeignTable(relationId))
+		/*
+		 * We allow truncating foreign tables that are added to metadata
+		 * only on the coordinator, as user mappings are not propagated.
+		 */
+		if (IsForeignTable(relationId) &&
+			IsCitusTableType(relationId, CITUS_LOCAL_TABLE) &&
+			!IsCoordinator())
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("truncating distributed foreign tables is "
-								   "currently unsupported"),
-							errhint("Consider undistributing table before TRUNCATE, "
-									"and then distribute or add to metadata again")));
+							errmsg("truncating foreign tables that are added to metadata "
+								   "can only be excuted on the coordinator")));
 		}
 	}
 }
@@ -437,8 +441,12 @@ AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
 		/*
 		 * We only acquire distributed lock on relation if
 		 * the relation is sync'ed between mx nodes.
+		 *
+		 * Even if users disable metadata sync, we cannot
+		 * allow them not to acquire the remote locks.
+		 * Hence, we have !IsCoordinator() check.
 		 */
-		if (ShouldSyncTableMetadata(relationId))
+		if (ShouldSyncTableMetadata(relationId) || !IsCoordinator())
 		{
 			char *qualifiedRelationName = generate_qualified_relation_name(relationId);
 			StringInfo lockRelationCommand = makeStringInfo();

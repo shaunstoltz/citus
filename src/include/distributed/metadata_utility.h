@@ -209,6 +209,9 @@ extern ShardInterval * CopyShardInterval(ShardInterval *srcInterval);
 extern uint64 ShardLength(uint64 shardId);
 extern bool NodeGroupHasShardPlacements(int32 groupId,
 										bool onlyConsiderActivePlacements);
+extern bool IsActiveShardPlacement(ShardPlacement *ShardPlacement);
+extern List * FilterShardPlacementList(List *shardPlacementList, bool (*filter)(
+										   ShardPlacement *));
 extern List * ActiveShardPlacementListOnGroup(uint64 shardId, int32 groupId);
 extern List * ActiveShardPlacementList(uint64 shardId);
 extern List * ShardPlacementListWithoutOrphanedPlacements(uint64 shardId);
@@ -238,7 +241,7 @@ extern void DeleteShardRow(uint64 shardId);
 extern void UpdateShardPlacementState(uint64 placementId, char shardState);
 extern void UpdatePlacementGroupId(uint64 placementId, int groupId);
 extern void DeleteShardPlacementRow(uint64 placementId);
-extern void CreateDistributedTable(Oid relationId, Var *distributionColumn,
+extern void CreateDistributedTable(Oid relationId, char *distributionColumnName,
 								   char distributionMethod, int shardCount,
 								   bool shardCountIsStrict, char *colocateWithTableName,
 								   bool viaDeprecatedAPI);
@@ -249,7 +252,7 @@ extern void EnsureDependenciesExistOnAllNodes(const ObjectAddress *target);
 extern List * GetDistributableDependenciesForObject(const ObjectAddress *target);
 extern bool ShouldPropagate(void);
 extern bool ShouldPropagateObject(const ObjectAddress *address);
-extern void ReplicateAllDependenciesToNode(const char *nodeName, int nodePort);
+extern List * ReplicateAllObjectsToNodeCommandList(const char *nodeName, int nodePort);
 
 /* Remaining metadata utility functions  */
 extern char * TableOwner(Oid relationId);
@@ -286,13 +289,7 @@ extern bool GetNodeDiskSpaceStatsForConnection(MultiConnection *connection,
 											   uint64 *availableBytes,
 											   uint64 *totalBytes);
 extern void ExecuteQueryViaSPI(char *query, int SPIOK);
-extern void EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId);
+extern void EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId, Oid ownerRelationId);
 extern void AlterSequenceType(Oid seqOid, Oid typeOid);
-extern void MarkSequenceListDistributedAndPropagateWithDependencies(Oid relationId,
-																	List *sequenceList);
-extern void MarkSequenceDistributedAndPropagateWithDependencies(Oid relationId, Oid
-																sequenceOid);
-extern void EnsureDistributedSequencesHaveOneType(Oid relationId,
-												  List *dependentSequenceList,
-												  List *attnumList);
+extern void EnsureRelationHasCompatibleSequenceTypes(Oid relationId);
 #endif   /* METADATA_UTILITY_H */

@@ -25,6 +25,7 @@
 
 #include "citus_version.h"
 #include "commands/explain.h"
+#include "common/string.h"
 #include "executor/executor.h"
 #include "distributed/backend_data.h"
 #include "distributed/citus_nodefuncs.h"
@@ -102,9 +103,11 @@ static char *CitusVersion = CITUS_VERSION;
 /* deprecated GUC value that should not be used anywhere outside this file */
 static int ReplicationModel = REPLICATION_MODEL_STREAMING;
 
+/* we override the application_name assign_hook and keep a pointer to the old one */
+static GucStringAssignHook OldApplicationNameAssignHook = NULL;
+
 
 void _PG_init(void);
-void _PG_fini(void);
 
 static void DoInitialCleanup(void);
 static void ResizeStackToMaximumDepth(void);
@@ -115,11 +118,16 @@ static void CitusCleanupConnectionsAtExit(int code, Datum arg);
 static void DecrementClientBackendCounterAtExit(int code, Datum arg);
 static void CreateRequiredDirectories(void);
 static void RegisterCitusConfigVariables(void);
+static void OverridePostgresConfigAssignHooks(void);
 static bool ErrorIfNotASuitableDeadlockFactor(double *newval, void **extra,
 											  GucSource source);
 static bool WarnIfDeprecatedExecutorUsed(int *newval, void **extra, GucSource source);
 static bool WarnIfReplicationModelIsSet(int *newval, void **extra, GucSource source);
 static bool NoticeIfSubqueryPushdownEnabled(bool *newval, void **extra, GucSource source);
+static bool HideShardsFromAppNamePrefixesCheckHook(char **newval, void **extra,
+												   GucSource source);
+static void HideShardsFromAppNamePrefixesAssignHook(const char *newval, void *extra);
+static void ApplicationNameAssignHook(const char *newval, void *extra);
 static bool NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source);
 static void NodeConninfoGucAssignHook(const char *newval, void *extra);
 static const char * MaxSharedPoolSizeGucShowHook(void);
@@ -157,13 +165,6 @@ static const struct config_enum_entry task_executor_type_options[] = {
 	{ "adaptive", MULTI_EXECUTOR_ADAPTIVE, false },
 	{ "real-time", DUMMY_REAL_TIME_EXECUTOR_ENUM_VALUE, false }, /* keep it for backward comp. */
 	{ "task-tracker", MULTI_EXECUTOR_ADAPTIVE, false },
-	{ NULL, 0, false }
-};
-
-static const struct config_enum_entry shard_placement_policy_options[] = {
-	{ "local-node-first", SHARD_PLACEMENT_LOCAL_NODE_FIRST, false },
-	{ "round-robin", SHARD_PLACEMENT_ROUND_ROBIN, false },
-	{ "random", SHARD_PLACEMENT_RANDOM, false },
 	{ NULL, 0, false }
 };
 
@@ -349,14 +350,6 @@ _PG_init(void)
 }
 
 
-/* shared library deconstruction function */
-void
-_PG_fini(void)
-{
-	columnar_fini();
-}
-
-
 /*
  * DoInitialCleanup does cleanup at start time.
  * Currently it:
@@ -437,8 +430,16 @@ multi_log_hook(ErrorData *edata)
 		MyBackendGotCancelledDueToDeadlock(clearState))
 	{
 		edata->sqlerrcode = ERRCODE_T_R_DEADLOCK_DETECTED;
-		edata->message = "canceling the transaction since it was "
-						 "involved in a distributed deadlock";
+
+		/*
+		 * This hook is called by EmitErrorReport() when emitting the ereport
+		 * either to frontend or to the server logs. And some callers of
+		 * EmitErrorReport() (e.g.: errfinish()) seems to assume that string
+		 * fields of given ErrorData object needs to be freed. For this reason,
+		 * we copy the message into heap here.
+		 */
+		edata->message = pstrdup("canceling the transaction since it was "
+								 "involved in a distributed deadlock");
 	}
 }
 
@@ -457,6 +458,7 @@ StartupCitusBackend(void)
 	InitializeMaintenanceDaemonBackend();
 	InitializeBackendData();
 	RegisterConnectionCleanup();
+	AssignGlobalPID();
 }
 
 
@@ -511,6 +513,9 @@ CitusCleanupConnectionsAtExit(int code, Datum arg)
 	 * are already given away.
 	 */
 	DeallocateReservedConnections();
+
+	/* we don't want any monitoring view/udf to show already exited backends */
+	UnSetGlobalPID();
 }
 
 
@@ -598,7 +603,7 @@ RegisterCitusConfigVariables(void)
 		false,
 #endif
 		PGC_SIGHUP,
-		GUC_STANDARD,
+		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -894,21 +899,10 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		"citus.enable_metadata_sync_by_default",
-		gettext_noop("Enables MX in the new nodes by default"),
+		"citus.enable_metadata_sync",
+		gettext_noop("Enables object and metadata syncing."),
 		NULL,
-		&EnableMetadataSyncByDefault,
-		true,
-		PGC_USERSET,
-		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.enable_object_propagation",
-		gettext_noop("Enables propagating object creation for more complex objects, "
-					 "schema's will always be created"),
-		NULL,
-		&EnableDependencyCreation,
+		&EnableMetadataSync,
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
@@ -983,6 +977,17 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_unsafe_triggers",
+		gettext_noop("Enables arbitrary triggers on distributed tables which may cause "
+					 "visibility and deadlock issues. Use at your own risk."),
+		NULL,
+		&EnableUnsafeTriggers,
+		false,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1105,6 +1110,24 @@ RegisterCitusConfigVariables(void)
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"citus.hide_shards_from_app_name_prefixes",
+		gettext_noop("If application_name starts with one of these values, hide shards"),
+		gettext_noop("Citus places distributed tables and shards in the same schema. "
+					 "That can cause confusion when inspecting the list of tables on "
+					 "a node with shards. This GUC can be used to hide the shards from "
+					 "pg_class for certain applications based on the application_name "
+					 "of the connection. The default is *, which hides shards from all "
+					 "applications. This behaviour can be overridden using the "
+					 "citus.override_table_visibility setting"),
+		&HideShardsFromAppNamePrefixes,
+		"*",
+		PGC_USERSET,
+		GUC_STANDARD,
+		HideShardsFromAppNamePrefixesCheckHook,
+		HideShardsFromAppNamePrefixesAssignHook,
+		NULL);
 
 	DefineCustomIntVariable(
 		"citus.isolation_test_session_process_id",
@@ -1614,22 +1637,6 @@ RegisterCitusConfigVariables(void)
 		GUC_STANDARD,
 		NULL, NULL, NULL);
 
-	DefineCustomEnumVariable(
-		"citus.shard_placement_policy",
-		gettext_noop("Sets the policy to use when choosing nodes for shard placement."),
-		gettext_noop("The master node chooses which worker nodes to place new shards "
-					 "on. This configuration value specifies the policy to use when "
-					 "selecting these nodes. The local-node-first policy places the "
-					 "first replica on the client node and chooses others randomly. "
-					 "The round-robin policy aims to distribute shards evenly across "
-					 "the cluster by selecting nodes in a round-robin fashion."
-					 "The random policy picks all workers randomly."),
-		&ShardPlacementPolicy,
-		SHARD_PLACEMENT_ROUND_ROBIN, shard_placement_policy_options,
-		PGC_USERSET,
-		GUC_STANDARD,
-		NULL, NULL, NULL);
-
 	DefineCustomIntVariable(
 		"citus.shard_replication_factor",
 		gettext_noop("Sets the replication factor for shards."),
@@ -1782,6 +1789,33 @@ RegisterCitusConfigVariables(void)
 
 	/* warn about config items in the citus namespace that are not registered above */
 	EmitWarningsOnPlaceholders("citus");
+
+	OverridePostgresConfigAssignHooks();
+}
+
+
+/*
+ * OverridePostgresConfigAssignHooks overrides GUC assign hooks where we want
+ * custom behaviour.
+ */
+static void
+OverridePostgresConfigAssignHooks(void)
+{
+	struct config_generic **guc_vars = get_guc_variables();
+	int gucCount = GetNumConfigOptions();
+
+	for (int gucIndex = 0; gucIndex < gucCount; gucIndex++)
+	{
+		struct config_generic *var = (struct config_generic *) guc_vars[gucIndex];
+
+		if (strcmp(var->name, "application_name") == 0)
+		{
+			struct config_string *stringVar = (struct config_string *) var;
+
+			OldApplicationNameAssignHook = stringVar->assign_hook;
+			stringVar->assign_hook = ApplicationNameAssignHook;
+		}
+	}
 }
 
 
@@ -1885,6 +1919,76 @@ WarnIfReplicationModelIsSet(int *newval, void **extra, GucSource source)
 
 
 /*
+ * HideShardsFromAppNamePrefixesCheckHook ensures that the
+ * citus.hide_shards_from_app_name_prefixes holds a valid list of application_name
+ * values.
+ */
+static bool
+HideShardsFromAppNamePrefixesCheckHook(char **newval, void **extra, GucSource source)
+{
+	List *prefixList = NIL;
+
+	/* SplitGUCList scribbles on the input */
+	char *splitCopy = pstrdup(*newval);
+
+	/* check whether we can split into a list of identifiers */
+	if (!SplitGUCList(splitCopy, ',', &prefixList))
+	{
+		GUC_check_errdetail("not a valid list of identifiers");
+		return false;
+	}
+
+	char *appNamePrefix = NULL;
+	foreach_ptr(appNamePrefix, prefixList)
+	{
+		int prefixLength = strlen(appNamePrefix);
+		if (prefixLength >= NAMEDATALEN)
+		{
+			GUC_check_errdetail("prefix %s is more than %d characters", appNamePrefix,
+								NAMEDATALEN);
+			return false;
+		}
+
+		char *prefixAscii = pstrdup(appNamePrefix);
+		pg_clean_ascii(prefixAscii);
+
+		if (strcmp(prefixAscii, appNamePrefix) != 0)
+		{
+			GUC_check_errdetail("prefix %s in citus.hide_shards_from_app_name_prefixes "
+								"contains non-ascii characters", appNamePrefix);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * HideShardsFromAppNamePrefixesAssignHook ensures changes to
+ * citus.hide_shards_from_app_name_prefixes are reflected in the decision
+ * whether or not to show shards.
+ */
+static void
+HideShardsFromAppNamePrefixesAssignHook(const char *newval, void *extra)
+{
+	ResetHideShardsDecision();
+}
+
+
+/*
+ * ApplicationNameAssignHook is called whenever application_name changes
+ * to allow us to reset our hide shards decision.
+ */
+static void
+ApplicationNameAssignHook(const char *newval, void *extra)
+{
+	ResetHideShardsDecision();
+	OldApplicationNameAssignHook(newval, extra);
+}
+
+
+/*
  * NodeConninfoGucCheckHook ensures conninfo settings are in the expected form
  * and that the keywords of all non-null settings are on a allowlist devised to
  * keep users from setting options that may result in confusion.
@@ -1894,7 +1998,6 @@ NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source)
 {
 	/* this array _must_ be kept in an order usable by bsearch */
 	const char *allowedConninfoKeywords[] = {
-		"application_name",
 		"connect_timeout",
 			#if defined(ENABLE_GSS) && defined(ENABLE_SSPI)
 		"gsslib",

@@ -137,6 +137,7 @@ AS 'citus'
 LANGUAGE C STRICT VOLATILE;
 
 -- this function is dropped in Citus10, added here for tests
+SET citus.enable_metadata_sync TO OFF;
 CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
                                                                       distribution_column text,
                                                                       distribution_method citus.distribution_type)
@@ -154,6 +155,7 @@ CREATE OR REPLACE FUNCTION pg_catalog.master_create_worker_shards(table_name tex
     RETURNS void
     AS 'citus', $$master_create_worker_shards$$
     LANGUAGE C STRICT;
+RESET citus.enable_metadata_sync;
 
 SET citus.next_shard_id TO 123000;
 
@@ -1399,3 +1401,52 @@ WHERE logicalrelid = 'r1'::regclass;
 
 DROP TABLE t1, r1;
 
+-- Test rebalancer with index on a table
+
+DROP TABLE IF EXISTS test_rebalance_with_index;
+CREATE TABLE test_rebalance_with_index (measureid integer PRIMARY KEY);
+SELECT create_distributed_table('test_rebalance_with_index', 'measureid');
+CREATE INDEX rebalance_with_index ON test_rebalance_with_index(measureid);
+
+INSERT INTO test_rebalance_with_index VALUES(0);
+INSERT INTO test_rebalance_with_index VALUES(1);
+INSERT INTO test_rebalance_with_index VALUES(2);
+
+SELECT * FROM master_drain_node('localhost', :worker_2_port);
+CALL citus_cleanup_orphaned_shards();
+UPDATE pg_dist_node SET shouldhaveshards=true WHERE nodeport = :worker_2_port;
+
+SELECT rebalance_table_shards();
+CALL citus_cleanup_orphaned_shards();
+DROP TABLE test_rebalance_with_index CASCADE;
+
+
+-- Test rebalancer with disabled worker
+
+SET citus.next_shard_id TO 433500;
+SET citus.shard_replication_factor TO 2;
+
+DROP TABLE IF EXISTS test_rebalance_with_disabled_worker;
+CREATE TABLE test_rebalance_with_disabled_worker (a int);
+SELECT create_distributed_table('test_rebalance_with_disabled_worker', 'a', colocate_with:='none');
+
+SELECT citus_disable_node('localhost', :worker_2_port);
+SELECT public.wait_until_metadata_sync(30000);
+
+SELECT rebalance_table_shards('test_rebalance_with_disabled_worker');
+
+SELECT citus_activate_node('localhost', :worker_2_port);
+
+DROP TABLE test_rebalance_with_disabled_worker;
+
+-- Test rebalance with all shards excluded
+
+DROP TABLE IF EXISTS test_with_all_shards_excluded;
+CREATE TABLE test_with_all_shards_excluded(a int PRIMARY KEY);
+SELECT create_distributed_table('test_with_all_shards_excluded', 'a', colocate_with:='none', shard_count:=4);
+
+SELECT shardid FROM pg_dist_shard;
+
+SELECT rebalance_table_shards('test_with_all_shards_excluded', excluded_shard_list:='{102073, 102074, 102075, 102076}');
+
+DROP TABLE test_with_all_shards_excluded;

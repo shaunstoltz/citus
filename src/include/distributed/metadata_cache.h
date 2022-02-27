@@ -115,6 +115,7 @@ typedef struct DistObjectCacheEntry
 
 	int distributionArgIndex;
 	int colocationId;
+	bool forceDelegation;
 } DistObjectCacheEntry;
 
 typedef enum
@@ -164,6 +165,7 @@ extern CitusTableCacheEntry * LookupCitusTableCacheEntry(Oid relationId);
 extern DistObjectCacheEntry * LookupDistObjectCacheEntry(Oid classid, Oid objid, int32
 														 objsubid);
 extern int32 GetLocalGroupId(void);
+extern int32 GetLocalNodeId(void);
 extern void CitusTableCacheFlushInvalidatedEntries(void);
 extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
 extern List * ShardPlacementListIncludingOrphanedPlacements(uint64 shardId);
@@ -252,6 +254,7 @@ extern Oid CitusExtraDataContainerFuncId(void);
 extern Oid CitusAnyValueFunctionId(void);
 extern Oid PgTableVisibleFuncId(void);
 extern Oid CitusTableVisibleFuncId(void);
+extern Oid RelationIsAKnownShardFuncId(void);
 extern Oid JsonbExtractPathFuncId(void);
 
 /* enum oids */

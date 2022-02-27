@@ -66,6 +66,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/transmit.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_transaction.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
@@ -257,7 +258,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 	else if (IsA(parsetree, DoStmt))
 	{
 		/*
-		 * All statements in a DO block are executed in a single transaciton,
+		 * All statements in a DO block are executed in a single transaction,
 		 * so we need to keep track of whether we are inside a DO block.
 		 */
 		DoBlockLevel += 1;
@@ -896,7 +897,7 @@ ShouldCheckUndistributeCitusLocalTables(void)
 		return false;
 	}
 
-	if (IsCitusInitiatedRemoteBackend())
+	if (IsCitusInternalBackend() || IsRebalancerInternalBackend())
 	{
 		/* connection from the coordinator operating on a shard */
 		return false;
@@ -1562,7 +1563,8 @@ DDLTaskList(Oid relationId, const char *commandString)
 List *
 NodeDDLTaskList(TargetWorkerSet targets, List *commands)
 {
-	List *workerNodes = TargetWorkerSetNodeList(targets, NoLock);
+	/* don't allow concurrent node list changes that require an exclusive lock */
+	List *workerNodes = TargetWorkerSetNodeList(targets, RowShareLock);
 
 	if (list_length(workerNodes) <= 0)
 	{

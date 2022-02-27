@@ -15,6 +15,9 @@
 #include "distributed/pg_version_constants.h"
 
 #include "miscadmin.h"
+#include "unistd.h"
+
+#include "safe_lib.h"
 
 #include "funcapi.h"
 #include "access/htup_details.h"
@@ -30,6 +33,7 @@
 #include "distributed/shared_connection_stats.h"
 #include "distributed/transaction_identifier.h"
 #include "distributed/tuplestore.h"
+#include "distributed/worker_manager.h"
 #include "nodes/execnodes.h"
 #include "postmaster/autovacuum.h" /* to access autovacuum_max_workers */
 #include "replication/walsender.h"
@@ -43,7 +47,8 @@
 
 
 #define GET_ACTIVE_TRANSACTION_QUERY "SELECT * FROM get_all_active_transactions();"
-#define ACTIVE_TRANSACTION_COLUMN_COUNT 6
+#define ACTIVE_TRANSACTION_COLUMN_COUNT 7
+#define GLOBAL_PID_NODE_ID_MULTIPLIER 10000000000
 
 /*
  * Each backend's data reside in the shared memory
@@ -78,6 +83,7 @@ typedef struct BackendManagementShmemData
 
 static void StoreAllActiveTransactions(Tuplestorestate *tupleStore, TupleDesc
 									   tupleDescriptor);
+static uint64 GenerateGlobalPID(void);
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static BackendManagementShmemData *backendManagementShmemData = NULL;
@@ -145,10 +151,6 @@ assign_distributed_transaction_id(PG_FUNCTION_ARGS)
 	MyBackendData->transactionId.transactionNumber = transactionNumber;
 	MyBackendData->transactionId.timestamp = timestamp;
 	MyBackendData->transactionId.transactionOriginator = false;
-
-	MyBackendData->citusBackend.initiatorNodeIdentifier =
-		MyBackendData->transactionId.initiatorNodeIdentifier;
-	MyBackendData->citusBackend.transactionOriginator = false;
 
 	SpinLockRelease(&MyBackendData->mutex);
 
@@ -315,6 +317,7 @@ get_global_active_transactions(PG_FUNCTION_ARGS)
 			values[3] = ParseBoolField(result, rowIndex, 3);
 			values[4] = ParseIntField(result, rowIndex, 4);
 			values[5] = ParseTimestampTzField(result, rowIndex, 5);
+			values[6] = ParseIntField(result, rowIndex, 6);
 
 			tuplestore_putvalues(tupleStore, tupleDescriptor, values, isNulls);
 		}
@@ -379,13 +382,11 @@ StoreAllActiveTransactions(Tuplestorestate *tupleStore, TupleDesc tupleDescripto
 			&backendManagementShmemData->backends[backendIndex];
 
 		/* to work on data after releasing g spinlock to protect against errors */
-		int initiatorNodeIdentifier = -1;
 		uint64 transactionNumber = 0;
 
 		SpinLockAcquire(&currentBackend->mutex);
 
-		/* we're only interested in backends initiated by Citus */
-		if (currentBackend->citusBackend.initiatorNodeIdentifier < 0)
+		if (currentBackend->globalPID == INVALID_CITUS_INTERNAL_BACKEND_GPID)
 		{
 			SpinLockRelease(&currentBackend->mutex);
 			continue;
@@ -403,30 +404,30 @@ StoreAllActiveTransactions(Tuplestorestate *tupleStore, TupleDesc tupleDescripto
 
 		Oid databaseId = currentBackend->databaseId;
 		int backendPid = ProcGlobal->allProcs[backendIndex].pid;
-		initiatorNodeIdentifier = currentBackend->citusBackend.initiatorNodeIdentifier;
 
 		/*
-		 * We prefer to use worker_query instead of transactionOriginator in the user facing
-		 * functions since its more intuitive. Thus, we negate the result before returning.
-		 *
-		 * We prefer to use citusBackend's transactionOriginator field over transactionId's
-		 * field with the same name. The reason is that it also covers backends that are not
-		 * inside a distributed transaction.
+		 * We prefer to use worker_query instead of distributedCommandOriginator in
+		 * the user facing functions since its more intuitive. Thus,
+		 * we negate the result before returning.
 		 */
-		bool coordinatorOriginatedQuery =
-			currentBackend->citusBackend.transactionOriginator;
+		bool distributedCommandOriginator =
+			currentBackend->distributedCommandOriginator;
 
 		transactionNumber = currentBackend->transactionId.transactionNumber;
 		TimestampTz transactionIdTimestamp = currentBackend->transactionId.timestamp;
 
 		SpinLockRelease(&currentBackend->mutex);
 
+		bool missingOk = true;
+		int nodeId = ExtractNodeIdFromGlobalPID(currentBackend->globalPID, missingOk);
+
 		values[0] = ObjectIdGetDatum(databaseId);
 		values[1] = Int32GetDatum(backendPid);
-		values[2] = Int32GetDatum(initiatorNodeIdentifier);
-		values[3] = !coordinatorOriginatedQuery;
+		values[2] = Int32GetDatum(nodeId);
+		values[3] = !distributedCommandOriginator;
 		values[4] = UInt64GetDatum(transactionNumber);
 		values[5] = TimestampTzGetDatum(transactionIdTimestamp);
+		values[6] = UInt64GetDatum(currentBackend->globalPID);
 
 		tuplestore_putvalues(tupleStore, tupleDescriptor, values, isNulls);
 
@@ -517,7 +518,6 @@ BackendManagementShmemInit(void)
 		{
 			BackendData *backendData =
 				&backendManagementShmemData->backends[backendIndex];
-			backendData->citusBackend.initiatorNodeIdentifier = -1;
 			SpinLockInit(&backendData->mutex);
 		}
 	}
@@ -631,6 +631,7 @@ InitializeBackendData(void)
 
 	/* zero out the backend data */
 	UnSetDistributedTransactionId();
+	UnSetGlobalPID();
 
 	UnlockBackendSharedMemory();
 }
@@ -656,8 +657,23 @@ UnSetDistributedTransactionId(void)
 		MyBackendData->transactionId.transactionNumber = 0;
 		MyBackendData->transactionId.timestamp = 0;
 
-		MyBackendData->citusBackend.initiatorNodeIdentifier = -1;
-		MyBackendData->citusBackend.transactionOriginator = false;
+		SpinLockRelease(&MyBackendData->mutex);
+	}
+}
+
+
+/*
+ * UnSetGlobalPID resets the global pid for the current backend.
+ */
+void
+UnSetGlobalPID(void)
+{
+	/* backend does not exist if the extension is not created */
+	if (MyBackendData)
+	{
+		SpinLockAcquire(&MyBackendData->mutex);
+
+		MyBackendData->globalPID = 0;
 
 		SpinLockRelease(&MyBackendData->mutex);
 	}
@@ -751,32 +767,164 @@ AssignDistributedTransactionId(void)
 	MyBackendData->transactionId.transactionNumber = nextTransactionNumber;
 	MyBackendData->transactionId.timestamp = currentTimestamp;
 
-	MyBackendData->citusBackend.initiatorNodeIdentifier = localGroupId;
-	MyBackendData->citusBackend.transactionOriginator = true;
-
 	SpinLockRelease(&MyBackendData->mutex);
 }
 
 
 /*
- * MarkCitusInitiatedCoordinatorBackend sets that coordinator backend is
- * initiated by Citus.
+ * AssignGlobalPID assigns a global process id for the current backend.
+ * If this is a Citus initiated backend, which means it is distributed part of a distributed
+ * query, then this function assigns the global pid extracted from the application name.
+ * If not, this function assigns a new generated global pid.
  */
 void
-MarkCitusInitiatedCoordinatorBackend(void)
+AssignGlobalPID(void)
 {
-	/*
-	 * GetLocalGroupId may throw exception which can cause leaving spin lock
-	 * unreleased. Calling GetLocalGroupId function before the lock to avoid this.
-	 */
-	int32 localGroupId = GetLocalGroupId();
+	uint64 globalPID = INVALID_CITUS_INTERNAL_BACKEND_GPID;
+	bool distributedCommandOriginator = false;
+
+	if (!IsCitusInternalBackend())
+	{
+		globalPID = GenerateGlobalPID();
+		distributedCommandOriginator = true;
+	}
+	else
+	{
+		globalPID = ExtractGlobalPID(application_name);
+	}
 
 	SpinLockAcquire(&MyBackendData->mutex);
-
-	MyBackendData->citusBackend.initiatorNodeIdentifier = localGroupId;
-	MyBackendData->citusBackend.transactionOriginator = true;
-
+	MyBackendData->globalPID = globalPID;
+	MyBackendData->distributedCommandOriginator = distributedCommandOriginator;
 	SpinLockRelease(&MyBackendData->mutex);
+}
+
+
+/*
+ * OverrideBackendDataDistributedCommandOriginator should only be used for isolation testing.
+ * See how it is used in the relevant functions.
+ */
+void
+OverrideBackendDataDistributedCommandOriginator(bool distributedCommandOriginator)
+{
+	SpinLockAcquire(&MyBackendData->mutex);
+	MyBackendData->distributedCommandOriginator =
+		distributedCommandOriginator;
+	SpinLockRelease(&MyBackendData->mutex);
+}
+
+
+/*
+ * GetGlobalPID returns the global process id of the current backend.
+ */
+uint64
+GetGlobalPID(void)
+{
+	uint64 globalPID = INVALID_CITUS_INTERNAL_BACKEND_GPID;
+
+	if (MyBackendData)
+	{
+		SpinLockAcquire(&MyBackendData->mutex);
+		globalPID = MyBackendData->globalPID;
+		SpinLockRelease(&MyBackendData->mutex);
+	}
+
+	return globalPID;
+}
+
+
+/*
+ * GenerateGlobalPID generates the global process id for the current backend.
+ */
+static uint64
+GenerateGlobalPID(void)
+{
+	/*
+	 * We try to create a human readable global pid that consists of node id and process id.
+	 * By multiplying node id with 10^10 and adding pid we generate a number where the smallest
+	 * 10 digit represent the pid and the remaining digits are the node id.
+	 *
+	 * Both node id and pid are 32 bit. We use 10^10 to fit all possible pids. Some very large
+	 * node ids might cause overflow. But even for the applications that scale around 50 nodes every
+	 * day it'd take about 100K years. So we are not worried.
+	 */
+	return (((uint64) GetLocalNodeId()) * GLOBAL_PID_NODE_ID_MULTIPLIER) + getpid();
+}
+
+
+/*
+ * ExtractGlobalPID extracts the global process id from the application name and returns it
+ * if the application name is not compatible with Citus' application names returns 0.
+ */
+uint64
+ExtractGlobalPID(char *applicationName)
+{
+	/* does application name exist */
+	if (!applicationName)
+	{
+		return INVALID_CITUS_INTERNAL_BACKEND_GPID;
+	}
+
+	/* we create our own copy of application name incase the original changes */
+	char *applicationNameCopy = pstrdup(applicationName);
+
+	uint64 prefixLength = strlen(CITUS_APPLICATION_NAME_PREFIX);
+
+	/* does application name start with Citus's application name prefix */
+	if (strncmp(applicationNameCopy, CITUS_APPLICATION_NAME_PREFIX, prefixLength) != 0)
+	{
+		return INVALID_CITUS_INTERNAL_BACKEND_GPID;
+	}
+
+	/* are the remaining characters of the application name numbers */
+	uint64 numberOfRemainingChars = strlen(applicationNameCopy) - prefixLength;
+	if (numberOfRemainingChars <= 0 ||
+		!strisdigit_s(applicationNameCopy + prefixLength, numberOfRemainingChars))
+	{
+		return INVALID_CITUS_INTERNAL_BACKEND_GPID;
+	}
+
+	char *globalPIDString = &applicationNameCopy[prefixLength];
+	uint64 globalPID = strtoul(globalPIDString, NULL, 10);
+
+	return globalPID;
+}
+
+
+/*
+ * ExtractNodeIdFromGlobalPID extracts the node id from the global pid.
+ * Global pid is constructed by multiplying node id with GLOBAL_PID_NODE_ID_MULTIPLIER
+ * and adding process id. So integer division of global pid by GLOBAL_PID_NODE_ID_MULTIPLIER
+ * gives us the node id.
+ */
+int
+ExtractNodeIdFromGlobalPID(uint64 globalPID, bool missingOk)
+{
+	int nodeId = (int) (globalPID / GLOBAL_PID_NODE_ID_MULTIPLIER);
+
+	if (!missingOk &&
+		nodeId == GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA)
+	{
+		ereport(ERROR, (errmsg("originator node of the query with the global pid "
+							   "%lu is not in Citus' metadata", globalPID),
+						errhint("connect to the node directly run pg_cancel_backend(pid) "
+								"or pg_terminate_backend(pid)")));
+	}
+
+	return nodeId;
+}
+
+
+/*
+ * ExtractProcessIdFromGlobalPID extracts the process id from the global pid.
+ * Global pid is constructed by multiplying node id with GLOBAL_PID_NODE_ID_MULTIPLIER
+ * and adding process id. So global pid mod GLOBAL_PID_NODE_ID_MULTIPLIER gives us the
+ * process id.
+ */
+int
+ExtractProcessIdFromGlobalPID(uint64 globalPID)
+{
+	return (int) (globalPID % GLOBAL_PID_NODE_ID_MULTIPLIER);
 }
 
 

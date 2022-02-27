@@ -161,9 +161,11 @@
 #include "distributed/shared_connection_stats.h"
 #include "distributed/subplan_execution.h"
 #include "distributed/transaction_management.h"
+#include "distributed/transaction_identifier.h"
 #include "distributed/tuple_destination.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/backend_data.h"
 #include "lib/ilist.h"
 #include "portability/instr_time.h"
 #include "storage/fd.h"
@@ -299,6 +301,14 @@ typedef struct DistributedExecution
 	 * do cleanup for repartition queries.
 	 */
 	List *jobIdList;
+
+	/*
+	 * Indicates whether we can execute tasks locally during distributed
+	 * execution. In other words, this flag must be set to false when
+	 * executing a command that we surely know that local execution would
+	 * fail, such as CREATE INDEX CONCURRENTLY.
+	 */
+	bool localExecutionSupported;
 } DistributedExecution;
 
 
@@ -543,6 +553,12 @@ typedef struct ShardCommandExecution
 	bool gotResults;
 
 	TaskExecutionState executionState;
+
+	/*
+	 * Indicates whether given shard command can be executed locally on
+	 * placements. Normally determined by DistributedExecution's same field.
+	 */
+	bool localExecutionSupported;
 } ShardCommandExecution;
 
 /*
@@ -803,6 +819,9 @@ AdaptiveExecutor(CitusScanState *scanState)
 	bool hasDependentJobs = HasDependentJobs(job);
 	if (hasDependentJobs)
 	{
+		/* jobs use intermediate results, which require a distributed transaction */
+		UseCoordinatedTransaction();
+
 		jobIdList = ExecuteDependentTasks(taskList, job);
 	}
 
@@ -812,9 +831,10 @@ AdaptiveExecutor(CitusScanState *scanState)
 		targetPoolSize = 1;
 	}
 
+	bool excludeFromXact = false;
+
 	TransactionProperties xactProperties = DecideTransactionPropertiesForTaskList(
-		distributedPlan->modLevel, taskList,
-		hasDependentJobs);
+		distributedPlan->modLevel, taskList, excludeFromXact);
 
 	bool localExecutionSupported = true;
 	DistributedExecution *execution = CreateDistributedExecution(
@@ -856,11 +876,6 @@ AdaptiveExecutor(CitusScanState *scanState)
 	}
 
 	FinishDistributedExecution(execution);
-
-	if (hasDependentJobs)
-	{
-		DoRepartitionCleanup(jobIdList);
-	}
 
 	if (SortReturning && distributedPlan->expectResults && commandType != CMD_SELECT)
 	{
@@ -948,6 +963,26 @@ ExecuteUtilityTaskListExtended(List *utilityTaskList, int poolSize,
 
 
 /*
+ * ExecuteTaskList is a proxy to ExecuteTaskListExtended
+ * with defaults for some of the arguments.
+ */
+uint64
+ExecuteTaskList(RowModifyLevel modLevel, List *taskList)
+{
+	bool localExecutionSupported = true;
+	ExecutionParams *executionParams = CreateBasicExecutionParams(
+		modLevel, taskList, MaxAdaptiveExecutorPoolSize, localExecutionSupported
+		);
+
+	bool excludeFromXact = false;
+	executionParams->xactProperties = DecideTransactionPropertiesForTaskList(
+		modLevel, taskList, excludeFromXact);
+
+	return ExecuteTaskListExtended(executionParams);
+}
+
+
+/*
  * ExecuteTaskListOutsideTransaction is a proxy to ExecuteTaskListExtended
  * with defaults for some of the arguments.
  */
@@ -1026,12 +1061,7 @@ ExecuteTaskListExtended(ExecutionParams *executionParams)
 	 * then we should error out as it would cause inconsistencies across the
 	 * remote connection and local execution.
 	 */
-	List *remoteTaskList = execution->remoteTaskList;
-	if (GetCurrentLocalExecutionStatus() == LOCAL_EXECUTION_REQUIRED &&
-		AnyTaskAccessesLocalNode(remoteTaskList))
-	{
-		ErrorIfTransactionAccessedPlacementsLocally();
-	}
+	EnsureCompatibleLocalExecutionState(execution->remoteTaskList);
 
 	/* run the remote execution */
 	StartDistributedExecution(execution);
@@ -1115,6 +1145,8 @@ CreateDistributedExecution(RowModifyLevel modLevel, List *taskList,
 
 	execution->jobIdList = jobIdList;
 
+	execution->localExecutionSupported = localExecutionSupported;
+
 	/*
 	 * Since task can have multiple queries, we are not sure how many columns we should
 	 * allocate for. We start with 16, and reallocate when we need more.
@@ -1143,7 +1175,8 @@ CreateDistributedExecution(RowModifyLevel modLevel, List *taskList,
 		}
 	}
 
-	if (localExecutionSupported && ShouldExecuteTasksLocally(taskList))
+	if (execution->localExecutionSupported &&
+		ShouldExecuteTasksLocally(taskList))
 	{
 		bool readOnlyPlan = !TaskListModifiesDatabase(modLevel, taskList);
 		ExtractLocalAndRemoteTasks(readOnlyPlan, taskList, &execution->localTaskList,
@@ -2007,6 +2040,8 @@ AssignTasksToConnectionsOrWorkerPool(DistributedExecution *execution)
 		shardCommandExecution->task = task;
 		shardCommandExecution->executionOrder = ExecutionOrderForTask(modLevel, task);
 		shardCommandExecution->executionState = TASK_EXECUTION_NOT_FINISHED;
+		shardCommandExecution->localExecutionSupported =
+			execution->localExecutionSupported;
 		shardCommandExecution->placementExecutions =
 			(TaskPlacementExecution **) palloc0(placementExecutionCount *
 												sizeof(TaskPlacementExecution *));
@@ -2623,12 +2658,6 @@ RunDistributedExecution(DistributedExecution *execution)
 		 */
 		UnclaimAllSessionConnections(execution->sessionList);
 
-		/* do repartition cleanup if this is a repartition query*/
-		if (list_length(execution->jobIdList) > 0)
-		{
-			DoRepartitionCleanup(execution->jobIdList);
-		}
-
 		if (execution->waitEventSet != NULL)
 		{
 			FreeWaitEventSet(execution->waitEventSet);
@@ -2844,14 +2873,18 @@ ManageWorkerPool(WorkerPool *workerPool)
 
 		if (execution->failed)
 		{
+			const char *errHint =
+				execution->localExecutionSupported ?
+				"This command supports local execution. Consider enabling "
+				"local execution using SET citus.enable_local_execution "
+				"TO true;" :
+				"Consider using a higher value for max_connections";
+
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg(
-								"could not establish any connections to the node %s:%d "
-								"when local execution is also disabled.",
-								workerPool->nodeName,
-								workerPool->nodePort),
-							errhint("Enable local execution via SET "
-									"citus.enable_local_execution TO true;")));
+							errmsg("the total number of connections on the "
+								   "server is more than max_connections(%d)",
+								   MaxConnections),
+							errhint("%s", errHint)));
 		}
 
 		return;
@@ -5034,6 +5067,12 @@ CanFailoverPlacementExecutionToLocalExecution(TaskPlacementExecution *placementE
 	if (!EnableLocalExecution)
 	{
 		/* the user explicitly disabled local execution */
+		return false;
+	}
+
+	if (!placementExecution->shardCommandExecution->localExecutionSupported)
+	{
+		/* cannot execute given task locally */
 		return false;
 	}
 

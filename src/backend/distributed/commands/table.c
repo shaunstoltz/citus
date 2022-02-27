@@ -378,6 +378,8 @@ PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
 		}
 
 		Var *parentDistributionColumn = DistPartitionKeyOrError(parentRelationId);
+		char *distributionColumnName =
+			ColumnToColumnName(parentRelationId, (Node *) parentDistributionColumn);
 		char parentDistributionMethod = DISTRIBUTE_BY_HASH;
 		char *parentRelationName = generate_qualified_relation_name(parentRelationId);
 		bool viaDeprecatedAPI = false;
@@ -385,7 +387,7 @@ PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
 		SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(parentRelationId,
 																  relationId);
 
-		CreateDistributedTable(relationId, parentDistributionColumn,
+		CreateDistributedTable(relationId, distributionColumnName,
 							   parentDistributionMethod, ShardCount, false,
 							   parentRelationName, viaDeprecatedAPI);
 	}
@@ -573,13 +575,8 @@ static void
 DistributePartitionUsingParent(Oid parentCitusRelationId, Oid partitionRelationId)
 {
 	Var *distributionColumn = DistPartitionKeyOrError(parentCitusRelationId);
-	char *distributionColumnName =
-		ColumnToColumnName(parentCitusRelationId,
-						   nodeToString(distributionColumn));
-	distributionColumn =
-		FindColumnWithNameOnTargetRelation(parentCitusRelationId,
-										   distributionColumnName,
-										   partitionRelationId);
+	char *distributionColumnName = ColumnToColumnName(parentCitusRelationId,
+													  (Node *) distributionColumn);
 
 	char distributionMethod = DISTRIBUTE_BY_HASH;
 	char *parentRelationName = generate_qualified_relation_name(parentCitusRelationId);
@@ -588,7 +585,7 @@ DistributePartitionUsingParent(Oid parentCitusRelationId, Oid partitionRelationI
 	SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(
 		parentCitusRelationId, partitionRelationId);
 
-	CreateDistributedTable(partitionRelationId, distributionColumn,
+	CreateDistributedTable(partitionRelationId, distributionColumnName,
 						   distributionMethod, ShardCount, false,
 						   parentRelationName, viaDeprecatedAPI);
 }
@@ -1085,15 +1082,9 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 		}
 		else if (AlterTableCommandTypeIsTrigger(alterTableType))
 		{
-			/*
-			 * We already error'ed out for ENABLE/DISABLE trigger commands for
-			 * other citus table types in ErrorIfUnsupportedAlterTableStmt.
-			 */
-			Assert(IsCitusTableType(leftRelationId, CITUS_LOCAL_TABLE));
-
 			char *triggerName = command->name;
-			return CitusLocalTableTriggerCommandDDLJob(leftRelationId, triggerName,
-													   alterTableCommand);
+			return CitusCreateTriggerCommandDDLJob(leftRelationId, triggerName,
+												   alterTableCommand);
 		}
 
 		/*
@@ -1955,6 +1946,12 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 			return;
 		}
 
+		/*
+		 * Before ensuring each dependency exist, update dependent sequences
+		 * types if necessary.
+		 */
+		EnsureRelationHasCompatibleSequenceTypes(relationId);
+
 		/* changing a relation could introduce new dependencies */
 		ObjectAddress tableAddress = { 0 };
 		ObjectAddressSet(tableAddress, RelationRelationId, relationId);
@@ -2045,18 +2042,9 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 							Oid seqOid = GetSequenceOid(relationId, attnum);
 							if (seqOid != InvalidOid)
 							{
-								EnsureDistributedSequencesHaveOneType(relationId,
-																	  list_make1_oid(
-																		  seqOid),
-																	  list_make1_int(
-																		  attnum));
-
-								if (ShouldSyncTableMetadata(relationId) &&
-									ClusterHasKnownMetadataWorkers())
+								if (ShouldSyncTableMetadata(relationId))
 								{
 									needMetadataSyncForNewSequences = true;
-									MarkSequenceDistributedAndPropagateWithDependencies(
-										relationId, seqOid);
 									alterTableDefaultNextvalCmd =
 										GetAddColumnWithNextvalDefaultCmd(seqOid,
 																		  relationId,
@@ -2088,16 +2076,9 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 				Oid seqOid = GetSequenceOid(relationId, attnum);
 				if (seqOid != InvalidOid)
 				{
-					EnsureDistributedSequencesHaveOneType(relationId,
-														  list_make1_oid(seqOid),
-														  list_make1_int(attnum));
-
-					if (ShouldSyncTableMetadata(relationId) &&
-						ClusterHasKnownMetadataWorkers())
+					if (ShouldSyncTableMetadata(relationId))
 					{
 						needMetadataSyncForNewSequences = true;
-						MarkSequenceDistributedAndPropagateWithDependencies(relationId,
-																			seqOid);
 						alterTableDefaultNextvalCmd = GetAlterColumnWithNextvalDefaultCmd(
 							seqOid, relationId, command->name);
 					}
@@ -2583,7 +2564,7 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
  * ALTER TABLE REPLICA IDENTITY
  * ALTER TABLE SET ()
  * ALTER TABLE RESET ()
- * ALTER TABLE ENABLE/DISABLE TRIGGER (only for citus local tables)
+ * ALTER TABLE ENABLE/DISABLE TRIGGER (if enable_unsafe_triggers is not set, we only support triggers for citus local tables)
  */
 static void
 ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
@@ -2627,8 +2608,7 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 							 * We currently don't support adding a serial column for an MX table
 							 * TODO: record the dependency in the workers
 							 */
-							if (ShouldSyncTableMetadata(relationId) &&
-								ClusterHasKnownMetadataWorkers())
+							if (ShouldSyncTableMetadata(relationId))
 							{
 								ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 												errmsg(
@@ -2918,7 +2898,7 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 									errhint("You can issue each subcommand separately")));
 				}
 
-				ErrorOutForTriggerIfNotCitusLocalTable(relationId);
+				ErrorOutForTriggerIfNotSupported(relationId);
 
 				break;
 			}

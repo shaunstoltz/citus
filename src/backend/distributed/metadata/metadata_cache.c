@@ -31,6 +31,7 @@
 #include "commands/dbcommands.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
+#include "distributed/backend_data.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/citus_ruleutils.h"
@@ -166,6 +167,7 @@ typedef struct MetadataCacheData
 	Oid secondaryNodeRoleId;
 	Oid pgTableIsVisibleFuncId;
 	Oid citusTableIsVisibleFuncId;
+	Oid relationIsAKnownShardFuncId;
 	Oid jsonbExtractPathFuncId;
 	bool databaseNameValid;
 	char databaseName[NAMEDATALEN];
@@ -199,6 +201,9 @@ static bool workerNodeHashValid = false;
 
 /* default value is -1, for coordinator it's 0 and for worker nodes > 0 */
 static int32 LocalGroupId = -1;
+
+/* default value is -1, increases with every node starting from 1 */
+static int32 LocalNodeId = -1;
 
 /* built first time through in InitializeDistCache */
 static ScanKeyData DistPartitionScanKey[1];
@@ -1362,6 +1367,9 @@ LookupDistObjectCacheEntry(Oid classid, Oid objid, int32 objsubid)
 									 1]);
 		cacheEntry->colocationId =
 			DatumGetInt32(datumArray[Anum_pg_dist_object_colocationid - 1]);
+
+		cacheEntry->forceDelegation =
+			DatumGetBool(datumArray[Anum_pg_dist_object_force_delegation - 1]);
 	}
 	else
 	{
@@ -2620,6 +2628,24 @@ CitusTableVisibleFuncId(void)
 
 
 /*
+ * RelationIsAKnownShardFuncId returns oid of the relation_is_a_known_shard function.
+ */
+Oid
+RelationIsAKnownShardFuncId(void)
+{
+	if (MetadataCache.relationIsAKnownShardFuncId == InvalidOid)
+	{
+		const int argCount = 1;
+
+		MetadataCache.relationIsAKnownShardFuncId =
+			FunctionOid("pg_catalog", "relation_is_a_known_shard", argCount);
+	}
+
+	return MetadataCache.relationIsAKnownShardFuncId;
+}
+
+
+/*
  * JsonbExtractPathFuncId returns oid of the jsonb_extract_path function.
  */
 Oid
@@ -3597,6 +3623,63 @@ GetLocalGroupId(void)
 
 
 /*
+ * GetNodeId returns the node identifier of the local node.
+ */
+int32
+GetLocalNodeId(void)
+{
+	InitializeCaches();
+
+	/*
+	 * Already set the node id, no need to read the heap again.
+	 */
+	if (LocalNodeId != -1)
+	{
+		return LocalNodeId;
+	}
+
+	uint32 nodeId = -1;
+
+	int32 localGroupId = GetLocalGroupId();
+
+	bool includeNodesFromOtherClusters = false;
+	List *workerNodeList = ReadDistNode(includeNodesFromOtherClusters);
+
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
+	{
+		if (workerNode->groupId == localGroupId &&
+			workerNode->isActive)
+		{
+			nodeId = workerNode->nodeId;
+			break;
+		}
+	}
+
+	/*
+	 * nodeId is -1 if we cannot find an active node whose group id is
+	 * localGroupId in pg_dist_node.
+	 */
+	if (nodeId == -1)
+	{
+		elog(DEBUG4, "there is no active node with group id '%d' on pg_dist_node",
+			 localGroupId);
+
+		/*
+		 * This is expected if the coordinator is not added to the metadata.
+		 * We'll return GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA for this case and
+		 * for all cases so views can function almost normally
+		 */
+		nodeId = GLOBAL_PID_NODE_ID_FOR_NODES_NOT_IN_METADATA;
+	}
+
+	LocalNodeId = nodeId;
+
+	return nodeId;
+}
+
+
+/*
  * RegisterLocalGroupIdCacheCallbacks registers the callbacks required to
  * maintain LocalGroupId at a consistent value. It's separate from
  * GetLocalGroupId so the callback can be registered early, before metadata
@@ -3997,6 +4080,7 @@ InvalidateMetadataSystemCache(void)
 	memset(&MetadataCache, 0, sizeof(MetadataCache));
 	workerNodeHashValid = false;
 	LocalGroupId = -1;
+	LocalNodeId = -1;
 }
 
 
@@ -4088,6 +4172,7 @@ InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId)
 	if (relationId == InvalidOid || relationId == MetadataCache.distNodeRelationId)
 	{
 		workerNodeHashValid = false;
+		LocalNodeId = -1;
 	}
 }
 

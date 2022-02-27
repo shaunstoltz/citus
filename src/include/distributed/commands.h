@@ -26,6 +26,9 @@ extern bool AddAllLocalTablesToMetadata;
 /* controlled via GUC, should be accessed via EnableLocalReferenceForeignKeys() */
 extern bool EnableLocalReferenceForeignKeys;
 
+extern bool EnableUnsafeTriggers;
+
+
 extern void SwitchToSequentialAndLocalExecutionIfRelationNameTooLong(Oid relationId,
 																	 char *
 																	 finalRelationName);
@@ -151,6 +154,8 @@ extern ObjectAddress AlterCollationSchemaStmtObjectAddress(Node *stmt,
 extern List * PostprocessAlterCollationSchemaStmt(Node *stmt, const char *queryString);
 extern char * GenerateBackupNameForCollationCollision(const ObjectAddress *address);
 extern ObjectAddress DefineCollationStmtObjectAddress(Node *stmt, bool missing_ok);
+extern List * PreprocessDefineCollationStmt(Node *stmt, const char *queryString,
+											ProcessUtilityContext processUtilityContext);
 extern List * PostprocessDefineCollationStmt(Node *stmt, const char *queryString);
 
 /* database.c - forward declarations */
@@ -366,6 +371,8 @@ extern ObjectAddress AlterRoleSetStmtObjectAddress(Node *node,
 extern List * GenerateCreateOrAlterRoleCommand(Oid roleOid);
 
 /* schema.c - forward declarations */
+extern List * PreprocessCreateSchemaStmt(Node *node, const char *queryString,
+										 ProcessUtilityContext processUtilityContext);
 extern List * PreprocessDropSchemaStmt(Node *dropSchemaStatement,
 									   const char *queryString,
 									   ProcessUtilityContext processUtilityContext);
@@ -375,6 +382,7 @@ extern List * PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
 										  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterSchemaRenameStmt(Node *node, const char *queryString,
 											  ProcessUtilityContext processUtilityContext);
+extern ObjectAddress CreateSchemaStmtObjectAddress(Node *node, bool missing_ok);
 extern ObjectAddress AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok);
 
 /* sequence.c - forward declarations */
@@ -397,6 +405,9 @@ extern ObjectAddress AlterSequenceOwnerStmtObjectAddress(Node *node, bool missin
 extern ObjectAddress RenameSequenceStmtObjectAddress(Node *node, bool missing_ok);
 extern void ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt);
 extern void ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt);
+extern char * GenerateBackupNameForSequenceCollision(const ObjectAddress *address);
+extern void RenameExistingSequenceWithDifferentTypeIfExists(RangeVar *sequence,
+															Oid desiredSeqTypeId);
 
 /* statistics.c - forward declarations */
 extern List * PreprocessCreateStatisticsStmt(Node *node, const char *queryString,
@@ -459,6 +470,54 @@ extern Oid GetSequenceOid(Oid relationId, AttrNumber attnum);
 extern bool ConstrTypeUsesIndex(ConstrType constrType);
 
 
+/* text_search.c - forward declarations */
+extern List * PostprocessCreateTextSearchConfigurationStmt(Node *node,
+														   const char *queryString);
+extern List * GetCreateTextSearchConfigStatements(const ObjectAddress *address);
+extern List * CreateTextSearchConfigDDLCommandsIdempotent(const ObjectAddress *address);
+extern List * PreprocessDropTextSearchConfigurationStmt(Node *node,
+														const char *queryString,
+														ProcessUtilityContext
+														processUtilityContext);
+extern List * PreprocessAlterTextSearchConfigurationStmt(Node *node,
+														 const char *queryString,
+														 ProcessUtilityContext
+														 processUtilityContext);
+extern List * PreprocessRenameTextSearchConfigurationStmt(Node *node,
+														  const char *queryString,
+														  ProcessUtilityContext
+														  processUtilityContext);
+extern List * PreprocessAlterTextSearchConfigurationSchemaStmt(Node *node,
+															   const char *queryString,
+															   ProcessUtilityContext
+															   processUtilityContext);
+extern List * PostprocessAlterTextSearchConfigurationSchemaStmt(Node *node,
+																const char *queryString);
+extern List * PreprocessTextSearchConfigurationCommentStmt(Node *node,
+														   const char *queryString,
+														   ProcessUtilityContext
+														   processUtilityContext);
+extern List * PreprocessAlterTextSearchConfigurationOwnerStmt(Node *node,
+															  const char *queryString,
+															  ProcessUtilityContext
+															  processUtilityContext);
+extern List * PostprocessAlterTextSearchConfigurationOwnerStmt(Node *node,
+															   const char *queryString);
+extern ObjectAddress CreateTextSearchConfigurationObjectAddress(Node *node,
+																bool missing_ok);
+extern ObjectAddress RenameTextSearchConfigurationStmtObjectAddress(Node *node,
+																	bool missing_ok);
+extern ObjectAddress AlterTextSearchConfigurationStmtObjectAddress(Node *node,
+																   bool missing_ok);
+extern ObjectAddress AlterTextSearchConfigurationSchemaStmtObjectAddress(Node *node,
+																		 bool missing_ok);
+extern ObjectAddress TextSearchConfigurationCommentObjectAddress(Node *node,
+																 bool missing_ok);
+extern ObjectAddress AlterTextSearchConfigurationOwnerObjectAddress(Node *node,
+																	bool missing_ok);
+extern char * GenerateBackupNameForTextSearchConfiguration(const ObjectAddress *address);
+extern List * get_ts_config_namelist(Oid tsconfigOid);
+
 /* truncate.c - forward declarations */
 extern void PreprocessTruncateStatement(TruncateStmt *truncateStatement);
 
@@ -506,7 +565,8 @@ extern char * GenerateBackupNameForProcCollision(const ObjectAddress *address);
 extern ObjectWithArgs * ObjectWithArgsFromOid(Oid funcOid);
 extern void UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 										   int *distribution_argument_index,
-										   int *colocationId);
+										   int *colocationId,
+										   bool *forceDelegation);
 
 /* vacuum.c - forward declarations */
 extern void PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand);
@@ -523,16 +583,19 @@ extern List * PostprocessAlterTriggerRenameStmt(Node *node, const char *queryStr
 extern void AlterTriggerRenameEventExtendNames(RenameStmt *renameTriggerStmt,
 											   char *schemaName, uint64 shardId);
 extern List * PostprocessAlterTriggerDependsStmt(Node *node, const char *queryString);
+extern List * PreprocessAlterTriggerDependsStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
 extern void AlterTriggerDependsEventExtendNames(
 	AlterObjectDependsStmt *alterTriggerDependsStmt,
 	char *schemaName, uint64 shardId);
+extern void ErrorOutForTriggerIfNotSupported(Oid relationId);
 extern List * PreprocessDropTriggerStmt(Node *node, const char *queryString,
 										ProcessUtilityContext processUtilityContext);
-extern void ErrorOutForTriggerIfNotCitusLocalTable(Oid relationId);
 extern void DropTriggerEventExtendNames(DropStmt *dropTriggerStmt, char *schemaName,
 										uint64 shardId);
-extern List * CitusLocalTableTriggerCommandDDLJob(Oid relationId, char *triggerName,
-												  const char *queryString);
+extern List * CitusCreateTriggerCommandDDLJob(Oid relationId, char *triggerName,
+											  const char *queryString);
 extern Oid GetTriggerFunctionId(Oid triggerId);
 
 /* cascade_table_operation_for_connected_relations.c */
