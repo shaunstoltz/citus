@@ -69,6 +69,10 @@
 	(strncmp(arg, prefix, strlen(prefix)) == 0)
 
 /* forward declaration for helper functions*/
+static bool RecreateSameNonColocatedFunction(ObjectAddress functionAddress,
+											 char *distributionArgumentName,
+											 bool colocateWithTableNameDefault,
+											 bool *forceDelegationAddress);
 static void ErrorIfAnyNodeDoesNotHaveMetadata(void);
 static char * GetAggregateDDLCommand(const RegProcedure funcOid, bool useCreateOrReplace);
 static char * GetFunctionAlterOwnerCommand(const RegProcedure funcOid);
@@ -82,7 +86,6 @@ static void EnsureFunctionCanBeColocatedWithTable(Oid functionOid, Oid
 static bool ShouldPropagateCreateFunction(CreateFunctionStmt *stmt);
 static bool ShouldPropagateAlterFunction(const ObjectAddress *address);
 static bool ShouldAddFunctionSignature(FunctionParameterMode mode);
-static ObjectAddress * GetUndistributableDependency(ObjectAddress *functionAddress);
 static ObjectAddress FunctionToObjectAddress(ObjectType objectType,
 											 ObjectWithArgs *objectWithArgs,
 											 bool missing_ok);
@@ -129,6 +132,7 @@ create_distributed_function(PG_FUNCTION_ARGS)
 
 	char *distributionArgumentName = NULL;
 	char *colocateWithTableName = NULL;
+	bool colocateWithTableNameDefault = false;
 	bool *forceDelegationAddress = NULL;
 	bool forceDelegation = false;
 	ObjectAddress extensionAddress = { 0 };
@@ -168,8 +172,13 @@ create_distributed_function(PG_FUNCTION_ARGS)
 		colocateWithText = PG_GETARG_TEXT_P(2);
 		colocateWithTableName = text_to_cstring(colocateWithText);
 
+		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) == 0)
+		{
+			colocateWithTableNameDefault = true;
+		}
+
 		/* check if the colocation belongs to a reference table */
-		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
+		if (!colocateWithTableNameDefault)
 		{
 			Oid colocationRelationId = ResolveRelationId(colocateWithText, false);
 			colocatedWithReferenceTable = IsCitusTableType(colocationRelationId,
@@ -192,6 +201,20 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	EnsureFunctionOwner(funcOid);
 
 	ObjectAddressSet(functionAddress, ProcedureRelationId, funcOid);
+
+	if (RecreateSameNonColocatedFunction(functionAddress,
+										 distributionArgumentName,
+										 colocateWithTableNameDefault,
+										 forceDelegationAddress))
+	{
+		char *schemaName = get_namespace_name(get_func_namespace(funcOid));
+		char *functionName = get_func_name(funcOid);
+		char *qualifiedName = quote_qualified_identifier(schemaName, functionName);
+		ereport(NOTICE, (errmsg("procedure %s is already distributed", qualifiedName),
+						 errdetail("Citus distributes procedures with CREATE "
+								   "[PROCEDURE|FUNCTION|AGGREGATE] commands")));
+		PG_RETURN_VOID();
+	}
 
 	/*
 	 * If the function is owned by an extension, only update the
@@ -257,6 +280,55 @@ create_distributed_function(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * RecreateSameNonColocatedFunction returns true if the given parameters of
+ * create_distributed_function will not change anything on the given function.
+ * Returns false otherwise.
+ */
+static bool
+RecreateSameNonColocatedFunction(ObjectAddress functionAddress,
+								 char *distributionArgumentName,
+								 bool colocateWithTableNameDefault,
+								 bool *forceDelegationAddress)
+{
+	DistObjectCacheEntry *cacheEntry =
+		LookupDistObjectCacheEntry(ProcedureRelationId,
+								   functionAddress.objectId,
+								   InvalidOid);
+
+	if (cacheEntry == NULL || !cacheEntry->isValid || !cacheEntry->isDistributed)
+	{
+		return false;
+	}
+
+	/*
+	 * If the colocationId, forceDelegation and distributionArgIndex fields of a
+	 * pg_dist_object entry of a distributed function are all set to zero, it means
+	 * that function is either automatically distributed by ddl propagation, without
+	 * calling create_distributed_function. Or, it could be distributed via
+	 * create_distributed_function, but with no parameters.
+	 *
+	 * For these cases, calling create_distributed_function for that function,
+	 * without parameters would be idempotent. Hence we can simply early return here,
+	 * by providing a notice message to the user.
+	 */
+
+	/* are pg_dist_object fields set to zero? */
+	bool functionDistributedWithoutParams =
+		cacheEntry->colocationId == 0 &&
+		cacheEntry->forceDelegation == 0 &&
+		cacheEntry->distributionArgIndex == 0;
+
+	/* called create_distributed_function without parameters? */
+	bool distributingAgainWithNoParams =
+		distributionArgumentName == NULL &&
+		colocateWithTableNameDefault &&
+		forceDelegationAddress == NULL;
+
+	return functionDistributedWithoutParams && distributingAgainWithNoParams;
 }
 
 
@@ -1293,47 +1365,12 @@ PostprocessCreateFunctionStmt(Node *node, const char *queryString)
 		return NIL;
 	}
 
-	/*
-	 * This check should have been valid for all objects not only for functions. Though,
-	 * we do this limited check for now as functions are more likely to be used with
-	 * such dependencies, and we want to scope it for now.
-	 */
-	ObjectAddress *undistributableDependency = GetUndistributableDependency(
-		&functionAddress);
-	if (undistributableDependency != NULL)
+	/* If the function has any unsupported dependency, create it locally */
+	DeferredErrorMessage *errMsg = DeferErrorIfHasUnsupportedDependency(&functionAddress);
+
+	if (errMsg != NULL)
 	{
-		if (SupportedDependencyByCitus(undistributableDependency))
-		{
-			/*
-			 * Citus can't distribute some relations as dependency, although those
-			 * types as supported by Citus. So we can use get_rel_name directly
-			 */
-			RangeVar *functionRangeVar = makeRangeVarFromNameList(stmt->funcname);
-			char *functionName = functionRangeVar->relname;
-			char *dependentRelationName =
-				get_rel_name(undistributableDependency->objectId);
-
-			ereport(WARNING, (errmsg("Citus can't distribute function \"%s\" having "
-									 "dependency on non-distributed relation \"%s\"",
-									 functionName, dependentRelationName),
-							  errdetail("Function will be created only locally"),
-							  errhint("To distribute function, distribute dependent "
-									  "relations first. Then, re-create the function")));
-		}
-		else
-		{
-			char *objectType = NULL;
-			#if PG_VERSION_NUM >= PG_VERSION_14
-			objectType = getObjectTypeDescription(undistributableDependency, false);
-			#else
-			objectType = getObjectTypeDescription(undistributableDependency);
-			#endif
-			ereport(WARNING, (errmsg("Citus can't distribute functions having "
-									 "dependency on unsupported object of type \"%s\"",
-									 objectType),
-							  errdetail("Function will be created only locally")));
-		}
-
+		RaiseDeferredError(errMsg, WARNING);
 		return NIL;
 	}
 
@@ -1345,51 +1382,6 @@ PostprocessCreateFunctionStmt(Node *node, const char *queryString)
 	commands = list_concat(commands, list_make1(ENABLE_DDL_PROPAGATION));
 
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
-
-/*
- * GetUndistributableDependency checks whether object has any non-distributable
- * dependency. If any one found, it will be returned.
- */
-static ObjectAddress *
-GetUndistributableDependency(ObjectAddress *objectAddress)
-{
-	List *dependencies = GetAllDependenciesForObject(objectAddress);
-	ObjectAddress *dependency = NULL;
-	foreach_ptr(dependency, dependencies)
-	{
-		if (IsObjectDistributed(dependency))
-		{
-			continue;
-		}
-
-		if (!SupportedDependencyByCitus(dependency))
-		{
-			/*
-			 * Since roles should be handled manually with Citus community, skip them.
-			 */
-			if (getObjectClass(dependency) != OCLASS_ROLE)
-			{
-				return dependency;
-			}
-		}
-
-		if (getObjectClass(dependency) == OCLASS_CLASS)
-		{
-			/*
-			 * Citus can only distribute dependent non-distributed sequence
-			 * and composite types.
-			 */
-			char relKind = get_rel_relkind(dependency->objectId);
-			if (relKind != RELKIND_SEQUENCE && relKind != RELKIND_COMPOSITE_TYPE)
-			{
-				return dependency;
-			}
-		}
-	}
-
-	return NULL;
 }
 
 
@@ -1443,10 +1435,18 @@ DefineAggregateStmtObjectAddress(Node *node, bool missing_ok)
 	ObjectWithArgs *objectWithArgs = makeNode(ObjectWithArgs);
 	objectWithArgs->objname = stmt->defnames;
 
-	FunctionParameter *funcParam = NULL;
-	foreach_ptr(funcParam, linitial(stmt->args))
+	if (stmt->args != NIL)
 	{
-		objectWithArgs->objargs = lappend(objectWithArgs->objargs, funcParam->argType);
+		FunctionParameter *funcParam = NULL;
+		foreach_ptr(funcParam, linitial(stmt->args))
+		{
+			objectWithArgs->objargs = lappend(objectWithArgs->objargs,
+											  funcParam->argType);
+		}
+	}
+	else
+	{
+		objectWithArgs->objargs = list_make1(makeTypeName("anyelement"));
 	}
 
 	return FunctionToObjectAddress(OBJECT_AGGREGATE, objectWithArgs, missing_ok);
@@ -1581,6 +1581,32 @@ PreprocessAlterFunctionOwnerStmt(Node *node, const char *queryString,
 								ENABLE_DDL_PROPAGATION);
 
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
+}
+
+
+/*
+ * PostprocessAlterFunctionOwnerStmt is invoked after the owner has been changed locally.
+ * Since changing the owner could result in new dependencies being found for this object
+ * we re-ensure all the dependencies for the function do exist.
+ *
+ * This is solely to propagate the new owner (and all its dependencies) if it was not
+ * already distributed in the cluster.
+ */
+List *
+PostprocessAlterFunctionOwnerStmt(Node *node, const char *queryString)
+{
+	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
+	AssertObjectTypeIsFunctional(stmt->objectType);
+
+	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
+	if (!ShouldPropagateAlterFunction(&address))
+	{
+		return NIL;
+	}
+
+	EnsureDependenciesExistOnAllNodes(&address);
+
+	return NIL;
 }
 
 
@@ -2019,10 +2045,10 @@ ShouldAddFunctionSignature(FunctionParameterMode mode)
 
 
 /*
- * FunctionToObjectAddress returns the ObjectAddress of a Function or Procedure based on
- * its type and ObjectWithArgs describing the Function/Procedure. If missing_ok is set to
- * false an error will be raised by postgres explaining the Function/Procedure could not
- * be found.
+ * FunctionToObjectAddress returns the ObjectAddress of a Function, Procedure or
+ * Aggregate based on its type and ObjectWithArgs describing the
+ * Function/Procedure/Aggregate. If missing_ok is set to false an error will be
+ * raised by postgres explaining the Function/Procedure could not be found.
  */
 static ObjectAddress
 FunctionToObjectAddress(ObjectType objectType, ObjectWithArgs *objectWithArgs,

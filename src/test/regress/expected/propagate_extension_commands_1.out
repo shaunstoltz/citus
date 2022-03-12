@@ -1,3 +1,11 @@
+-- print whether we're using version > 12 to make version-specific tests clear
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int > 12 AS version_above_twelve;
+ version_above_twelve
+---------------------------------------------------------------------
+ f
+(1 row)
+
 CREATE SCHEMA "extension'test";
 -- use  a schema name with escape character
 SET search_path TO "extension'test";
@@ -6,13 +14,13 @@ SET client_min_messages TO WARNING;
 -- the extension is on contrib, so should be avaliable for the regression tests
 CREATE EXTENSION seg;
 --  make sure that both the schema and the extension is distributed
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
  count
 ---------------------------------------------------------------------
      1
 (1 row)
 
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_namespace WHERE nspname = 'extension''test');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_namespace WHERE nspname = 'extension''test');
  count
 ---------------------------------------------------------------------
      1
@@ -34,7 +42,7 @@ SELECT count(*) from pg_dist_partition where logicalrelid='extension''test.test_
 
 CREATE TYPE two_segs AS (seg_1 seg, seg_2 seg);
 -- verify that the type that depends on the extension is also marked as distributed
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_type WHERE typname = 'two_segs' AND typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'extension''test'));
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_type WHERE typname = 'two_segs' AND typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'extension''test'));
  count
 ---------------------------------------------------------------------
      1
@@ -67,7 +75,7 @@ BEGIN;
 
 COMMIT;
 -- make sure that the extension is distributed even if we run create extension in a transaction block
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
  count
 ---------------------------------------------------------------------
      1
@@ -122,7 +130,7 @@ ALTER EXTENSION isn SET SCHEMA public;
 -- switch back to public schema as we set extension's schema to public
 SET search_path TO public;
 -- make sure that the extension is distributed
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
  count
 ---------------------------------------------------------------------
      1
@@ -184,8 +192,6 @@ SELECT create_reference_table('ref_table_2');
 CREATE FUNCTION dintdict_init(internal) RETURNS internal AS 'dict_int.so' LANGUAGE C STRICT;
 CREATE FUNCTION dintdict_lexize(internal, internal, internal, internal) RETURNS internal AS 'dict_int.so' LANGUAGE C STRICT;
 CREATE TEXT SEARCH TEMPLATE intdict_template (LEXIZE = dintdict_lexize, INIT   = dintdict_init );
-CREATE TEXT SEARCH DICTIONARY intdict (TEMPLATE = intdict_template);
-COMMENT ON TEXT SEARCH DICTIONARY intdict IS 'dictionary for integers';
 SELECT run_command_on_workers($$
 CREATE TEXT SEARCH TEMPLATE intdict_template (LEXIZE = dintdict_lexize, INIT   = dintdict_init );
 $$);
@@ -194,22 +200,8 @@ $$);
  (localhost,57637,t,"CREATE TEXT SEARCH TEMPLATE")
 (1 row)
 
-SELECT run_command_on_workers($$
 CREATE TEXT SEARCH DICTIONARY intdict (TEMPLATE = intdict_template);
-$$);
-               run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,"CREATE TEXT SEARCH DICTIONARY")
-(1 row)
-
-SELECT run_command_on_workers($$
 COMMENT ON TEXT SEARCH DICTIONARY intdict IS 'dictionary for integers';
-$$);
-   run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,COMMENT)
-(1 row)
-
 CREATE EXTENSION dict_int FROM unpackaged;
 SELECT run_command_on_workers($$SELECT count(extnamespace) FROM pg_extension WHERE extname = 'dict_int'$$);
  run_command_on_workers
@@ -223,7 +215,27 @@ SELECT run_command_on_workers($$SELECT extversion FROM pg_extension WHERE extnam
  (localhost,57637,t,1.0)
 (1 row)
 
--- and add the other node
+-- adding the second node will fail as the text search template needs to be created manually
+SELECT 1 from master_add_node('localhost', :worker_2_port);
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+-- create the text search template manually on the worker
+\c - - - :worker_2_port
+SET citus.enable_metadata_sync TO false;
+CREATE FUNCTION dintdict_init(internal) RETURNS internal AS 'dict_int.so' LANGUAGE C STRICT;
+ERROR:  function "dintdict_init" already exists with same argument types
+CREATE FUNCTION dintdict_lexize(internal, internal, internal, internal) RETURNS internal AS 'dict_int.so' LANGUAGE C STRICT;
+ERROR:  function "dintdict_lexize" already exists with same argument types
+CREATE TEXT SEARCH TEMPLATE intdict_template (LEXIZE = dintdict_lexize, INIT   = dintdict_init );
+ERROR:  duplicate key value violates unique constraint "pg_ts_template_tmplname_index"
+DETAIL:  Key (tmplname, tmplnamespace)=(intdict_template, 2200) already exists.
+RESET citus.enable_metadata_sync;
+\c - - - :master_port
+SET client_min_messages TO WARNING;
+-- add the second node now
 SELECT 1 from master_add_node('localhost', :worker_2_port);
  ?column?
 ---------------------------------------------------------------------
@@ -281,7 +293,7 @@ BEGIN;
 ROLLBACK;
 -- at the end of the transaction block, we did not create isn extension in coordinator or worker nodes as we rollback'ed
 -- make sure that the extension is not distributed
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'isn');
  count
 ---------------------------------------------------------------------
      0
@@ -318,7 +330,7 @@ SELECT count(*) FROM pg_extension WHERE extname IN ('pg_buffercache', 'isn');
 
 -- drop extension should just work
 DROP EXTENSION seg CASCADE;
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
  count
 ---------------------------------------------------------------------
      0
@@ -332,7 +344,7 @@ SELECT run_command_on_workers($$SELECT count(*) FROM pg_extension WHERE extname 
 (2 rows)
 
 -- make sure that the extension is not avaliable anymore as a distributed object
-SELECT count(*) FROM citus.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname IN ('seg', 'isn'));
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid = (SELECT oid FROM pg_extension WHERE extname IN ('seg', 'isn'));
  count
 ---------------------------------------------------------------------
      0
@@ -343,6 +355,7 @@ SET search_path TO "extension'test";
 -- check restriction for sequential execution
 -- enable it and see that create command errors but continues its execution by changing citus.multi_shard_modify_mode TO 'off
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
 	CREATE TABLE some_random_table (a int);
 	SELECT create_distributed_table('some_random_table', 'a');
  create_distributed_table
@@ -438,9 +451,9 @@ BEGIN;
 COMMIT;
 -- Check the pg_dist_object
 SELECT pg_proc.proname as DistributedFunction
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
  distributedfunction
 ---------------------------------------------------------------------
@@ -449,9 +462,9 @@ classid = 'pg_proc'::regclass;
 
 SELECT run_command_on_workers($$
 SELECT count(*)
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
 $$);
  run_command_on_workers
@@ -467,7 +480,7 @@ SELECT 1 from master_add_node('localhost', :worker_2_port);
 (1 row)
 
 -- make sure that both extensions are created on both nodes
-SELECT count(*) FROM citus.pg_dist_object WHERE objid IN (SELECT oid FROM pg_extension WHERE extname IN ('seg', 'isn'));
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE objid IN (SELECT oid FROM pg_extension WHERE extname IN ('seg', 'isn'));
  count
 ---------------------------------------------------------------------
      2
@@ -483,9 +496,9 @@ SELECT run_command_on_workers($$SELECT count(*) FROM pg_extension WHERE extname 
 -- Check the pg_dist_object on the both nodes
 SELECT run_command_on_workers($$
 SELECT count(*)
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
 $$);
  run_command_on_workers
@@ -497,9 +510,9 @@ $$);
 DROP EXTENSION seg CASCADE;
 -- Recheck the pg_dist_object
 SELECT pg_proc.proname as DistributedFunction
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
  distributedfunction
 ---------------------------------------------------------------------
@@ -507,9 +520,9 @@ classid = 'pg_proc'::regclass;
 
 SELECT run_command_on_workers($$
 SELECT count(*)
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
 $$);
  run_command_on_workers
@@ -523,7 +536,7 @@ SET citus.enable_ddl_propagation TO false;
 CREATE EXTENSION seg;
 SET citus.enable_ddl_propagation TO true;
 -- Check the extension in pg_dist_object
-SELECT count(*) FROM citus.pg_dist_object WHERE classid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE classid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
 objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
  count
 ---------------------------------------------------------------------
@@ -532,9 +545,9 @@ objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
 
 SELECT run_command_on_workers($$
 SELECT count(*)
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
 $$);
  run_command_on_workers
@@ -550,7 +563,7 @@ SELECT create_distributed_function('seg_in(cstring)', '$1', 'test_extension_func
 (1 row)
 
 -- Recheck the extension in pg_dist_object
-SELECT count(*) FROM citus.pg_dist_object WHERE classid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
+SELECT count(*) FROM pg_catalog.pg_dist_object WHERE classid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND
 objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
  count
 ---------------------------------------------------------------------
@@ -558,9 +571,9 @@ objid = (SELECT oid FROM pg_extension WHERE extname = 'seg');
 (1 row)
 
 SELECT pg_proc.proname as DistributedFunction
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
  distributedfunction
 ---------------------------------------------------------------------
@@ -569,9 +582,9 @@ classid = 'pg_proc'::regclass;
 
 SELECT run_command_on_workers($$
 SELECT count(*)
-FROM citus.pg_dist_object, pg_proc
+FROM pg_catalog.pg_dist_object, pg_proc
 WHERE pg_proc.proname = 'seg_in' and
-pg_proc.oid = citus.pg_dist_object.objid and
+pg_proc.oid = pg_catalog.pg_dist_object.objid and
 classid = 'pg_proc'::regclass;
 $$);
  run_command_on_workers
@@ -585,6 +598,7 @@ DROP TABLE test_extension_function;
 -- Test extension function altering distribution argument
 BEGIN;
 SET citus.shard_replication_factor = 1;
+SET citus.multi_shard_modify_mode TO sequential;
 CREATE TABLE test_extension_function(col1 float8[], col2 float8[]);
 SELECT create_distributed_table('test_extension_function', 'col1', colocate_with := 'none');
  create_distributed_table
@@ -599,7 +613,7 @@ SELECT create_distributed_function('cube(float8[], float8[])', '$1', 'test_exten
 
 (1 row)
 
-SELECT distribution_argument_index FROM citus.pg_dist_object WHERE classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND
+SELECT distribution_argument_index FROM pg_catalog.pg_dist_object WHERE classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND
 objid = (SELECT oid FROM pg_proc WHERE prosrc = 'cube_a_f8_f8');
  distribution_argument_index
 ---------------------------------------------------------------------
@@ -612,7 +626,7 @@ SELECT create_distributed_function('cube(float8[], float8[])', '$2', 'test_exten
 
 (1 row)
 
-SELECT distribution_argument_index FROM citus.pg_dist_object WHERE classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND
+SELECT distribution_argument_index FROM pg_catalog.pg_dist_object WHERE classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND
 objid = (SELECT oid FROM pg_proc WHERE prosrc = 'cube_a_f8_f8');
  distribution_argument_index
 ---------------------------------------------------------------------

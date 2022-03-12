@@ -31,6 +31,7 @@
 #include "distributed/commands/sequence.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/metadata/distobject.h"
+#include "distributed/metadata/dependency.h"
 #include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"

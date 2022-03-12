@@ -122,6 +122,7 @@ typedef struct ViewDependencyNode
 
 
 static List * GetRelationSequenceDependencyList(Oid relationId);
+static List * GetRelationFunctionDependencyList(Oid relationId);
 static List * GetRelationTriggerFunctionDependencyList(Oid relationId);
 static List * GetRelationStatsSchemaDependencyList(Oid relationId);
 static List * GetRelationIndicesDependencyList(Oid relationId);
@@ -135,6 +136,7 @@ static void CollectObjectAddress(ObjectAddressCollector *collector,
 								 const ObjectAddress *address);
 static bool IsObjectAddressCollected(ObjectAddress findAddress,
 									 ObjectAddressCollector *collector);
+static ObjectAddress * GetUndistributableDependency(const ObjectAddress *objectAddress);
 static void MarkObjectVisited(ObjectAddressCollector *collector,
 							  ObjectAddress target);
 static bool TargetObjectVisited(ObjectAddressCollector *collector,
@@ -674,6 +676,11 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			return true;
 		}
 
+		case OCLASS_TSDICT:
+		{
+			return true;
+		}
+
 		case OCLASS_TYPE:
 		{
 			switch (get_typtype(address->objectId))
@@ -737,6 +744,165 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			return false;
 		}
 	}
+}
+
+
+/*
+ * DeferErrorIfHasUnsupportedDependency returns deferred error message if the given
+ * object has any undistributable dependency.
+ */
+DeferredErrorMessage *
+DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
+{
+	ObjectAddress *undistributableDependency = GetUndistributableDependency(
+		objectAddress);
+
+	if (undistributableDependency == NULL)
+	{
+		return NULL;
+	}
+
+	char *objectDescription = NULL;
+	char *dependencyDescription = NULL;
+	StringInfo errorInfo = makeStringInfo();
+	StringInfo detailInfo = makeStringInfo();
+
+	#if PG_VERSION_NUM >= PG_VERSION_14
+	objectDescription = getObjectDescription(objectAddress, false);
+	dependencyDescription = getObjectDescription(undistributableDependency, false);
+	#else
+	objectDescription = getObjectDescription(objectAddress);
+	dependencyDescription = getObjectDescription(undistributableDependency);
+	#endif
+
+	/*
+	 * If the given object is a procedure, we want to create it locally,
+	 * so provide that information in the error detail.
+	 */
+	if (getObjectClass(objectAddress) == OCLASS_PROC)
+	{
+		appendStringInfo(detailInfo, "\"%s\" will be created only locally",
+						 objectDescription);
+	}
+
+	if (SupportedDependencyByCitus(undistributableDependency))
+	{
+		StringInfo hintInfo = makeStringInfo();
+
+		appendStringInfo(errorInfo, "\"%s\" has dependency to \"%s\" that is not in "
+									"Citus' metadata",
+						 objectDescription,
+						 dependencyDescription);
+
+		appendStringInfo(hintInfo, "Distribute \"%s\" first to distribute \"%s\"",
+						 dependencyDescription,
+						 objectDescription);
+
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 errorInfo->data,
+							 strlen(detailInfo->data) == 0 ? NULL : detailInfo->data,
+							 hintInfo->data);
+	}
+
+	appendStringInfo(errorInfo, "\"%s\" has dependency on unsupported "
+								"object \"%s\"", objectDescription,
+					 dependencyDescription);
+
+	return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+						 errorInfo->data,
+						 strlen(detailInfo->data) == 0 ? NULL : detailInfo->data,
+						 NULL);
+}
+
+
+/*
+ * GetUndistributableDependency checks whether object has any non-distributable
+ * dependency. If any one found, it will be returned.
+ */
+static ObjectAddress *
+GetUndistributableDependency(const ObjectAddress *objectAddress)
+{
+	List *dependencies = GetAllDependenciesForObject(objectAddress);
+	ObjectAddress *dependency = NULL;
+
+	/*
+	 * Users can disable metadata sync by their own risk. If it is disabled, Citus
+	 * doesn't propagate dependencies. So, if it is disabled, there is no undistributable
+	 * dependency.
+	 */
+	if (!EnableMetadataSync)
+	{
+		return NULL;
+	}
+
+	foreach_ptr(dependency, dependencies)
+	{
+		/*
+		 * Objects with the id smaller than FirstNormalObjectId should be created within
+		 * initdb. Citus needs to have such objects as distributed, so we can not add
+		 * such check to dependency resolution logic. Though, Citus shouldn't error
+		 * out if such dependency is not supported. So, skip them here.
+		 */
+		if (dependency->objectId < FirstNormalObjectId)
+		{
+			continue;
+		}
+
+		/*
+		 * If object is distributed already, ignore it.
+		 */
+		if (IsObjectDistributed(dependency))
+		{
+			continue;
+		}
+
+		/*
+		 * If the dependency is not supported with Citus, return the dependency.
+		 */
+		if (!SupportedDependencyByCitus(dependency))
+		{
+			/*
+			 * Skip roles and text search templates.
+			 *
+			 * Roles should be handled manually with Citus community whereas text search
+			 * templates should be handled manually in both community and enterprise
+			 */
+			if (getObjectClass(dependency) != OCLASS_ROLE &&
+				getObjectClass(dependency) != OCLASS_TSTEMPLATE)
+			{
+				return dependency;
+			}
+		}
+
+		if (getObjectClass(dependency) == OCLASS_CLASS)
+		{
+			char relKind = get_rel_relkind(dependency->objectId);
+
+			if (relKind == RELKIND_SEQUENCE || relKind == RELKIND_COMPOSITE_TYPE)
+			{
+				/* citus knows how to auto-distribute these dependencies */
+				continue;
+			}
+			else if (relKind == RELKIND_INDEX || relKind == RELKIND_PARTITIONED_INDEX)
+			{
+				/*
+				 * Indexes are only qualified for distributed objects for dependency
+				 * tracking purposes, so we can ignore those.
+				 */
+				continue;
+			}
+			else
+			{
+				/*
+				 * Citus doesn't know how to auto-distribute the rest of the RELKINDs
+				 * via dependency resolution
+				 */
+				return dependency;
+			}
+		}
+	}
+
+	return NULL;
 }
 
 
@@ -1091,12 +1257,18 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 			 * with them.
 			 */
 			List *sequenceDependencyList = GetRelationSequenceDependencyList(relationId);
-
 			result = list_concat(result, sequenceDependencyList);
 
 			/*
+			 * Get the dependent functions for tables as columns has default values
+			 * and contraints, then expand dependency list with them.
+			 */
+			List *functionDependencyList = GetRelationFunctionDependencyList(relationId);
+			result = list_concat(result, functionDependencyList);
+
+			/*
 			 * Tables could have indexes. Indexes themself could have dependencies that
-			 * need to be propagated. eg. TEXT SEARCH CONFIGRUATIONS. Here we add the
+			 * need to be propagated. eg. TEXT SEARCH CONFIGURATIONS. Here we add the
 			 * addresses of all indices to the list of objects to vist, as to make sure we
 			 * create all objects required by the indices before we create the table
 			 * including indices.
@@ -1131,6 +1303,21 @@ GetRelationSequenceDependencyList(Oid relationId)
 		CreateObjectAddressDependencyDefList(RelationRelationId, dependentSequenceList);
 
 	return sequenceDependencyDefList;
+}
+
+
+/*
+ * GetRelationFunctionDependencyList returns the function dependency definition
+ * list for the given relation.
+ */
+static List *
+GetRelationFunctionDependencyList(Oid relationId)
+{
+	List *dependentFunctionOids = GetDependentFunctionsWithRelation(relationId);
+	List *functionDependencyDefList =
+		CreateObjectAddressDependencyDefList(ProcedureRelationId, dependentFunctionOids);
+
+	return functionDependencyDefList;
 }
 
 

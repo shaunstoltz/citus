@@ -136,11 +136,8 @@ PostprocessCreateExtensionStmt(Node *node, const char *queryString)
 		return NIL;
 	}
 
-	/*
-	 * If the extension command is a part of a multi-statement transaction,
-	 * do not propagate it
-	 */
-	if (IsMultiStatementTransaction())
+	/* check creation against multi-statement transaction policy */
+	if (!ShouldPropagateCreateInCoordinatedTransction())
 	{
 		return NIL;
 	}
@@ -516,6 +513,16 @@ MarkExistingObjectDependenciesDistributedIfSupported()
 		ObjectAddress tableAddress = { 0 };
 		ObjectAddressSet(tableAddress, RelationRelationId, citusTableId);
 
+		if (ShouldSyncTableMetadata(citusTableId))
+		{
+			/* we need to pass pointer allocated in the heap */
+			ObjectAddress *addressPointer = palloc0(sizeof(ObjectAddress));
+			*addressPointer = tableAddress;
+
+			/* as of Citus 11, tables that should be synced are also considered object */
+			resultingObjectAddresses = lappend(resultingObjectAddresses, addressPointer);
+		}
+
 		List *distributableDependencyObjectAddresses =
 			GetDistributableDependenciesForObject(&tableAddress);
 
@@ -539,11 +546,22 @@ MarkExistingObjectDependenciesDistributedIfSupported()
 	/* remove duplicates from object addresses list for efficiency */
 	List *uniqueObjectAddresses = GetUniqueDependenciesList(resultingObjectAddresses);
 
+	/*
+	 * We should sync the new dependencies during ALTER EXTENSION because
+	 * we cannot know whether the nodes has already been upgraded or not. If
+	 * the nodes are not upgraded at this point, we cannot sync the object. Also,
+	 * when the workers upgraded, they'd get the same objects anyway.
+	 */
+	bool prevMetadataSyncValue = EnableMetadataSync;
+	SetLocalEnableMetadataSync(false);
+
 	ObjectAddress *objectAddress = NULL;
 	foreach_ptr(objectAddress, uniqueObjectAddresses)
 	{
 		MarkObjectDistributed(objectAddress);
 	}
+
+	SetLocalEnableMetadataSync(prevMetadataSyncValue);
 }
 
 
@@ -751,12 +769,22 @@ RecreateExtensionStmt(Oid extensionOid)
 
 	/* make DefEleme for extensionSchemaName */
 	Node *schemaNameArg = (Node *) makeString(extensionSchemaName);
-
 	DefElem *schemaDefElement = makeDefElem("schema", schemaNameArg, location);
 
 	/* append the schema name DefElem finally */
 	createExtensionStmt->options = lappend(createExtensionStmt->options,
 										   schemaDefElement);
+
+	char *extensionVersion = get_extension_version(extensionOid);
+	if (extensionVersion != NULL)
+	{
+		Node *extensionVersionArg = (Node *) makeString(extensionVersion);
+		DefElem *extensionVersionElement =
+			makeDefElem("new_version", extensionVersionArg, location);
+
+		createExtensionStmt->options = lappend(createExtensionStmt->options,
+											   extensionVersionElement);
+	}
 
 	return (Node *) createExtensionStmt;
 }

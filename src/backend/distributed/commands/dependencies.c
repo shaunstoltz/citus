@@ -20,6 +20,8 @@
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/multi_executor.h"
+#include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
@@ -29,6 +31,8 @@
 
 typedef bool (*AddressPredicate)(const ObjectAddress *);
 
+static void EnsureDependenciesCanBeDistributed(const ObjectAddress *relationAddress);
+static void ErrorIfCircularDependencyExists(const ObjectAddress *objectAddress);
 static int ObjectAddressComparator(const void *a, const void *b);
 static List * GetDependencyCreateDDLCommands(const ObjectAddress *dependency);
 static List * FilterObjectAddressListByPredicate(List *objectAddressList,
@@ -53,6 +57,12 @@ EnsureDependenciesExistOnAllNodes(const ObjectAddress *target)
 {
 	List *dependenciesWithCommands = NIL;
 	List *ddlCommands = NULL;
+
+	/*
+	 * If there is any unsupported dependency or circular dependency exists, Citus can
+	 * not ensure dependencies will exist on all nodes.
+	 */
+	EnsureDependenciesCanBeDistributed(target);
 
 	/* collect all dependencies in creation order and get their ddl commands */
 	List *dependencies = GetDependenciesForObject(target);
@@ -129,6 +139,60 @@ EnsureDependenciesExistOnAllNodes(const ObjectAddress *target)
 		 * Metadata of the table itself must be propagated with the current user.
 		 */
 		MarkObjectDistributedViaSuperUser(dependency);
+	}
+}
+
+
+/*
+ * EnsureDependenciesCanBeDistributed ensures all dependencies of the given object
+ * can be distributed.
+ */
+static void
+EnsureDependenciesCanBeDistributed(const ObjectAddress *objectAddress)
+{
+	/* If the object circularcly depends to itself, Citus can not handle it */
+	ErrorIfCircularDependencyExists(objectAddress);
+
+	/* If the object has any unsupported dependency, error out */
+	DeferredErrorMessage *depError = DeferErrorIfHasUnsupportedDependency(objectAddress);
+
+	if (depError != NULL)
+	{
+		RaiseDeferredError(depError, ERROR);
+	}
+}
+
+
+/*
+ * ErrorIfCircularDependencyExists checks whether given object has circular dependency
+ * with itself via existing objects of pg_dist_object.
+ */
+static void
+ErrorIfCircularDependencyExists(const ObjectAddress *objectAddress)
+{
+	List *dependencies = GetAllSupportedDependenciesForObject(objectAddress);
+
+	ObjectAddress *dependency = NULL;
+	foreach_ptr(dependency, dependencies)
+	{
+		if (dependency->classId == objectAddress->classId &&
+			dependency->objectId == objectAddress->objectId &&
+			dependency->objectSubId == objectAddress->objectSubId)
+		{
+			char *objectDescription = NULL;
+
+			#if PG_VERSION_NUM >= PG_VERSION_14
+			objectDescription = getObjectDescription(objectAddress, false);
+			#else
+			objectDescription = getObjectDescription(objectAddress);
+			#endif
+
+			ereport(ERROR, (errmsg("Citus can not handle circular dependencies "
+								   "between distributed objects"),
+							errdetail("\"%s\" circularly depends itself, resolve "
+									  "circular dependency first",
+									  objectDescription)));
+		}
 	}
 }
 
@@ -334,6 +398,11 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
 			return CreateTextSearchConfigDDLCommandsIdempotent(dependency);
 		}
 
+		case OCLASS_TSDICT:
+		{
+			return CreateTextSearchDictDDLCommandsIdempotent(dependency);
+		}
+
 		case OCLASS_TYPE:
 		{
 			return CreateTypeDDLCommandsIdempotent(dependency);
@@ -456,6 +525,88 @@ ShouldPropagate(void)
 	}
 
 	return true;
+}
+
+
+/*
+ * ShouldPropagateCreateInCoordinatedTransction returns based the current state of the
+ * session and policies if Citus needs to propagate the creation of new objects.
+ *
+ * Creation of objects on other nodes could be postponed till the object is actually used
+ * in a sharded object (eg. distributed table or index on a distributed table). In certain
+ * use cases the opportunity for parallelism in a transaction block is preferred. When
+ * configured like that the creation of an object might be postponed and backfilled till
+ * the object is actually used.
+ */
+bool
+ShouldPropagateCreateInCoordinatedTransction()
+{
+	if (!IsMultiStatementTransaction())
+	{
+		/*
+		 * If we are in a single statement transaction we will always propagate the
+		 * creation of objects. There are no downsides in regard to performance or
+		 * transactional limitations. These only arise with transaction blocks consisting
+		 * of multiple statements.
+		 */
+		return true;
+	}
+
+	if (MultiShardConnectionType == SEQUENTIAL_CONNECTION)
+	{
+		/*
+		 * If we are in a transaction that is already switched to sequential, either by
+		 * the user, or automatically by an other command, we will always propagate the
+		 * creation of new objects to the workers.
+		 *
+		 * This guarantees no strange anomalies when the transaction aborts or on
+		 * visibility of the newly created object.
+		 */
+		return true;
+	}
+
+	switch (CreateObjectPropagationMode)
+	{
+		case CREATE_OBJECT_PROPAGATION_DEFERRED:
+		{
+			/*
+			 * We prefer parallelism at this point. Since we did not already return while
+			 * checking for sequential mode we are still in parallel mode. We don't want
+			 * to switch that now, thus not propagating the creation.
+			 */
+			return false;
+		}
+
+		case CREATE_OBJECT_PROPAGATION_AUTOMATIC:
+		{
+			/*
+			 * When we run in optimistic mode we want to switch to sequential mode, only
+			 * if this would _not_ give an error to the user. Meaning, we either are
+			 * already in sequential mode (checked earlier), or there has been no parallel
+			 * execution in the current transaction block.
+			 *
+			 * If switching to sequential would throw an error we would stay in parallel
+			 * mode while creating new objects. We will rely on Citus' mechanism to ensure
+			 * the existence if the object would be used in the same transaction.
+			 */
+			if (ParallelQueryExecutedInTransaction())
+			{
+				return false;
+			}
+
+			return true;
+		}
+
+		case CREATE_OBJECT_PROPAGATION_IMMEDIATE:
+		{
+			return true;
+		}
+
+		default:
+		{
+			elog(ERROR, "unsupported ddl propagation mode");
+		}
+	}
 }
 
 
