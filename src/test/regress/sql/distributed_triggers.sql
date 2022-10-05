@@ -3,7 +3,6 @@ DROP SCHEMA IF EXISTS distributed_triggers CASCADE;
 CREATE SCHEMA distributed_triggers;
 SET search_path TO 'distributed_triggers';
 SET citus.shard_replication_factor = 1;
-SET citus.shard_count = 32;
 SET citus.next_shard_id TO 800000;
 
 --
@@ -175,6 +174,8 @@ DROP TRIGGER bad_shardkey_record_change_trigger ON data;
 
 CREATE OR REPLACE FUNCTION remote_shardkey_record_change()
 RETURNS trigger
+SET search_path = 'distributed_triggers'
+LANGUAGE plpgsql
 AS $$
 DECLARE
     last_change_id bigint;
@@ -182,14 +183,17 @@ BEGIN
     UPDATE distributed_triggers.data_changes SET operation_type = TG_OP;
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER remote_shardkey_record_change_trigger
 AFTER INSERT OR UPDATE OR DELETE ON data
 FOR EACH ROW EXECUTE FUNCTION distributed_triggers.remote_shardkey_record_change();
 
 CREATE FUNCTION insert_document(key text, id text)
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = 'distributed_triggers'
+AS $fn$
 BEGIN
 	INSERT INTO distributed_triggers.data VALUES (key, id, '{"id1":"id2"}');
 	DELETE FROM distributed_triggers.data where shard_key_value = key;
@@ -297,7 +301,7 @@ CREATE TRIGGER record_emp_trig
 AFTER INSERT OR UPDATE OR DELETE ON emptest
     FOR EACH STATEMENT EXECUTE FUNCTION distributed_triggers.record_emp();
 
-INSERT INTO emptest VALUES ('test5', 1);
+INSERT INTO emptest VALUES ('test6', 1);
 DELETE FROM emptest;
 SELECT * FROM emptest;
 SELECT operation_type FROM record_op;
@@ -411,10 +415,15 @@ SELECT operation_type, product_sku, state_code FROM record_sale ORDER BY 1,2,3;
 --
 --Test ALTER TRIGGER
 --
+-- Pre PG15, renaming the trigger on the parent table didn't rename the same trigger on
+-- the children as well. Hence, let's not print the trigger names of the children
+-- In PG15, rename is consistent for all partitions of the parent
+-- This is tested in pg15.sql file.
+
 CREATE VIEW sale_triggers AS
     SELECT tgname, tgrelid::regclass, tgenabled
     FROM pg_trigger
-    WHERE tgrelid::regclass::text like 'sale%'
+    WHERE tgrelid::regclass::text = 'sale'
     ORDER BY 1, 2;
 
 SELECT * FROM sale_triggers ORDER BY 1,2;
@@ -465,8 +474,8 @@ SELECT tgrelid::regclass::text, tgname FROM pg_trigger WHERE tgname like 'insert
 SELECT run_command_on_workers($$SELECT count(*) FROM pg_trigger WHERE tgname like 'insert_99_trigger%'$$);
 
 RESET client_min_messages;
-SET citus.enable_unsafe_triggers TO false;
-SELECT run_command_on_workers('ALTER SYSTEM SET citus.enable_unsafe_triggers TO false;');
+RESET citus.enable_unsafe_triggers;
+SELECT run_command_on_workers('ALTER SYSTEM RESET citus.enable_unsafe_triggers;');
 SELECT run_command_on_workers('SELECT pg_reload_conf();');
 SET citus.log_remote_commands TO off;
 

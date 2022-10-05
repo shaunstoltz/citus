@@ -21,9 +21,7 @@
 #include "distributed/query_utils.h"
 #include "distributed/worker_manager.h"
 #include "utils/builtins.h"
-#if PG_VERSION_NUM >= PG_VERSION_13
 #include "common/hashfn.h"
-#endif
 
 /* controlled via GUC, used mostly for testing */
 bool LogIntermediateResults = false;
@@ -373,19 +371,13 @@ RemoveLocalNodeFromWorkerList(List *workerNodeList)
 	int32 localGroupId = GetLocalGroupId();
 
 	ListCell *workerNodeCell = NULL;
-	#if PG_VERSION_NUM < PG_VERSION_13
-	ListCell *prev = NULL;
-	#endif
 	foreach(workerNodeCell, workerNodeList)
 	{
 		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
 		if (workerNode->groupId == localGroupId)
 		{
-			return list_delete_cell_compat(workerNodeList, workerNodeCell, prev);
+			return list_delete_cell(workerNodeList, workerNodeCell);
 		}
-		#if PG_VERSION_NUM < PG_VERSION_13
-		prev = workerNodeCell;
-		#endif
 	}
 
 	return workerNodeList;

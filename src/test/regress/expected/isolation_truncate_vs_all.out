@@ -20,11 +20,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -46,11 +41,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-drop s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -68,11 +58,6 @@ step s2-drop: <... completed>
 step s2-commit: COMMIT;
 step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 ERROR:  relation "truncate_append" does not exist
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-ddl-create-index s1-commit s2-commit s1-select-count s1-show-indexes
 master_create_empty_shard
@@ -100,11 +85,6 @@ run_command_on_workers
 (localhost,57637,t,0)
 (localhost,57638,t,0)
 (2 rows)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
 
 
 starting permutation: s1-initialize s1-ddl-create-index s1-begin s2-begin s1-truncate s2-ddl-drop-index s1-commit s2-commit s1-select-count s1-show-indexes
@@ -135,13 +115,8 @@ run_command_on_workers
 (localhost,57638,t,0)
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
 
-(1 row)
-
-
-starting permutation: s1-initialize s1-begin s1-truncate s2-ddl-create-index-concurrently s1-commit s1-select-count s1-show-indexes
+starting permutation: s1-initialize s1-begin s1-truncate s2-ddl-create-index-concurrently s1-commit s2-empty s1-select-count s1-show-indexes
 master_create_empty_shard
 ---------------------------------------------------------------------
                   5990340
@@ -153,6 +128,7 @@ step s1-truncate: TRUNCATE truncate_append;
 step s2-ddl-create-index-concurrently: CREATE INDEX CONCURRENTLY truncate_append_index ON truncate_append(id); <waiting ...>
 step s1-commit: COMMIT;
 step s2-ddl-create-index-concurrently: <... completed>
+step s2-empty:
 step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 count
 ---------------------------------------------------------------------
@@ -165,11 +141,6 @@ run_command_on_workers
 (localhost,57637,t,0)
 (localhost,57638,t,0)
 (2 rows)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
 
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-ddl-add-column s1-commit s2-commit s1-select-count s1-show-columns
@@ -198,11 +169,6 @@ run_command_on_workers
 (localhost,57637,t,"")
 (localhost,57638,t,"")
 (2 rows)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
 
 
 starting permutation: s1-initialize s1-ddl-add-column s1-begin s2-begin s1-truncate s2-ddl-drop-column s1-commit s2-commit s1-select-count s1-show-columns
@@ -233,11 +199,6 @@ run_command_on_workers
 (localhost,57638,t,"")
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-ddl-rename-column s1-commit s2-commit s1-select-count s1-show-columns
 master_create_empty_shard
@@ -266,11 +227,6 @@ run_command_on_workers
 (localhost,57638,t,"")
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-table-size s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -297,11 +253,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-master-modify-multiple-shards s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -321,11 +272,6 @@ step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 count
 ---------------------------------------------------------------------
     0
-(1 row)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
 (1 row)
 
 
@@ -352,11 +298,6 @@ step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 count
 ---------------------------------------------------------------------
     0
-(1 row)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
 (1 row)
 
 
@@ -386,11 +327,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-truncate s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -412,11 +348,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-drop s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -435,11 +366,6 @@ ERROR:  relation "truncate_append" does not exist
 step s2-commit: COMMIT;
 step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 ERROR:  relation "truncate_append" does not exist
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-ddl-create-index s2-truncate s1-commit s2-commit s1-select-count s1-show-indexes
 master_create_empty_shard
@@ -467,11 +393,6 @@ run_command_on_workers
 (localhost,57637,t,0)
 (localhost,57638,t,0)
 (2 rows)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
 
 
 starting permutation: s1-initialize s1-ddl-create-index s1-begin s2-begin s1-ddl-drop-index s2-truncate s1-commit s2-commit s1-select-count s1-show-indexes
@@ -502,11 +423,6 @@ run_command_on_workers
 (localhost,57638,t,0)
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-ddl-add-column s2-truncate s1-commit s2-commit s1-select-count s1-show-columns
 master_create_empty_shard
@@ -534,11 +450,6 @@ run_command_on_workers
 (localhost,57637,t,"")
 (localhost,57638,t,"")
 (2 rows)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
 
 
 starting permutation: s1-initialize s1-ddl-add-column s1-begin s2-begin s1-ddl-drop-column s2-truncate s1-commit s2-commit s1-select-count s1-show-columns
@@ -569,11 +480,6 @@ run_command_on_workers
 (localhost,57638,t,"")
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-ddl-rename-column s2-truncate s1-commit s2-commit s1-select-count s1-show-columns
 master_create_empty_shard
@@ -602,11 +508,6 @@ run_command_on_workers
 (localhost,57638,t,"")
 (2 rows)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-table-size s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -632,11 +533,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-initialize s1-begin s2-begin s1-master-modify-multiple-shards s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -656,11 +552,6 @@ step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 count
 ---------------------------------------------------------------------
     0
-(1 row)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
 (1 row)
 
 
@@ -689,11 +580,6 @@ count
     0
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-drop s1-create-non-distributed-table s1-begin s2-begin s1-distribute-table s2-truncate s1-commit s2-commit s1-select-count
 master_create_empty_shard
@@ -719,10 +605,5 @@ step s1-select-count: SELECT COUNT(*) FROM truncate_append;
 count
 ---------------------------------------------------------------------
     0
-(1 row)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
 (1 row)
 

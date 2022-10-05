@@ -242,7 +242,7 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 		ereport(DEBUG1, (errmsg(
 							 "Plan " UINT64_FORMAT
 							 " query after replacing subqueries and CTEs: %s", planId,
-							 ApplyLogRedaction(subPlanString->data))));
+							 subPlanString->data)));
 	}
 
 	recursivePlanningDepth--;
@@ -763,7 +763,7 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 			ereport(DEBUG1, (errmsg("generating subplan " UINT64_FORMAT
 									"_%u for CTE %s: %s", planId, subPlanId,
 									cteName,
-									ApplyLogRedaction(subPlanString->data))));
+									subPlanString->data)));
 		}
 
 		/* build a sub plan for the CTE */
@@ -1181,7 +1181,7 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 
 		ereport(DEBUG1, (errmsg("generating subplan " UINT64_FORMAT
 								"_%u for subquery %s", planId, subPlanId,
-								ApplyLogRedaction(subqueryString->data))));
+								subqueryString->data)));
 	}
 
 	/* finally update the input subquery to point the result query */
@@ -1214,7 +1214,7 @@ CreateDistributedSubPlan(uint32 subPlanId, Query *subPlanQuery)
 	}
 
 	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
-	subPlan->plan = planner_compat(subPlanQuery, cursorOptions, NULL);
+	subPlan->plan = planner(subPlanQuery, NULL, cursorOptions, NULL);
 	subPlan->subPlanId = subPlanId;
 
 	return subPlan;
@@ -1952,7 +1952,7 @@ BuildReadIntermediateResultsQuery(List *targetEntryList, List *columnAliasList,
 		 */
 		if (columnAliasCount >= columnNumber)
 		{
-			Value *columnAlias = (Value *) list_nth(columnAliasList, columnNumber - 1);
+			String *columnAlias = (String *) list_nth(columnAliasList, columnNumber - 1);
 			Assert(IsA(columnAlias, String));
 			newTargetEntry->resname = strVal(columnAlias);
 		}

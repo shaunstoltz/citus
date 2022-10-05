@@ -33,6 +33,7 @@
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/foreign_key_relationship.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
 #include "distributed/multi_client_executor.h"
@@ -96,7 +97,7 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	text *relationNameText = PG_GETARG_TEXT_P(0);
 	char *relationName = text_to_cstring(relationNameText);
 	uint32 attemptableNodeCount = 0;
-	ObjectAddress tableAddress = { 0 };
+	ObjectAddress *tableAddress = palloc0(sizeof(ObjectAddress));
 
 	uint32 candidateNodeIndex = 0;
 	List *candidateNodeList = NIL;
@@ -115,8 +116,8 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	 * via their own connection and committed immediately so they become visible to all
 	 * sessions creating shards.
 	 */
-	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
-	EnsureDependenciesExistOnAllNodes(&tableAddress);
+	ObjectAddressSet(*tableAddress, RelationRelationId, relationId);
+	EnsureAllObjectDependenciesExistOnAllNodes(list_make1(tableAddress));
 	EnsureReferenceTablesExistOnAllNodes();
 
 	/* don't allow the table to be dropped */
@@ -768,7 +769,8 @@ ReceiveAndUpdateShardsSizes(List *connectionList)
 	 * all the placements. We use a hash table to remember already visited shard ids
 	 * since we update all the different placements of a shard id at once.
 	 */
-	HTAB *alreadyVisitedShardPlacements = CreateOidVisitedHashSet();
+	HTAB *alreadyVisitedShardPlacements = CreateSimpleHashSetWithName(Oid,
+																	  "oid visited hash set");
 
 	MultiConnection *connection = NULL;
 	foreach_ptr(connection, connectionList)
@@ -923,7 +925,7 @@ WorkerShardStats(ShardPlacement *placement, Oid relationId, const char *shardNam
 	}
 
 	errno = 0;
-	uint64 tableSize = pg_strtouint64(tableSizeString, &tableSizeStringEnd, 0);
+	uint64 tableSize = strtou64(tableSizeString, &tableSizeStringEnd, 0);
 	if (errno != 0 || (*tableSizeStringEnd) != '\0')
 	{
 		PQclear(queryResult);

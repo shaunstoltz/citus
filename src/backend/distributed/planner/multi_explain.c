@@ -25,6 +25,7 @@
 #include "commands/explain.h"
 #include "commands/tablecmds.h"
 #include "optimizer/cost.h"
+#include "distributed/citus_depended_object.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/connection_management.h"
 #include "distributed/deparse_shard_query.h"
@@ -57,7 +58,9 @@
 #include "nodes/print.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "portability/instr_time.h"
+#include "rewrite/rewriteHandler.h"
 #include "tcop/dest.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -152,7 +155,11 @@ static void ExplainAnalyzeDestPutTuple(TupleDestination *self, Task *task,
 									   HeapTuple heapTuple, uint64 tupleLibpqSize);
 static TupleDesc ExplainAnalyzeDestTupleDescForQuery(TupleDestination *self, int
 													 queryNumber);
-static char * WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc);
+static char * WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc,
+										 ParamListInfo params);
+static char * FetchPlanQueryForExplainAnalyze(const char *queryString,
+											  ParamListInfo params);
+static char * ParameterResolutionSubquery(ParamListInfo params);
 static List * SplitString(const char *str, char delimiter, int maxLength);
 
 /* Static Explain functions copied from explain.c */
@@ -291,8 +298,6 @@ ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
 		 */
 		char *queryString = pstrdup("");
 		instr_time planduration;
-		#if PG_VERSION_NUM >= PG_VERSION_13
-
 		BufferUsage bufusage_start,
 					bufusage;
 
@@ -300,7 +305,7 @@ ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
 		{
 			bufusage_start = pgBufferUsage;
 		}
-		#endif
+
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			char *resultId = GenerateResultId(planId, subPlan->subPlanId);
@@ -309,6 +314,8 @@ ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
 			appendStringInfo(es->str, "->  Distributed Subplan %s\n", resultId);
 			es->indent += 3;
 		}
+
+		ExplainOpenGroup("Subplan", NULL, true, es);
 
 		if (es->analyze)
 		{
@@ -342,18 +349,20 @@ ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
 
 		INSTR_TIME_SET_ZERO(planduration);
 
-		#if PG_VERSION_NUM >= PG_VERSION_13
-
 		/* calc differences of buffer counters. */
 		if (es->buffers)
 		{
 			memset(&bufusage, 0, sizeof(BufferUsage));
 			BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
 		}
-		#endif
 
-		ExplainOnePlanCompat(plan, into, es, queryString, params, NULL, &planduration,
-							 (es->buffers ? &bufusage : NULL));
+		ExplainOpenGroup("PlannedStmt", "PlannedStmt", false, es);
+
+		ExplainOnePlan(plan, into, es, queryString, params, NULL, &planduration,
+					   (es->buffers ? &bufusage : NULL));
+
+		ExplainCloseGroup("PlannedStmt", "PlannedStmt", false, es);
+		ExplainCloseGroup("Subplan", NULL, true, es);
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
@@ -373,7 +382,7 @@ static void
 ExplainPropertyBytes(const char *qlabel, int64 bytes, ExplainState *es)
 {
 	Datum textDatum = DirectFunctionCall1(pg_size_pretty, Int64GetDatum(bytes));
-	ExplainPropertyText(qlabel, text_to_cstring(DatumGetTextP(textDatum)), es);
+	ExplainPropertyText(qlabel, TextDatumGetCString(textDatum), es);
 }
 
 
@@ -575,8 +584,6 @@ static void
 ExplainTaskList(CitusScanState *scanState, List *taskList, ExplainState *es,
 				ParamListInfo params)
 {
-	ListCell *taskCell = NULL;
-	ListCell *remoteExplainCell = NULL;
 	List *remoteExplainList = NIL;
 
 	/* if tasks are executed, we sort them by time; unless we are on a test env */
@@ -591,10 +598,9 @@ ExplainTaskList(CitusScanState *scanState, List *taskList, ExplainState *es,
 		taskList = SortList(taskList, CompareTasksByTaskId);
 	}
 
-	foreach(taskCell, taskList)
+	Task *task = NULL;
+	foreach_ptr(task, taskList)
 	{
-		Task *task = (Task *) lfirst(taskCell);
-
 		RemoteExplainPlan *remoteExplain = RemoteExplain(task, es, params);
 		remoteExplainList = lappend(remoteExplainList, remoteExplain);
 
@@ -604,12 +610,9 @@ ExplainTaskList(CitusScanState *scanState, List *taskList, ExplainState *es,
 		}
 	}
 
-	forboth(taskCell, taskList, remoteExplainCell, remoteExplainList)
+	RemoteExplainPlan *remoteExplain = NULL;
+	forboth_ptr(task, taskList, remoteExplain, remoteExplainList)
 	{
-		Task *task = (Task *) lfirst(taskCell);
-		RemoteExplainPlan *remoteExplain =
-			(RemoteExplainPlan *) lfirst(remoteExplainCell);
-
 		ExplainTask(scanState, task, remoteExplain->placementIndex,
 					remoteExplain->explainOutputList, es);
 	}
@@ -916,18 +919,13 @@ BuildRemoteExplainQuery(char *queryString, ExplainState *es)
 
 	appendStringInfo(explainQuery,
 					 "EXPLAIN (ANALYZE %s, VERBOSE %s, "
-					 "COSTS %s, BUFFERS %s, "
-#if PG_VERSION_NUM >= PG_VERSION_13
-					 "WAL %s, "
-#endif
+					 "COSTS %s, BUFFERS %s, WAL %s, "
 					 "TIMING %s, SUMMARY %s, FORMAT %s) %s",
 					 es->analyze ? "TRUE" : "FALSE",
 					 es->verbose ? "TRUE" : "FALSE",
 					 es->costs ? "TRUE" : "FALSE",
 					 es->buffers ? "TRUE" : "FALSE",
-#if PG_VERSION_NUM >= PG_VERSION_13
 					 es->wal ? "TRUE" : "FALSE",
-#endif
 					 es->timing ? "TRUE" : "FALSE",
 					 es->summary ? "TRUE" : "FALSE",
 					 formatStr,
@@ -1021,9 +1019,7 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 
 	/* use the same defaults as NewExplainState() for following options */
 	es->buffers = ExtractFieldBoolean(explainOptions, "buffers", es->buffers);
-#if PG_VERSION_NUM >= PG_VERSION_13
 	es->wal = ExtractFieldBoolean(explainOptions, "wal", es->wal);
-#endif
 	es->costs = ExtractFieldBoolean(explainOptions, "costs", es->costs);
 	es->summary = ExtractFieldBoolean(explainOptions, "summary", es->summary);
 	es->verbose = ExtractFieldBoolean(explainOptions, "verbose", es->verbose);
@@ -1048,14 +1044,25 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 	int numParams = boundParams ? boundParams->numParams : 0;
 	Oid *paramTypes = NULL;
 	const char **paramValues = NULL;
+
 	if (boundParams != NULL)
 	{
 		ExtractParametersFromParamList(boundParams, &paramTypes, &paramValues, false);
 	}
 
-	List *queryList = pg_analyze_and_rewrite(parseTree, queryString, paramTypes,
-											 numParams, NULL);
+	/* resolve OIDs of unknown (user-defined) types */
+	Query *analyzedQuery = parse_analyze_varparams_compat(parseTree, queryString,
+														  &paramTypes, &numParams, NULL);
 
+#if PG_VERSION_NUM >= PG_VERSION_14
+
+	/* pg_rewrite_query is a wrapper around QueryRewrite with some debugging logic */
+	List *queryList = pg_rewrite_query(analyzedQuery);
+#else
+
+	/* pg_rewrite_query is not yet public in PostgreSQL 13 */
+	List *queryList = QueryRewrite(analyzedQuery);
+#endif
 	if (list_length(queryList) != 1)
 	{
 		ereport(ERROR, (errmsg("cannot EXPLAIN ANALYZE a query rewritten "
@@ -1072,7 +1079,7 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 
 	INSTR_TIME_SET_CURRENT(planStart);
 
-	PlannedStmt *plan = pg_plan_query_compat(query, NULL, CURSOR_OPT_PARALLEL_OK, NULL);
+	PlannedStmt *plan = pg_plan_query(query, NULL, CURSOR_OPT_PARALLEL_OK, NULL);
 
 	INSTR_TIME_SET_CURRENT(planDuration);
 	INSTR_TIME_SUBTRACT(planDuration, planStart);
@@ -1160,9 +1167,7 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	/* save the flags of current EXPLAIN command */
 	CurrentDistributedQueryExplainOptions.costs = es->costs;
 	CurrentDistributedQueryExplainOptions.buffers = es->buffers;
-#if PG_VERSION_NUM >= PG_VERSION_13
 	CurrentDistributedQueryExplainOptions.wal = es->wal;
-#endif
 	CurrentDistributedQueryExplainOptions.verbose = es->verbose;
 	CurrentDistributedQueryExplainOptions.summary = es->summary;
 	CurrentDistributedQueryExplainOptions.timing = es->timing;
@@ -1171,7 +1176,6 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	/* rest is copied from ExplainOneQuery() */
 	instr_time planstart,
 			   planduration;
-	#if PG_VERSION_NUM >= PG_VERSION_13
 	BufferUsage bufusage_start,
 				bufusage;
 
@@ -1179,15 +1183,27 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	{
 		bufusage_start = pgBufferUsage;
 	}
-	#endif
 
 	INSTR_TIME_SET_CURRENT(planstart);
 
+	/*
+	 * We should not hide any objects while explaining some query to not break
+	 * postgres vanilla tests.
+	 *
+	 * The filter 'is_citus_depended_object' is added to explain result
+	 * and causes some tests to fail if HideCitusDependentObjects is true.
+	 * Therefore, we disable HideCitusDependentObjects until the current transaction
+	 * ends.
+	 *
+	 * We do not use security quals because a postgres vanilla test fails
+	 * with a change of order for its result.
+	 */
+	SetLocalHideCitusDependentObjectsDisabledWhenAlreadyEnabled();
+
 	/* plan the query */
-	PlannedStmt *plan = pg_plan_query_compat(query, NULL, cursorOptions, params);
+	PlannedStmt *plan = pg_plan_query(query, NULL, cursorOptions, params);
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
-	#if PG_VERSION_NUM >= PG_VERSION_13
 
 	/* calc differences of buffer counters. */
 	if (es->buffers)
@@ -1195,11 +1211,10 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 		memset(&bufusage, 0, sizeof(BufferUsage));
 		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
 	}
-	#endif
 
 	/* run it (if needed) and produce output */
-	ExplainOnePlanCompat(plan, into, es, queryString, params, queryEnv,
-						 &planduration, (es->buffers ? &bufusage : NULL));
+	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
+				   &planduration, (es->buffers ? &bufusage : NULL));
 }
 
 
@@ -1383,9 +1398,21 @@ ExplainAnalyzeTaskList(List *originalTaskList,
 
 		Task *explainAnalyzeTask = copyObject(originalTask);
 		const char *queryString = TaskQueryString(explainAnalyzeTask);
-		char *wrappedQuery = WrapQueryForExplainAnalyze(queryString, tupleDesc);
-		char *fetchQuery =
-			"SELECT explain_analyze_output, execution_duration FROM worker_last_saved_explain_analyze()";
+		ParamListInfo taskParams = params;
+
+		/*
+		 * We will not send parameters if they have already been resolved in the query
+		 * string.
+		 */
+		if (explainAnalyzeTask->parametersInQueryStringResolved)
+		{
+			taskParams = NULL;
+		}
+
+		char *wrappedQuery = WrapQueryForExplainAnalyze(queryString, tupleDesc,
+														taskParams);
+		char *fetchQuery = FetchPlanQueryForExplainAnalyze(queryString, taskParams);
+
 		SetTaskQueryStringList(explainAnalyzeTask, list_make2(wrappedQuery, fetchQuery));
 
 		TupleDestination *originalTaskDest = originalTask->tupleDest ?
@@ -1407,7 +1434,8 @@ ExplainAnalyzeTaskList(List *originalTaskList,
  * call so we can fetch its explain analyze after its execution.
  */
 static char *
-WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
+WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc,
+						   ParamListInfo params)
 {
 	StringInfo columnDef = makeStringInfo();
 	for (int columnIndex = 0; columnIndex < tupleDesc->natts; columnIndex++)
@@ -1436,17 +1464,12 @@ WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
 
 	StringInfo explainOptions = makeStringInfo();
 	appendStringInfo(explainOptions,
-					 "{\"verbose\": %s, \"costs\": %s, \"buffers\": %s, "
-#if PG_VERSION_NUM >= PG_VERSION_13
-					 "\"wal\": %s, "
-#endif
+					 "{\"verbose\": %s, \"costs\": %s, \"buffers\": %s, \"wal\": %s, "
 					 "\"timing\": %s, \"summary\": %s, \"format\": \"%s\"}",
 					 CurrentDistributedQueryExplainOptions.verbose ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.costs ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.buffers ? "true" : "false",
-#if PG_VERSION_NUM >= PG_VERSION_13
 					 CurrentDistributedQueryExplainOptions.wal ? "true" : "false",
-#endif
 					 CurrentDistributedQueryExplainOptions.timing ? "true" : "false",
 					 CurrentDistributedQueryExplainOptions.summary ? "true" : "false",
 					 ExplainFormatStr(CurrentDistributedQueryExplainOptions.format));
@@ -1459,6 +1482,17 @@ WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
 	 * number of columns returned by worker_save_query_explain_analyze.
 	 */
 	char *workerSaveQueryFetchCols = (tupleDesc->natts == 0) ? "" : "*";
+
+	if (params != NULL)
+	{
+		/*
+		 * Add a dummy CTE to ensure all parameters are referenced, such that their
+		 * types can be resolved.
+		 */
+		appendStringInfo(wrappedQuery, "WITH unused AS (%s) ",
+						 ParameterResolutionSubquery(params));
+	}
+
 	appendStringInfo(wrappedQuery,
 					 "SELECT %s FROM worker_save_query_explain_analyze(%s, %s) AS (%s)",
 					 workerSaveQueryFetchCols,
@@ -1467,6 +1501,60 @@ WrapQueryForExplainAnalyze(const char *queryString, TupleDesc tupleDesc)
 					 columnDef->data);
 
 	return wrappedQuery->data;
+}
+
+
+/*
+ * FetchPlanQueryForExplainAnalyze generates a query to fetch the plan saved
+ * by worker_save_query_explain_analyze from the worker.
+ */
+static char *
+FetchPlanQueryForExplainAnalyze(const char *queryString, ParamListInfo params)
+{
+	StringInfo fetchQuery = makeStringInfo();
+
+	if (params != NULL)
+	{
+		/*
+		 * Add a dummy CTE to ensure all parameters are referenced, such that their
+		 * types can be resolved.
+		 */
+		appendStringInfo(fetchQuery, "WITH unused AS (%s) ",
+						 ParameterResolutionSubquery(params));
+	}
+
+	appendStringInfoString(fetchQuery,
+						   "SELECT explain_analyze_output, execution_duration "
+						   "FROM worker_last_saved_explain_analyze()");
+
+	return fetchQuery->data;
+}
+
+
+/*
+ * ParameterResolutionSubquery generates a subquery that returns all parameters
+ * in params with explicit casts to their type names. This can be used in cases
+ * where we use custom type parameters that are not directly referenced.
+ */
+static char *
+ParameterResolutionSubquery(ParamListInfo params)
+{
+	StringInfo paramsQuery = makeStringInfo();
+
+	appendStringInfo(paramsQuery, "SELECT");
+
+	for (int paramIndex = 0; paramIndex < params->numParams; paramIndex++)
+	{
+		ParamExternData *param = &params->params[paramIndex];
+		char *typeName = format_type_extended(param->ptype, -1,
+											  FORMAT_TYPE_FORCE_QUALIFY);
+
+		appendStringInfo(paramsQuery, "%s $%d::%s",
+						 paramIndex > 0 ? "," : "",
+						 paramIndex + 1, typeName);
+	}
+
+	return paramsQuery->data;
 }
 
 
@@ -1536,22 +1624,18 @@ ExplainOneQuery(Query *query, int cursorOptions,
 	{
 		instr_time	planstart,
 					planduration;
-		#if PG_VERSION_NUM >= PG_VERSION_13
 		BufferUsage bufusage_start,
 			    bufusage;
 
 		if (es->buffers)
 			bufusage_start = pgBufferUsage;
-		#endif
 		INSTR_TIME_SET_CURRENT(planstart);
 
 		/* plan the query */
-		PlannedStmt *plan = pg_plan_query_compat(query, NULL, cursorOptions, params);
+		PlannedStmt *plan = pg_plan_query(query, NULL, cursorOptions, params);
 
 		INSTR_TIME_SET_CURRENT(planduration);
 		INSTR_TIME_SUBTRACT(planduration, planstart);
-
-		#if PG_VERSION_NUM >= PG_VERSION_13
 
 		/* calc differences of buffer counters. */
 		if (es->buffers)
@@ -1559,9 +1643,9 @@ ExplainOneQuery(Query *query, int cursorOptions,
 			memset(&bufusage, 0, sizeof(BufferUsage));
 			BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
 		}
-		#endif
+
 		/* run it (if needed) and produce output */
-		ExplainOnePlanCompat(plan, into, es, queryString, params, queryEnv,
+		ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 					   &planduration, (es->buffers ? &bufusage : NULL));
 	}
 }
@@ -1600,10 +1684,10 @@ ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es
 
 	if (es->buffers)
 		instrument_option |= INSTRUMENT_BUFFERS;
-#if PG_VERSION_NUM >= PG_VERSION_13
+
 	if (es->wal)
 		instrument_option |= INSTRUMENT_WAL;
-#endif
+
 	/*
 	 * We always collect timing for the entire statement, even when node-level
 	 * timing is off, so we don't look at es->timing here.  (We could skip

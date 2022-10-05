@@ -33,93 +33,24 @@ static AlterOwnerStmt * RecreateAlterDatabaseOwnerStmt(Oid databaseOid);
 static Oid get_database_owner(Oid db_oid);
 
 /* controlled via GUC */
-bool EnableAlterDatabaseOwner = false;
-
-
-/*
- * PreprocessAlterDatabaseOwnerStmt is called during the utility hook before the alter
- * command is applied locally on the coordinator. This will verify if the command needs to
- * be propagated to the workers and if so prepares a list of ddl commands to execute.
- */
-List *
-PreprocessAlterDatabaseOwnerStmt(Node *node, const char *queryString,
-								 ProcessUtilityContext processUtilityContext)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_DATABASE);
-
-	ObjectAddress typeAddress = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&typeAddress))
-	{
-		return NIL;
-	}
-
-	if (!EnableAlterDatabaseOwner)
-	{
-		/* don't propagate if GUC is turned off */
-		return NIL;
-	}
-
-	EnsureCoordinator();
-
-	QualifyTreeNode((Node *) stmt);
-	const char *sql = DeparseTreeNode((Node *) stmt);
-
-	EnsureSequentialMode(OBJECT_DATABASE);
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
-
-/*
- * PostprocessAlterDatabaseOwnerStmt is called during the utility hook after the alter
- * database command has been applied locally.
- *
- * Its main purpose is to propagate the newly formed dependencies onto the nodes before
- * applying the change of owner of the databse. This ensures, for systems that have role
- * management, that the roles will be created before applying the alter owner command.
- */
-List *
-PostprocessAlterDatabaseOwnerStmt(Node *node, const char *queryString)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_DATABASE);
-
-	ObjectAddress typeAddress = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&typeAddress))
-	{
-		return NIL;
-	}
-
-	if (!EnableAlterDatabaseOwner)
-	{
-		/* don't propagate if GUC is turned off */
-		return NIL;
-	}
-
-	EnsureDependenciesExistOnAllNodes(&typeAddress);
-	return NIL;
-}
+bool EnableAlterDatabaseOwner = true;
 
 
 /*
  * AlterDatabaseOwnerObjectAddress returns the ObjectAddress of the database that is the
  * object of the AlterOwnerStmt. Errors if missing_ok is false.
  */
-ObjectAddress
-AlterDatabaseOwnerObjectAddress(Node *node, bool missing_ok)
+List *
+AlterDatabaseOwnerObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
 	Assert(stmt->objectType == OBJECT_DATABASE);
 
-	Oid databaseOid = get_database_oid(strVal((Value *) stmt->object), missing_ok);
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, DatabaseRelationId, databaseOid);
+	Oid databaseOid = get_database_oid(strVal((String *) stmt->object), missing_ok);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, DatabaseRelationId, databaseOid);
 
-	return address;
+	return list_make1(address);
 }
 
 

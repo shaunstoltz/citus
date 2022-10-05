@@ -4,6 +4,19 @@
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 13000000;
 SET citus.shard_count TO 6;
 SET citus.shard_replication_factor TO 1;
+-- this function is dropped in Citus10, added here for tests
+SET citus.enable_metadata_sync TO OFF;
+CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                                      distribution_column text,
+                                                                      distribution_method citus.distribution_type)
+    RETURNS void
+    LANGUAGE C STRICT
+    AS 'citus', $$master_create_distributed_table$$;
+COMMENT ON FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                               distribution_column text,
+                                                               distribution_method citus.distribution_type)
+    IS 'define the table distribution functions';
+RESET citus.enable_metadata_sync;
 -- create distributed tables
 CREATE TABLE table1_group1 ( id int PRIMARY KEY);
 SELECT create_distributed_table('table1_group1', 'id', 'hash');
@@ -46,9 +59,9 @@ SELECT master_create_empty_shard('table6_append');
                   13000021
 (1 row)
 
--- Mark tables as non-mx tables, in order to be able to test master_copy_shard_placement
+-- Mark tables as non-mx tables, in order to be able to test citus_copy_shard_placement
 UPDATE pg_dist_partition SET repmodel='c' WHERE logicalrelid IN
-	('table1_group1'::regclass, 'table2_group1'::regclass, 'table5_groupX'::regclass);
+    ('table1_group1'::regclass, 'table2_group1'::regclass, 'table5_groupX'::regclass);
 -- test copy
 -- test copying colocated shards
 -- status before shard copy
@@ -76,9 +89,14 @@ ORDER BY s.shardid, sp.nodeport;
  13000011 | table2_group1 |    57638
 (12 rows)
 
+-- try to copy colocated shards without a replica identity
+SELECT citus_copy_shard_placement(13000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+ERROR:  cannot use logical replication to transfer shards of the relation table2_group1 since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
+DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
 -- copy colocated shards
-SELECT master_copy_shard_placement(13000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, false);
- master_copy_shard_placement
+SELECT citus_copy_shard_placement(13000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
+ citus_copy_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
@@ -125,9 +143,15 @@ SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table2_
 (1 row)
 
 \c - - - :master_port
--- copy colocated shards again to see error message
-SELECT master_copy_shard_placement(13000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, false, 'force_logical');
-ERROR:  the force_logical transfer mode is currently unsupported
+-- copy colocated shards again to see warning
+SELECT citus_copy_shard_placement(13000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
+WARNING:  shard is already present on node localhost:xxxxx
+DETAIL:  Copy may have already completed.
+ citus_copy_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
 -- test copying NOT colocated shard
 -- status before shard copy
 SELECT s.shardid, s.logicalrelid::regclass, sp.nodeport
@@ -151,8 +175,8 @@ ORDER BY s.shardid, sp.nodeport;
 (8 rows)
 
 -- copy NOT colocated shard
-SELECT master_copy_shard_placement(13000012, 'localhost', :worker_1_port, 'localhost', :worker_2_port, false);
- master_copy_shard_placement
+SELECT citus_copy_shard_placement(13000012, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
+ citus_copy_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
@@ -196,8 +220,12 @@ ORDER BY s.shardid, sp.nodeport;
 (2 rows)
 
 -- copy shard in append distributed table
-SELECT master_copy_shard_placement(13000020, 'localhost', :worker_2_port, 'localhost', :worker_1_port, false, 'force_logical');
-ERROR:  the force_logical transfer mode is currently unsupported
+SELECT citus_copy_shard_placement(13000020, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
+ citus_copy_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
 -- status after shard copy
 SELECT s.shardid, s.logicalrelid::regclass, sp.nodeport
 FROM
@@ -209,9 +237,10 @@ WHERE
 ORDER BY s.shardid, sp.nodeport;
  shardid  | logicalrelid  | nodeport
 ---------------------------------------------------------------------
+ 13000020 | table6_append |    57637
  13000020 | table6_append |    57638
  13000021 | table6_append |    57637
-(2 rows)
+(3 rows)
 
 -- test move
 -- test moving colocated shards
@@ -242,11 +271,8 @@ ORDER BY s.shardid, sp.nodeport;
  13000011 | table2_group1 |    57638
 (14 rows)
 
--- try force_logical
-SELECT master_move_shard_placement(13000001, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
-ERROR:  the force_logical transfer mode is currently unsupported
 -- move colocated shards
-SELECT master_move_shard_placement(13000001, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
+SELECT master_move_shard_placement(13000001, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
  master_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -279,6 +305,15 @@ ORDER BY s.shardid, sp.nodeport;
  13000010 | table2_group1 |    57637
  13000011 | table2_group1 |    57638
 (14 rows)
+
+-- moving the shard again is idempotent
+SELECT citus_move_shard_placement(13000001, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
+WARNING:  shard is already present on node localhost:xxxxx
+DETAIL:  Move may have already completed.
+ citus_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
 
 -- also connect worker to verify we successfully moved given shard (and other colocated shards)
 \c - - - :worker_1_port
@@ -320,7 +355,7 @@ ORDER BY s.shardid, sp.nodeport;
 (9 rows)
 
 -- move NOT colocated shard
-SELECT master_move_shard_placement(13000013, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
+SELECT master_move_shard_placement(13000013, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
  master_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -362,12 +397,13 @@ WHERE
 ORDER BY s.shardid, sp.nodeport;
  shardid  | logicalrelid  | nodeport
 ---------------------------------------------------------------------
+ 13000020 | table6_append |    57637
  13000020 | table6_append |    57638
  13000021 | table6_append |    57637
-(2 rows)
+(3 rows)
 
 -- move shard in append distributed table
-SELECT master_move_shard_placement(13000021, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+SELECT master_move_shard_placement(13000021, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
  master_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -385,13 +421,15 @@ WHERE
 ORDER BY s.shardid, sp.nodeport;
  shardid  | logicalrelid  | nodeport
 ---------------------------------------------------------------------
+ 13000020 | table6_append |    57637
  13000020 | table6_append |    57638
  13000021 | table6_append |    57638
-(2 rows)
+(3 rows)
 
 -- try to move shard from wrong node
-SELECT master_move_shard_placement(13000021, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
-ERROR:  source placement must be in active state
+SELECT master_move_shard_placement(13000021, 'localhost', :master_port, 'localhost', :worker_1_port, 'force_logical');
+ERROR:  could not find placement matching "localhost:xxxxx"
+HINT:  Confirm the placement still exists and try again.
 -- test shard move with foreign constraints
 DROP TABLE IF EXISTS table1_group1, table2_group1;
 SET citus.shard_count TO 6;
@@ -413,7 +451,7 @@ SELECT create_distributed_table('table2_group1', 'table1_id', 'hash');
 
 -- Mark the tables as non-mx tables
 UPDATE pg_dist_partition SET repmodel='c' WHERE logicalrelid IN
-	('table1_group1'::regclass, 'table2_group1'::regclass);
+    ('table1_group1'::regclass, 'table2_group1'::regclass);
 -- status before shard rebalance
 SELECT s.shardid, s.logicalrelid::regclass, sp.nodeport
 FROM
@@ -492,16 +530,17 @@ SELECT  "Constraint", "Definition" FROM table_fkeys
   WHERE "Constraint" LIKE 'table2_group%' OR "Constraint" LIKE 'table1_group%';
               Constraint               |                          Definition
 ---------------------------------------------------------------------
+ table2_group1_table1_id_fkey          | FOREIGN KEY (table1_id) REFERENCES table1_group1(id)
  table2_group1_table1_id_fkey_13000028 | FOREIGN KEY (table1_id) REFERENCES table1_group1_13000022(id)
  table2_group1_table1_id_fkey_13000029 | FOREIGN KEY (table1_id) REFERENCES table1_group1_13000023(id)
  table2_group1_table1_id_fkey_13000031 | FOREIGN KEY (table1_id) REFERENCES table1_group1_13000025(id)
  table2_group1_table1_id_fkey_13000033 | FOREIGN KEY (table1_id) REFERENCES table1_group1_13000027(id)
-(4 rows)
+(5 rows)
 
 \c - - - :master_port
 -- test shard copy with foreign constraints
 -- we expect it to error out because we do not support foreign constraints with replication factor > 1
-SELECT master_copy_shard_placement(13000022, 'localhost', :worker_2_port, 'localhost', :worker_1_port, false);
+SELECT citus_copy_shard_placement(13000022, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
 ERROR:  cannot replicate shards with foreign keys
 -- lets also test that master_move_shard_placement doesn't break serials
 CREATE TABLE serial_move_test (key int, other_val serial);
@@ -532,12 +571,14 @@ SELECT * FROM run_command_on_placements('serial_move_test', 'SELECT DISTINCT key
  localhost |    57637 | 13000034 | t       | 15
 (1 row)
 
-SELECT master_move_shard_placement(13000034, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+SELECT master_move_shard_placement(13000034, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
  master_move_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
 
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 5 orphaned shards
 -- confirm the successfull move
 SELECT * FROM run_command_on_placements('serial_move_test', 'SELECT DISTINCT key FROM %s WHERE key = 15') WHERE result = '15' AND shardid = 13000034;
  nodename  | nodeport | shardid  | success | result
@@ -558,12 +599,227 @@ INSERT INTO serial_move_test (key) VALUES (15) RETURNING *;
   15 |         4
 (1 row)
 
+-- lets do some failure testing
+CREATE TABLE logical_failure_test (key int);
+SET citus.shard_replication_factor TO 1;
+SET citus.shard_count TO 4;
+SELECT create_distributed_table('logical_failure_test', 'key');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+-- ensure that the shard is created for this user
+\c - - - :worker_2_port
+\dt logical_failure_test_13000038
+                     List of relations
+ Schema |             Name              | Type  |  Owner
+---------------------------------------------------------------------
+ public | logical_failure_test_13000038 | table | postgres
+(1 row)
+
+DROP TABLE logical_failure_test_13000038;
+-- should fail since the command wouldn't be able to connect to the worker_1
+\c - - - :master_port
+SELECT master_move_shard_placement(13000038, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
+WARNING:  relation "public.logical_failure_test_13000038" does not exist
+CONTEXT:  while executing command on localhost:xxxxx
+ERROR:  cannot get the size because of a connection error
+CALL citus_cleanup_orphaned_shards();
+DROP TABLE logical_failure_test;
+-- lets test the logical replication modes
+CREATE TABLE test_with_pkey (key int PRIMARY KEY, value int NOT NULL);
+SET citus.shard_replication_factor TO 1;
+SET citus.shard_count TO 4;
+SELECT create_distributed_table('test_with_pkey', 'key', colocate_with => 'none');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+-- should succeed since there is a replica identity defined
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+-- should succeed since we still have a replica identity
+ALTER TABLE test_with_pkey REPLICA IDENTITY FULL;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'auto');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+-- make sure we have the replica identity after the move
+SELECT result FROM run_command_on_placements( 'test_with_pkey', 'SELECT relreplident FROM pg_class WHERE relname = ''%s''') WHERE shardid = 13000042;
+ result
+---------------------------------------------------------------------
+ f
+(1 row)
+
+-- this time should fail since we don't have replica identity any more
+ALTER TABLE test_with_pkey REPLICA IDENTITY NOTHING;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'auto');
+ERROR:  cannot use logical replication to transfer shards of the relation test_with_pkey since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
+DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
+CALL citus_cleanup_orphaned_shards();
+-- make sure we have the replica identity after the move
+SELECT result FROM run_command_on_placements( 'test_with_pkey', 'SELECT relreplident FROM pg_class WHERE relname = ''%s''') WHERE shardid = 13000042;
+ result
+---------------------------------------------------------------------
+ n
+(1 row)
+
+-- should succeed since we still have a replica identity
+ALTER TABLE test_with_pkey REPLICA IDENTITY USING INDEX test_with_pkey_pkey;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+-- make sure we have the replica identity after the move
+SELECT result FROM run_command_on_placements( 'test_with_pkey', 'SELECT relreplident FROM pg_class WHERE relname = ''%s''') WHERE shardid = 13000042;
+ result
+---------------------------------------------------------------------
+ i
+(1 row)
+
+-- one final test with shard_transfer_mode auto
+CREATE UNIQUE INDEX req_rep_idx ON test_with_pkey(key, value);
+ALTER TABLE test_with_pkey REPLICA IDENTITY USING INDEX req_rep_idx;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'auto');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+-- make sure we have the replica identity after the move
+SELECT result FROM run_command_on_placements( 'test_with_pkey', 'SELECT relreplident FROM pg_class WHERE relname = ''%s''') WHERE shardid = 13000042;
+ result
+---------------------------------------------------------------------
+ i
+(1 row)
+
+ALTER TABLE test_with_pkey REPLICA IDENTITY NOTHING;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+-- make sure we have the replica identity after the move
+SELECT result FROM run_command_on_placements( 'test_with_pkey', 'SELECT relreplident FROM pg_class WHERE relname = ''%s''') WHERE shardid = 13000042;
+ result
+---------------------------------------------------------------------
+ n
+(1 row)
+
+-- should succeed but not use logical replication
+ALTER TABLE test_with_pkey REPLICA IDENTITY NOTHING;
+SET client_min_messages TO DEBUG1;
+SELECT master_move_shard_placement(13000042, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'block_writes');
+DEBUG:  table "test_with_pkey_13000042" does not exist, skipping
+DETAIL:  from localhost:xxxxx
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+LOG:  deferred drop of orphaned shard public.test_with_pkey_13000042 on localhost:xxxxx after a move completed
+NOTICE:  cleaned up 1 orphaned shards
+SET client_min_messages TO DEFAULT;
+-- we don't support multiple shard moves in a single transaction
+SELECT
+    master_move_shard_placement(shardid, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical')
+FROM
+    pg_dist_shard_placement where nodeport = :worker_1_port AND
+    shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'test_with_pkey'::regclass);
+ERROR:  moving multiple shard placements via logical replication in the same transaction is currently not supported
+HINT:  If you wish to move multiple shard placements in a single transaction set the shard_transfer_mode to 'block_writes'.
+CALL citus_cleanup_orphaned_shards();
+-- similar test with explicit transaction block
+BEGIN;
+    SELECT master_move_shard_placement(13000042, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+    SELECT master_move_shard_placement(13000044, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
+ERROR:  moving multiple shard placements via logical replication in the same transaction is currently not supported
+HINT:  If you wish to move multiple shard placements in a single transaction set the shard_transfer_mode to 'block_writes'.
+COMMIT;
+    CALL citus_cleanup_orphaned_shards();
+-- we do support the same with block writes
+SELECT
+    master_move_shard_placement(shardid, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='block_writes')
+FROM
+    pg_dist_shard_placement where nodeport = :worker_1_port AND
+    shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'test_with_pkey'::regclass);
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+
+(2 rows)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 2 orphaned shards
+-- we should be able to move shard placements after COMMIT/ABORT
+BEGIN;
+    SELECT master_move_shard_placement(13000043, 'localhost', :worker_2_port, 'localhost', :worker_1_port, shard_transfer_mode:='force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+COMMIT;
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+SELECT master_move_shard_placement(13000045, 'localhost', :worker_2_port, 'localhost', :worker_1_port, shard_transfer_mode:='force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
+BEGIN;
+    SELECT master_move_shard_placement(13000043, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+ABORT;
+SELECT master_move_shard_placement(13000045, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
+ master_move_shard_placement
+---------------------------------------------------------------------
+
+(1 row)
+
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 1 orphaned shards
 -- we should be able to move shard placements of partitioend tables
 CREATE SCHEMA move_partitions;
 CREATE TABLE move_partitions.events (
-	id serial,
-	t timestamptz default now(),
-	payload text
+    id serial,
+    t timestamptz default now(),
+    payload text
 )
 PARTITION BY RANGE(t);
 SET citus.shard_count TO 6;
@@ -589,11 +845,22 @@ FROM pg_dist_shard JOIN pg_dist_shard_placement USING (shardid)
 WHERE logicalrelid = 'move_partitions.events'::regclass AND nodeport = :worker_2_port
 AND shardstate != 4
 ORDER BY shardid LIMIT 1;
+ERROR:  cannot use logical replication to transfer shards of the relation events_1 since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
+DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
+CALL citus_cleanup_orphaned_shards();
+-- force logical replication
+SELECT master_move_shard_placement(shardid, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical')
+FROM pg_dist_shard JOIN pg_dist_shard_placement USING (shardid)
+WHERE logicalrelid = 'move_partitions.events'::regclass AND nodeport = :worker_2_port
+ORDER BY shardid LIMIT 1;
  master_move_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
 
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 2 orphaned shards
 SELECT count(*) FROM move_partitions.events;
  count
 ---------------------------------------------------------------------
@@ -612,6 +879,8 @@ ORDER BY shardid LIMIT 1;
 
 (1 row)
 
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 2 orphaned shards
 SELECT count(*) FROM move_partitions.events;
  count
 ---------------------------------------------------------------------
@@ -628,6 +897,8 @@ ORDER BY shardid LIMIT 1;
 
 (1 row)
 
+CALL citus_cleanup_orphaned_shards();
+NOTICE:  cleaned up 2 orphaned shards
 SELECT count(*) FROM move_partitions.events;
  count
 ---------------------------------------------------------------------
@@ -644,3 +915,11 @@ WHERE logicalrelid::text LIKE 'move_partitions.events%' AND nodeport = :worker_1
 (1 row)
 
 DROP TABLE move_partitions.events;
+-- set back to the defaults and drop the tables
+SET client_min_messages TO DEFAULT;
+DROP TABLE test_with_pkey;
+DROP TABLE table2_group1;
+DROP TABLE table1_group1;
+DROP TABLE table5_groupX;
+DROP TABLE table6_append;
+DROP TABLE serial_move_test;

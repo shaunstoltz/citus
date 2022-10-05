@@ -3,6 +3,7 @@ import shutil
 import sys
 import subprocess
 import atexit
+import concurrent.futures
 
 import utils
 from utils import USER, cd
@@ -24,9 +25,19 @@ def initialize_temp_dir_if_not_exists(temp_dir):
     os.chmod(temp_dir, 0o777)
 
 
+def parallel_run(function, items, *args, **kwargs):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(function, item, *args, **kwargs)
+            for item in items
+        ]
+        for future in futures:
+            future.result()
+
 def initialize_db_for_cluster(pg_path, rel_data_path, settings, node_names):
     subprocess.run(["mkdir", rel_data_path], check=True)
-    for node_name in node_names:
+
+    def initialize(node_name):
         abs_data_path = os.path.abspath(os.path.join(rel_data_path, node_name))
         command = [
             os.path.join(pg_path, "initdb"),
@@ -34,9 +45,19 @@ def initialize_db_for_cluster(pg_path, rel_data_path, settings, node_names):
             abs_data_path,
             "--username",
             USER,
+            "--no-sync",
+            # --allow-group-access is used to ensure we set permissions on
+            # private keys correctly
+            "--allow-group-access",
+            "--encoding",
+            "UTF8",
+            "--locale",
+            "POSIX"
         ]
         subprocess.run(command, check=True)
         add_settings(abs_data_path, settings)
+
+    parallel_run(initialize, node_names)
 
 
 def add_settings(abs_data_path, settings):
@@ -49,14 +70,16 @@ def add_settings(abs_data_path, settings):
             conf_file.write(setting)
 
 
-def create_role(pg_path, port, node_ports, user_name):
-    for port in node_ports:
-        command = "SELECT worker_create_or_alter_role('{}', 'CREATE ROLE {} WITH LOGIN CREATEROLE CREATEDB;', NULL)".format(
+def create_role(pg_path, node_ports, user_name):
+    def create(port):
+        command = "SET citus.enable_ddl_propagation TO OFF; SELECT worker_create_or_alter_role('{}', 'CREATE ROLE {} WITH LOGIN CREATEROLE CREATEDB;', NULL)".format(
             user_name, user_name
         )
         utils.psql(pg_path, port, command)
-        command = "GRANT CREATE ON DATABASE postgres to {}".format(user_name)
+        command = "SET citus.enable_ddl_propagation TO OFF; GRANT CREATE ON DATABASE postgres to {}".format(user_name)
         utils.psql(pg_path, port, command)
+
+    parallel_run(create, node_ports)
 
 
 def coordinator_should_haveshards(pg_path, port):
@@ -67,7 +90,7 @@ def coordinator_should_haveshards(pg_path, port):
 
 
 def start_databases(pg_path, rel_data_path, node_name_to_ports, logfile_prefix, env_variables):
-    for node_name in node_name_to_ports.keys():
+    def start(node_name):
         abs_data_path = os.path.abspath(os.path.join(rel_data_path, node_name))
         node_port = node_name_to_ports[node_name]
         command = [
@@ -89,6 +112,11 @@ def start_databases(pg_path, rel_data_path, node_name_to_ports, logfile_prefix, 
 
         subprocess.run(command, check=True)
 
+    parallel_run(start, node_name_to_ports.keys())
+
+    # We don't want parallel shutdown here because that will fail when it's
+    # tried in this atexit call with an error like:
+    # cannot schedule new futures after interpreter shutdown
     atexit.register(
         stop_databases,
         pg_path,
@@ -96,18 +124,23 @@ def start_databases(pg_path, rel_data_path, node_name_to_ports, logfile_prefix, 
         node_name_to_ports,
         logfile_prefix,
         no_output=True,
+        parallel=False,
     )
 
 
 def create_citus_extension(pg_path, node_ports):
-    for port in node_ports:
+    def create(port):
         utils.psql(pg_path, port, "CREATE EXTENSION citus;")
+
+    parallel_run(create, node_ports)
 
 
 def run_pg_regress(pg_path, pg_srcdir, port, schedule):
     should_exit = True
-    _run_pg_regress(pg_path, pg_srcdir, port, schedule, should_exit)
-    subprocess.run("bin/copy_modified", check=True)
+    try:
+        _run_pg_regress(pg_path, pg_srcdir, port, schedule, should_exit)
+    finally:
+        subprocess.run("bin/copy_modified", check=True)
 
 
 def run_pg_regress_without_exit(
@@ -185,10 +218,10 @@ def save_regression_diff(name, output_dir):
     shutil.move(path, new_file_path)
 
 
-def sync_metadata_to_workers(pg_path, worker_ports, coordinator_port):
+def stop_metadata_to_workers(pg_path, worker_ports, coordinator_port):
     for port in worker_ports:
         command = (
-            "SELECT * from start_metadata_sync_to_node('localhost', {port});".format(
+            "SELECT * from stop_metadata_sync_to_node('localhost', {port});".format(
                 port=port
             )
         )
@@ -215,9 +248,9 @@ def logfile_name(logfile_prefix, node_name):
 
 
 def stop_databases(
-    pg_path, rel_data_path, node_name_to_ports, logfile_prefix, no_output=False
+    pg_path, rel_data_path, node_name_to_ports, logfile_prefix, no_output=False, parallel=True
 ):
-    for node_name in node_name_to_ports.keys():
+    def stop(node_name):
         abs_data_path = os.path.abspath(os.path.join(rel_data_path, node_name))
         node_port = node_name_to_ports[node_name]
         command = [
@@ -239,6 +272,12 @@ def stop_databases(
         else:
             subprocess.call(command)
 
+    if parallel:
+        parallel_run(stop, node_name_to_ports.keys())
+    else:
+        for node_name in node_name_to_ports.keys():
+            stop(node_name)
+
 
 def initialize_citus_cluster(bindir, datadir, settings, config):
     # In case there was a leftover from previous runs, stop the databases
@@ -251,8 +290,8 @@ def initialize_citus_cluster(bindir, datadir, settings, config):
     start_databases(bindir, datadir, config.node_name_to_ports, config.name, config.env_variables)
     create_citus_extension(bindir, config.node_name_to_ports.values())
     add_workers(bindir, config.worker_ports, config.coordinator_port())
-    if config.is_mx:
-        sync_metadata_to_workers(bindir, config.worker_ports, config.coordinator_port())
+    if not config.is_mx:
+        stop_metadata_to_workers(bindir, config.worker_ports, config.coordinator_port())
     if config.add_coordinator_to_metadata:
         add_coordinator_to_metadata(bindir, config.coordinator_port())
     config.setup_steps()

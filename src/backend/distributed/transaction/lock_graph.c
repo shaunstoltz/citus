@@ -309,7 +309,7 @@ ParseIntField(PGresult *result, int rowIndex, int colIndex)
 
 	char *resultString = PQgetvalue(result, rowIndex, colIndex);
 
-	return pg_strtouint64(resultString, NULL, 10);
+	return strtou64(resultString, NULL, 10);
 }
 
 
@@ -561,13 +561,23 @@ BuildLocalWaitGraph(bool onlyDistributedTx)
 		PGPROC *currentProc = &ProcGlobal->allProcs[curBackend];
 		BackendData currentBackendData;
 
-		/* skip if the PGPROC slot is unused */
 		if (currentProc->pid == 0)
 		{
+			/* skip if the PGPROC slot is unused */
 			continue;
 		}
 
 		GetBackendDataForProc(currentProc, &currentBackendData);
+		if (!currentBackendData.activeBackend)
+		{
+			/*
+			 * Skip if the PGPROC slot is unused. We should normally use
+			 * IsBackendPid() to be able to skip reliably all the exited
+			 * processes. However, that is a costly operation. Instead, we
+			 * keep track of activeBackend in Citus code.
+			 */
+			continue;
+		}
 
 		/*
 		 * Only start searching from distributed transactions, since we only

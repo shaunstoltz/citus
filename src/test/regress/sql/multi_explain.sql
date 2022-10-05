@@ -24,6 +24,17 @@ BEGIN
 END;
 $BODY$ LANGUAGE plpgsql;
 
+CREATE FUNCTION explain_analyze_json(query text)
+RETURNS jsonb
+AS $BODY$
+DECLARE
+  result jsonb;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE TRUE, FORMAT JSON) %s', query) INTO result;
+  RETURN result;
+END;
+$BODY$ LANGUAGE plpgsql;
+
 -- Function that parses explain output as XML
 CREATE FUNCTION explain_xml(query text)
 RETURNS xml
@@ -35,6 +46,19 @@ BEGIN
   RETURN result;
 END;
 $BODY$ LANGUAGE plpgsql;
+
+-- Function that parses explain output as XML
+CREATE FUNCTION explain_analyze_xml(query text)
+RETURNS xml
+AS $BODY$
+DECLARE
+  result xml;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE true, FORMAT XML) %s', query) INTO result;
+  RETURN result;
+END;
+$BODY$ LANGUAGE plpgsql;
+
 
 -- VACUMM related tables to ensure test outputs are stable
 VACUUM ANALYZE lineitem;
@@ -63,6 +87,13 @@ SELECT true AS valid FROM explain_json($$
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity$$);
 
+SELECT true AS valid FROM explain_analyze_json($$
+	WITH a AS (
+		SELECT l_quantity, count(*) count_quantity FROM lineitem
+		GROUP BY l_quantity ORDER BY count_quantity, l_quantity LIMIT 10)
+	SELECT count(*) FROM a
+$$);
+
 -- Test XML format
 EXPLAIN (COSTS FALSE, FORMAT XML)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
@@ -72,6 +103,13 @@ EXPLAIN (COSTS FALSE, FORMAT XML)
 SELECT true AS valid FROM explain_xml($$
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity$$);
+
+SELECT true AS valid FROM explain_analyze_xml($$
+	WITH a AS (
+		SELECT l_quantity, count(*) count_quantity FROM lineitem
+		GROUP BY l_quantity ORDER BY count_quantity, l_quantity LIMIT 10)
+	SELECT count(*) FROM a
+$$);
 
 -- Test YAML format
 EXPLAIN (COSTS FALSE, FORMAT YAML)
@@ -84,9 +122,11 @@ EXPLAIN (COSTS FALSE, FORMAT TEXT)
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
 
 -- Test analyze (with TIMING FALSE and SUMMARY FALSE for consistent output)
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 
 -- EXPLAIN ANALYZE doesn't show worker tasks for repartition joins yet
 SET citus.shard_count TO 3;
@@ -104,9 +144,11 @@ END;
 DROP TABLE t1, t2;
 
 -- Test query text output, with ANALYZE ON
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE, VERBOSE TRUE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 
 -- Test query text output, with ANALYZE OFF
 EXPLAIN (COSTS FALSE, ANALYZE FALSE, TIMING FALSE, SUMMARY FALSE, VERBOSE TRUE)
@@ -212,6 +254,20 @@ FROM
 		user_id) AS subquery;
 
 -- Union and left join subquery pushdown
+
+-- enable_group_by_reordering is a new GUC introduced in PG15
+-- it does some optimization of the order of group by keys which results
+-- in a different explain output plan between PG13/14 and PG15
+-- Hence we set that GUC to off.
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
+\gset
+\if :server_version_ge_15
+SET enable_group_by_reordering TO off;
+\endif
+SELECT DISTINCT 1 FROM run_command_on_workers($$ALTER SYSTEM SET enable_group_by_reordering TO off;$$);
+SELECT run_command_on_workers($$SELECT pg_reload_conf()$$);
+
 EXPLAIN (COSTS OFF)
 SELECT
 	avg(array_length(events, 1)) AS event_average,
@@ -347,6 +403,12 @@ GROUP BY
 ORDER BY
 	count_pay;
 
+\if :server_version_ge_15
+RESET enable_group_by_reordering;
+\endif
+SELECT DISTINCT 1 FROM run_command_on_workers($$ALTER SYSTEM RESET enable_group_by_reordering;$$);
+SELECT run_command_on_workers($$SELECT pg_reload_conf()$$);
+
 -- Lateral join subquery pushdown
 -- set subquery_pushdown due to limit in the query
 SET citus.subquery_pushdown to ON;
@@ -430,9 +492,11 @@ EXPLAIN (COSTS FALSE)
 	DELETE FROM lineitem_hash_part;
 
 -- Test analyze (with TIMING FALSE and SUMMARY FALSE for consistent output)
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 
 SET citus.explain_all_tasks TO off;
 
@@ -1089,6 +1153,14 @@ CREATE TABLE tbl (a int, b multi_explain.int_wrapper_type);
 SELECT create_distributed_table('tbl', 'a');
 
 EXPLAIN :default_analyze_flags SELECT * FROM tbl;
+
+PREPARE q1(int_wrapper_type) AS WITH a AS (SELECT * FROM tbl WHERE b = $1 AND a = 1 OFFSET 0) SELECT * FROM a;
+EXPLAIN (COSTS false) EXECUTE q1('(1)');
+EXPLAIN :default_analyze_flags EXECUTE q1('(1)');
+
+PREPARE q2(int_wrapper_type) AS WITH a AS (UPDATE tbl SET b = $1 WHERE a = 1 RETURNING *) SELECT * FROM a;
+EXPLAIN (COSTS false) EXECUTE q2('(1)');
+EXPLAIN :default_analyze_flags EXECUTE q2('(1)');
 
 SET client_min_messages TO ERROR;
 DROP SCHEMA multi_explain CASCADE;

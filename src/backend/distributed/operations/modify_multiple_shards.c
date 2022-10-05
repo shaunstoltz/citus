@@ -5,9 +5,7 @@
  *
  * This file contains master_modify_multiple_shards function, which takes a update
  * or delete query and runs it worker shards of the distributed table. The distributed
- * modify operation can be done within a distributed transaction and committed in
- * one-phase or two-phase fashion, depending on the citus.multi_shard_commit_protocol
- * setting.
+ * modify operation can be done within a distributed transaction.
  *
  * Copyright (c) Citus Data, Inc.
  *
@@ -80,7 +78,7 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 	if (!IsA(queryTreeNode, DeleteStmt) && !IsA(queryTreeNode, UpdateStmt))
 	{
 		ereport(ERROR, (errmsg("query \"%s\" is not a delete or update "
-							   "statement", ApplyLogRedaction(queryString))));
+							   "statement", queryString)));
 	}
 
 	ereport(WARNING, (errmsg("master_modify_multiple_shards is deprecated and will be "

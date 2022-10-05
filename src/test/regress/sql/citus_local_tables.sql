@@ -133,7 +133,7 @@ BEGIN;
   SELECT * FROM citus_local_table_3;
 ROLLBACK;
 
--- show that we do not support policies in citus community --
+-- show that we support policies in citus enterprise --
 
 BEGIN;
   CREATE TABLE citus_local_table_3 (table_user text);
@@ -144,7 +144,6 @@ BEGIN;
   CREATE POLICY table_policy ON citus_local_table_3 TO table_users
       USING (table_user = current_user);
 
-  -- this should error out
   SELECT citus_add_local_table_to_metadata('citus_local_table_3');
 ROLLBACK;
 
@@ -224,8 +223,8 @@ SELECT master_create_empty_shard('citus_local_table_1');
 -- get_shard_id_for_distribution_column is supported
 SELECT get_shard_id_for_distribution_column('citus_local_table_1', 'not_checking_this_arg_for_non_dist_tables');
 SELECT get_shard_id_for_distribution_column('citus_local_table_1');
--- master_copy_shard_placement is not supported
-SELECT master_copy_shard_placement(shardid, 'localhost', :master_port, 'localhost', :worker_1_port, true)
+-- citus_copy_shard_placement is not supported
+SELECT citus_copy_shard_placement(shardid, 'localhost', :master_port, 'localhost', :worker_1_port)
 FROM (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='citus_local_table_1'::regclass) as shardid;
 -- undistribute_table is supported
 BEGIN;

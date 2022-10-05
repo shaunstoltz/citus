@@ -26,9 +26,7 @@
 #include "distributed/placement_connection.h"
 #include "distributed/relation_access_tracking.h"
 #include "utils/hsearch.h"
-#if PG_VERSION_NUM >= PG_VERSION_13
 #include "common/hashfn.h"
-#endif
 #include "utils/memutils.h"
 
 
@@ -971,7 +969,6 @@ ResetPlacementConnectionManagement(void)
 	hash_delete_all(ConnectionPlacementHash);
 	hash_delete_all(ConnectionShardHash);
 	hash_delete_all(ColocatedPlacementsHash);
-	ResetRelationAccessHash();
 
 	/*
 	 * NB: memory for ConnectionReference structs and subordinate data is
@@ -1091,9 +1088,6 @@ InitPlacementConnectionManagement(void)
 
 	ConnectionShardHash = hash_create("citus connection cache (shardid)",
 									  64, &info, hashFlags);
-
-	/* (relationId) = [relationAccessMode] hash */
-	AllocateRelationAccessHash();
 }
 
 

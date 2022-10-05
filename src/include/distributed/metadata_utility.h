@@ -23,7 +23,9 @@
 #include "catalog/objectaddress.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/connection_management.h"
+#include "distributed/errormessage.h"
 #include "distributed/relay_utility.h"
+#include "distributed/worker_manager.h"
 #include "utils/acl.h"
 #include "utils/relcache.h"
 
@@ -40,6 +42,15 @@
 	"worker_partitioned_relation_total_size(%s)"
 
 #define SHARD_SIZES_COLUMN_COUNT (3)
+
+/*
+ * Flag to keep track of whether the process is currently in a function converting the
+ * type of the table. Since it only affects the level of the log shown while dropping/
+ * recreating table within the table type conversion, rollbacking to the savepoint hasn't
+ * been implemented for the sake of simplicity. If you are planning to use that flag for
+ * any other purpose, please consider implementing that.
+ */
+extern bool InTableTypeConversionFunctionCall;
 
 /* In-memory representation of a typed tuple in pg_dist_shard. */
 typedef struct ShardInterval
@@ -192,6 +203,74 @@ typedef enum SizeQueryType
 	TABLE_SIZE /* pg_table_size() */
 } SizeQueryType;
 
+typedef enum BackgroundJobStatus
+{
+	BACKGROUND_JOB_STATUS_SCHEDULED,
+	BACKGROUND_JOB_STATUS_RUNNING,
+	BACKGROUND_JOB_STATUS_FINISHED,
+	BACKGROUND_JOB_STATUS_CANCELLING,
+	BACKGROUND_JOB_STATUS_CANCELLED,
+	BACKGROUND_JOB_STATUS_FAILING,
+	BACKGROUND_JOB_STATUS_FAILED
+} BackgroundJobStatus;
+
+typedef struct BackgroundJob
+{
+	int64 jobid;
+	BackgroundJobStatus state;
+	char *jobType;
+	char *description;
+	TimestampTz *started_at;
+	TimestampTz *finished_at;
+
+	/* extra space to store values for nullable value types above */
+	struct
+	{
+		TimestampTz started_at;
+		TimestampTz finished_at;
+	} __nullable_storage;
+} BackgroundJob;
+
+typedef enum BackgroundTaskStatus
+{
+	BACKGROUND_TASK_STATUS_BLOCKED,
+	BACKGROUND_TASK_STATUS_RUNNABLE,
+	BACKGROUND_TASK_STATUS_RUNNING,
+	BACKGROUND_TASK_STATUS_CANCELLING,
+	BACKGROUND_TASK_STATUS_DONE,
+	BACKGROUND_TASK_STATUS_ERROR,
+	BACKGROUND_TASK_STATUS_UNSCHEDULED,
+	BACKGROUND_TASK_STATUS_CANCELLED
+} BackgroundTaskStatus;
+
+typedef struct BackgroundTask
+{
+	int64 jobid;
+	int64 taskid;
+	Oid owner;
+	int32 *pid;
+	BackgroundTaskStatus status;
+	char *command;
+	int32 *retry_count;
+	TimestampTz *not_before;
+	char *message;
+
+	/* extra space to store values for nullable value types above */
+	struct
+	{
+		int32 pid;
+		int32 retry_count;
+		TimestampTz not_before;
+	} __nullable_storage;
+} BackgroundTask;
+
+#define SET_NULLABLE_FIELD(ptr, field, value) \
+	(ptr)->__nullable_storage.field = (value); \
+	(ptr)->field = &((ptr)->__nullable_storage.field)
+
+#define UNSET_NULLABLE_FIELD(ptr, field) \
+	(ptr)->field = NULL; \
+	memset_struct_0((ptr)->__nullable_storage.field)
 
 /* Size functions */
 extern Datum citus_table_size(PG_FUNCTION_ARGS);
@@ -216,6 +295,7 @@ extern List * ActiveShardPlacementListOnGroup(uint64 shardId, int32 groupId);
 extern List * ActiveShardPlacementList(uint64 shardId);
 extern List * ShardPlacementListWithoutOrphanedPlacements(uint64 shardId);
 extern ShardPlacement * ActiveShardPlacement(uint64 shardId, bool missingOk);
+extern WorkerNode * ActiveShardPlacementWorkerNode(uint64 shardId);
 extern List * BuildShardPlacementList(int64 shardId);
 extern List * AllShardPlacementsOnNodeGroup(int32 groupId);
 extern List * AllShardPlacementsWithShardPlacementState(ShardState shardState);
@@ -236,6 +316,10 @@ extern void InsertIntoPgDistPartition(Oid relationId, char distributionMethod,
 									  Var *distributionColumn, uint32 colocationId,
 									  char replicationModel, bool autoConverted);
 extern void UpdatePgDistPartitionAutoConverted(Oid citusTableId, bool autoConverted);
+extern void UpdateDistributionColumnGlobally(Oid relationId, char distributionMethod,
+											 Var *distributionColumn, int colocationId);
+extern void UpdateDistributionColumn(Oid relationId, char distributionMethod,
+									 Var *distributionColumn, int colocationId);
 extern void DeletePartitionRow(Oid distributedRelationId);
 extern void DeleteShardRow(uint64 shardId);
 extern void UpdateShardPlacementState(uint64 placementId, char shardState);
@@ -248,18 +332,22 @@ extern void CreateDistributedTable(Oid relationId, char *distributionColumnName,
 extern void CreateTruncateTrigger(Oid relationId);
 extern TableConversionReturn * UndistributeTable(TableConversionParameters *params);
 
-extern void EnsureDependenciesExistOnAllNodes(const ObjectAddress *target);
+extern void EnsureAllObjectDependenciesExistOnAllNodes(const List *targets);
+extern DeferredErrorMessage * DeferErrorIfCircularDependencyExists(const
+																   ObjectAddress *
+																   objectAddress);
 extern List * GetDistributableDependenciesForObject(const ObjectAddress *target);
+extern List * GetAllDependencyCreateDDLCommands(const List *dependencies);
 extern bool ShouldPropagate(void);
 extern bool ShouldPropagateCreateInCoordinatedTransction(void);
-extern bool ShouldPropagateObject(const ObjectAddress *address);
+extern bool ShouldPropagateAnyObject(List *addresses);
 extern List * ReplicateAllObjectsToNodeCommandList(const char *nodeName, int nodePort);
 
 /* Remaining metadata utility functions  */
+extern Oid TableOwnerOid(Oid relationId);
 extern char * TableOwner(Oid relationId);
 extern void EnsureTablePermissions(Oid relationId, AclMode mode);
 extern void EnsureTableOwner(Oid relationId);
-extern void EnsureSchemaOwner(Oid schemaId);
 extern void EnsureHashDistributedTable(Oid relationId);
 extern void EnsureFunctionOwner(Oid functionId);
 extern void EnsureSuperUser(void);
@@ -290,7 +378,33 @@ extern bool GetNodeDiskSpaceStatsForConnection(MultiConnection *connection,
 											   uint64 *availableBytes,
 											   uint64 *totalBytes);
 extern void ExecuteQueryViaSPI(char *query, int SPIOK);
-extern void EnsureSequenceTypeSupported(Oid seqOid, Oid seqTypId, Oid ownerRelationId);
+extern void ExecuteAndLogQueryViaSPI(char *query, int SPIOK, int logLevel);
+extern void EnsureSequenceTypeSupported(Oid seqOid, Oid attributeTypeId, Oid
+										ownerRelationId);
 extern void AlterSequenceType(Oid seqOid, Oid typeOid);
 extern void EnsureRelationHasCompatibleSequenceTypes(Oid relationId);
+extern bool HasRunnableBackgroundTask(void);
+extern bool HasNonTerminalJobOfType(const char *jobType, int64 *jobIdOut);
+extern int64 CreateBackgroundJob(const char *jobType, const char *description);
+extern BackgroundTask * ScheduleBackgroundTask(int64 jobId, Oid owner, char *command,
+											   int dependingTaskCount,
+											   int64 dependingTaskIds[]);
+extern BackgroundTask * GetRunnableBackgroundTask(void);
+extern void ResetRunningBackgroundTasks(void);
+extern BackgroundJob * GetBackgroundJobByJobId(int64 jobId);
+extern BackgroundTask * GetBackgroundTaskByTaskId(int64 taskId);
+extern void UpdateBackgroundJob(int64 jobId);
+extern void UpdateBackgroundTask(BackgroundTask *task);
+extern void UpdateJobStatus(int64 taskId, const pid_t *pid, BackgroundTaskStatus status,
+							const int32 *retry_count, char *message);
+extern bool UpdateJobError(BackgroundTask *job, ErrorData *edata);
+extern List * CancelTasksForJob(int64 jobid);
+extern void UnscheduleDependentTasks(BackgroundTask *task);
+extern void UnblockDependingBackgroundTasks(BackgroundTask *task);
+extern BackgroundJobStatus BackgroundJobStatusByOid(Oid enumOid);
+extern BackgroundTaskStatus BackgroundTaskStatusByOid(Oid enumOid);
+extern bool IsBackgroundJobStatusTerminal(BackgroundJobStatus status);
+extern bool IsBackgroundTaskStatusTerminal(BackgroundTaskStatus status);
+extern Oid BackgroundJobStatusOid(BackgroundJobStatus status);
+extern Oid BackgroundTaskStatusOid(BackgroundTaskStatus status);
 #endif   /* METADATA_UTILITY_H */

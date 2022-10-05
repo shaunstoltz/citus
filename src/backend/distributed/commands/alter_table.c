@@ -32,6 +32,8 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_rewrite_d.h"
 #include "columnar/columnar.h"
 #include "columnar/columnar_tableam.h"
 #include "commands/defrem.h"
@@ -41,6 +43,7 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/deparser.h"
 #include "distributed/distribution_column.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/metadata/dependency.h"
@@ -52,6 +55,7 @@
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_utils.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
@@ -193,7 +197,6 @@ static void EnsureTableNotPartition(Oid relationId);
 static TableConversionState * CreateTableConversion(TableConversionParameters *params);
 static void CreateDistributedTableLike(TableConversionState *con);
 static void CreateCitusTableLike(TableConversionState *con);
-static List * GetViewCreationCommandsOfTable(Oid relationId);
 static void ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 						 bool suppressNoticeMessages);
 static bool HasAnyGeneratedStoredColumns(Oid relationId);
@@ -205,16 +208,25 @@ static char * CreateWorkerChangeSequenceDependencyCommand(char *sequenceSchemaNa
 														  char *sourceName,
 														  char *targetSchemaName,
 														  char *targetName);
+static void ErrorIfMatViewSizeExceedsTheLimit(Oid matViewOid);
+static char * CreateMaterializedViewDDLCommand(Oid matViewOid);
 static char * GetAccessMethodForMatViewIfExists(Oid viewOid);
 static bool WillRecreateForeignKeyToReferenceTable(Oid relationId,
 												   CascadeToColocatedOption cascadeOption);
 static void WarningsForDroppingForeignKeysWithDistributedTables(Oid relationId);
+static void ErrorIfUnsupportedCascadeObjects(Oid relationId);
+static bool DoesCascadeDropUnsupportedObject(Oid classId, Oid id, HTAB *nodeMap);
 
 PG_FUNCTION_INFO_V1(undistribute_table);
 PG_FUNCTION_INFO_V1(alter_distributed_table);
 PG_FUNCTION_INFO_V1(alter_table_set_access_method);
 PG_FUNCTION_INFO_V1(worker_change_sequence_dependency);
 
+/* global variable keeping track of whether we are in a table type conversion function */
+bool InTableTypeConversionFunctionCall = false;
+
+/* controlled by GUC, in MB */
+int MaxMatViewSizeToAutoRecreate = 1024;
 
 /*
  * undistribute_table gets a distributed table name and
@@ -385,6 +397,8 @@ UndistributeTable(TableConversionParameters *params)
 		ErrorIfAnyPartitionRelationInvolvedInNonInheritedFKey(partitionList);
 	}
 
+	ErrorIfUnsupportedCascadeObjects(params->relationId);
+
 	params->conversionType = UNDISTRIBUTE_TABLE;
 	params->shardCountIsNull = true;
 	TableConversionState *con = CreateTableConversion(params);
@@ -415,6 +429,8 @@ AlterDistributedTable(TableConversionParameters *params)
 	EnsureTableNotForeign(params->relationId);
 	EnsureTableNotPartition(params->relationId);
 	EnsureHashDistributedTable(params->relationId);
+
+	ErrorIfUnsupportedCascadeObjects(params->relationId);
 
 	params->conversionType = ALTER_DISTRIBUTED_TABLE;
 	TableConversionState *con = CreateTableConversion(params);
@@ -472,6 +488,8 @@ AlterTableSetAccessMethod(TableConversionParameters *params)
 		}
 	}
 
+	ErrorIfUnsupportedCascadeObjects(params->relationId);
+
 	params->conversionType = ALTER_TABLE_SET_ACCESS_METHOD;
 	params->shardCountIsNull = true;
 	TableConversionState *con = CreateTableConversion(params);
@@ -503,10 +521,16 @@ AlterTableSetAccessMethod(TableConversionParameters *params)
  *
  * The function returns a TableConversionReturn object that can stores variables that
  * can be used at the caller operations.
+ *
+ * To be able to provide more meaningful messages while converting a table type,
+ * Citus keeps InTableTypeConversionFunctionCall flag. Don't forget to set it properly
+ * in case you add a new way to return from this function.
  */
 TableConversionReturn *
 ConvertTable(TableConversionState *con)
 {
+	InTableTypeConversionFunctionCall = true;
+
 	/*
 	 * We undistribute citus local tables that are not chained with any reference
 	 * tables via foreign keys at the end of the utility hook.
@@ -535,6 +559,7 @@ ConvertTable(TableConversionState *con)
 		 * subgraph including itself, so return here.
 		 */
 		SetLocalEnableLocalReferenceForeignKeys(oldEnableLocalReferenceForeignKeys);
+		InTableTypeConversionFunctionCall = false;
 		return NULL;
 	}
 	char *newAccessMethod = con->accessMethod ? con->accessMethod :
@@ -562,8 +587,9 @@ ConvertTable(TableConversionState *con)
 	List *justBeforeDropCommands = NIL;
 	List *attachPartitionCommands = NIL;
 
-	postLoadCommands = list_concat(postLoadCommands,
-								   GetViewCreationCommandsOfTable(con->relationId));
+	postLoadCommands =
+		list_concat(postLoadCommands,
+					GetViewCreationTableDDLCommandsOfTable(con->relationId));
 
 	List *foreignKeyCommands = NIL;
 	if (con->conversionType == ALTER_DISTRIBUTED_TABLE)
@@ -614,6 +640,8 @@ ConvertTable(TableConversionState *con)
 		Oid partitionRelationId = InvalidOid;
 		foreach_oid(partitionRelationId, partitionList)
 		{
+			char *tableQualifiedName = generate_qualified_relation_name(
+				partitionRelationId);
 			char *detachPartitionCommand = GenerateDetachPartitionCommand(
 				partitionRelationId);
 			char *attachPartitionCommand = GenerateAlterTableAttachPartitionCommand(
@@ -659,6 +687,19 @@ ConvertTable(TableConversionState *con)
 				foreignKeyCommands = list_concat(foreignKeyCommands,
 												 partitionReturn->foreignKeyCommands);
 			}
+
+
+			/*
+			 * If we are altering a partitioned distributed table by
+			 * colocateWith:none, we override con->colocationWith parameter
+			 * with the first newly created partition table to share the
+			 * same colocation group for rest of partitions and partitioned
+			 * table.
+			 */
+			if (con->colocateWith != NULL && IsColocateWithNone(con->colocateWith))
+			{
+				con->colocateWith = tableQualifiedName;
+			}
 		}
 	}
 
@@ -687,7 +728,7 @@ ConvertTable(TableConversionState *con)
 		strcmp(con->originalAccessMethod, "columnar") == 0)
 	{
 		ColumnarOptions options = { 0 };
-		ReadColumnarOptions(con->relationId, &options);
+		extern_ReadColumnarOptions(con->relationId, &options);
 
 		ColumnarTableDDLContext *context = (ColumnarTableDDLContext *) palloc0(
 			sizeof(ColumnarTableDDLContext));
@@ -700,7 +741,7 @@ ConvertTable(TableConversionState *con)
 		char *columnarOptionsSql = GetShardedTableDDLCommandColumnar(con->hashOfName,
 																	 context);
 
-		ExecuteQueryViaSPI(columnarOptionsSql, SPI_OK_SELECT);
+		ExecuteQueryViaSPI(columnarOptionsSql, SPI_OK_UTILITY);
 	}
 
 	con->newRelationId = get_relname_relid(con->tempName, con->schemaId);
@@ -819,6 +860,7 @@ ConvertTable(TableConversionState *con)
 
 	SetLocalEnableLocalReferenceForeignKeys(oldEnableLocalReferenceForeignKeys);
 
+	InTableTypeConversionFunctionCall = false;
 	return ret;
 }
 
@@ -831,6 +873,11 @@ static void
 DropIndexesNotSupportedByColumnar(Oid relationId, bool suppressNoticeMessages)
 {
 	Relation columnarRelation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(columnarRelation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *indexIdList = RelationGetIndexList(columnarRelation);
 
 	/*
@@ -843,7 +890,7 @@ DropIndexesNotSupportedByColumnar(Oid relationId, bool suppressNoticeMessages)
 	foreach_oid(indexId, indexIdList)
 	{
 		char *indexAmName = GetIndexAccessMethodName(indexId);
-		if (ColumnarSupportsIndexAM(indexAmName))
+		if (extern_ColumnarSupportsIndexAM(indexAmName))
 		{
 			continue;
 		}
@@ -1238,6 +1285,87 @@ CreateCitusTableLike(TableConversionState *con)
 
 
 /*
+ * ErrorIfUnsupportedCascadeObjects gets oid of a relation, finds the objects
+ * that dropping this relation cascades into and errors if there are any extensions
+ * that would be dropped.
+ */
+static void
+ErrorIfUnsupportedCascadeObjects(Oid relationId)
+{
+	HTAB *nodeMap = CreateSimpleHashSetWithName(Oid, "object dependency map (oid)");
+
+	bool unsupportedObjectInDepGraph =
+		DoesCascadeDropUnsupportedObject(RelationRelationId, relationId, nodeMap);
+
+	if (unsupportedObjectInDepGraph)
+	{
+		ereport(ERROR, (errmsg("cannot alter table because an extension depends on it")));
+	}
+}
+
+
+/*
+ * DoesCascadeDropUnsupportedObject walks through the objects that depend on the
+ * object with object id and returns true if it finds any unsupported objects.
+ *
+ * This function only checks extensions as unsupported objects.
+ *
+ * Extension dependency is different than the rest. If an object depends on an extension
+ * dropping the object would drop the extension too.
+ * So we check with IsAnyObjectAddressOwnedByExtension function.
+ */
+static bool
+DoesCascadeDropUnsupportedObject(Oid classId, Oid objectId, HTAB *nodeMap)
+{
+	bool found = false;
+	hash_search(nodeMap, &objectId, HASH_ENTER, &found);
+
+	if (found)
+	{
+		return false;
+	}
+
+	ObjectAddress *objectAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*objectAddress, classId, objectId);
+	if (IsAnyObjectAddressOwnedByExtension(list_make1(objectAddress), NULL))
+	{
+		return true;
+	}
+
+	Oid targetObjectClassId = classId;
+	Oid targetObjectId = objectId;
+	List *dependencyTupleList = GetPgDependTuplesForDependingObjects(targetObjectClassId,
+																	 targetObjectId);
+
+	HeapTuple depTup = NULL;
+	foreach_ptr(depTup, dependencyTupleList)
+	{
+		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
+
+		Oid dependingOid = InvalidOid;
+		Oid dependingClassId = InvalidOid;
+
+		if (pg_depend->classid == RewriteRelationId)
+		{
+			dependingOid = GetDependingView(pg_depend);
+			dependingClassId = RelationRelationId;
+		}
+		else
+		{
+			dependingOid = pg_depend->objid;
+			dependingClassId = pg_depend->classid;
+		}
+
+		if (DoesCascadeDropUnsupportedObject(dependingClassId, dependingOid, nodeMap))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+
+/*
  * GetViewCreationCommandsOfTable takes a table oid generates the CREATE VIEW
  * commands for views that depend to the given table. This includes the views
  * that recursively depend on the table too.
@@ -1246,43 +1374,149 @@ List *
 GetViewCreationCommandsOfTable(Oid relationId)
 {
 	List *views = GetDependingViews(relationId);
+
 	List *commands = NIL;
 
 	Oid viewOid = InvalidOid;
 	foreach_oid(viewOid, views)
 	{
-		Datum viewDefinitionDatum = DirectFunctionCall1(pg_get_viewdef,
-														ObjectIdGetDatum(viewOid));
-		char *viewDefinition = TextDatumGetCString(viewDefinitionDatum);
 		StringInfo query = makeStringInfo();
-		char *viewName = get_rel_name(viewOid);
-		char *schemaName = get_namespace_name(get_rel_namespace(viewOid));
-		char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
-		bool isMatView = get_rel_relkind(viewOid) == RELKIND_MATVIEW;
 
-		/* here we need to get the access method of the view to recreate it */
-		char *accessMethodName = GetAccessMethodForMatViewIfExists(viewOid);
-
-		appendStringInfoString(query, "CREATE ");
-
-		if (isMatView)
+		/* See comments on CreateMaterializedViewDDLCommand for its limitations */
+		if (get_rel_relkind(viewOid) == RELKIND_MATVIEW)
 		{
-			appendStringInfoString(query, "MATERIALIZED ");
+			ErrorIfMatViewSizeExceedsTheLimit(viewOid);
+
+			char *matViewCreateCommands = CreateMaterializedViewDDLCommand(viewOid);
+			appendStringInfoString(query, matViewCreateCommands);
+		}
+		else
+		{
+			char *viewCreateCommand = CreateViewDDLCommand(viewOid);
+			appendStringInfoString(query, viewCreateCommand);
 		}
 
-		appendStringInfo(query, "VIEW %s ", qualifiedViewName);
+		char *alterViewCommmand = AlterViewOwnerCommand(viewOid);
+		appendStringInfoString(query, alterViewCommmand);
 
-		if (accessMethodName)
-		{
-			appendStringInfo(query, "USING %s ", accessMethodName);
-		}
-
-		appendStringInfo(query, "AS %s", viewDefinition);
-
-		commands = lappend(commands, makeTableDDLCommandString(query->data));
+		commands = lappend(commands, query->data);
 	}
 
 	return commands;
+}
+
+
+/*
+ * GetViewCreationTableDDLCommandsOfTable is the same as GetViewCreationCommandsOfTable,
+ * but the returned list includes objects of TableDDLCommand's, not strings.
+ */
+List *
+GetViewCreationTableDDLCommandsOfTable(Oid relationId)
+{
+	List *commands = GetViewCreationCommandsOfTable(relationId);
+	List *tableDDLCommands = NIL;
+
+	char *command = NULL;
+	foreach_ptr(command, commands)
+	{
+		tableDDLCommands = lappend(tableDDLCommands, makeTableDDLCommandString(command));
+	}
+
+	return tableDDLCommands;
+}
+
+
+/*
+ * ErrorIfMatViewSizeExceedsTheLimit takes the oid of a materialized view and errors
+ * out if the size of the matview exceeds the limit set by the GUC
+ * citus.max_matview_size_to_auto_recreate.
+ */
+static void
+ErrorIfMatViewSizeExceedsTheLimit(Oid matViewOid)
+{
+	if (MaxMatViewSizeToAutoRecreate >= 0)
+	{
+		/* if it's below 0, it means the user has removed the limit */
+		Datum relSizeDatum = DirectFunctionCall1(pg_total_relation_size,
+												 ObjectIdGetDatum(matViewOid));
+		uint64 matViewSize = DatumGetInt64(relSizeDatum);
+
+		/* convert from MB to bytes */
+		uint64 limitSizeInBytes = MaxMatViewSizeToAutoRecreate * 1024L * 1024L;
+
+		if (matViewSize > limitSizeInBytes)
+		{
+			ereport(ERROR, (errmsg("size of the materialized view %s exceeds "
+								   "citus.max_matview_size_to_auto_recreate "
+								   "(currently %d MB)", get_rel_name(matViewOid),
+								   MaxMatViewSizeToAutoRecreate),
+							errdetail("Citus restricts automatically recreating "
+									  "materialized views that are larger than the "
+									  "limit, because it could take too long."),
+							errhint(
+								"Consider increasing the size limit by setting "
+								"citus.max_matview_size_to_auto_recreate; "
+								"or you can remove the limit by setting it to -1")));
+		}
+	}
+}
+
+
+/*
+ * CreateMaterializedViewDDLCommand creates the command to create materialized view.
+ * Note that this function doesn't support
+ * - Aliases
+ * - Storage parameters
+ * - Tablespace
+ * - WITH [NO] DATA
+ * options for the given materialized view. Parser functions for materialized views
+ * should be added to handle them.
+ *
+ * Related issue: https://github.com/citusdata/citus/issues/5968
+ */
+static char *
+CreateMaterializedViewDDLCommand(Oid matViewOid)
+{
+	StringInfo query = makeStringInfo();
+
+	char *viewName = get_rel_name(matViewOid);
+	char *schemaName = get_namespace_name(get_rel_namespace(matViewOid));
+	char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
+
+	/* here we need to get the access method of the view to recreate it */
+	char *accessMethodName = GetAccessMethodForMatViewIfExists(matViewOid);
+
+	appendStringInfo(query, "CREATE MATERIALIZED VIEW %s ", qualifiedViewName);
+
+	if (accessMethodName)
+	{
+		appendStringInfo(query, "USING %s ", accessMethodName);
+	}
+
+	/*
+	 * Set search_path to NIL so that all objects outside of pg_catalog will be
+	 * schema-prefixed.
+	 */
+	OverrideSearchPath *overridePath = GetOverrideSearchPath(CurrentMemoryContext);
+	overridePath->schemas = NIL;
+	overridePath->addCatalog = true;
+	PushOverrideSearchPath(overridePath);
+
+	/*
+	 * Push the transaction snapshot to be able to get vief definition with pg_get_viewdef
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	Datum viewDefinitionDatum = DirectFunctionCall1(pg_get_viewdef,
+													ObjectIdGetDatum(matViewOid));
+	char *viewDefinition = TextDatumGetCString(viewDefinitionDatum);
+
+	PopActiveSnapshot();
+	PopOverrideSearchPath();
+
+	appendStringInfo(query, "AS %s", viewDefinition);
+
+	return query->data;
 }
 
 
@@ -1343,11 +1577,7 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 		ExecuteQueryViaSPI(query->data, SPI_OK_INSERT);
 	}
 
-#if PG_VERSION_NUM >= PG_VERSION_13
 	List *ownedSequences = getOwnedSequences(sourceId);
-#else
-	List *ownedSequences = getOwnedSequences(sourceId, InvalidAttrNumber);
-#endif
 	Oid sequenceOid = InvalidOid;
 	foreach_oid(sequenceOid, ownedSequences)
 	{
@@ -1374,6 +1604,8 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 		}
 		else if (ShouldSyncTableMetadata(sourceId))
 		{
+			char *qualifiedTableName = quote_qualified_identifier(schemaName, sourceName);
+
 			/*
 			 * We are converting a citus local table to a distributed/reference table,
 			 * so we should prevent dropping the sequence on the table. Otherwise, we'd
@@ -1382,8 +1614,8 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 			StringInfo command = makeStringInfo();
 
 			appendStringInfo(command,
-							 "SELECT pg_catalog.worker_drop_sequence_dependency('%s');",
-							 quote_qualified_identifier(schemaName, sourceName));
+							 "SELECT pg_catalog.worker_drop_sequence_dependency(%s);",
+							 quote_literal_cstr(qualifiedTableName));
 
 			SendCommandToWorkersWithMetadata(command->data);
 		}
@@ -1673,11 +1905,17 @@ CreateWorkerChangeSequenceDependencyCommand(char *sequenceSchemaName, char *sequ
 											char *sourceSchemaName, char *sourceName,
 											char *targetSchemaName, char *targetName)
 {
+	char *qualifiedSchemaName = quote_qualified_identifier(sequenceSchemaName,
+														   sequenceName);
+	char *qualifiedSourceName = quote_qualified_identifier(sourceSchemaName, sourceName);
+	char *qualifiedTargetName = quote_qualified_identifier(targetSchemaName, targetName);
+
 	StringInfo query = makeStringInfo();
-	appendStringInfo(query, "SELECT worker_change_sequence_dependency('%s', '%s', '%s')",
-					 quote_qualified_identifier(sequenceSchemaName, sequenceName),
-					 quote_qualified_identifier(sourceSchemaName, sourceName),
-					 quote_qualified_identifier(targetSchemaName, targetName));
+	appendStringInfo(query, "SELECT worker_change_sequence_dependency(%s, %s, %s)",
+					 quote_literal_cstr(qualifiedSchemaName),
+					 quote_literal_cstr(qualifiedSourceName),
+					 quote_literal_cstr(qualifiedTargetName));
+
 	return query->data;
 }
 
@@ -1786,6 +2024,19 @@ ExecuteQueryViaSPI(char *query, int SPIOK)
 	{
 		ereport(ERROR, (errmsg("could not finish SPI connection")));
 	}
+}
+
+
+/*
+ * ExecuteAndLogQueryViaSPI is a wrapper around ExecuteQueryViaSPI, that logs
+ * the query to be executed, with the given log level.
+ */
+void
+ExecuteAndLogQueryViaSPI(char *query, int SPIOK, int logLevel)
+{
+	ereport(logLevel, (errmsg("executing \"%s\"", query)));
+
+	ExecuteQueryViaSPI(query, SPIOK);
 }
 
 

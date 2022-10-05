@@ -20,12 +20,6 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 
-
-#define CREATE_SEQUENCE_COMMAND \
-	"CREATE SEQUENCE IF NOT EXISTS %s AS %s INCREMENT BY " INT64_FORMAT \
-	" MINVALUE " INT64_FORMAT " MAXVALUE " INT64_FORMAT \
-	" START WITH " INT64_FORMAT " CACHE " INT64_FORMAT " %sCYCLE"
-
 /* Function declarations for version independent Citus ruleutils wrapper functions */
 extern char * pg_get_extensiondef_string(Oid tableRelationId);
 extern Oid get_extension_schema(Oid ext_oid);
@@ -43,9 +37,12 @@ extern void deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid,
 extern void deparse_shard_reindex_statement(ReindexStmt *origStmt, Oid distrelid,
 											int64 shardid, StringInfo buffer);
 extern char * pg_get_indexclusterdef_string(Oid indexRelationId);
+extern List * pg_get_table_grants(Oid relationId);
 extern bool contain_nextval_expression_walker(Node *node, void *context);
 extern char * pg_get_replica_identity_command(Oid tableRelationId);
+extern List * pg_get_row_level_security_commands(Oid relationId);
 extern const char * RoleSpecString(RoleSpec *spec, bool withQuoteIdentifier);
+extern char * flatten_reloptions(Oid relid);
 
 /* Function declarations for version dependent PostgreSQL ruleutils functions */
 extern void pg_get_query_def(Query *query, StringInfo buffer);

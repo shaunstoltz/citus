@@ -41,6 +41,7 @@ extern PropSetCmdBehavior PropagateSetCommands;
 extern bool EnableDDLPropagation;
 extern int CreateObjectPropagationMode;
 extern bool EnableCreateTypePropagation;
+extern bool EnableCreateRolePropagation;
 extern bool EnableAlterRolePropagation;
 extern bool EnableAlterRoleSetPropagation;
 extern bool EnableAlterDatabaseOwner;
@@ -50,13 +51,13 @@ extern bool InDelegatedProcedureCall;
 
 /*
  * A DDLJob encapsulates the remote tasks and commands needed to process all or
- * part of a distributed DDL command. It hold the distributed relation's oid,
+ * part of a distributed DDL command. It hold the target object's address,
  * the original DDL command string (for MX DDL propagation), and a task list of
  * DDL_TASK-type Tasks to be executed.
  */
 typedef struct DDLJob
 {
-	Oid targetRelationId;      /* oid of the target distributed relation */
+	ObjectAddress targetObjectAddress;      /* target distributed object address */
 
 	/*
 	 * Whether to commit and start a new transaction before sending commands
@@ -75,6 +76,7 @@ typedef struct DDLJob
 	List *taskList;            /* worker DDL tasks to execute */
 } DDLJob;
 
+extern ProcessUtility_hook_type PrevProcessUtility;
 
 extern void multi_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -82,13 +84,13 @@ extern void multi_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 #endif
 								 ProcessUtilityContext context, ParamListInfo params,
 								 struct QueryEnvironment *queryEnv, DestReceiver *dest,
-								 QueryCompletionCompat *completionTag
+								 QueryCompletion *completionTag
 								 );
 extern void ProcessUtilityParseTree(Node *node, const char *queryString,
 									ProcessUtilityContext context, ParamListInfo
 									params,
 									DestReceiver *dest,
-									QueryCompletionCompat *completionTag
+									QueryCompletion *completionTag
 									);
 extern void MarkInvalidateForeignKeyGraph(void);
 extern void InvalidateForeignKeyGraphForDDL(void);
@@ -101,8 +103,5 @@ extern void NotifyUtilityHookConstraintDropped(void);
 extern void ResetConstraintDropped(void);
 extern void ExecuteDistributedDDLJob(DDLJob *ddlJob);
 extern void ColumnarTableSetOptionsHook(Oid relationId, ColumnarOptions options);
-
-/* forward declarations for sending custom commands to a distributed table */
-extern DDLJob * CreateCustomDDLTaskList(Oid relationId, TableDDLCommand *command);
 
 #endif /* MULTI_UTILITY_H */

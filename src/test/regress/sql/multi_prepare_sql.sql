@@ -547,22 +547,12 @@ DROP TABLE text_partition_column_table;
 -- Domain type columns can give issues
 CREATE DOMAIN test_key AS text CHECK(VALUE ~ '^test-\d$');
 
--- TODO: Once domains are supported, remove enable_metadata_sync off/on change
--- on dependent table distribution below.
-SELECT run_command_on_workers($$
-  CREATE DOMAIN test_key AS text CHECK(VALUE ~ '^test-\d$')
-$$);
-
 CREATE TABLE domain_partition_column_table (
     key test_key NOT NULL,
     value int
 );
 
--- Disable metadata sync since citus doesn't support distributing
--- domains for now.
-SET citus.enable_metadata_sync TO OFF;
 SELECT create_distributed_table('domain_partition_column_table', 'key');
-RESET citus.enable_metadata_sync;
 
 PREPARE prepared_coercion_to_domain_insert(text) AS
 	INSERT INTO domain_partition_column_table VALUES ($1, 1);
@@ -624,7 +614,7 @@ CREATE OR REPLACE FUNCTION immutable_bleat(text) RETURNS int LANGUAGE plpgsql IM
 CREATE TABLE test_table (test_id integer NOT NULL, data text);
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
-SELECT create_distributed_table('test_table', 'test_id', 'hash');
+SELECT create_distributed_table('test_table', 'test_id', 'hash', colocate_with := 'none');
 
 -- avoid 9.6+ only context messages
 \set VERBOSITY terse
@@ -637,19 +627,19 @@ EXECUTE countsome; -- should indicate planning
 EXECUTE countsome; -- no replanning
 
 -- invalidate half of the placements using SQL, should invalidate via trigger
-UPDATE pg_dist_shard_placement SET shardstate = '3'
+DELETE FROM pg_dist_shard_placement
 WHERE shardid IN (
         SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'test_table'::regclass)
     AND nodeport = :worker_1_port;
 EXECUTE countsome; -- should indicate replanning
 EXECUTE countsome; -- no replanning
 
--- repair shards, should invalidate via master_metadata_utility.c
-SELECT master_copy_shard_placement(shardid, 'localhost', :worker_2_port, 'localhost', :worker_1_port)
+-- copy shards, should invalidate via master_metadata_utility.c
+SELECT citus_copy_shard_placement(shardid, 'localhost', :worker_2_port, 'localhost', :worker_1_port, transfer_mode := 'block_writes')
 FROM pg_dist_shard_placement
 WHERE shardid IN (
         SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'test_table'::regclass)
-    AND nodeport = :worker_1_port;
+    AND nodeport = :worker_2_port;
 EXECUTE countsome; -- should indicate replanning
 EXECUTE countsome; -- no replanning
 

@@ -11,7 +11,6 @@
 #include "postgres.h"
 
 #include "funcapi.h"
-#include "pg_config.h"
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "catalog/pg_am.h"
@@ -115,8 +114,6 @@ columnar_storage_info(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("table \"%s\" is not a columnar table",
 							   RelationGetRelationName(rel))));
 	}
-
-	RelationOpenSmgr(rel);
 
 	Datum values[STORAGE_INFO_NATTS] = { 0 };
 	bool nulls[STORAGE_INFO_NATTS] = { 0 };

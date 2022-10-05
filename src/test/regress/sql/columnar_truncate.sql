@@ -2,10 +2,6 @@
 -- Test the TRUNCATE TABLE command for columnar tables.
 --
 
--- print whether we're using version > 10 to make version-specific tests clear
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 10 AS version_above_ten;
-
 -- CREATE a columnar table, fill with some data --
 CREATE TABLE columnar_truncate_test (a int, b int) USING columnar;
 CREATE TABLE columnar_truncate_test_second (a int, b int) USING columnar;
@@ -90,7 +86,7 @@ INSERT INTO columnar_same_transaction_truncate SELECT * FROM generate_series(20,
 COMMIT;
 
 -- should output "1" for the newly created relation
-SELECT count(distinct storage_id) - :columnar_data_files_before_truncate FROM columnar.stripe;
+SELECT count(distinct storage_id) - :columnar_data_files_before_truncate FROM columnar_internal.stripe;
 SELECT * FROM columnar_same_transaction_truncate;
 
 DROP TABLE columnar_same_transaction_truncate;
@@ -128,7 +124,6 @@ set columnar.compression = 'pglz';
 INSERT INTO truncate_schema.truncate_tbl SELECT generate_series(1, 100);
 set columnar.compression to default;
 -- create a user that can not truncate
-SELECT run_command_on_workers($$CREATE USER truncate_user;$$);
 CREATE USER truncate_user;
 GRANT USAGE ON SCHEMA truncate_schema TO truncate_user;
 GRANT SELECT ON TABLE truncate_schema.truncate_tbl TO truncate_user;

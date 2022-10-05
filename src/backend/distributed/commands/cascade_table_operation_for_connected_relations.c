@@ -26,6 +26,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/worker_protocol.h"
+#include "executor/spi.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -513,6 +514,51 @@ ExecuteCascadeOperationForRelationIdList(List *relationIdList,
 
 
 /*
+ * ExecuteAndLogUtilityCommandListInTableTypeConversionViaSPI is a wrapper function
+ * around ExecuteAndLogQueryViaSPI, that executes view creation commands
+ * with the flag InTableTypeConversionFunctionCall set to true.
+ */
+void
+ExecuteAndLogUtilityCommandListInTableTypeConversionViaSPI(List *utilityCommandList)
+{
+	bool oldValue = InTableTypeConversionFunctionCall;
+	InTableTypeConversionFunctionCall = true;
+
+	MemoryContext savedMemoryContext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		char *utilityCommand = NULL;
+		foreach_ptr(utilityCommand, utilityCommandList)
+		{
+			/*
+			 * CREATE MATERIALIZED VIEW commands need to be parsed/transformed,
+			 * which SPI does for us.
+			 */
+			ExecuteAndLogQueryViaSPI(utilityCommand, SPI_OK_UTILITY, DEBUG1);
+		}
+	}
+	PG_CATCH();
+	{
+		InTableTypeConversionFunctionCall = oldValue;
+		MemoryContextSwitchTo(savedMemoryContext);
+
+		ErrorData *errorData = CopyErrorData();
+		FlushErrorState();
+
+		if (errorData->elevel != ERROR)
+		{
+			PG_RE_THROW();
+		}
+
+		ThrowErrorData(errorData);
+	}
+	PG_END_TRY();
+
+	InTableTypeConversionFunctionCall = oldValue;
+}
+
+
+/*
  * ExecuteAndLogUtilityCommandList takes a list of utility commands and calls
  * ExecuteAndLogUtilityCommand function for each of them.
  */
@@ -577,11 +623,11 @@ ExecuteForeignKeyCreateCommand(const char *commandString, bool skip_validation)
 	 */
 	Assert(IsA(parseTree, AlterTableStmt));
 
+	bool oldSkipConstraintsValidationValue = SkipConstraintValidation;
+
 	if (skip_validation && IsA(parseTree, AlterTableStmt))
 	{
-		parseTree =
-			SkipForeignKeyValidationIfConstraintIsFkey((AlterTableStmt *) parseTree,
-													   true);
+		EnableSkippingConstraintValidation();
 
 		ereport(DEBUG4, (errmsg("skipping validation for foreign key create "
 								"command \"%s\"", commandString)));
@@ -589,4 +635,6 @@ ExecuteForeignKeyCreateCommand(const char *commandString, bool skip_validation)
 
 	ProcessUtilityParseTree(parseTree, commandString, PROCESS_UTILITY_QUERY,
 							NULL, None_Receiver, NULL);
+
+	SkipConstraintValidation = oldSkipConstraintsValidationValue;
 }

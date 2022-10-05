@@ -32,7 +32,7 @@ CREATE TABLE test_schema_support.nation_append(
     n_regionkey integer not null,
     n_comment varchar(152)
 );
-SELECT master_create_distributed_table('test_schema_support.nation_append', 'n_nationkey', 'append');
+SELECT create_distributed_table('test_schema_support.nation_append', 'n_nationkey', 'append');
 SELECT master_create_empty_shard('test_schema_support.nation_append') as simple_shardid \gset
 
 -- append table to shard
@@ -55,7 +55,7 @@ CREATE TABLE test_schema_support."nation._'append" (
     n_regionkey integer not null,
     n_comment varchar(152));
 
-SELECT master_create_distributed_table('test_schema_support."nation._''append"', 'n_nationkey', 'append');
+SELECT create_distributed_table('test_schema_support."nation._''append"', 'n_nationkey', 'append');
 SELECT master_create_empty_shard('test_schema_support."nation._''append"') as special_shardid \gset
 
 copy test_schema_support."nation._'append" FROM STDIN with (append_to_shard :special_shardid, delimiter '|');
@@ -298,6 +298,7 @@ SELECT quote_ident(current_setting('lc_collate')) as current_locale \gset
 CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
 \c - - - :master_port
+SET citus.shard_replication_factor TO 2;
 
 CREATE TABLE test_schema_support.nation_hash_collation(
     n_nationkey integer not null,
@@ -306,8 +307,7 @@ CREATE TABLE test_schema_support.nation_hash_collation(
     n_comment varchar(152)
 );
 SELECT master_get_table_ddl_events('test_schema_support.nation_hash_collation') ORDER BY 1;
-SELECT master_create_distributed_table('test_schema_support.nation_hash_collation', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('test_schema_support.nation_hash_collation', 4, 2);
+SELECT create_distributed_table('test_schema_support.nation_hash_collation', 'n_nationkey', 'hash', shard_count := 4, colocate_with := 'none');
 
 \copy test_schema_support.nation_hash_collation FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
@@ -329,8 +329,8 @@ CREATE TABLE nation_hash_collation_search_path(
     n_regionkey integer not null,
     n_comment varchar(152)
 );
-SELECT master_create_distributed_table('nation_hash_collation_search_path', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('nation_hash_collation_search_path', 4, 2);
+SET citus.shard_replication_factor TO 2;
+SELECT create_distributed_table('nation_hash_collation_search_path', 'n_nationkey', 'hash', shard_count := 4, colocate_with := 'none');
 
 \copy nation_hash_collation_search_path FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
@@ -355,8 +355,7 @@ CREATE TABLE test_schema_support.nation_hash_composite_types(
     n_comment varchar(152),
     test_col test_schema_support.new_composite_type
 );
-SELECT master_create_distributed_table('test_schema_support.nation_hash_composite_types', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('test_schema_support.nation_hash_composite_types', 4, 2);
+SELECT create_distributed_table('test_schema_support.nation_hash_composite_types', 'n_nationkey', 'hash', shard_count := 4, colocate_with := 'none');
 
 -- insert some data to verify composite type queries
 \copy test_schema_support.nation_hash_composite_types FROM STDIN with delimiter '|';
@@ -463,12 +462,12 @@ DROP INDEX index1;
 \c - - - :master_port
 
 
--- test master_copy_shard_placement with schemas
+-- test citus_copy_shard_placement with schemas
 SET search_path TO public;
 
--- mark shard as inactive
-UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1190000 and nodeport = :worker_1_port;
-SELECT master_copy_shard_placement(1190000, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
+-- delete placements
+DELETE FROM pg_dist_shard_placement WHERE shardid = 1190000 and nodeport = :worker_1_port;
+SELECT citus_copy_shard_placement(1190000, 'localhost', :worker_2_port, 'localhost', :worker_1_port, transfer_mode := 'block_writes');
 
 -- verify shardstate
 SELECT shardstate, nodename, nodeport FROM pg_dist_shard_placement WHERE shardid = 1190000 ORDER BY nodeport;
@@ -478,8 +477,8 @@ SELECT shardstate, nodename, nodeport FROM pg_dist_shard_placement WHERE shardid
 SET search_path TO test_schema_support;
 
 -- mark shard as inactive
-UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1190000 and nodeport = :worker_1_port;
-SELECT master_copy_shard_placement(1190000, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
+DELETE FROM pg_dist_shard_placement WHERE shardid = 1190000 and nodeport = :worker_1_port;
+SELECT citus_copy_shard_placement(1190000, 'localhost', :worker_2_port, 'localhost', :worker_1_port, transfer_mode := 'block_writes');
 
 -- verify shardstate
 SELECT shardstate, nodename, nodeport FROM pg_dist_shard_placement WHERE shardid = 1190000 ORDER BY nodeport;
@@ -827,7 +826,7 @@ DROP SCHEMA "cItuS.T E E N'sSchema", "citus-teen's scnd schm." CASCADE;
 
 
 -- test schema propagation with user other than current user
-SELECT run_command_on_coordinator_and_workers('CREATE USER "test-user"');
+CREATE USER "test-user";
 SELECT run_command_on_coordinator_and_workers('GRANT ALL ON DATABASE postgres to "test-user"');
 
 CREATE SCHEMA schema_with_user AUTHORIZATION "test-user";
@@ -845,7 +844,7 @@ SET citus.next_shard_id TO 1197000;
 -- we do not use run_command_on_coordinator_and_workers here because when there is CASCADE, it causes deadlock
 DROP OWNED BY "test-user" CASCADE;
 SELECT run_command_on_workers('DROP OWNED BY "test-user" CASCADE');
-SELECT run_command_on_coordinator_and_workers('DROP USER "test-user"');
+DROP USER "test-user";
 
 DROP FUNCTION run_command_on_coordinator_and_workers(p_sql text);
 

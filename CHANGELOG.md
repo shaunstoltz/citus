@@ -1,3 +1,566 @@
+### citus v11.1.2 (September 30, 2022) ###
+
+* Adds support for PostgreSQL 15rc1
+
+* Disallows having `ON DELETE/UPDATE SET DEFAULT` actions on columns that
+  default to sequences
+
+* Fixes a bug that might cause inserting incorrect `DEFAULT` values when
+  applying foreign key actions
+
+* Fixes a performance issue related to shard-moves by creating replica
+  identities before copying shards
+
+* Improves logging during shard-splits and resource cleanup
+
+* Makes sure to reuse connections for shard-splits and logical replication
+
+* Makes sure to try dropping replication slots a few more times after a failure
+  at the end of the shard-split
+
+### citus v11.1.1 (September 16, 2022) ###
+
+* Fixes a bug that prevents `create_distributed_table_concurrently()` working
+  on an empty node
+
+### citus v11.1.0 (September 15, 2022) ###
+
+* Adds support for PostgreSQL 15beta4
+
+* Adds ability to run shard rebalancer in the background
+
+* Adds `create_distributed_table_concurrently()` UDF to distribute tables
+  without interrupting the application
+
+* Adds `citus_split_shard_by_split_points()` UDF that allows
+  splitting a shard to specified set of nodes without blocking writes
+  and based on given split points
+
+* Adds support for non-blocking tenant isolation
+
+* Adds support for isolation tenants that use partitioned tables
+  or columnar tables
+
+* Separates columnar table access method into a separate logical extension
+
+* Adds support for online replication in `replicate_reference_tables()`
+
+* Improves performance of blocking shard moves
+
+* Improves non-blocking shard moves with a faster custom copy logic
+
+* Creates all foreign keys quickly at the end of a shard move
+
+* Limits `get_rebalance_progress()` to show shards in moving state
+
+* Makes `citus_move_shard_placement()` idempotent if shard already exists
+  on target node
+
+* Shows `citus_copy_shard_placement()` progress in `get_rebalance_progres()`
+
+* Supports changing CPU priorities for backends and shard moves
+
+* Adds the GUC `citus.allow_unsafe_constraints` to allow unique/exclusion/
+  primary key constraints without distribution column
+
+* Introduces GUC `citus.skip_constraint_validation`
+
+* Introduces `citus_locks` view
+
+* Improves `citus_tables` view by showing local tables added to metadata
+
+* Improves columnar table access method by moving old catalog tables into
+  an internal schema and introduces more secure & informative views based
+  on them
+
+* Adds support for `GRANT/REVOKE` on aggregates
+
+* Adds support for `NULLS NOT DISTINCT` clauses for indexes for PG15+
+
+* Adds support for setting relation options for columnar tables using
+  `ALTER TABLE`
+
+* Adds support for unlogged distributed sequences
+
+* Removes `do_repair` option from `citus_copy_shard_placement()`
+
+* Removes deprecated re-partitioning functions like
+  `worker_hash_partition_table()`
+
+* Drops support for isolation tenants that use replicated tables
+
+* Checks existence of the shards before insert, delete, and update
+
+* Hides tables owned by extensions from `citus_tables` and `citus_shards`
+
+* Propagates `VACUUM` and `ANALYZE` to worker nodes
+
+* Makes non-partitioned table size calculation quicker
+
+* Improves `create_distributed_table()` by creating new colocation entries when
+  using `colocate_with => 'none'`
+
+* Ensures that `SELECT .. FOR UPDATE` opens a transaction block when used in
+  a function call
+
+* Prevents a segfault by disallowing usage of SQL functions referencing to a
+  distributed table
+
+* Prevents creating a new colocation entry when replicating reference tables
+
+* Fixes a bug in query escaping in `undistribute_table()` and
+  `alter_distributed_table()`
+
+* Fixes a bug preventing the usage of `isolate_tenant_to_new_shard()` with text
+  column
+
+* Fixes a bug that may cause `GRANT` to propagate within `CREATE EXTENSION`
+
+* Fixes a bug that causes incorrectly marking `metadatasynced` flag for
+  coordinator
+
+* Fixes a bug that may prevent Citus from creating function in transaction
+  block properly
+
+* Fixes a bug that prevents promoting read-replicas as primaries
+
+* Fixes a bug that prevents setting colocation group of a partitioned
+  distributed table to `none`
+
+* Fixes a bug that prevents using `AUTO` option for `VACUUM (INDEX_CLEANUP)`
+  operation
+
+* Fixes a segfault in `citus_copy_shard_placement()`
+
+* Fixes an issue that can cause logical reference table replication to fail
+
+* Fixes schema name qualification for `RENAME SEQUENCE` statement
+
+* Fixes several small memory leaks
+
+* Fixes the transaction timestamp column of the `get_current_transaction_id()`
+  on coordinator
+
+* Maps any unused parameters to a generic type in prepared statements
+
+### citus v10.2.8 (August 19, 2022) ###
+
+* Fixes compilation warning caused by latest upgrade script changes
+
+* Fixes compilation warning on PG13 + OpenSSL 3.0
+
+### citus v11.0.6 (August 19, 2022) ###
+
+* Fixes a bug that could cause failures in `CREATE ROLE` statement
+
+* Fixes a bug that could cause failures in `create_distributed_table`
+
+* Fixes a bug that prevents distributing tables that depend on sequences
+
+* Fixes reference table lock contention
+
+* Fixes upgrade paths for 11.0
+
+### citus v10.2.7 (August 19, 2022) ###
+
+* Fixes a bug that could cause failures in `INSERT INTO .. SELECT`
+
+* Fixes a bug that could cause leaking files when materialized views are
+  refreshed
+
+* Fixes an unexpected error for foreign tables when upgrading Postgres
+
+* Fixes columnar freezing/wraparound bug
+
+* Fixes reference table lock contention
+
+* Prevents alter table functions from dropping extensions
+
+### citus v11.0.5 (August 1, 2022) ###
+
+* Avoids possible information leakage about existing users
+
+* Allows using `WITH HOLD` cursors with parameters
+
+* Fixes a bug that could cause failures in `INSERT INTO .. SELECT`
+
+* Fixes a bug that prevents pushing down `IN` expressions when using columnar
+  custom scan
+
+* Fixes a concurrency bug between creating a co-located distributed table and
+  shard moves
+
+* Fixes a crash that can happen due to catalog read in `shmem_exit`
+
+* Fixes an unexpected error caused by constraints when moving shards
+
+* Fixes an unexpected error for foreign tables when upgrading Postgres
+
+* Prevents adding local table into metadata if there is a view with circular
+  dependencies on it
+
+* Reduces memory consumption of index name fix for partitioned tables
+
+### citus v11.0.4 (July 13, 2022) ###
+
+* Fixes a bug that prevents promoting read-replicas as primaries
+
+### citus v11.0.3 (July 5, 2022) ###
+
+* Fixes a bug that prevents adding local tables with materialized views to
+  Citus metadata
+
+* Fixes a bug that prevents using `COMPRESSION` and `CONSTRAINT` on a column
+
+* Fixes upgrades to Citus 11 when there are no nodes in the metadata
+
+### citus v11.0.2 (June 15, 2022) ###
+
+* Drops support for PostgreSQL 12
+
+* Open sources enterprise features, see the rest of changelog items
+
+* Turns metadata syncing on by default
+
+* Introduces `citus_finish_citus_upgrade()` procedure which is necessary to
+  upgrade from earlier versions
+
+* Open sources non-blocking shard moves/shard rebalancer
+  (`citus.logical_replication_timeout`)
+
+* Open sources propagation of `CREATE/DROP/ALTER ROLE` statements
+
+* Open sources propagation of `GRANT` statements
+
+* Open sources propagation of `CLUSTER` statements
+
+* Open sources propagation of `ALTER DATABASE ... OWNER TO ...`
+
+* Open sources optimization for `COPY` when loading `JSON` to avoid double
+  parsing of the `JSON` object (`citus.skip_jsonb_validation_in_copy`)
+
+* Open sources support for row level security
+
+* Open sources support for `pg_dist_authinfo`, which allows storing different
+  authentication options for different users, e.g. you can store
+  passwords or certificates here.
+
+* Open sources support for `pg_dist_poolinfo`, which allows using connection
+  poolers in between coordinator and workers
+
+* Open sources tracking distributed query execution times using
+  citus_stat_statements (`citus.stat_statements_max`,
+  `citus.stat_statements_purge_interval`,
+  `citus.stat_statements_track`). This is disabled by default.
+
+* Open sources tenant_isolation
+
+* Open sources support for `sslkey` and `sslcert` in `citus.node_conninfo`
+
+* Adds `citus.max_client_connections` GUC to limit non-Citus connections
+
+* Allows locally creating objects having a dependency that cannot be distributed
+
+* Distributes aggregates with `CREATE AGGREGATE` command
+
+* Distributes functions with `CREATE FUNCTION` command
+
+* Adds `citus.create_object_propagation` GUC to control DDL creation behaviour
+  in transactions
+
+* Hides shards based on `application_name` prefix
+
+* Prevents specifying `application_name` via `citus.node_conninfo`
+
+* Starts identifying rebalancer backends by `application_name=citus_rebalancer`
+
+* Starts identifying internal backends by `application_name=citus_internal`
+
+* Adds `citus.enable_unsafe_triggers` flag to enable unsafe triggers on
+  distributed tables
+
+* Adds `fix_partition_shard_index_names` UDF to fix currently broken names
+
+* Adds propagation for foreign server commands
+
+* Adds propagation of `DOMAIN` objects
+
+* Adds propagation of `TEXT SEARCH CONFIGURATION` objects
+
+* Adds propagation of `TEXT SEARCH DICTIONARY` objects
+
+* Adds support for `ALTER FUNCTION ... SUPPORT ...` commands
+
+* Adds support for `CREATE SCHEMA AUTHORIZATION` statements without schema name
+
+* Adds support for `CREATE/DROP/ALTER VIEW` commands
+
+* Adds support for `TRUNCATE` for foreign tables
+
+* Adds support for adding local tables to metadata using
+  `citus_add_local_table_to_metadata()` UDF
+
+* Adds support for adding partitioned local tables to Citus metadata
+
+* Adds support for automatic binary encoding in re-partition joins when possible
+
+* Adds support for foreign tables in MX
+
+* Adds support for operator class parameters in indexes
+
+* Adds support for re-partition joins in transaction blocks
+
+* Adds support for re-partition joins on followers
+
+* Adds support for shard replication > 1 hash distributed tables on Citus MX
+
+* Adds support for `LOCK` commands on distributed tables from worker nodes
+
+* Adds support for `TABLESAMPLE`
+
+* Adds support for propagating views when syncing Citus table metadata
+
+* Improves handling of `IN`, `OUT` and `INOUT` parameters for functions
+
+* Introduces `citus_backend_gpid()` UDF to get global pid of the current backend
+
+* Introduces `citus_check_cluster_node_health` UDF to check cluster connectivity
+
+* Introduces `citus_check_connection_to_node` UDF to check node connectivity
+
+* Introduces `citus_coordinator_nodeid` UDF to find the node id of the
+  coordinator node
+
+* Introduces `citus_stat_activity` view and drops `citus_worker_stat_activity`
+  UDF
+
+* Introduces `citus.use_citus_managed_tables` GUC to add local tables to Citus
+  metadata automatically
+
+* Introduces a new flag `force_delegation` in `create_distributed_function()`
+
+* Introduces `run_command_on_coordinator` UDF
+
+* Introduces `synchronous` option to `citus_disable_node()` UDF
+
+* Introduces `citus_is_coordinator` UDF to check whether a node is the
+  coordinator
+
+* Allows adding a unique constraint with an index
+
+* Allows `create_distributed_function()` on a function owned by an extension
+
+* Allows creating distributed tables in sequential mode
+
+* Allows disabling nodes when multiple failures happen
+
+* Allows `lock_table_if_exits` to be called outside of a transaction blocks
+
+* Adds support for pushing procedures with `OUT` arguments down to the worker
+  nodes
+
+* Overrides `pg_cancel_backend()` and `pg_terminate_backend()` to run with
+  global pid
+
+* Delegates function calls of the form `SELECT .. FROM func()`
+
+* Adds propagation of `CREATE SCHEMA .. GRANT ON SCHEMA ..` commands
+
+* Propagates `pg_dist_object` to worker nodes
+
+* Adds propagation of `SCHEMA` operations
+
+* Adds missing version-mismatch checks for columnar tables
+
+* Adds missing version-mismatch checks for internal functions
+
+* `citus_shard_indexes_on_worker` shows all local shard indexes regardless of
+  `search_path`
+
+* `citus_shards_on_worker` shows all local shards regardless of `search_path`
+
+* Enables distributed execution from `run_command_on_*` functions
+
+* Deprecates inactive shard state, never marks any placement inactive
+
+* Disables distributed & reference foreign tables
+
+* Prevents propagating objects having a circular dependency
+
+* Prevents propagating objects having a dependency to an object with unsupported
+  type
+
+* Deprecates `master_get_table_metadata` UDF
+
+* Disallows remote execution from queries on shards
+
+* Drops `citus.enable_cte_inlining` GUC
+
+* Drops `citus.single_shard_commit_protocol` GUC, defaults to 2PC
+
+* Drops support for `citus.multi_shard_commit_protocol`, always use 2PC
+
+* Avoids unnecessary errors for `ALTER STATISTICS IF EXISTS` when the statistics
+  does not exist
+
+* Fixes a bug that prevents dropping/altering indexes
+
+* Fixes a bug that prevents non-client backends from accessing shards
+
+* Fixes columnar freezing/wraparound bug
+
+* Fixes `invalid read of size 1` memory error with `citus_add_node`
+
+* Fixes schema name qualification for `ALTER/DROP SEQUENCE`
+
+* Fixes schema name qualification for `ALTER/DROP STATISTICS`
+
+* Fixes schema name qualification for `CREATE STATISTICS`
+
+* Fixes a bug that causes columnar storage pages to have zero LSN
+
+* Fixes a bug that causes issues while create dependencies from multiple
+  sessions
+
+* Fixes a bug that causes reading columnar metapage as all-zeros when
+  writing to a columnar table
+
+* Fixes a bug that could break `DROP SCHEMA/EXTENSON` commands when there is a
+  columnar table
+
+* Fixes a bug that could break pg upgrades due to missing `pg_depend` records
+  for columnar table access method
+
+* Fixes a bug that could cause `CREATE INDEX` to fail for expressions when using
+  custom `search_path`
+
+* Fixes a bug that could cause `worker_save_query_explain_analyze` to fail on
+  custom types
+
+* Fixes a bug that could cause failed re-partition joins to leak result tables
+
+* Fixes a bug that could cause prerequisite columnar table access method
+  objects being not created during pg upgrades
+
+* Fixes a bug that could cause re-partition joins involving local shards to fail
+
+* Fixes a bug that could cause false positive distributed deadlocks due to local
+  execution
+
+* Fixes a bug that could cause leaking files when materialized views are
+  refreshed
+
+* Fixes a bug that could cause unqualified `DROP DOMAIN IF EXISTS` to fail
+
+* Fixes a bug that could cause wrong schema and ownership after
+  `alter_distributed_table`
+
+* Fixes a bug that could cause `EXPLAIN ANALYZE` to fail for prepared statements
+  with custom type
+
+* Fixes a bug that could cause Citus not to create function in transaction block
+  properly
+
+* Fixes a bug that could cause returning invalid JSON when running
+  `EXPLAIN ANALYZE` with subplans
+
+* Fixes a bug that limits usage of sequences in non-int columns
+
+* Fixes a bug that prevents `DROP SCHEMA CASCADE`
+
+* Fixes a build error that happens when `lz4` is not installed
+
+* Fixes a clog lookup failure that could occur when writing to a columnar table
+
+* Fixes a crash that occurs when the aggregate that cannot be pushed-down
+  returns empty result from a worker
+
+* Fixes a missing `FROM` clause entry error
+
+* Fixes a possible segfault that could happen when reporting distributed
+  deadlock
+
+* Fixes an issue that could cause unexpected errors when there is an in-progress
+  write to a columnar table
+
+* Fixes an unexpected error that occurs due to aborted writes to a columnar
+  table with an index
+
+* Fixes an unexpected error that occurs when writing to a columnar table created
+  in older version
+
+* Fixes issue when compiling Citus from source with some compilers
+
+* Fixes issues on `ATTACH PARTITION` logic
+
+* Fixes naming issues of newly created partitioned indexes
+
+* Honors `enable_metadata_sync` in node operations
+
+* Improves nested execution checks and adds GUC to control
+  (`citus.allow_nested_distributed_execution`)
+
+* Improves self-deadlock prevention for `CREATE INDEX / REINDEX CONCURRENTLY`
+  commands for builds using PG14 or higher
+
+* Moves `pg_dist_object` to `pg_catalog` schema
+
+* Parallelizes metadata syncing on node activation
+
+* Partitions shards to be co-located with the parent shards
+
+* Prevents Citus table functions from being called on shards
+
+* Prevents creating distributed functions when there are out of sync nodes
+
+* Prevents alter table functions from dropping extensions
+
+* Refrains reading the metadata cache for all tables during upgrade
+
+* Provides notice message for idempotent `create_distributed_function` calls
+
+* Reinstates optimisation for uniform shard interval ranges
+
+* Relaxes table ownership check to privileges check while acquiring lock
+
+* Drops support for `citus.shard_placement_policy` GUC
+
+* Drops `master_append_table_to_shard` UDF
+
+* Drops `master_apply_delete_command` UDF
+
+* Removes copy into new shard logic for append-distributed tables
+
+* Drops support for distributed `cstore_fdw` tables in favor of Citus
+  columnar table access method
+
+* Removes support for dropping distributed and local indexes in the same
+  statement
+
+* Replaces `citus.enable_object_propagation` GUC with
+  `citus.enable_metadata_sync`
+
+* Requires superuser for `citus_add_node()` and `citus_activate_node()` UDFs
+
+* Revokes read access to `columnar.chunk` from unprivileged user
+
+* Disallows unsupported lateral subqueries on distributed tables
+
+* Stops updating shard range in `citus_update_shard_statistics` for append
+  tables
+
+### citus v10.2.5 (March 15, 2022) ###
+
+* Fixes a bug that could cause `worker_save_query_explain_analyze` to fail on
+  custom types
+
+* Fixes a bug that limits usage of sequences in non-integer columns
+
+* Fixes a crash that occurs when the aggregate that cannot be pushed-down
+  returns empty result from a worker
+
+* Improves concurrent metadata syncing and metadata changing DDL operations
+
 ### citus v10.2.4 (February 1, 2022) ###
 
 * Adds support for operator class parameters in indexes

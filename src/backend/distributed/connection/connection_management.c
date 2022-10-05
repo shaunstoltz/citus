@@ -16,7 +16,7 @@
 #include "miscadmin.h"
 
 #include "safe_lib.h"
-
+#include "postmaster/postmaster.h"
 #include "access/hash.h"
 #include "commands/dbcommands.h"
 #include "distributed/backend_data.h"
@@ -63,7 +63,6 @@ static void FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry);
 static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit);
 static bool ShouldShutdownConnection(MultiConnection *connection, const int
 									 cachedConnectionCount);
-static void ResetConnection(MultiConnection *connection);
 static bool RemoteTransactionIdle(MultiConnection *connection);
 static int EventSetSizeForConnectionList(List *connections);
 
@@ -105,7 +104,7 @@ InitializeConnectionManagement(void)
 	 * management. Doing so, instead of allocating in TopMemoryContext, makes
 	 * it easier to associate used memory.
 	 */
-	ConnectionContext = AllocSetContextCreateExtended(TopMemoryContext,
+	ConnectionContext = AllocSetContextCreateInternal(TopMemoryContext,
 													  "Connection Context",
 													  ALLOCSET_DEFAULT_MINSIZE,
 													  ALLOCSET_DEFAULT_INITSIZE,
@@ -245,6 +244,23 @@ GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 
 
 /*
+ * GetConnectionForLocalQueriesOutsideTransaction returns a localhost connection for
+ * subtransaction. To avoid creating excessive connections, we reuse an
+ * existing connection.
+ */
+MultiConnection *
+GetConnectionForLocalQueriesOutsideTransaction(char *userName)
+{
+	int connectionFlag = OUTSIDE_TRANSACTION;
+	MultiConnection *connection =
+		GetNodeUserDatabaseConnection(connectionFlag, LocalHostName, PostPortNumber,
+									  userName, get_database_name(MyDatabaseId));
+
+	return connection;
+}
+
+
+/*
  * StartNodeUserDatabaseConnection() initiates a connection to a remote node.
  *
  * If user or database are NULL, the current session's defaults are used. The
@@ -288,6 +304,15 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	else
 	{
 		strlcpy(key.database, CurrentDatabaseName(), NAMEDATALEN);
+	}
+
+	if (flags & REQUIRE_REPLICATION_CONNECTION_PARAM)
+	{
+		key.replicationConnParam = true;
+	}
+	else
+	{
+		key.replicationConnParam = false;
 	}
 
 	if (CurrentCoordinatedTransactionState == COORD_TRANS_NONE)
@@ -597,6 +622,7 @@ ConnectionAvailableToNode(char *hostName, int nodePort, const char *userName,
 	key.port = nodePort;
 	strlcpy(key.user, userName, NAMEDATALEN);
 	strlcpy(key.database, database, NAMEDATALEN);
+	key.replicationConnParam = false;
 
 	ConnectionHashEntry *entry =
 		(ConnectionHashEntry *) hash_search(ConnectionHash, &key, HASH_FIND, &found);
@@ -666,6 +692,7 @@ CloseConnection(MultiConnection *connection)
 
 	strlcpy(key.hostname, connection->hostname, MAX_NODE_LENGTH);
 	key.port = connection->port;
+	key.replicationConnParam = connection->requiresReplication;
 	strlcpy(key.user, connection->user, NAMEDATALEN);
 	strlcpy(key.database, connection->database, NAMEDATALEN);
 
@@ -677,8 +704,8 @@ CloseConnection(MultiConnection *connection)
 		dlist_delete(&connection->connectionNode);
 
 		/* same for transaction state and shard/placement machinery */
-		CloseRemoteTransaction(connection);
 		CloseShardPlacementAssociation(connection);
+		ResetRemoteTransaction(connection);
 
 		/* we leave the per-host entry alive */
 		pfree(connection);
@@ -870,7 +897,19 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 
 		int eventMask = MultiConnectionStateEventMask(connectionState);
 
-		AddWaitEventToSet(waitEventSet, eventMask, sock, NULL, connectionState);
+		int waitEventSetIndex =
+			CitusAddWaitEventSetToSet(waitEventSet, eventMask, sock,
+									  NULL, (void *) connectionState);
+		if (waitEventSetIndex == WAIT_EVENT_SET_INDEX_FAILED)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("connection establishment for node %s:%d failed",
+								   connectionState->connection->hostname,
+								   connectionState->connection->port),
+							errhint("Check both the local and remote server logs for the "
+									"connection establishment errors.")));
+		}
+
 		numEventsAdded++;
 
 		if (waitCount)
@@ -1020,7 +1059,19 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				{
 					/* connection state changed, reset the event mask */
 					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
-					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
+					bool success =
+						CitusModifyWaitEvent(waitEventSet, event->pos,
+											 eventMask, NULL);
+					if (!success)
+					{
+						ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+										errmsg("connection establishment for node %s:%d "
+											   "failed", connection->hostname,
+											   connection->port),
+										errhint("Check both the local and remote server "
+												"logs for the connection establishment "
+												"errors.")));
+					}
 				}
 
 				/*
@@ -1186,6 +1237,7 @@ ConnectionHashHash(const void *key, Size keysize)
 	hash = hash_combine(hash, hash_uint32(entry->port));
 	hash = hash_combine(hash, string_hash(entry->user, NAMEDATALEN));
 	hash = hash_combine(hash, string_hash(entry->database, NAMEDATALEN));
+	hash = hash_combine(hash, hash_uint32(entry->replicationConnParam));
 
 	return hash;
 }
@@ -1199,6 +1251,7 @@ ConnectionHashCompare(const void *a, const void *b, Size keysize)
 
 	if (strncmp(ca->hostname, cb->hostname, MAX_NODE_LENGTH) != 0 ||
 		ca->port != cb->port ||
+		ca->replicationConnParam != cb->replicationConnParam ||
 		strncmp(ca->user, cb->user, NAMEDATALEN) != 0 ||
 		strncmp(ca->database, cb->database, NAMEDATALEN) != 0)
 	{
@@ -1226,6 +1279,7 @@ StartConnectionEstablishment(MultiConnection *connection, ConnectionHashKey *key
 	connection->port = key->port;
 	strlcpy(connection->database, key->database, NAMEDATALEN);
 	strlcpy(connection->user, key->user, NAMEDATALEN);
+	connection->requiresReplication = key->replicationConnParam;
 
 	connection->pgConn = PQconnectStartParams((const char **) entry->keywords,
 											  (const char **) entry->values,
@@ -1262,6 +1316,7 @@ WarmUpConnParamsHash(void)
 		key.port = workerNode->workerPort;
 		strlcpy(key.database, CurrentDatabaseName(), NAMEDATALEN);
 		strlcpy(key.user, CurrentUserName(), NAMEDATALEN);
+		key.replicationConnParam = false;
 		FindOrCreateConnParamsEntry(&key);
 	}
 }
@@ -1404,7 +1459,10 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 			/*
 			 * reset healthy session lifespan connections.
 			 */
-			ResetConnection(connection);
+			ResetRemoteTransaction(connection);
+
+			UnclaimConnection(connection);
+
 
 			cachedConnectionCount++;
 		}
@@ -1436,49 +1494,10 @@ ShouldShutdownConnection(MultiConnection *connection, const int cachedConnection
 		   connection->forceCloseAtTransactionEnd ||
 		   PQstatus(connection->pgConn) != CONNECTION_OK ||
 		   !RemoteTransactionIdle(connection) ||
+		   connection->requiresReplication ||
 		   (MaxCachedConnectionLifetime >= 0 &&
 			MillisecondsToTimeout(connection->connectionEstablishmentStart,
 								  MaxCachedConnectionLifetime) <= 0);
-}
-
-
-/*
- * IsRebalancerInitiatedBackend returns true if we are in a backend that citus
- * rebalancer initiated.
- */
-bool
-IsRebalancerInternalBackend(void)
-{
-	return application_name && strcmp(application_name, CITUS_REBALANCER_NAME) == 0;
-}
-
-
-/*
- * IsCitusInitiatedRemoteBackend returns true if we are in a backend that citus
- * initiated via remote connection.
- */
-bool
-IsCitusInternalBackend(void)
-{
-	return ExtractGlobalPID(application_name) != INVALID_CITUS_INTERNAL_BACKEND_GPID;
-}
-
-
-/*
- * ResetConnection preserves the given connection for later usage by
- * resetting its states.
- */
-static void
-ResetConnection(MultiConnection *connection)
-{
-	/* reset per-transaction state */
-	ResetRemoteTransaction(connection);
-	ResetShardPlacementAssociation(connection);
-
-	/* reset copy state */
-	connection->copyBytesWrittenSinceLastFlush = 0;
-
-	UnclaimConnection(connection);
 }
 
 
@@ -1520,4 +1539,96 @@ MarkConnectionConnected(MultiConnection *connection)
 	{
 		INSTR_TIME_SET_CURRENT(connection->connectionEstablishmentEnd);
 	}
+}
+
+
+/*
+ * CitusAddWaitEventSetToSet is a wrapper around Postgres' AddWaitEventToSet().
+ *
+ * AddWaitEventToSet() may throw hard errors. For example, when the
+ * underlying socket for a connection is closed by the remote server
+ * and already reflected by the OS, however Citus hasn't had a chance
+ * to get this information. In that case, if replication factor is >1,
+ * Citus can failover to other nodes for executing the query. Even if
+ * replication factor = 1, Citus can give much nicer errors.
+ *
+ * So CitusAddWaitEventSetToSet simply puts ModifyWaitEvent into a
+ * PG_TRY/PG_CATCH block in order to catch any hard errors, and
+ * returns this information to the caller.
+ */
+int
+CitusAddWaitEventSetToSet(WaitEventSet *set, uint32 events, pgsocket fd,
+						  Latch *latch, void *user_data)
+{
+	volatile int waitEventSetIndex = WAIT_EVENT_SET_INDEX_NOT_INITIALIZED;
+	MemoryContext savedContext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		waitEventSetIndex =
+			AddWaitEventToSet(set, events, fd, latch, (void *) user_data);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * We might be in an arbitrary memory context when the
+		 * error is thrown and we should get back to one we had
+		 * at PG_TRY() time, especially because we are not
+		 * re-throwing the error.
+		 */
+		MemoryContextSwitchTo(savedContext);
+
+		FlushErrorState();
+
+		/* let the callers know about the failure */
+		waitEventSetIndex = WAIT_EVENT_SET_INDEX_FAILED;
+	}
+	PG_END_TRY();
+
+	return waitEventSetIndex;
+}
+
+
+/*
+ * CitusModifyWaitEvent is a wrapper around Postgres' ModifyWaitEvent().
+ *
+ * ModifyWaitEvent may throw hard errors. For example, when the underlying
+ * socket for a connection is closed by the remote server and already
+ * reflected by the OS, however Citus hasn't had a chance to get this
+ * information. In that case, if replication factor is >1, Citus can
+ * failover to other nodes for executing the query. Even if replication
+ * factor = 1, Citus can give much nicer errors.
+ *
+ * So CitusModifyWaitEvent simply puts ModifyWaitEvent into a PG_TRY/PG_CATCH
+ * block in order to catch any hard errors, and returns this information to the
+ * caller.
+ */
+bool
+CitusModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
+{
+	volatile bool success = true;
+	MemoryContext savedContext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		ModifyWaitEvent(set, pos, events, latch);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * We might be in an arbitrary memory context when the
+		 * error is thrown and we should get back to one we had
+		 * at PG_TRY() time, especially because we are not
+		 * re-throwing the error.
+		 */
+		MemoryContextSwitchTo(savedContext);
+
+		FlushErrorState();
+
+		/* let the callers know about the failure */
+		success = false;
+	}
+	PG_END_TRY();
+
+	return success;
 }

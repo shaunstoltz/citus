@@ -59,12 +59,16 @@ static void AppendDefElemParallel(StringInfo buf, DefElem *def);
 static void AppendDefElemCost(StringInfo buf, DefElem *def);
 static void AppendDefElemRows(StringInfo buf, DefElem *def);
 static void AppendDefElemSet(StringInfo buf, DefElem *def);
+static void AppendDefElemSupport(StringInfo buf, DefElem *def);
 
 static void AppendVarSetValue(StringInfo buf, VariableSetStmt *setStmt);
 static void AppendRenameFunctionStmt(StringInfo buf, RenameStmt *stmt);
 static void AppendAlterFunctionSchemaStmt(StringInfo buf, AlterObjectSchemaStmt *stmt);
 static void AppendAlterFunctionOwnerStmt(StringInfo buf, AlterOwnerStmt *stmt);
 static void AppendAlterFunctionDependsStmt(StringInfo buf, AlterObjectDependsStmt *stmt);
+
+static void AppendGrantOnFunctionStmt(StringInfo buf, GrantStmt *stmt);
+static void AppendGrantOnFunctionFunctions(StringInfo buf, GrantStmt *stmt);
 
 static char * CopyAndConvertToUpperCase(const char *str);
 
@@ -179,6 +183,10 @@ AppendDefElem(StringInfo buf, DefElem *def)
 	{
 		AppendDefElemSet(buf, def);
 	}
+	else if (strcmp(def->defname, "support") == 0)
+	{
+		AppendDefElemSupport(buf, def);
+	}
 }
 
 
@@ -188,7 +196,7 @@ AppendDefElem(StringInfo buf, DefElem *def)
 static void
 AppendDefElemStrict(StringInfo buf, DefElem *def)
 {
-	if (intVal(def->arg) == 1)
+	if (boolVal(def->arg))
 	{
 		appendStringInfo(buf, " STRICT");
 	}
@@ -215,7 +223,7 @@ AppendDefElemVolatility(StringInfo buf, DefElem *def)
 static void
 AppendDefElemLeakproof(StringInfo buf, DefElem *def)
 {
-	if (intVal(def->arg) == 0)
+	if (!boolVal(def->arg))
 	{
 		appendStringInfo(buf, " NOT");
 	}
@@ -229,7 +237,7 @@ AppendDefElemLeakproof(StringInfo buf, DefElem *def)
 static void
 AppendDefElemSecurity(StringInfo buf, DefElem *def)
 {
-	if (intVal(def->arg) == 0)
+	if (!boolVal(def->arg))
 	{
 		appendStringInfo(buf, " SECURITY INVOKER");
 	}
@@ -279,6 +287,16 @@ AppendDefElemSet(StringInfo buf, DefElem *def)
 	VariableSetStmt *setStmt = castNode(VariableSetStmt, def->arg);
 
 	AppendVariableSet(buf, setStmt);
+}
+
+
+/*
+ * AppendDefElemSupport appends a string representing the DefElem to a buffer
+ */
+static void
+AppendDefElemSupport(StringInfo buf, DefElem *def)
+{
+	appendStringInfo(buf, " SUPPORT %s", defGetString(def));
 }
 
 
@@ -381,18 +399,18 @@ AppendVarSetValue(StringInfo buf, VariableSetStmt *setStmt)
 			appendStringInfo(buf, " SET %s =", quote_identifier(setStmt->name));
 		}
 
-		Value value = varArgConst->val;
-		switch (value.type)
+		Node *value = (Node *) &varArgConst->val;
+		switch (value->type)
 		{
 			case T_Integer:
 			{
-				appendStringInfo(buf, " %d", intVal(&value));
+				appendStringInfo(buf, " %d", intVal(value));
 				break;
 			}
 
 			case T_Float:
 			{
-				appendStringInfo(buf, " %s", strVal(&value));
+				appendStringInfo(buf, " %s", strVal(value));
 				break;
 			}
 
@@ -413,7 +431,7 @@ AppendVarSetValue(StringInfo buf, VariableSetStmt *setStmt)
 
 					Datum interval =
 						DirectFunctionCall3(interval_in,
-											CStringGetDatum(strVal(&value)),
+											CStringGetDatum(strVal(value)),
 											ObjectIdGetDatum(InvalidOid),
 											Int32GetDatum(typmod));
 
@@ -425,7 +443,7 @@ AppendVarSetValue(StringInfo buf, VariableSetStmt *setStmt)
 				else
 				{
 					appendStringInfo(buf, " %s", quote_literal_cstr(strVal(
-																		&value)));
+																		value)));
 				}
 				break;
 			}
@@ -695,4 +713,122 @@ CopyAndConvertToUpperCase(const char *str)
 	}
 
 	return result;
+}
+
+
+/*
+ * DeparseGrantOnFunctionStmt builds and returns a string representing the GrantOnFunctionStmt
+ */
+char *
+DeparseGrantOnFunctionStmt(Node *node)
+{
+	GrantStmt *stmt = castNode(GrantStmt, node);
+	Assert(isFunction(stmt->objtype));
+
+	StringInfoData str = { 0 };
+	initStringInfo(&str);
+
+	AppendGrantOnFunctionStmt(&str, stmt);
+
+	return str.data;
+}
+
+
+/*
+ * AppendGrantOnFunctionStmt builds and returns an SQL command representing a
+ * GRANT .. ON FUNCTION command from given GrantStmt object.
+ */
+static void
+AppendGrantOnFunctionStmt(StringInfo buf, GrantStmt *stmt)
+{
+	Assert(isFunction(stmt->objtype));
+
+	if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+	{
+		elog(ERROR,
+			 "GRANT .. ALL FUNCTIONS/PROCEDURES IN SCHEMA is not supported for formatting.");
+	}
+
+	appendStringInfoString(buf, stmt->is_grant ? "GRANT " : "REVOKE ");
+
+	if (!stmt->is_grant && stmt->grant_option)
+	{
+		appendStringInfoString(buf, "GRANT OPTION FOR ");
+	}
+
+	AppendGrantPrivileges(buf, stmt);
+
+	AppendGrantOnFunctionFunctions(buf, stmt);
+
+	AppendGrantGrantees(buf, stmt);
+
+	if (stmt->is_grant && stmt->grant_option)
+	{
+		appendStringInfoString(buf, " WITH GRANT OPTION");
+	}
+	if (!stmt->is_grant)
+	{
+		if (stmt->behavior == DROP_RESTRICT)
+		{
+			appendStringInfoString(buf, " RESTRICT");
+		}
+		else if (stmt->behavior == DROP_CASCADE)
+		{
+			appendStringInfoString(buf, " CASCADE");
+		}
+	}
+	appendStringInfoString(buf, ";");
+}
+
+
+/*
+ * AppendGrantOnFunctionFunctions appends the function names along with their arguments
+ * to the given StringInfo from the given GrantStmt
+ */
+static void
+AppendGrantOnFunctionFunctions(StringInfo buf, GrantStmt *stmt)
+{
+	ListCell *cell = NULL;
+
+	/*
+	 * The FUNCTION syntax works for plain functions, aggregate functions, and window
+	 * functions, but not for procedures; use PROCEDURE for those. Alternatively, use
+	 * ROUTINE to refer to a function, aggregate function, window function, or procedure
+	 * regardless of its precise type.
+	 * https://www.postgresql.org/docs/current/sql-grant.html
+	 */
+	appendStringInfo(buf, " ON ROUTINE ");
+
+	foreach(cell, stmt->objects)
+	{
+		/*
+		 * GrantOnFunction statement keeps its objects (functions) as
+		 * a list of ObjectWithArgs
+		 */
+		ObjectWithArgs *function = (ObjectWithArgs *) lfirst(cell);
+
+		appendStringInfoString(buf, NameListToString(function->objname));
+		if (!function->args_unspecified)
+		{
+			/* if args are specified, we should append "(arg1, arg2, ...)" to the function name */
+			const char *args = TypeNameListToString(function->objargs);
+			appendStringInfo(buf, "(%s)", args);
+		}
+		if (cell != list_tail(stmt->objects))
+		{
+			appendStringInfoString(buf, ", ");
+		}
+	}
+}
+
+
+/*
+ * isFunction returns true if the given ObjectType is a function, a procedure, a routine
+ * or an aggregate otherwise returns false
+ */
+bool
+isFunction(ObjectType objectType)
+{
+	return (objectType == OBJECT_FUNCTION || objectType == OBJECT_PROCEDURE ||
+			objectType == OBJECT_ROUTINE || objectType == OBJECT_AGGREGATE);
 }

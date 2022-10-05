@@ -14,6 +14,14 @@
 
 #include "distributed/pg_version_constants.h"
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+#define ExecARDeleteTriggers_compat(a, b, c, d, e, f) \
+	ExecARDeleteTriggers(a, b, c, d, e, f)
+#else
+#define ExecARDeleteTriggers_compat(a, b, c, d, e, f) \
+	ExecARDeleteTriggers(a, b, c, d, e)
+#endif
+
 #if PG_VERSION_NUM >= PG_VERSION_14
 #define ColumnarProcessUtility_compat(a, b, c, d, e, f, g, h) \
 	ColumnarProcessUtility(a, b, c, d, e, f, g, h)
@@ -41,9 +49,5 @@
 
 #define ExplainPropertyLong(qlabel, value, es) \
 	ExplainPropertyInteger(qlabel, NULL, value, es)
-
-#if PG_VERSION_NUM < 130000
-#define detoast_attr(X) heap_tuple_untoast_attr(X)
-#endif
 
 #endif /* COLUMNAR_COMPAT_H */

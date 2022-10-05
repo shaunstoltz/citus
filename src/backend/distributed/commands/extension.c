@@ -10,8 +10,14 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/xact.h"
 #include "citus_version.h"
+#include "catalog/dependency.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_extension_d.h"
+#include "columnar/columnar.h"
+#include "catalog/pg_foreign_data_wrapper.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
@@ -26,9 +32,12 @@
 #include "distributed/multi_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/transaction_management.h"
+#include "foreign/foreign.h"
 #include "nodes/makefuncs.h"
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/syscache.h"
 
 
 /* Local functions forward declarations for helper functions */
@@ -37,9 +46,11 @@ static void AddSchemaFieldIfMissing(CreateExtensionStmt *stmt);
 static List * FilterDistributedExtensions(List *extensionObjectList);
 static List * ExtensionNameListToObjectAddressList(List *extensionObjectList);
 static void MarkExistingObjectDependenciesDistributedIfSupported(void);
+static List * GetAllViews(void);
 static bool ShouldPropagateExtensionCommand(Node *parseTree);
 static bool IsAlterExtensionSetSchemaCitus(Node *parseTree);
 static Node * RecreateExtensionStmt(Oid extensionOid);
+static List * GenerateGrantCommandsOnExtesionDependentFDWs(Oid extensionId);
 
 
 /*
@@ -170,9 +181,12 @@ PostprocessCreateExtensionStmt(Node *node, const char *queryString)
 								(void *) createExtensionStmtSql,
 								ENABLE_DDL_PROPAGATION);
 
-	ObjectAddress extensionAddress = GetObjectAddressFromParseTree(node, false);
+	List *extensionAddresses = GetObjectAddressListFromParseTree(node, false, true);
 
-	EnsureDependenciesExistOnAllNodes(&extensionAddress);
+	/*  the code-path only supports a single object */
+	Assert(list_length(extensionAddresses) == 1);
+
+	EnsureAllObjectDependenciesExistOnAllNodes(extensionAddresses);
 
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
@@ -295,7 +309,7 @@ FilterDistributedExtensions(List *extensionObjectList)
 {
 	List *extensionNameList = NIL;
 
-	Value *objectName = NULL;
+	String *objectName = NULL;
 	foreach_ptr(objectName, extensionObjectList)
 	{
 		const char *extensionName = strVal(objectName);
@@ -308,10 +322,9 @@ FilterDistributedExtensions(List *extensionObjectList)
 			continue;
 		}
 
-		ObjectAddress address = { 0 };
-		ObjectAddressSet(address, ExtensionRelationId, extensionOid);
-
-		if (!IsObjectDistributed(&address))
+		ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*address, ExtensionRelationId, extensionOid);
+		if (!IsAnyObjectDistributed(list_make1(address)))
 		{
 			continue;
 		}
@@ -334,7 +347,7 @@ ExtensionNameListToObjectAddressList(List *extensionObjectList)
 {
 	List *extensionObjectAddressList = NIL;
 
-	Value *objectName;
+	String *objectName;
 	foreach_ptr(objectName, extensionObjectList)
 	{
 		/*
@@ -400,7 +413,10 @@ PreprocessAlterExtensionSchemaStmt(Node *node, const char *queryString,
 List *
 PostprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
 {
-	ObjectAddress extensionAddress = GetObjectAddressFromParseTree(node, false);
+	List *extensionAddresses = GetObjectAddressListFromParseTree(node, false, true);
+
+	/*  the code-path only supports a single object */
+	Assert(list_length(extensionAddresses) == 1);
 
 	if (!ShouldPropagateExtensionCommand(node))
 	{
@@ -408,7 +424,7 @@ PostprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
 	}
 
 	/* dependencies (schema) have changed let's ensure they exist */
-	EnsureDependenciesExistOnAllNodes(&extensionAddress);
+	EnsureAllObjectDependenciesExistOnAllNodes(extensionAddresses);
 
 	return NIL;
 }
@@ -493,7 +509,7 @@ PostprocessAlterExtensionCitusUpdateStmt(Node *node)
  *
  * Note that this function is not responsible for ensuring if dependencies exist on
  * nodes and satisfying these dependendencies if not exists, which is already done by
- * EnsureDependenciesExistOnAllNodes on demand. Hence, this function is just designed
+ * EnsureAllObjectDependenciesExistOnAllNodes on demand. Hence, this function is just designed
  * to be used when "ALTER EXTENSION citus UPDATE" is executed.
  * This is because we want to add existing objects that would have already been in
  * pg_dist_object if we had created them in new version of Citus to pg_dist_object.
@@ -510,25 +526,77 @@ MarkExistingObjectDependenciesDistributedIfSupported()
 	Oid citusTableId = InvalidOid;
 	foreach_oid(citusTableId, citusTableIdList)
 	{
-		ObjectAddress tableAddress = { 0 };
-		ObjectAddressSet(tableAddress, RelationRelationId, citusTableId);
-
-		if (ShouldSyncTableMetadata(citusTableId))
+		if (!ShouldMarkRelationDistributed(citusTableId))
 		{
-			/* we need to pass pointer allocated in the heap */
-			ObjectAddress *addressPointer = palloc0(sizeof(ObjectAddress));
-			*addressPointer = tableAddress;
-
-			/* as of Citus 11, tables that should be synced are also considered object */
-			resultingObjectAddresses = lappend(resultingObjectAddresses, addressPointer);
+			continue;
 		}
 
-		List *distributableDependencyObjectAddresses =
-			GetDistributableDependenciesForObject(&tableAddress);
+		/* refrain reading the metadata cache for all tables */
+		if (ShouldSyncTableMetadataViaCatalog(citusTableId))
+		{
+			ObjectAddress tableAddress = { 0 };
+			ObjectAddressSet(tableAddress, RelationRelationId, citusTableId);
 
-		resultingObjectAddresses = list_concat(resultingObjectAddresses,
-											   distributableDependencyObjectAddresses);
+			/*
+			 * We mark tables distributed immediately because we also need to mark
+			 * views as distributed. We check whether the views that depend on
+			 * the table has any auto-distirbutable dependencies below. Citus
+			 * currently cannot "auto" distribute tables as dependencies, so we
+			 * mark them distributed immediately.
+			 */
+			MarkObjectDistributedLocally(&tableAddress);
+
+			/*
+			 * All the distributable dependencies of a table should be marked as
+			 * distributed.
+			 */
+			List *distributableDependencyObjectAddresses =
+				GetDistributableDependenciesForObject(&tableAddress);
+
+			resultingObjectAddresses =
+				list_concat(resultingObjectAddresses,
+							distributableDependencyObjectAddresses);
+		}
 	}
+
+	/*
+	 * As of Citus 11, views on Citus tables that do not have any unsupported
+	 * dependency should also be distributed.
+	 *
+	 * In general, we mark views distributed as long as it does not have
+	 * any unsupported dependencies.
+	 */
+	List *viewList = GetAllViews();
+	Oid viewOid = InvalidOid;
+	foreach_oid(viewOid, viewList)
+	{
+		if (!ShouldMarkRelationDistributed(viewOid))
+		{
+			continue;
+		}
+
+		ObjectAddress viewAddress = { 0 };
+		ObjectAddressSet(viewAddress, RelationRelationId, viewOid);
+
+		/*
+		 * If a view depends on multiple views, that view will be marked
+		 * as distributed while it is processed for the last view
+		 * table.
+		 */
+		MarkObjectDistributedLocally(&viewAddress);
+
+		/* we need to pass pointer allocated in the heap */
+		ObjectAddress *addressPointer = palloc0(sizeof(ObjectAddress));
+		*addressPointer = viewAddress;
+
+		List *distributableDependencyObjectAddresses =
+			GetDistributableDependenciesForObject(&viewAddress);
+
+		resultingObjectAddresses =
+			list_concat(resultingObjectAddresses,
+						distributableDependencyObjectAddresses);
+	}
+
 
 	/* resolve dependencies of the objects in pg_dist_object*/
 	List *distributedObjectAddressList = GetDistributedObjectAddressList();
@@ -562,6 +630,40 @@ MarkExistingObjectDependenciesDistributedIfSupported()
 	}
 
 	SetLocalEnableMetadataSync(prevMetadataSyncValue);
+}
+
+
+/*
+ * GetAllViews returns list of view oids that exists on this server.
+ */
+static List *
+GetAllViews(void)
+{
+	List *viewOidList = NIL;
+
+	Relation pgClass = table_open(RelationRelationId, AccessShareLock);
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgClass, InvalidOid, false, NULL,
+													0, NULL);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_class relationForm = (Form_pg_class) GETSTRUCT(heapTuple);
+
+		/* we're only interested in views */
+		if (relationForm->relkind == RELKIND_VIEW)
+		{
+			viewOidList = lappend_oid(viewOidList, relationForm->oid);
+		}
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgClass, NoLock);
+
+	return viewOidList;
 }
 
 
@@ -651,6 +753,60 @@ IsCreateAlterExtensionUpdateCitusStmt(Node *parseTree)
 
 
 /*
+ * PreProcessCreateExtensionCitusStmtForColumnar determines whether need to
+ * install citus_columnar first or citus_columnar is supported on current
+ * citus version, when a given utility is a CREATE statement
+ */
+void
+PreprocessCreateExtensionStmtForCitusColumnar(Node *parsetree)
+{
+	/*CREATE EXTENSION CITUS (version Z) */
+	CreateExtensionStmt *createExtensionStmt = castNode(CreateExtensionStmt,
+														parsetree);
+
+	if (strcmp(createExtensionStmt->extname, "citus") == 0)
+	{
+		int versionNumber = (int) (100 * strtod(CITUS_MAJORVERSION, NULL));
+		DefElem *newVersionValue = GetExtensionOption(createExtensionStmt->options,
+													  "new_version");
+
+		/*create extension citus version xxx*/
+		if (newVersionValue)
+		{
+			char *newVersion = strdup(defGetString(newVersionValue));
+			versionNumber = GetExtensionVersionNumber(newVersion);
+		}
+
+		/*citus version >= 11.1 requires install citus_columnar first*/
+		if (versionNumber >= 1110 && !CitusHasBeenLoaded())
+		{
+			if (get_extension_oid("citus_columnar", true) == InvalidOid)
+			{
+				CreateExtensionWithVersion("citus_columnar", NULL);
+			}
+		}
+	}
+
+	/*Edge case check: citus_columnar are supported on citus version >= 11.1*/
+	if (strcmp(createExtensionStmt->extname, "citus_columnar") == 0)
+	{
+		Oid citusOid = get_extension_oid("citus", true);
+		if (citusOid != InvalidOid)
+		{
+			char *curCitusVersion = strdup(get_extension_version(citusOid));
+			int curCitusVersionNum = GetExtensionVersionNumber(curCitusVersion);
+			if (curCitusVersionNum < 1110)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg(
+									"must upgrade citus to version 11.1-1 first before install citus_columnar")));
+			}
+		}
+	}
+}
+
+
+/*
  * IsDropCitusExtensionStmt iterates the objects to be dropped in a drop statement
  * and try to find citus extension there.
  */
@@ -671,7 +827,7 @@ IsDropCitusExtensionStmt(Node *parseTree)
 	}
 
 	/* now that we have a DropStmt, check if citus extension is among the objects to dropped */
-	Value *objectName;
+	String *objectName;
 	foreach_ptr(objectName, dropStmt->objects)
 	{
 		const char *extensionName = strVal(objectName);
@@ -718,6 +874,101 @@ IsAlterExtensionSetSchemaCitus(Node *parseTree)
 
 
 /*
+ * PreprocessAlterExtensionCitusStmtForCitusColumnar pre-process the case when upgrade citus
+ * to version that support citus_columnar, or downgrade citus to lower version that
+ * include columnar inside citus extension
+ */
+void
+PreprocessAlterExtensionCitusStmtForCitusColumnar(Node *parseTree)
+{
+	/*upgrade citus: alter extension citus update to 'xxx' */
+	DefElem *newVersionValue = GetExtensionOption(
+		((AlterExtensionStmt *) parseTree)->options, "new_version");
+	Oid citusColumnarOid = get_extension_oid("citus_columnar", true);
+	if (newVersionValue)
+	{
+		char *newVersion = defGetString(newVersionValue);
+		double newVersionNumber = GetExtensionVersionNumber(strdup(newVersion));
+
+		/*alter extension citus update to version >= 11.1-1, and no citus_columnar installed */
+		if (newVersionNumber >= 1110 && citusColumnarOid == InvalidOid)
+		{
+			/*it's upgrade citus to 11.1-1 or further version */
+			CreateExtensionWithVersion("citus_columnar", CITUS_COLUMNAR_INTERNAL_VERSION);
+		}
+		else if (newVersionNumber < 1110 && citusColumnarOid != InvalidOid)
+		{
+			/*downgrade citus, need downgrade citus_columnar to Y */
+			AlterExtensionUpdateStmt("citus_columnar", CITUS_COLUMNAR_INTERNAL_VERSION);
+		}
+	}
+	else
+	{
+		/*alter extension citus update without specifying the version*/
+		int versionNumber = (int) (100 * strtod(CITUS_MAJORVERSION, NULL));
+		if (versionNumber >= 1110)
+		{
+			if (citusColumnarOid == InvalidOid)
+			{
+				CreateExtensionWithVersion("citus_columnar",
+										   CITUS_COLUMNAR_INTERNAL_VERSION);
+			}
+		}
+	}
+}
+
+
+/*
+ * PostprocessAlterExtensionCitusStmtForCitusColumnar process the case when upgrade citus
+ * to version that support citus_columnar, or downgrade citus to lower version that
+ * include columnar inside citus extension
+ */
+void
+PostprocessAlterExtensionCitusStmtForCitusColumnar(Node *parseTree)
+{
+	DefElem *newVersionValue = GetExtensionOption(
+		((AlterExtensionStmt *) parseTree)->options, "new_version");
+	Oid citusColumnarOid = get_extension_oid("citus_columnar", true);
+	if (newVersionValue)
+	{
+		char *newVersion = defGetString(newVersionValue);
+		double newVersionNumber = GetExtensionVersionNumber(strdup(newVersion));
+		if (newVersionNumber >= 1110 && citusColumnarOid != InvalidOid)
+		{
+			/*upgrade citus, after "ALTER EXTENSION citus update to xxx" updates citus_columnar Y to version Z. */
+			char *curColumnarVersion = get_extension_version(citusColumnarOid);
+			if (strcmp(curColumnarVersion, CITUS_COLUMNAR_INTERNAL_VERSION) == 0)
+			{
+				AlterExtensionUpdateStmt("citus_columnar", "11.1-1");
+			}
+		}
+		else if (newVersionNumber < 1110 && citusColumnarOid != InvalidOid)
+		{
+			/*downgrade citus, after "ALTER EXTENSION citus update to xxx" drops citus_columnar extension */
+			char *curColumnarVersion = get_extension_version(citusColumnarOid);
+			if (strcmp(curColumnarVersion, CITUS_COLUMNAR_INTERNAL_VERSION) == 0)
+			{
+				RemoveExtensionById(citusColumnarOid);
+			}
+		}
+	}
+	else
+	{
+		/*alter extension citus update, need upgrade citus_columnar from Y to Z*/
+		int versionNumber = (int) (100 * strtod(CITUS_MAJORVERSION, NULL));
+		if (versionNumber >= 1110)
+		{
+			char *curColumnarVersion = get_extension_version(citusColumnarOid);
+			if (strcmp(curColumnarVersion, CITUS_COLUMNAR_INTERNAL_VERSION) == 0)
+			{
+				AlterExtensionUpdateStmt("citus_columnar", "11.1-1");
+			}
+		}
+	}
+}
+
+
+/*
  * CreateExtensionDDLCommand returns a list of DDL statements (const char *) to be
  * executed on a node to recreate the extension addressed by the extensionAddress.
  */
@@ -731,6 +982,12 @@ CreateExtensionDDLCommand(const ObjectAddress *extensionAddress)
 	const char *ddlCommand = DeparseTreeNode(stmt);
 
 	List *ddlCommands = list_make1((void *) ddlCommand);
+
+	/* any privilege granted on FDWs that belong to the extension should be included */
+	List *FDWGrants =
+		GenerateGrantCommandsOnExtesionDependentFDWs(extensionAddress->objectId);
+
+	ddlCommands = list_concat(ddlCommands, FDWGrants);
 
 	return ddlCommands;
 }
@@ -791,11 +1048,93 @@ RecreateExtensionStmt(Oid extensionOid)
 
 
 /*
+ * GenerateGrantCommandsOnExtesionDependentFDWs returns a list of commands that GRANTs
+ * the privileges on FDWs that are depending on the given extension.
+ */
+static List *
+GenerateGrantCommandsOnExtesionDependentFDWs(Oid extensionId)
+{
+	List *commands = NIL;
+	List *FDWOids = GetDependentFDWsToExtension(extensionId);
+
+	Oid FDWOid = InvalidOid;
+	foreach_oid(FDWOid, FDWOids)
+	{
+		Acl *aclEntry = GetPrivilegesForFDW(FDWOid);
+
+		if (aclEntry == NULL)
+		{
+			continue;
+		}
+
+		AclItem *privileges = ACL_DAT(aclEntry);
+		int numberOfPrivsGranted = ACL_NUM(aclEntry);
+
+		for (int i = 0; i < numberOfPrivsGranted; i++)
+		{
+			commands = list_concat(commands,
+								   GenerateGrantOnFDWQueriesFromAclItem(FDWOid,
+																		&privileges[i]));
+		}
+	}
+
+	return commands;
+}
+
+
+/*
+ * GetDependentFDWsToExtension gets an extension oid and returns the list of oids of FDWs
+ * that are depending on the given extension.
+ */
+List *
+GetDependentFDWsToExtension(Oid extensionId)
+{
+	List *extensionFDWs = NIL;
+	ScanKeyData key[3];
+	int scanKeyCount = 3;
+	HeapTuple tup;
+
+	Relation pgDepend = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ExtensionRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(extensionId));
+	ScanKeyInit(&key[2],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ForeignDataWrapperRelationId));
+
+	SysScanDesc scan = systable_beginscan(pgDepend, InvalidOid, false,
+										  NULL, scanKeyCount, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend pgDependEntry = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (pgDependEntry->deptype == DEPENDENCY_EXTENSION)
+		{
+			extensionFDWs = lappend_oid(extensionFDWs, pgDependEntry->objid);
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(pgDepend, AccessShareLock);
+
+	return extensionFDWs;
+}
+
+
+/*
  * AlterExtensionSchemaStmtObjectAddress returns the ObjectAddress of the extension that is
  * the subject of the AlterObjectSchemaStmt. Errors if missing_ok is false.
  */
-ObjectAddress
-AlterExtensionSchemaStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterExtensionSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_EXTENSION);
@@ -811,10 +1150,10 @@ AlterExtensionSchemaStmtObjectAddress(Node *node, bool missing_ok)
 							   extensionName)));
 	}
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, ExtensionRelationId, extensionOid);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, ExtensionRelationId, extensionOid);
 
-	return address;
+	return list_make1(address);
 }
 
 
@@ -822,8 +1161,8 @@ AlterExtensionSchemaStmtObjectAddress(Node *node, bool missing_ok)
  * AlterExtensionUpdateStmtObjectAddress returns the ObjectAddress of the extension that is
  * the subject of the AlterExtensionStmt. Errors if missing_ok is false.
  */
-ObjectAddress
-AlterExtensionUpdateStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterExtensionUpdateStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterExtensionStmt *stmt = castNode(AlterExtensionStmt, node);
 	const char *extensionName = stmt->extname;
@@ -837,8 +1176,85 @@ AlterExtensionUpdateStmtObjectAddress(Node *node, bool missing_ok)
 							   extensionName)));
 	}
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, ExtensionRelationId, extensionOid);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, ExtensionRelationId, extensionOid);
 
-	return address;
+	return list_make1(address);
+}
+
+
+/*
+ * CreateExtensionWithVersion builds and execute create extension statements
+ * per given extension name and extension verision
+ */
+void
+CreateExtensionWithVersion(char *extname, char *extVersion)
+{
+	CreateExtensionStmt *createExtensionStmt = makeNode(CreateExtensionStmt);
+
+	/* set location to -1 as it is unknown */
+	int location = -1;
+
+	/* set extension name and if_not_exists fields */
+	createExtensionStmt->extname = extname;
+	createExtensionStmt->if_not_exists = true;
+
+	if (extVersion == NULL)
+	{
+		createExtensionStmt->options = NIL;
+	}
+	else
+	{
+		Node *extensionVersionArg = (Node *) makeString(extVersion);
+		DefElem *extensionVersionElement = makeDefElem("new_version", extensionVersionArg,
+													   location);
+		createExtensionStmt->options = lappend(createExtensionStmt->options,
+											   extensionVersionElement);
+	}
+
+	CreateExtension(NULL, createExtensionStmt);
+	CommandCounterIncrement();
+}
+
+
+/*
+ * GetExtensionVersionNumber convert extension version to real value
+ */
+int
+GetExtensionVersionNumber(char *extVersion)
+{
+	char *strtokPosition = NULL;
+	char *versionVal = strtok_r(extVersion, "-", &strtokPosition);
+	double versionNumber = strtod(versionVal, NULL);
+	return (int) (versionNumber * 100);
+}
+
+
+/*
+ * AlterExtensionUpdateStmt builds and execute Alter extension statements
+ * per given extension name and updates extension verision
+ */
+void
+AlterExtensionUpdateStmt(char *extname, char *extVersion)
+{
+	AlterExtensionStmt *alterExtensionStmt = makeNode(AlterExtensionStmt);
+
+	/* set location to -1 as it is unknown */
+	int location = -1;
+	alterExtensionStmt->extname = extname;
+
+	if (extVersion == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("alter extension \"%s\" should not be empty",
+							   extVersion)));
+	}
+
+	Node *extensionVersionArg = (Node *) makeString(extVersion);
+	DefElem *extensionVersionElement = makeDefElem("new_version", extensionVersionArg,
+												   location);
+	alterExtensionStmt->options = lappend(alterExtensionStmt->options,
+										  extensionVersionElement);
+	ExecAlterExtensionStmt(NULL, alterExtensionStmt);
+	CommandCounterIncrement();
 }

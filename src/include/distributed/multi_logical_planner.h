@@ -90,6 +90,9 @@ typedef struct MultiTable
 	Alias *referenceNames;
 	Query *subquery; /* this field is only valid for non-relation subquery types */
 	bool includePartitions;
+
+	/* FROM .. TABLESAMPLE clause */
+	TableSampleClause *tablesample;
 } MultiTable;
 
 
@@ -175,9 +178,7 @@ typedef struct MultiExtendedOp
 	List *sortClauseList;
 	Node *limitCount;
 	Node *limitOffset;
-#if PG_VERSION_NUM >= PG_VERSION_13
 	LimitOption limitOption;
-#endif
 	Node *havingQual;
 	List *distinctClause;
 	List *windowClause;

@@ -17,6 +17,7 @@
 # ---
 test: multi_extension
 test: single_node
+test: relation_access_tracking_single_node
 test: single_node_truncate
 test: multi_test_helpers multi_test_helpers_superuser
 test: multi_cluster_management
@@ -35,6 +36,7 @@ test: distributed_triggers
 test: multi_test_catalog_views
 test: multi_table_ddl
 test: multi_sequence_default
+test: grant_on_sequence_propagation
 test: multi_name_lengths
 test: multi_name_resolution
 test: multi_metadata_access
@@ -45,7 +47,7 @@ test: multi_read_from_secondaries
 # ----------
 # multi_citus_tools tests utility functions written for citus tools
 # ----------
-test: multi_citus_tools
+test: multi_citus_tools citus_depended_object
 
 # ----------
 # multi_replicate_reference_table tests replicating reference tables to new nodes after we add new nodes
@@ -60,7 +62,7 @@ test: multi_remove_node_reference_table
 # ----------
 test: multi_create_table
 test: multi_create_table_superuser
-test: multi_create_table_constraints multi_master_protocol multi_load_data multi_load_data_superuser multi_behavioral_analytics_create_table
+test: multi_master_protocol multi_load_data multi_load_data_superuser multi_behavioral_analytics_create_table
 test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries multi_insert_select multi_behavioral_analytics_create_table_superuser
 test: multi_shard_update_delete recursive_dml_with_different_planners_executors
 test: insert_select_repartition window_functions dml_recursive multi_insert_select_window
@@ -178,7 +180,7 @@ test: multi_modifications
 test: multi_distribution_metadata
 test: multi_prune_shard_list
 test: multi_upsert multi_simple_queries multi_data_types
-test: master_copy_shard_placement
+test: citus_copy_shard_placement
 # multi_utilities cannot be run in parallel with other tests because it checks
 # global locks
 test: multi_utilities
@@ -186,7 +188,7 @@ test: foreign_key_to_reference_table validate_constraint
 test: multi_repartition_udt multi_repartitioned_subquery_udf multi_subtransactions
 
 test: multi_modifying_xacts
-test: multi_generate_ddl_commands multi_repair_shards
+test: multi_generate_ddl_commands
 test: multi_create_shards
 test: multi_transaction_recovery
 
@@ -229,6 +231,9 @@ test: multi_drop_extension
 test: multi_metadata_sync
 test: multi_unsupported_worker_operations
 
+test: grant_on_function_propagation
+test: grant_on_foreign_server_propagation
+
 # ----------
 # grant_on_schema_propagation tests if the GRANT ... ON SCHEMA queries are propagated correctly
 # multi_schema_support makes sure we can work with tables in schemas other than public with no problem
@@ -248,10 +253,8 @@ test: multi_truncate
 
 # ----------
 # multi_colocation_utils tests utility functions written for co-location feature & internal API
-# multi_colocated_shard_transfer tests master_copy_shard_placement with colocated tables.
 # ----------
 test: multi_colocation_utils
-test: multi_colocated_shard_transfer
 
 # ----------
 # node_conninfo_reload tests that node_conninfo changes take effect
@@ -272,7 +275,7 @@ test: add_coordinator
 test: replicate_reference_tables_to_coordinator
 test: citus_local_tables
 test: mixed_relkind_tests
-test: multi_row_router_insert
+test: multi_row_router_insert create_distributed_table_concurrently
 test: multi_reference_table citus_local_tables_queries
 test: citus_local_table_triggers
 test: coordinator_shouldhaveshards
@@ -283,7 +286,9 @@ test: create_citus_local_table_cascade
 test: fkeys_between_local_ref
 test: auto_undist_citus_local
 test: mx_regular_user
+test: citus_locks
 test: global_cancel
+test: sequencenes_owned_by
 test: remove_coordinator
 
 # ----------
@@ -317,13 +322,14 @@ test: ssl_by_default
 # TODO: After deprecating parameterless create_distributed_function combine
 # distributed_functions and function_propagation tests
 # ---------
-test: distributed_types distributed_types_conflict disable_object_propagation distributed_types_xact_add_enum_value text_search
+test: distributed_types distributed_types_conflict disable_object_propagation distributed_types_xact_add_enum_value text_search distributed_domain
 test: check_mx
 test: distributed_functions distributed_functions_conflict
 test: distributed_collations
 test: distributed_procedure
 test: distributed_collations_conflict
 test: function_propagation
+test: view_propagation
 test: check_mx
 
 # ---------

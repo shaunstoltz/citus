@@ -25,6 +25,11 @@
 #include "columnar/columnar_compression.h"
 #include "columnar/columnar_metadata.h"
 
+#define COLUMNAR_AM_NAME "columnar"
+#define COLUMNAR_MODULE_NAME "citus_columnar"
+
+#define COLUMNAR_SETOPTIONS_HOOK_SYM "ColumnarTableSetOptions_hook"
+
 /* Defines for valid option names */
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_limit"
@@ -47,6 +52,9 @@
 #define COLUMNAR_POSTSCRIPT_SIZE_LENGTH 1
 #define COLUMNAR_POSTSCRIPT_SIZE_MAX 256
 #define COLUMNAR_BYTES_PER_PAGE (BLCKSZ - SizeOfPageHeaderData)
+
+/*global variables for citus_columnar fake version Y */
+#define CITUS_COLUMNAR_INTERNAL_VERSION "11.1-0"
 
 /*
  * ColumnarOptions holds the option values to be used when reading or writing
@@ -187,6 +195,10 @@ typedef enum StripeWriteStateEnum
 	STRIPE_WRITE_IN_PROGRESS
 } StripeWriteStateEnum;
 
+typedef bool (*ColumnarSupportsIndexAM_type)(char *);
+typedef const char *(*CompressionTypeStr_type)(CompressionType);
+typedef bool (*IsColumnarTableAmTable_type)(Oid);
+typedef bool (*ReadColumnarOptions_type)(Oid, ColumnarOptions *);
 
 /* ColumnarReadState represents state of a columnar scan. */
 struct ColumnarReadState;
@@ -205,8 +217,8 @@ extern int columnar_compression_level;
 
 /* called when the user changes options on the given relation */
 typedef void (*ColumnarTableSetOptions_hook_type)(Oid relid, ColumnarOptions options);
-extern ColumnarTableSetOptions_hook_type ColumnarTableSetOptions_hook;
 
+extern void columnar_init(void);
 extern void columnar_init_gucs(void);
 
 extern CompressionType ParseCompressionType(const char *compressionTypeString);
@@ -302,6 +314,7 @@ extern Datum columnar_relation_storageid(PG_FUNCTION_ARGS);
 /* write_state_management.c */
 extern ColumnarWriteState * columnar_init_write_state(Relation relation, TupleDesc
 													  tupdesc,
+													  Oid tupSlotRelationId,
 													  SubTransactionId currentSubXid);
 extern void FlushWriteStateForRelfilenode(Oid relfilenode, SubTransactionId
 										  currentSubXid);
@@ -314,6 +327,5 @@ extern void NonTransactionDropWriteState(Oid relfilenode);
 extern bool PendingWritesInUpperTransactions(Oid relfilenode,
 											 SubTransactionId currentSubXid);
 extern MemoryContext GetWriteContextForDebug(void);
-
 
 #endif /* COLUMNAR_H */

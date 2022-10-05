@@ -16,28 +16,34 @@
 #include "distributed/deparser.h"
 #include "distributed/pg_version_constants.h"
 #include "distributed/version_compat.h"
+#include "distributed/commands/utility_hook.h"
 
 static DistributeObjectOps NoDistributeOps = {
 	.deparse = NULL,
 	.qualify = NULL,
 	.preprocess = NULL,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_NONE,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Aggregate_AlterObjectSchema = {
 	.deparse = DeparseAlterFunctionSchemaStmt,
 	.qualify = QualifyAlterFunctionSchemaStmt,
-	.preprocess = PreprocessAlterFunctionSchemaStmt,
-	.postprocess = PostprocessAlterFunctionSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Aggregate_AlterOwner = {
 	.deparse = DeparseAlterFunctionOwnerStmt,
 	.qualify = QualifyAlterFunctionOwnerStmt,
-	.preprocess = PreprocessAlterFunctionOwnerStmt,
-	.postprocess = PostprocessAlterFunctionOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionOwnerObjectAddress,
 	.markDistributed = false,
 };
@@ -45,31 +51,47 @@ static DistributeObjectOps Aggregate_Define = {
 	.deparse = NULL,
 	.qualify = QualifyDefineAggregateStmt,
 	.preprocess = NULL,
-	.postprocess = PostprocessDefineAggregateStmt,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_AGGREGATE,
+	.operationType = DIST_OPS_CREATE,
 	.address = DefineAggregateStmtObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps Aggregate_Drop = {
 	.deparse = DeparseDropFunctionStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropFunctionStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Aggregate_Rename = {
 	.deparse = DeparseRenameFunctionStmt,
 	.qualify = QualifyRenameFunctionStmt,
-	.preprocess = PreprocessRenameFunctionStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameFunctionStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Aggregate_Grant = {
+	.deparse = DeparseGrantOnFunctionStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnFunctionStmt,
+	.postprocess = PostprocessGrantOnFunctionStmt,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_AlterEnum = {
 	.deparse = DeparseAlterEnumStmt,
 	.qualify = QualifyAlterEnumStmt,
-	.preprocess = PreprocessAlterEnumStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterEnumStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -78,6 +100,7 @@ static DistributeObjectOps Any_AlterExtension = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterExtensionUpdateStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterExtensionUpdateStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -86,15 +109,18 @@ static DistributeObjectOps Any_AlterExtensionContents = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterExtensionContentsStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_AlterForeignServer = {
 	.deparse = DeparseAlterForeignServerStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessAlterForeignServerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.objectType = OBJECT_FOREIGN_SERVER,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterForeignServerStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_AlterFunction = {
@@ -102,6 +128,7 @@ static DistributeObjectOps Any_AlterFunction = {
 	.qualify = QualifyAlterFunctionStmt,
 	.preprocess = PreprocessAlterFunctionStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -110,6 +137,7 @@ static DistributeObjectOps Any_AlterPolicy = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterPolicyStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -118,6 +146,7 @@ static DistributeObjectOps Any_AlterRole = {
 	.qualify = NULL,
 	.preprocess = NULL,
 	.postprocess = PostprocessAlterRoleStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterRoleStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -126,6 +155,7 @@ static DistributeObjectOps Any_AlterRoleSet = {
 	.qualify = QualifyAlterRoleSetStmt,
 	.preprocess = PreprocessAlterRoleSetStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterRoleSetStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -134,6 +164,7 @@ static DistributeObjectOps Any_AlterTableMoveAll = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTableMoveAllStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -142,22 +173,39 @@ static DistributeObjectOps Any_Cluster = {
 	.qualify = NULL,
 	.preprocess = PreprocessClusterStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_NONE,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_CompositeType = {
 	.deparse = DeparseCompositeTypeStmt,
 	.qualify = QualifyCompositeTypeStmt,
-	.preprocess = PreprocessCompositeTypeStmt,
-	.postprocess = PostprocessCompositeTypeStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_CREATE,
+	.featureFlag = &EnableCreateTypePropagation,
 	.address = CompositeTypeStmtObjectAddress,
+	.markDistributed = true,
+};
+static DistributeObjectOps Any_CreateDomain = {
+	.deparse = DeparseCreateDomainStmt,
+	.qualify = QualifyCreateDomainStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_CREATE,
+	.address = CreateDomainStmtObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps Any_CreateEnum = {
 	.deparse = DeparseCreateEnumStmt,
 	.qualify = QualifyCreateEnumStmt,
-	.preprocess = PreprocessCreateEnumStmt,
-	.postprocess = PostprocessCreateEnumStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_CREATE,
+	.featureFlag = &EnableCreateTypePropagation,
 	.address = CreateEnumStmtObjectAddress,
 	.markDistributed = true,
 };
@@ -166,6 +214,7 @@ static DistributeObjectOps Any_CreateExtension = {
 	.qualify = NULL,
 	.preprocess = NULL,
 	.postprocess = PostprocessCreateExtensionStmt,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateExtensionStmtObjectAddress,
 	.markDistributed = true,
 };
@@ -174,22 +223,53 @@ static DistributeObjectOps Any_CreateFunction = {
 	.qualify = NULL,
 	.preprocess = PreprocessCreateFunctionStmt,
 	.postprocess = PostprocessCreateFunctionStmt,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateFunctionStmtObjectAddress,
+	.markDistributed = true,
+};
+static DistributeObjectOps Any_View = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = PreprocessViewStmt,
+	.postprocess = PostprocessViewStmt,
+	.operationType = DIST_OPS_CREATE,
+	.address = ViewStmtObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps Any_CreatePolicy = {
 	.deparse = NULL,
 	.qualify = NULL,
-	.preprocess = PreprocessCreatePolicyStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreatePolicyStmt,
+	.operationType = DIST_OPS_CREATE,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Any_CreateRole = {
+	.deparse = DeparseCreateRoleStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessCreateRoleStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_CREATE,
+	.address = CreateRoleStmtObjectAddress,
+	.markDistributed = true,
+};
+static DistributeObjectOps Any_DropRole = {
+	.deparse = DeparseDropRoleStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessDropRoleStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_CreateForeignServer = {
 	.deparse = DeparseCreateForeignServerStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessCreateForeignServerStmt,
-	.postprocess = PostprocessCreateForeignServerStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_FOREIGN_SERVER,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateForeignServerStmtObjectAddress,
 	.markDistributed = true,
 };
@@ -198,6 +278,7 @@ static DistributeObjectOps Any_CreateSchema = {
 	.qualify = NULL,
 	.preprocess = PreprocessCreateSchemaStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateSchemaStmtObjectAddress,
 	.markDistributed = true,
 };
@@ -206,6 +287,7 @@ static DistributeObjectOps Any_CreateStatistics = {
 	.qualify = QualifyCreateStatisticsStmt,
 	.preprocess = PreprocessCreateStatisticsStmt,
 	.postprocess = PostprocessCreateStatisticsStmt,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateStatisticsStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -214,6 +296,7 @@ static DistributeObjectOps Any_CreateTrigger = {
 	.qualify = NULL,
 	.preprocess = NULL,
 	.postprocess = PostprocessCreateTriggerStmt,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateTriggerStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -222,6 +305,16 @@ static DistributeObjectOps Any_Grant = {
 	.qualify = NULL,
 	.preprocess = PreprocessGrantStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Any_GrantRole = {
+	.deparse = DeparseGrantRoleStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantRoleStmt,
+	.postprocess = PostprocessGrantRoleStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -230,6 +323,7 @@ static DistributeObjectOps Any_Index = {
 	.qualify = NULL,
 	.preprocess = PreprocessIndexStmt,
 	.postprocess = PostprocessIndexStmt,
+	.operationType = DIST_OPS_CREATE,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -238,7 +332,8 @@ static DistributeObjectOps Any_Reindex = {
 	.qualify = NULL,
 	.preprocess = PreprocessReindexStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.operationType = DIST_OPS_NONE,
+	.address = ReindexStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Any_Rename = {
@@ -246,6 +341,7 @@ static DistributeObjectOps Any_Rename = {
 	.qualify = NULL,
 	.preprocess = PreprocessRenameStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -254,55 +350,128 @@ static DistributeObjectOps Attribute_Rename = {
 	.qualify = QualifyRenameAttributeStmt,
 	.preprocess = PreprocessRenameAttributeStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameAttributeStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Collation_AlterObjectSchema = {
 	.deparse = DeparseAlterCollationSchemaStmt,
 	.qualify = QualifyAlterCollationSchemaStmt,
-	.preprocess = PreprocessAlterCollationSchemaStmt,
-	.postprocess = PostprocessAlterCollationSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_COLLATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterCollationSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Collation_AlterOwner = {
 	.deparse = DeparseAlterCollationOwnerStmt,
 	.qualify = QualifyAlterCollationOwnerStmt,
-	.preprocess = PreprocessAlterCollationOwnerStmt,
-	.postprocess = PostprocessAlterCollationOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_COLLATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterCollationOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Collation_Define = {
 	.deparse = NULL,
 	.qualify = NULL,
-	.preprocess = PreprocessDefineCollationStmt,
-	.postprocess = PostprocessDefineCollationStmt,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_COLLATION,
+	.operationType = DIST_OPS_CREATE,
 	.address = DefineCollationStmtObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps Collation_Drop = {
 	.deparse = DeparseDropCollationStmt,
 	.qualify = QualifyDropCollationStmt,
-	.preprocess = PreprocessDropCollationStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Collation_Rename = {
 	.deparse = DeparseRenameCollationStmt,
 	.qualify = QualifyRenameCollationStmt,
-	.preprocess = PreprocessRenameCollationStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_COLLATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameCollationStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Database_AlterOwner = {
 	.deparse = DeparseAlterDatabaseOwnerStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessAlterDatabaseOwnerStmt,
-	.postprocess = PostprocessAlterDatabaseOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_DATABASE,
+	.operationType = DIST_OPS_ALTER,
+	.featureFlag = &EnableAlterDatabaseOwner,
 	.address = AlterDatabaseOwnerObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Domain_Alter = {
+	.deparse = DeparseAlterDomainStmt,
+	.qualify = QualifyAlterDomainStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterDomainStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Domain_AlterObjectSchema = {
+	.deparse = DeparseAlterDomainSchemaStmt,
+	.qualify = QualifyAlterDomainSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterTypeSchemaStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Domain_AlterOwner = {
+	.deparse = DeparseAlterDomainOwnerStmt,
+	.qualify = QualifyAlterDomainOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterDomainOwnerStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Domain_Drop = {
+	.deparse = DeparseDropDomainStmt,
+	.qualify = QualifyDropDomainStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Domain_Rename = {
+	.deparse = DeparseRenameDomainStmt,
+	.qualify = QualifyRenameDomainStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = NULL,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_ALTER,
+	.address = RenameDomainStmtObjectAddress,
+	.markDistributed = false,
+};
+
+static DistributeObjectOps Domain_RenameConstraint = {
+	.deparse = DeparseDomainRenameConstraintStmt,
+	.qualify = QualifyDomainRenameConstraintStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = NULL,
+	.objectType = OBJECT_DOMAIN,
+	.operationType = DIST_OPS_ALTER,
+	.address = DomainRenameConstraintStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Extension_AlterObjectSchema = {
@@ -310,6 +479,7 @@ static DistributeObjectOps Extension_AlterObjectSchema = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterExtensionSchemaStmt,
 	.postprocess = PostprocessAlterExtensionSchemaStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterExtensionSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -318,30 +488,54 @@ static DistributeObjectOps Extension_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropExtensionStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps FDW_Grant = {
+	.deparse = DeparseGrantOnFDWStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnFDWStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps ForeignServer_Drop = {
 	.deparse = DeparseDropForeignServerStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropForeignServerStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps ForeignServer_Grant = {
+	.deparse = DeparseGrantOnForeignServerStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnForeignServerStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps ForeignServer_Rename = {
 	.deparse = DeparseAlterForeignServerRenameStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessRenameForeignServerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.objectType = OBJECT_FOREIGN_SERVER,
+	.operationType = DIST_OPS_ALTER,
+	.address = RenameForeignServerStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps ForeignServer_AlterOwner = {
 	.deparse = DeparseAlterForeignServerOwnerStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessAlterForeignServerOwnerStmt,
-	.postprocess = PostprocessAlterForeignServerOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FOREIGN_SERVER,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterForeignServerOwnerStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -350,6 +544,7 @@ static DistributeObjectOps ForeignTable_AlterTable = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTableStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -358,38 +553,64 @@ static DistributeObjectOps Function_AlterObjectDepends = {
 	.qualify = QualifyAlterFunctionDependsStmt,
 	.preprocess = PreprocessAlterFunctionDependsStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionDependsStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Function_AlterObjectSchema = {
 	.deparse = DeparseAlterFunctionSchemaStmt,
 	.qualify = QualifyAlterFunctionSchemaStmt,
-	.preprocess = PreprocessAlterFunctionSchemaStmt,
-	.postprocess = PostprocessAlterFunctionSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Function_AlterOwner = {
 	.deparse = DeparseAlterFunctionOwnerStmt,
 	.qualify = QualifyAlterFunctionOwnerStmt,
-	.preprocess = PreprocessAlterFunctionOwnerStmt,
-	.postprocess = PostprocessAlterFunctionOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Function_Drop = {
 	.deparse = DeparseDropFunctionStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropFunctionStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Function_Grant = {
+	.deparse = DeparseGrantOnFunctionStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnFunctionStmt,
+	.postprocess = PostprocessGrantOnFunctionStmt,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps View_Drop = {
+	.deparse = DeparseDropViewStmt,
+	.qualify = QualifyDropViewStmt,
+	.preprocess = PreprocessDropViewStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = DropViewStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Function_Rename = {
 	.deparse = DeparseRenameFunctionStmt,
 	.qualify = QualifyRenameFunctionStmt,
-	.preprocess = PreprocessRenameFunctionStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameFunctionStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -398,6 +619,7 @@ static DistributeObjectOps Index_AlterTable = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTableStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -406,6 +628,7 @@ static DistributeObjectOps Index_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropIndexStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -414,6 +637,7 @@ static DistributeObjectOps Policy_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropPolicyStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -422,38 +646,55 @@ static DistributeObjectOps Procedure_AlterObjectDepends = {
 	.qualify = QualifyAlterFunctionDependsStmt,
 	.preprocess = PreprocessAlterFunctionDependsStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionDependsStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Procedure_AlterObjectSchema = {
 	.deparse = DeparseAlterFunctionSchemaStmt,
 	.qualify = QualifyAlterFunctionSchemaStmt,
-	.preprocess = PreprocessAlterFunctionSchemaStmt,
-	.postprocess = PostprocessAlterFunctionSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Procedure_AlterOwner = {
 	.deparse = DeparseAlterFunctionOwnerStmt,
 	.qualify = QualifyAlterFunctionOwnerStmt,
-	.preprocess = PreprocessAlterFunctionOwnerStmt,
-	.postprocess = PostprocessAlterFunctionOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Procedure_Drop = {
 	.deparse = DeparseDropFunctionStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropFunctionStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Procedure_Grant = {
+	.deparse = DeparseGrantOnFunctionStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnFunctionStmt,
+	.postprocess = PostprocessGrantOnFunctionStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Procedure_Rename = {
 	.deparse = DeparseRenameFunctionStmt,
 	.qualify = QualifyRenameFunctionStmt,
-	.preprocess = PreprocessRenameFunctionStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameFunctionStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -462,6 +703,7 @@ static DistributeObjectOps Routine_AlterObjectDepends = {
 	.qualify = QualifyAlterFunctionDependsStmt,
 	.preprocess = PreprocessAlterFunctionDependsStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionDependsStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -470,6 +712,7 @@ static DistributeObjectOps Sequence_Alter = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterSequenceStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterSequenceStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -478,6 +721,7 @@ static DistributeObjectOps Sequence_AlterObjectSchema = {
 	.qualify = QualifyAlterSequenceSchemaStmt,
 	.preprocess = PreprocessAlterSequenceSchemaStmt,
 	.postprocess = PostprocessAlterSequenceSchemaStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterSequenceSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -486,14 +730,36 @@ static DistributeObjectOps Sequence_AlterOwner = {
 	.qualify = QualifyAlterSequenceOwnerStmt,
 	.preprocess = PreprocessAlterSequenceOwnerStmt,
 	.postprocess = PostprocessAlterSequenceOwnerStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterSequenceOwnerStmtObjectAddress,
 	.markDistributed = false,
 };
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+static DistributeObjectOps Sequence_AlterPersistence = {
+	.deparse = DeparseAlterSequencePersistenceStmt,
+	.qualify = QualifyAlterSequencePersistenceStmt,
+	.preprocess = PreprocessAlterSequencePersistenceStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterSequencePersistenceStmtObjectAddress,
+	.markDistributed = false,
+};
+#endif
 static DistributeObjectOps Sequence_Drop = {
 	.deparse = DeparseDropSequenceStmt,
-	.qualify = NULL,
+	.qualify = QualifyDropSequenceStmt,
 	.preprocess = PreprocessDropSequenceStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = SequenceDropStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Sequence_Grant = {
+	.deparse = DeparseGrantOnSequenceStmt,
+	.qualify = QualifyGrantOnSequenceStmt,
+	.preprocess = PreprocessGrantOnSequenceStmt,
+	.postprocess = PostprocessGrantOnSequenceStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -502,38 +768,47 @@ static DistributeObjectOps Sequence_Rename = {
 	.qualify = QualifyRenameSequenceStmt,
 	.preprocess = PreprocessRenameSequenceStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameSequenceStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchConfig_Alter = {
 	.deparse = DeparseAlterTextSearchConfigurationStmt,
 	.qualify = QualifyAlterTextSearchConfigurationStmt,
-	.preprocess = PreprocessAlterTextSearchConfigurationStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchConfigurationStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchConfig_AlterObjectSchema = {
 	.deparse = DeparseAlterTextSearchConfigurationSchemaStmt,
 	.qualify = QualifyAlterTextSearchConfigurationSchemaStmt,
-	.preprocess = PreprocessAlterTextSearchConfigurationSchemaStmt,
-	.postprocess = PostprocessAlterTextSearchConfigurationSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchConfigurationSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchConfig_AlterOwner = {
 	.deparse = DeparseAlterTextSearchConfigurationOwnerStmt,
 	.qualify = QualifyAlterTextSearchConfigurationOwnerStmt,
-	.preprocess = PreprocessAlterTextSearchConfigurationOwnerStmt,
-	.postprocess = PostprocessAlterTextSearchConfigurationOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchConfigurationOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchConfig_Comment = {
 	.deparse = DeparseTextSearchConfigurationCommentStmt,
 	.qualify = QualifyTextSearchConfigurationCommentStmt,
-	.preprocess = PreprocessTextSearchConfigurationCommentStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = TextSearchConfigurationCommentObjectAddress,
 	.markDistributed = false,
 };
@@ -541,55 +816,68 @@ static DistributeObjectOps TextSearchConfig_Define = {
 	.deparse = DeparseCreateTextSearchConfigurationStmt,
 	.qualify = NULL,
 	.preprocess = NULL,
-	.postprocess = PostprocessCreateTextSearchConfigurationStmt,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateTextSearchConfigurationObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps TextSearchConfig_Drop = {
 	.deparse = DeparseDropTextSearchConfigurationStmt,
 	.qualify = QualifyDropTextSearchConfigurationStmt,
-	.preprocess = PreprocessDropTextSearchConfigurationStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = DropTextSearchConfigObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchConfig_Rename = {
 	.deparse = DeparseRenameTextSearchConfigurationStmt,
 	.qualify = QualifyRenameTextSearchConfigurationStmt,
-	.preprocess = PreprocessRenameTextSearchConfigurationStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSCONFIGURATION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameTextSearchConfigurationStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchDict_Alter = {
 	.deparse = DeparseAlterTextSearchDictionaryStmt,
 	.qualify = QualifyAlterTextSearchDictionaryStmt,
-	.preprocess = PreprocessAlterTextSearchDictionaryStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchDictionaryStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchDict_AlterObjectSchema = {
 	.deparse = DeparseAlterTextSearchDictionarySchemaStmt,
 	.qualify = QualifyAlterTextSearchDictionarySchemaStmt,
-	.preprocess = PreprocessAlterTextSearchDictionarySchemaStmt,
-	.postprocess = PostprocessAlterTextSearchDictionarySchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchDictionarySchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchDict_AlterOwner = {
 	.deparse = DeparseAlterTextSearchDictionaryOwnerStmt,
 	.qualify = QualifyAlterTextSearchDictionaryOwnerStmt,
-	.preprocess = PreprocessAlterTextSearchDictionaryOwnerStmt,
-	.postprocess = PostprocessAlterTextSearchDictionaryOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTextSearchDictOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchDict_Comment = {
 	.deparse = DeparseTextSearchDictionaryCommentStmt,
 	.qualify = QualifyTextSearchDictionaryCommentStmt,
-	.preprocess = PreprocessTextSearchDictionaryCommentStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_ALTER,
 	.address = TextSearchDictCommentObjectAddress,
 	.markDistributed = false,
 };
@@ -597,23 +885,28 @@ static DistributeObjectOps TextSearchDict_Define = {
 	.deparse = DeparseCreateTextSearchDictionaryStmt,
 	.qualify = NULL,
 	.preprocess = NULL,
-	.postprocess = PostprocessCreateTextSearchDictionaryStmt,
+	.postprocess = PostprocessCreateDistributedObjectFromCatalogStmt,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_CREATE,
 	.address = CreateTextSearchDictObjectAddress,
 	.markDistributed = true,
 };
 static DistributeObjectOps TextSearchDict_Drop = {
 	.deparse = DeparseDropTextSearchDictionaryStmt,
 	.qualify = QualifyDropTextSearchDictionaryStmt,
-	.preprocess = PreprocessDropTextSearchDictionaryStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = DropTextSearchDictObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps TextSearchDict_Rename = {
 	.deparse = DeparseRenameTextSearchDictionaryStmt,
 	.qualify = QualifyRenameTextSearchDictionaryStmt,
-	.preprocess = PreprocessRenameTextSearchDictionaryStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TSDICTIONARY,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameTextSearchDictionaryStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -622,38 +915,55 @@ static DistributeObjectOps Trigger_AlterObjectDepends = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTriggerDependsStmt,
 	.postprocess = PostprocessAlterTriggerDependsStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Routine_AlterObjectSchema = {
 	.deparse = DeparseAlterFunctionSchemaStmt,
 	.qualify = QualifyAlterFunctionSchemaStmt,
-	.preprocess = PreprocessAlterFunctionSchemaStmt,
-	.postprocess = PostprocessAlterFunctionSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Routine_AlterOwner = {
 	.deparse = DeparseAlterFunctionOwnerStmt,
 	.qualify = QualifyAlterFunctionOwnerStmt,
-	.preprocess = PreprocessAlterFunctionOwnerStmt,
-	.postprocess = PostprocessAlterFunctionOwnerStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterFunctionOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Routine_Drop = {
 	.deparse = DeparseDropFunctionStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropFunctionStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = NULL,
+	.markDistributed = false,
+};
+static DistributeObjectOps Routine_Grant = {
+	.deparse = DeparseGrantOnFunctionStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnFunctionStmt,
+	.postprocess = PostprocessGrantOnFunctionStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Routine_Rename = {
 	.deparse = DeparseRenameFunctionStmt,
 	.qualify = QualifyRenameFunctionStmt,
-	.preprocess = PreprocessRenameFunctionStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_FUNCTION,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameFunctionStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -662,6 +972,7 @@ static DistributeObjectOps Schema_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropSchemaStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -670,32 +981,35 @@ static DistributeObjectOps Schema_Grant = {
 	.qualify = NULL,
 	.preprocess = PreprocessGrantOnSchemaStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Schema_Rename = {
 	.deparse = DeparseAlterSchemaRenameStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessAlterSchemaRenameStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_SCHEMA,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterSchemaRenameStmtObjectAddress,
 	.markDistributed = false,
 };
-#if PG_VERSION_NUM >= PG_VERSION_13
 static DistributeObjectOps Statistics_Alter = {
 	.deparse = DeparseAlterStatisticsStmt,
 	.qualify = QualifyAlterStatisticsStmt,
 	.preprocess = PreprocessAlterStatisticsStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
-#endif
 static DistributeObjectOps Statistics_AlterObjectSchema = {
 	.deparse = DeparseAlterStatisticsSchemaStmt,
 	.qualify = QualifyAlterStatisticsSchemaStmt,
 	.preprocess = PreprocessAlterStatisticsSchemaStmt,
 	.postprocess = PostprocessAlterStatisticsSchemaStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterStatisticsSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -703,6 +1017,7 @@ static DistributeObjectOps Statistics_AlterOwner = {
 	.deparse = DeparseAlterStatisticsOwnerStmt,
 	.qualify = QualifyAlterStatisticsOwnerStmt,
 	.preprocess = PreprocessAlterStatisticsOwnerStmt,
+	.operationType = DIST_OPS_ALTER,
 	.postprocess = PostprocessAlterStatisticsOwnerStmt,
 	.address = NULL,
 	.markDistributed = false,
@@ -712,7 +1027,8 @@ static DistributeObjectOps Statistics_Drop = {
 	.qualify = QualifyDropStatisticsStmt,
 	.preprocess = PreprocessDropStatisticsStmt,
 	.postprocess = NULL,
-	.address = NULL,
+	.operationType = DIST_OPS_DROP,
+	.address = DropStatisticsObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Statistics_Rename = {
@@ -720,6 +1036,7 @@ static DistributeObjectOps Statistics_Rename = {
 	.qualify = QualifyAlterStatisticsRenameStmt,
 	.preprocess = PreprocessAlterStatisticsRenameStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -728,6 +1045,7 @@ static DistributeObjectOps Table_AlterTable = {
 	.qualify = NULL,
 	.preprocess = PreprocessAlterTableStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -736,6 +1054,7 @@ static DistributeObjectOps Table_AlterObjectSchema = {
 	.qualify = QualifyAlterTableSchemaStmt,
 	.preprocess = PreprocessAlterTableSchemaStmt,
 	.postprocess = PostprocessAlterTableSchemaStmt,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTableSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
@@ -744,38 +1063,80 @@ static DistributeObjectOps Table_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropTableStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Type_AlterObjectSchema = {
 	.deparse = DeparseAlterTypeSchemaStmt,
 	.qualify = QualifyAlterTypeSchemaStmt,
-	.preprocess = PreprocessAlterTypeSchemaStmt,
-	.postprocess = PostprocessAlterTypeSchemaStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTypeSchemaStmtObjectAddress,
+	.markDistributed = false,
+};
+
+/*
+ * PreprocessAlterViewSchemaStmt and PostprocessAlterViewSchemaStmt functions can be called
+ * internally by ALTER TABLE view_name SET SCHEMA ... if the ALTER TABLE command targets a
+ * view. In other words ALTER VIEW view_name SET SCHEMA will use the View_AlterObjectSchema
+ * but ALTER TABLE view_name SET SCHEMA will use Table_AlterObjectSchema but call process
+ * functions of View_AlterObjectSchema internally.
+ */
+static DistributeObjectOps View_AlterObjectSchema = {
+	.deparse = DeparseAlterViewSchemaStmt,
+	.qualify = QualifyAlterViewSchemaStmt,
+	.preprocess = PreprocessAlterViewSchemaStmt,
+	.postprocess = PostprocessAlterViewSchemaStmt,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterViewSchemaStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Type_AlterOwner = {
 	.deparse = DeparseAlterTypeOwnerStmt,
 	.qualify = QualifyAlterTypeOwnerStmt,
-	.preprocess = PreprocessAlterTypeOwnerStmt,
-	.postprocess = NULL,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.postprocess = PostprocessAlterDistributedObjectStmt,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTypeOwnerObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Type_AlterTable = {
 	.deparse = DeparseAlterTypeStmt,
 	.qualify = QualifyAlterTypeStmt,
-	.preprocess = PreprocessAlterTypeStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_ALTER,
 	.address = AlterTypeStmtObjectAddress,
+	.markDistributed = false,
+};
+
+/*
+ * PreprocessAlterViewStmt and PostprocessAlterViewStmt functions can be called internally
+ * by ALTER TABLE view_name SET/RESET ... if the ALTER TABLE command targets a view. In
+ * other words ALTER VIEW view_name SET/RESET will use the View_AlterView
+ * but ALTER TABLE view_name SET/RESET will use Table_AlterTable but call process
+ * functions of View_AlterView internally.
+ */
+static DistributeObjectOps View_AlterView = {
+	.deparse = DeparseAlterViewStmt,
+	.qualify = QualifyAlterViewStmt,
+	.preprocess = PreprocessAlterViewStmt,
+	.postprocess = PostprocessAlterViewStmt,
+	.operationType = DIST_OPS_ALTER,
+	.address = AlterViewStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Type_Drop = {
 	.deparse = DeparseDropTypeStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessDropTypeStmt,
+	.preprocess = PreprocessDropDistributedObjectStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
@@ -784,21 +1145,50 @@ static DistributeObjectOps Trigger_Drop = {
 	.qualify = NULL,
 	.preprocess = PreprocessDropTriggerStmt,
 	.postprocess = NULL,
+	.operationType = DIST_OPS_DROP,
 	.address = NULL,
 	.markDistributed = false,
 };
 static DistributeObjectOps Type_Rename = {
 	.deparse = DeparseRenameTypeStmt,
 	.qualify = QualifyRenameTypeStmt,
-	.preprocess = PreprocessRenameTypeStmt,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
 	.postprocess = NULL,
+	.objectType = OBJECT_TYPE,
+	.operationType = DIST_OPS_ALTER,
 	.address = RenameTypeStmtObjectAddress,
+	.markDistributed = false,
+};
+static DistributeObjectOps Vacuum_Analyze = {
+	.deparse = NULL,
+	.qualify = NULL,
+	.preprocess = NULL,
+	.postprocess = PostprocessVacuumStmt,
+	.operationType = DIST_OPS_NONE,
+	.address = NULL,
+	.markDistributed = false,
+};
+
+/*
+ * PreprocessRenameViewStmt function can be called internally by ALTER TABLE view_name
+ * RENAME ... if the ALTER TABLE command targets a view or a view's column. In other words
+ * ALTER VIEW view_name RENAME will use the View_Rename but ALTER TABLE view_name RENAME
+ * will use Any_Rename but call process functions of View_Rename internally.
+ */
+static DistributeObjectOps View_Rename = {
+	.deparse = DeparseRenameViewStmt,
+	.qualify = QualifyRenameViewStmt,
+	.preprocess = PreprocessRenameViewStmt,
+	.postprocess = NULL,
+	.operationType = DIST_OPS_ALTER,
+	.address = RenameViewStmtObjectAddress,
 	.markDistributed = false,
 };
 static DistributeObjectOps Trigger_Rename = {
 	.deparse = NULL,
 	.qualify = NULL,
-	.preprocess = NULL,
+	.preprocess = PreprocessAlterTriggerRenameStmt,
+	.operationType = DIST_OPS_ALTER,
 	.postprocess = PostprocessAlterTriggerRenameStmt,
 	.address = NULL,
 	.markDistributed = false,
@@ -815,6 +1205,11 @@ GetDistributeObjectOps(Node *node)
 {
 	switch (nodeTag(node))
 	{
+		case T_AlterDomainStmt:
+		{
+			return &Domain_Alter;
+		}
+
 		case T_AlterEnumStmt:
 		{
 			return &Any_AlterEnum;
@@ -887,6 +1282,11 @@ GetDistributeObjectOps(Node *node)
 					return &Collation_AlterObjectSchema;
 				}
 
+				case OBJECT_DOMAIN:
+				{
+					return &Domain_AlterObjectSchema;
+				}
+
 				case OBJECT_EXTENSION:
 				{
 					return &Extension_AlterObjectSchema;
@@ -938,6 +1338,11 @@ GetDistributeObjectOps(Node *node)
 					return &Type_AlterObjectSchema;
 				}
 
+				case OBJECT_VIEW:
+				{
+					return &View_AlterObjectSchema;
+				}
+
 				default:
 				{
 					return &NoDistributeOps;
@@ -963,6 +1368,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_DATABASE:
 				{
 					return &Database_AlterOwner;
+				}
+
+				case OBJECT_DOMAIN:
+				{
+					return &Domain_AlterOwner;
 				}
 
 				case OBJECT_FOREIGN_SERVER:
@@ -1032,13 +1442,11 @@ GetDistributeObjectOps(Node *node)
 			return &Sequence_Alter;
 		}
 
-#if PG_VERSION_NUM >= PG_VERSION_13
 		case T_AlterStatsStmt:
 		{
 			return &Statistics_Alter;
 		}
 
-#endif
 		case T_AlterTableStmt:
 		{
 			AlterTableStmt *stmt = castNode(AlterTableStmt, node);
@@ -1066,7 +1474,47 @@ GetDistributeObjectOps(Node *node)
 
 				case OBJECT_SEQUENCE:
 				{
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+					ListCell *cmdCell = NULL;
+					foreach(cmdCell, stmt->cmds)
+					{
+						AlterTableCmd *cmd = castNode(AlterTableCmd, lfirst(cmdCell));
+						switch (cmd->subtype)
+						{
+							case AT_ChangeOwner:
+							{
+								return &Sequence_AlterOwner;
+							}
+
+							case AT_SetLogged:
+							{
+								return &Sequence_AlterPersistence;
+							}
+
+							case AT_SetUnLogged:
+							{
+								return &Sequence_AlterPersistence;
+							}
+
+							default:
+							{
+								return &NoDistributeOps;
+							}
+						}
+					}
+#endif
+
+					/*
+					 * Prior to PG15, the only Alter Table statement
+					 * with Sequence as its object was an
+					 * Alter Owner statement
+					 */
 					return &Sequence_AlterOwner;
+				}
+
+				case OBJECT_VIEW:
+				{
+					return &View_AlterView;
 				}
 
 				default:
@@ -1123,6 +1571,11 @@ GetDistributeObjectOps(Node *node)
 			return &Any_CompositeType;
 		}
 
+		case T_CreateDomainStmt:
+		{
+			return &Any_CreateDomain;
+		}
+
 		case T_CreateEnumStmt:
 		{
 			return &Any_CreateEnum;
@@ -1146,6 +1599,11 @@ GetDistributeObjectOps(Node *node)
 		case T_CreatePolicyStmt:
 		{
 			return &Any_CreatePolicy;
+		}
+
+		case T_CreateRoleStmt:
+		{
+			return &Any_CreateRole;
 		}
 
 		case T_CreateSchemaStmt:
@@ -1195,6 +1653,11 @@ GetDistributeObjectOps(Node *node)
 			}
 		}
 
+		case T_DropRoleStmt:
+		{
+			return &Any_DropRole;
+		}
+
 		case T_DropStmt:
 		{
 			DropStmt *stmt = castNode(DropStmt, node);
@@ -1208,6 +1671,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_COLLATION:
 				{
 					return &Collation_Drop;
+				}
+
+				case OBJECT_DOMAIN:
+				{
+					return &Domain_Drop;
 				}
 
 				case OBJECT_EXTENSION:
@@ -1285,11 +1753,21 @@ GetDistributeObjectOps(Node *node)
 					return &Trigger_Drop;
 				}
 
+				case OBJECT_VIEW:
+				{
+					return &View_Drop;
+				}
+
 				default:
 				{
 					return &NoDistributeOps;
 				}
 			}
+		}
+
+		case T_GrantRoleStmt:
+		{
+			return &Any_GrantRole;
 		}
 
 		case T_GrantStmt:
@@ -1300,6 +1778,41 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_SCHEMA:
 				{
 					return &Schema_Grant;
+				}
+
+				case OBJECT_SEQUENCE:
+				{
+					return &Sequence_Grant;
+				}
+
+				case OBJECT_FDW:
+				{
+					return &FDW_Grant;
+				}
+
+				case OBJECT_FOREIGN_SERVER:
+				{
+					return &ForeignServer_Grant;
+				}
+
+				case OBJECT_FUNCTION:
+				{
+					return &Function_Grant;
+				}
+
+				case OBJECT_AGGREGATE:
+				{
+					return &Aggregate_Grant;
+				}
+
+				case OBJECT_PROCEDURE:
+				{
+					return &Procedure_Grant;
+				}
+
+				case OBJECT_ROUTINE:
+				{
+					return &Routine_Grant;
 				}
 
 				default:
@@ -1314,9 +1827,19 @@ GetDistributeObjectOps(Node *node)
 			return &Any_Index;
 		}
 
+		case T_ViewStmt:
+		{
+			return &Any_View;
+		}
+
 		case T_ReindexStmt:
 		{
 			return &Any_Reindex;
+		}
+
+		case T_VacuumStmt:
+		{
+			return &Vacuum_Analyze;
 		}
 
 		case T_RenameStmt:
@@ -1337,6 +1860,16 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_COLLATION:
 				{
 					return &Collation_Rename;
+				}
+
+				case OBJECT_DOMAIN:
+				{
+					return &Domain_Rename;
+				}
+
+				case OBJECT_DOMCONSTRAINT:
+				{
+					return &Domain_RenameConstraint;
 				}
 
 				case OBJECT_FOREIGN_SERVER:
@@ -1392,6 +1925,27 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_TRIGGER:
 				{
 					return &Trigger_Rename;
+				}
+
+				case OBJECT_VIEW:
+				{
+					return &View_Rename;
+				}
+
+				case OBJECT_COLUMN:
+				{
+					switch (stmt->relationType)
+					{
+						case OBJECT_VIEW:
+						{
+							return &View_Rename;
+						}
+
+						default:
+						{
+							return &Any_Rename;
+						}
+					}
 				}
 
 				default:

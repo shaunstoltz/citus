@@ -27,6 +27,11 @@ static void AppendSequenceNameList(StringInfo buf, List *objects, ObjectType obj
 static void AppendRenameSequenceStmt(StringInfo buf, RenameStmt *stmt);
 static void AppendAlterSequenceSchemaStmt(StringInfo buf, AlterObjectSchemaStmt *stmt);
 static void AppendAlterSequenceOwnerStmt(StringInfo buf, AlterTableStmt *stmt);
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+static void AppendAlterSequencePersistenceStmt(StringInfo buf, AlterTableStmt *stmt);
+#endif
+static void AppendGrantOnSequenceStmt(StringInfo buf, GrantStmt *stmt);
+static void AppendGrantOnSequenceSequences(StringInfo buf, GrantStmt *stmt);
 
 /*
  * DeparseDropSequenceStmt builds and returns a string representing the DropStmt
@@ -85,12 +90,6 @@ AppendSequenceNameList(StringInfo buf, List *objects, ObjectType objtype)
 		}
 
 		RangeVar *seq = makeRangeVarFromNameList((List *) lfirst(objectCell));
-
-		if (seq->schemaname == NULL)
-		{
-			Oid schemaOid = RangeVarGetCreationNamespace(seq);
-			seq->schemaname = get_namespace_name(schemaOid);
-		}
 
 		char *qualifiedSequenceName = quote_qualified_identifier(seq->schemaname,
 																 seq->relname);
@@ -257,6 +256,200 @@ AppendAlterSequenceOwnerStmt(StringInfo buf, AlterTableStmt *stmt)
 								errdetail("sub command type: %d",
 										  alterTableCmd->subtype)));
 			}
+		}
+	}
+}
+
+
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+/*
+ * DeparseAlterSequencePersistenceStmt builds and returns a string representing
+ * the AlterTableStmt consisting of changing the persistence of a sequence
+ */
+char *
+DeparseAlterSequencePersistenceStmt(Node *node)
+{
+	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
+	StringInfoData str = { 0 };
+	initStringInfo(&str);
+
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	AppendAlterSequencePersistenceStmt(&str, stmt);
+
+	return str.data;
+}
+
+
+/*
+ * AppendAlterSequencePersistenceStmt appends a string representing the
+ * AlterTableStmt to a buffer consisting of changing the persistence of a sequence
+ */
+static void
+AppendAlterSequencePersistenceStmt(StringInfo buf, AlterTableStmt *stmt)
+{
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	RangeVar *seq = stmt->relation;
+	char *qualifiedSequenceName = quote_qualified_identifier(seq->schemaname,
+															 seq->relname);
+	appendStringInfoString(buf, "ALTER SEQUENCE ");
+
+	if (stmt->missing_ok)
+	{
+		appendStringInfoString(buf, "IF EXISTS ");
+	}
+
+	appendStringInfoString(buf, qualifiedSequenceName);
+
+	ListCell *cmdCell = NULL;
+	foreach(cmdCell, stmt->cmds)
+	{
+		if (cmdCell != list_head(stmt->cmds))
+		{
+			/*
+			 * As of PG15, we cannot reach this code because ALTER SEQUENCE
+			 * is only supported for a single sequence. Still, let's be
+			 * defensive for future PG changes
+			 */
+			ereport(ERROR, (errmsg("More than one subcommand is not supported "
+								   "for ALTER SEQUENCE")));
+		}
+
+		AlterTableCmd *alterTableCmd = castNode(AlterTableCmd, lfirst(cmdCell));
+		switch (alterTableCmd->subtype)
+		{
+			case AT_SetLogged:
+			{
+				appendStringInfoString(buf, " SET LOGGED;");
+				break;
+			}
+
+			case AT_SetUnLogged:
+			{
+				appendStringInfoString(buf, " SET UNLOGGED;");
+				break;
+			}
+
+			default:
+			{
+				/*
+				 * normally we shouldn't ever reach this
+				 * because we enter this function after making sure this stmt is of the form
+				 * ALTER SEQUENCE .. SET LOGGED/UNLOGGED
+				 */
+				ereport(ERROR, (errmsg("unsupported subtype for alter sequence command"),
+								errdetail("sub command type: %d",
+										  alterTableCmd->subtype)));
+			}
+		}
+	}
+}
+
+
+#endif
+
+
+/*
+ * DeparseGrantOnSequenceStmt builds and returns a string representing the GrantOnSequenceStmt
+ */
+char *
+DeparseGrantOnSequenceStmt(Node *node)
+{
+	GrantStmt *stmt = castNode(GrantStmt, node);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
+
+	StringInfoData str = { 0 };
+	initStringInfo(&str);
+
+	AppendGrantOnSequenceStmt(&str, stmt);
+
+	return str.data;
+}
+
+
+/*
+ * AppendGrantOnSequenceStmt builds and returns an SQL command representing a
+ * GRANT .. ON SEQUENCE command from given GrantStmt object.
+ */
+static void
+AppendGrantOnSequenceStmt(StringInfo buf, GrantStmt *stmt)
+{
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
+
+	if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+	{
+		/*
+		 * Normally we shouldn't reach this
+		 * We deparse a GrantStmt with OBJECT_SEQUENCE after setting targtype
+		 * to ACL_TARGET_OBJECT
+		 */
+		elog(ERROR,
+			 "GRANT .. ALL SEQUENCES IN SCHEMA is not supported for formatting.");
+	}
+
+	appendStringInfoString(buf, stmt->is_grant ? "GRANT " : "REVOKE ");
+
+	if (!stmt->is_grant && stmt->grant_option)
+	{
+		appendStringInfoString(buf, "GRANT OPTION FOR ");
+	}
+
+	AppendGrantPrivileges(buf, stmt);
+
+	AppendGrantOnSequenceSequences(buf, stmt);
+
+	AppendGrantGrantees(buf, stmt);
+
+	if (stmt->is_grant && stmt->grant_option)
+	{
+		appendStringInfoString(buf, " WITH GRANT OPTION");
+	}
+	if (!stmt->is_grant)
+	{
+		if (stmt->behavior == DROP_RESTRICT)
+		{
+			appendStringInfoString(buf, " RESTRICT");
+		}
+		else if (stmt->behavior == DROP_CASCADE)
+		{
+			appendStringInfoString(buf, " CASCADE");
+		}
+	}
+	appendStringInfoString(buf, ";");
+}
+
+
+/*
+ * AppendGrantOnSequenceSequences appends the sequence names along with their arguments
+ * to the given StringInfo from the given GrantStmt
+ */
+static void
+AppendGrantOnSequenceSequences(StringInfo buf, GrantStmt *stmt)
+{
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
+
+	appendStringInfoString(buf, " ON SEQUENCE ");
+
+	ListCell *cell = NULL;
+	foreach(cell, stmt->objects)
+	{
+		/*
+		 * GrantOnSequence statement keeps its objects (sequences) as
+		 * a list of RangeVar-s
+		 */
+		RangeVar *sequence = (RangeVar *) lfirst(cell);
+
+		/*
+		 * We have qualified the statement beforehand
+		 */
+		appendStringInfoString(buf, quote_qualified_identifier(sequence->schemaname,
+															   sequence->relname));
+
+		if (cell != list_tail(stmt->objects))
+		{
+			appendStringInfoString(buf, ", ");
 		}
 	}
 }

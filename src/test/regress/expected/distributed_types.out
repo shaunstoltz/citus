@@ -1,14 +1,5 @@
 SET citus.next_shard_id TO 20010000;
 CREATE USER typeuser;
-NOTICE:  not propagating CREATE ROLE/USER commands to worker nodes
-HINT:  Connect to worker nodes directly to manually create all necessary users and roles.
-SELECT run_command_on_workers($$CREATE USER typeuser;$$);
-      run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,"CREATE ROLE")
- (localhost,57638,t,"CREATE ROLE")
-(2 rows)
-
 CREATE SCHEMA type_tests AUTHORIZATION typeuser;
 CREATE SCHEMA type_tests2 AUTHORIZATION typeuser; -- to test creation in a specific schema and moving to schema
 SET search_path TO type_tests;
@@ -414,30 +405,13 @@ ERROR:  inserting or modifying composite type fields is not supported
 HINT:  Use the column name to insert or update the composite type as a single value
 CREATE TYPE two_ints as (if1 int, if2 int);
 CREATE DOMAIN domain AS two_ints CHECK ((VALUE).if1 > 0);
--- citus does not propagate domain objects
--- TODO: Once domains are supported, remove enable_metadata_sync off/on change
--- on dependent table distribution below.
-SELECT run_command_on_workers(
-$$
-    CREATE DOMAIN type_tests.domain AS type_tests.two_ints CHECK ((VALUE).if1 > 0);
-$$);
-       run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,"CREATE DOMAIN")
- (localhost,57638,t,"CREATE DOMAIN")
-(2 rows)
-
 CREATE TABLE domain_indirection_test (f1 int, f3 domain, domain_array domain[]);
--- Disable metadata sync since citus doesn't support distributing
--- domains for now.
-SET citus.enable_metadata_sync TO OFF;
 SELECT create_distributed_table('domain_indirection_test', 'f1');
  create_distributed_table
 ---------------------------------------------------------------------
 
 (1 row)
 
-RESET citus.enable_metadata_sync;
 -- not supported (field indirection to underlying composite type)
 INSERT INTO domain_indirection_test (f1,f3.if1, f3.if2) VALUES (0, 1, 2);
 ERROR:  inserting or modifying composite type fields is not supported
@@ -566,15 +540,46 @@ CREATE TYPE circ_type1 AS (a int);
 CREATE TYPE circ_type2 AS (a int, b circ_type1);
 ALTER TYPE circ_type1 ADD ATTRIBUTE b circ_type2;
 ERROR:  composite type circ_type1 cannot be made a member of itself
+-- Show that types can be created locally if has unsupported dependency
+CREATE TYPE text_local_def;
+CREATE FUNCTION text_local_def_in(cstring)
+   RETURNS text_local_def
+   AS 'textin'
+   LANGUAGE internal STRICT IMMUTABLE;
+NOTICE:  return type text_local_def is only a shell
+WARNING:  "function text_local_def_in(cstring)" has dependency on unsupported object "type text_local_def"
+DETAIL:  "function text_local_def_in(cstring)" will be created only locally
+CREATE FUNCTION text_local_def_out(text_local_def)
+   RETURNS cstring
+   AS 'textout'
+   LANGUAGE internal STRICT IMMUTABLE;
+NOTICE:  argument type text_local_def is only a shell
+WARNING:  "function text_local_def_out(text_local_def)" has dependency on unsupported object "type text_local_def"
+DETAIL:  "function text_local_def_out(text_local_def)" will be created only locally
+CREATE TYPE text_local_def (
+   internallength = variable,
+   input = text_local_def_in,
+   output = text_local_def_out,
+   alignment = int4,
+   default = 'zippo'
+);
+-- It should be created locally as it has unsupported dependency
+CREATE TYPE default_test_row AS (f1 text_local_def, f2 int4);
+WARNING:  "type default_test_row" has dependency on unsupported object "type text_local_def"
+DETAIL:  "type default_test_row" will be created only locally
+-- Distributing table depending on that type should error out
+CREATE TABLE table_text_local_def(id int, col_1 default_test_row);
+SELECT create_distributed_table('table_text_local_def','id');
+ERROR:  "table table_text_local_def" has dependency on unsupported object "type text_local_def"
+-- will skip trying to propagate the type/enum due to temp schema
+CREATE TYPE pg_temp.temp_type AS (int_field int);
+WARNING:  "type temp_type" has dependency on unsupported object "schema pg_temp_xxx"
+DETAIL:  "type temp_type" will be created only locally
+CREATE TYPE pg_temp.temp_enum AS ENUM ('one', 'two', 'three');
+WARNING:  "type temp_enum" has dependency on unsupported object "schema pg_temp_xxx"
+DETAIL:  "type temp_enum" will be created only locally
 -- clear objects
 SET client_min_messages TO error; -- suppress cascading objects dropping
 DROP SCHEMA type_tests CASCADE;
 DROP SCHEMA type_tests2 CASCADE;
 DROP USER typeuser;
-SELECT run_command_on_workers($$DROP USER typeuser;$$);
-     run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,"DROP ROLE")
- (localhost,57638,t,"DROP ROLE")
-(2 rows)
-

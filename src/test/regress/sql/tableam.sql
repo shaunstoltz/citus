@@ -1,11 +1,3 @@
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS server_version_above_eleven
-\gset
-\if :server_version_above_eleven
-\else
-\q
-\endif
-
 SET citus.shard_replication_factor to 1;
 SET citus.next_shard_id TO 60000;
 SET citus.next_placement_id TO 60000;
@@ -15,6 +7,7 @@ create schema test_tableam;
 set search_path to test_tableam;
 
 SELECT public.run_command_on_coordinator_and_workers($Q$
+	SET citus.enable_ddl_propagation TO off;
 	CREATE FUNCTION fake_am_handler(internal)
 	RETURNS table_am_handler
 	AS 'citus'
@@ -33,7 +26,7 @@ ALTER EXTENSION citus ADD ACCESS METHOD fake_am;
 create table test_hash_dist(id int, val int) using fake_am;
 insert into test_hash_dist values (1, 1);
 
-select create_distributed_table('test_hash_dist','id');
+select create_distributed_table('test_hash_dist','id', colocate_with := 'none');
 
 select * from test_hash_dist;
 insert into test_hash_dist values (1, 1);
@@ -88,35 +81,39 @@ COPY test_range_dist FROM PROGRAM 'echo 25, 16 && echo 26, 1 && echo 27, 4 && ec
 SELECT * FROM master_get_table_ddl_events('test_range_dist');
 
 --
--- Test master_copy_shard_placement with a fake_am table
+-- Test copy_copy_shard_placement with a fake_am table
 --
 
 select a.shardid, a.nodeport
 FROM pg_dist_shard b, pg_dist_shard_placement a
-WHERE a.shardid=b.shardid AND logicalrelid = 'test_range_dist'::regclass::oid
+WHERE a.shardid=b.shardid AND logicalrelid = 'test_hash_dist'::regclass::oid
 ORDER BY a.shardid, nodeport;
 
-SELECT master_copy_shard_placement(
-           get_shard_id_for_distribution_column('test_range_dist', '1'),
+-- Change repmodel to allow copy_copy_shard_placement
+UPDATE pg_dist_partition SET repmodel='c' WHERE logicalrelid = 'test_hash_dist'::regclass;
+
+SELECT citus_copy_shard_placement(
+           get_shard_id_for_distribution_column('test_hash_dist', '1'),
            'localhost', :worker_1_port,
            'localhost', :worker_2_port,
-           do_repair := false,
 		   transfer_mode := 'block_writes');
 
 select a.shardid, a.nodeport
 FROM pg_dist_shard b, pg_dist_shard_placement a
-WHERE a.shardid=b.shardid AND logicalrelid = 'test_range_dist'::regclass::oid
+WHERE a.shardid=b.shardid AND logicalrelid = 'test_hash_dist'::regclass::oid
 ORDER BY a.shardid, nodeport;
 
 -- verify that data was copied correctly
 
 \c - - - :worker_1_port
-select * from test_tableam.test_range_dist_60005 ORDER BY id;
+select * from test_tableam.test_hash_dist_60000 ORDER BY id;
 
 \c - - - :worker_2_port
-select * from test_tableam.test_range_dist_60005 ORDER BY id;
+select * from test_tableam.test_hash_dist_60000 ORDER BY id;
 
 \c - - - :master_port
+
+set search_path to test_tableam;
 
 --
 -- Test that partitioned tables work correctly with a fake_am table

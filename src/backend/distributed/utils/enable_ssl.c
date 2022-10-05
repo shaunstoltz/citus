@@ -8,6 +8,19 @@
  *-------------------------------------------------------------------------
  */
 
+
+/*
+ * Make sure that functions marked as deprecated in OpenSSL 3.0 don't trigger
+ * deprecation warnings by indicating that we're using the OpenSSL 1.0.1
+ * compatibile API. Postgres does this by already in PG14, so we should not do
+ * it otherwise we get warnings about redefining this value.
+ */
+#if PG_VERSION_NUM < PG_VERSION_14
+#ifndef OPENSSL_API_COMPAT
+#define OPENSSL_API_COMPAT 0x1000100L
+#endif
+#endif
+
 #include "postgres.h"
 
 #include "distributed/connection_management.h"
@@ -162,8 +175,6 @@ citus_check_defaults_for_sslmode(PG_FUNCTION_ARGS)
 		AlterSystemSetConfigFile((AlterSystemStmt *) resetCitusNodeConnInfoParseTree);
 		configChanged = true;
 	}
-
-	/* placeholder for extra changes to configuration before reloading */
 
 	if (configChanged)
 	{

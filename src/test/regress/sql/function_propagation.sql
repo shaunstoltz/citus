@@ -1,5 +1,6 @@
 CREATE SCHEMA function_propagation_schema;
 SET search_path TO 'function_propagation_schema';
+ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 10000;
 
 -- Check whether supported dependencies can be distributed while propagating functions
 
@@ -101,7 +102,7 @@ $$;
 SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_6'::regproc::oid;
 SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_6'::regproc::oid;$$) ORDER BY 1,2;
 
--- Views are not supported
+-- Views are supported
 CREATE VIEW function_prop_view AS SELECT * FROM function_prop_table;
 CREATE OR REPLACE FUNCTION func_7(param_1 function_prop_view)
 RETURNS int
@@ -192,6 +193,7 @@ $$;
 
 -- Function as a default column
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_def()
     RETURNS int
     LANGUAGE plpgsql AS
@@ -201,7 +203,6 @@ BEGIN;
     END;
     $$;
 
-    -- Function shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_def'::regproc::oid;
 
     CREATE TABLE table_to_prop_func(id int, col_1 int default func_in_transaction_def());
@@ -217,6 +218,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Multiple functions as a default column
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_1()
     RETURNS int
     LANGUAGE plpgsql AS
@@ -235,7 +237,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_1'::regproc::oid;
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_2'::regproc::oid;
 
@@ -275,8 +276,8 @@ COMMIT;
 -- Adding a column with default value should propagate the function
 BEGIN;
     CREATE TABLE table_to_prop_func_4(id int);
-    SELECT create_distributed_table('table_to_prop_func_4', 'id');
 
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_4()
     RETURNS int
     LANGUAGE plpgsql AS
@@ -286,7 +287,8 @@ BEGIN;
     END;
     $$;
 
-    -- Function shouldn't be propagated within transaction
+    SELECT create_distributed_table('table_to_prop_func_4', 'id');
+
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_4'::regproc::oid;
 
     ALTER TABLE table_to_prop_func_4 ADD COLUMN col_1 int default function_propagation_schema.func_in_transaction_4();
@@ -303,6 +305,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 BEGIN;
     CREATE TABLE non_dist_table_for_function(id int);
 
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION non_dist_func(col_1 non_dist_table_for_function)
     RETURNS int
     LANGUAGE plpgsql AS
@@ -322,6 +325,7 @@ ROLLBACK;
 
 -- Adding multiple columns with default values should propagate the function
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_5()
     RETURNS int
     LANGUAGE plpgsql AS
@@ -340,8 +344,6 @@ BEGIN;
     END;
     $$;
 
-
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_5'::regproc::oid;
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_6'::regproc::oid;
 
@@ -359,6 +361,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Adding a constraint with function check should propagate the function
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_7(param_1 int)
     RETURNS boolean
     LANGUAGE plpgsql AS
@@ -368,7 +371,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_7'::regproc::oid;
 
     CREATE TABLE table_to_prop_func_6(id int, col_1 int check (function_propagation_schema.func_in_transaction_7(col_1)));
@@ -384,6 +386,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Adding a constraint with multiple functions check should propagate the function
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_8(param_1 int)
     RETURNS boolean
     LANGUAGE plpgsql AS
@@ -402,7 +405,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_8'::regproc::oid;
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_9'::regproc::oid;
 
@@ -424,6 +426,7 @@ BEGIN;
     CREATE TABLE table_to_prop_func_8(id int, col_1 int);
     SELECT create_distributed_table('table_to_prop_func_8', 'id');
 
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_10(param_1 int)
     RETURNS boolean
     LANGUAGE plpgsql AS
@@ -433,7 +436,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_10'::regproc::oid;
 
     ALTER TABLE table_to_prop_func_8 ADD CONSTRAINT col1_check CHECK (function_propagation_schema.func_in_transaction_10(col_1));
@@ -468,7 +470,7 @@ COMMIT;
 
 -- Show that function as a part of generated always is supporte
 BEGIN;
-
+    SET LOCAL citus.create_object_propagation TO deferred;
 	CREATE OR REPLACE FUNCTION non_sense_func_for_generated_always()
 	RETURNS int
 	LANGUAGE plpgsql IMMUTABLE AS
@@ -478,7 +480,6 @@ BEGIN;
 	END;
 	$$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.non_sense_func_for_generated_always'::regproc::oid;
 
 	CREATE TABLE people (
@@ -495,6 +496,7 @@ COMMIT;
 
 -- Show that functions depending table via rule are also distributed
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_for_rule()
     RETURNS int
     LANGUAGE plpgsql STABLE AS
@@ -503,8 +505,8 @@ BEGIN;
         return 4;
     END;
     $$;
+    RESET citus.create_object_propagation;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_for_rule'::regproc::oid;
 
     CREATE TABLE table_1_for_rule(id int, col_1 int);
@@ -524,7 +526,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Show that functions as partitioning functions are supported
 BEGIN;
-
+    SET LOCAL citus.create_object_propagation TO deferred;
 	CREATE OR REPLACE FUNCTION non_sense_func_for_partitioning(int)
 	RETURNS int
 	LANGUAGE plpgsql IMMUTABLE AS
@@ -534,7 +536,6 @@ BEGIN;
 	END;
 	$$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.non_sense_func_for_partitioning'::regproc::oid;
 
     CREATE TABLE partitioned_table_to_test_func_prop(id INT, a INT) PARTITION BY RANGE (non_sense_func_for_partitioning(id));
@@ -551,6 +552,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Test function dependency on citus local table
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_for_local_table()
     RETURNS int
     LANGUAGE plpgsql AS
@@ -560,7 +562,6 @@ BEGIN;
     END;
     $$;
 
-    -- Function shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_for_local_table'::regproc::oid;
 
     CREATE TABLE citus_local_table_to_test_func(l1 int DEFAULT func_in_transaction_for_local_table());
@@ -573,6 +574,7 @@ ROLLBACK;
 
 -- Show that having a function dependency on exlude also works
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION exclude_bool_func()
     RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE AS
@@ -582,7 +584,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.exclude_bool_func'::regproc::oid;
 
     CREATE TABLE exclusion_func_prop_table (id int, EXCLUDE USING btree (id WITH =) WHERE (exclude_bool_func()));
@@ -598,6 +599,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Show that having a function dependency for index also works
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_for_index_predicate(col_1 int)
     RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE AS
@@ -607,7 +609,6 @@ BEGIN;
     END;
     $$;
 
-    -- Functions shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_for_index_predicate'::regproc::oid;
 
     CREATE TABLE table_to_check_func_index_dep (id int, col_2 int);
@@ -657,6 +658,7 @@ SELECT * FROM run_command_on_workers($$SELECT pg_identify_object_as_address(clas
 
 -- Test function with SQL language and sequence dependency
 BEGIN;
+    SET LOCAL citus.create_object_propagation TO deferred;
     CREATE OR REPLACE FUNCTION func_in_transaction_def_with_seq(val bigint)
     RETURNS bigint
     LANGUAGE SQL AS
@@ -671,7 +673,6 @@ BEGIN;
     SELECT func_in_transaction_def_with_seq(val);
     $$;
 
-    -- Function shouldn't be propagated within transaction
     SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid = 'function_propagation_schema.func_in_transaction_def_with_seq'::regproc::oid;
 
     CREATE SEQUENCE myseq;
@@ -831,6 +832,27 @@ ALTER TABLE table_1_for_circ_dep_3 ADD COLUMN col_2 table_2_for_circ_dep_3;
 
 -- It should error out due to circular dependency
 SELECT create_distributed_table('table_1_for_circ_dep_3','id');
+
+-- will skip trying to propagate the function due to temp schema
+CREATE FUNCTION pg_temp.temp_func(group_size BIGINT) RETURNS SETOF integer[]
+AS $$
+    SELECT array_agg(s) OVER w
+      FROM generate_series(1,5) s
+    WINDOW w AS (ORDER BY s ROWS BETWEEN CURRENT ROW AND GROUP_SIZE FOLLOWING)
+$$ LANGUAGE SQL STABLE;
+
+SELECT create_distributed_function('pg_temp.temp_func(BIGINT)');
+
+-- Show that support functions are supported
+CREATE FUNCTION func_with_support(int, int) RETURNS bool
+  LANGUAGE internal STRICT IMMUTABLE PARALLEL SAFE
+  AS $$int4eq$$ SUPPORT generate_series_int8_support;
+
+CREATE FUNCTION func_with_support_2(int, int) RETURNS bool
+  LANGUAGE internal STRICT IMMUTABLE PARALLEL SAFE
+  AS $$int4eq$$;
+
+ALTER FUNCTION func_with_support_2(int, int) SUPPORT generate_series_int8_support;
 
 RESET search_path;
 SET client_min_messages TO WARNING;

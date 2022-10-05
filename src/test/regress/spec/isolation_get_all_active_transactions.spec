@@ -1,31 +1,27 @@
 setup
 {
+	SET LOCAL citus.multi_shard_modify_mode TO 'sequential';
 	SET citus.shard_replication_factor TO 1;
 
 	CREATE TABLE test_table(column1 int, column2 int);
 	SELECT create_distributed_table('test_table', 'column1');
 
 	CREATE USER test_user_1;
-	SELECT run_command_on_workers('CREATE USER test_user_1');
 
 	CREATE USER test_user_2;
-	SELECT run_command_on_workers('CREATE USER test_user_2');
 
 	CREATE USER test_readonly;
-	SELECT run_command_on_workers('CREATE USER test_readonly');
 
 	CREATE USER test_monitor;
-	SELECT run_command_on_workers('CREATE USER test_monitor');
 
 	GRANT pg_monitor TO test_monitor;
-	SELECT run_command_on_workers('GRANT pg_monitor TO test_monitor');
 }
 
 teardown
 {
 	DROP TABLE test_table;
 	DROP USER test_user_1, test_user_2, test_readonly, test_monitor;
-	SELECT run_command_on_workers('DROP USER test_user_1, test_user_2, test_readonly, test_monitor');
+	DROP TABLE IF EXISTS selected_pid;
 }
 
 session "s1"
@@ -34,10 +30,7 @@ session "s1"
 step "s1-grant"
 {
 	GRANT ALL ON test_table TO test_user_1;
-	SELECT bool_and(success) FROM run_command_on_placements('test_table', 'GRANT ALL ON TABLE %s TO test_user_1');
-
 	GRANT ALL ON test_table TO test_user_2;
-	SELECT bool_and(success) FROM run_command_on_placements('test_table', 'GRANT ALL ON TABLE %s TO test_user_2');
 }
 
 step "s1-begin-insert"
@@ -108,4 +101,26 @@ step "s3-as-monitor"
 	SELECT count(*) FROM get_global_active_transactions() WHERE transaction_number != 0;
 }
 
+step "s3-show-activity"
+{
+	SET ROLE postgres;
+	select count(*) from get_all_active_transactions() where process_id IN (SELECT * FROM selected_pid);
+}
+
+session "s4"
+
+step "s4-record-pid"
+{
+	SELECT pg_backend_pid() INTO selected_pid;
+}
+
+session "s5"
+
+step "s5-kill"
+{
+	SELECT pg_terminate_backend(pg_backend_pid) FROM selected_pid;
+}
+
+
 permutation "s1-grant" "s1-begin-insert" "s2-begin-insert" "s3-as-admin" "s3-as-user-1" "s3-as-readonly" "s3-as-monitor" "s1-commit" "s2-commit"
+permutation "s4-record-pid" "s3-show-activity" "s5-kill" "s3-show-activity"

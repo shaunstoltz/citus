@@ -34,6 +34,7 @@
 #include "distributed/commands/utility_hook.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
+#include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
@@ -41,8 +42,6 @@
 #include "distributed/worker_create_or_replace.h"
 
 
-static List * GetDistributedTextSearchConfigurationNames(DropStmt *stmt);
-static List * GetDistributedTextSearchDictionaryNames(DropStmt *stmt);
 static DefineStmt * GetTextSearchConfigDefineStmt(Oid tsconfigOid);
 static DefineStmt * GetTextSearchDictionaryDefineStmt(Oid tsdictOid);
 static List * GetTextSearchDictionaryInitOptions(HeapTuple tup, Form_pg_ts_dict dict);
@@ -57,97 +56,6 @@ static List * get_ts_dict_namelist(Oid tsdictOid);
 static List * get_ts_template_namelist(Oid tstemplateOid);
 static Oid get_ts_config_parser_oid(Oid tsconfigOid);
 static char * get_ts_parser_tokentype_name(Oid parserOid, int32 tokentype);
-
-/*
- * PostprocessCreateTextSearchConfigurationStmt is called after the TEXT SEARCH
- * CONFIGURATION has been created locally.
- *
- * Contrary to many other objects a text search configuration is often created as a copy
- * of an existing configuration. After the copy there is no relation to the configuration
- * that has been copied. This prevents our normal approach of ensuring dependencies to
- * exist before forwarding a close ressemblance of the statement the user executed.
- *
- * Instead we recreate the object based on what we find in our own catalog, hence the
- * amount of work we perform in the postprocess function, contrary to other objects.
- */
-List *
-PostprocessCreateTextSearchConfigurationStmt(Node *node, const char *queryString)
-{
-	DefineStmt *stmt = castNode(DefineStmt, node);
-	Assert(stmt->kind == OBJECT_TSCONFIGURATION);
-
-	if (!ShouldPropagate())
-	{
-		return NIL;
-	}
-
-	/* check creation against multi-statement transaction policy */
-	if (!ShouldPropagateCreateInCoordinatedTransction())
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	/*
-	 * TEXT SEARCH CONFIGURATION objects are more complex with their mappings and the
-	 * possibility of copying from existing templates that we will require the idempotent
-	 * recreation commands to be run for successful propagation
-	 */
-	List *commands = CreateTextSearchConfigDDLCommandsIdempotent(&address);
-
-	commands = lcons(DISABLE_DDL_PROPAGATION, commands);
-	commands = lappend(commands, ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
-
-/*
- * PostprocessCreateTextSearchDictionaryStmt is called after the TEXT SEARCH DICTIONARY has been
- * created locally.
- */
-List *
-PostprocessCreateTextSearchDictionaryStmt(Node *node, const char *queryString)
-{
-	DefineStmt *stmt = castNode(DefineStmt, node);
-	Assert(stmt->kind == OBJECT_TSDICTIONARY);
-
-	if (!ShouldPropagate())
-	{
-		return NIL;
-	}
-
-	/* check creation against multi-statement transaction policy */
-	if (!ShouldPropagateCreateInCoordinatedTransction())
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	QualifyTreeNode(node);
-	const char *createTSDictionaryStmtSql = DeparseTreeNode(node);
-
-	/*
-	 * To prevent recursive propagation in mx architecture, we disable ddl
-	 * propagation before sending the command to workers.
-	 */
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) createTSDictionaryStmtSql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
 
 List *
 GetCreateTextSearchConfigStatements(const ObjectAddress *address)
@@ -214,602 +122,6 @@ CreateTextSearchDictDDLCommandsIdempotent(const ObjectAddress *address)
 	List *stmts = GetCreateTextSearchDictionaryStatements(address);
 	List *sqls = DeparseTreeNodes(stmts);
 	return list_make1(WrapCreateOrReplaceList(sqls));
-}
-
-
-/*
- * PreprocessDropTextSearchConfigurationStmt prepares the statements we need to send to
- * the workers. After we have dropped the configurations locally they also got removed from
- * pg_dist_object so it is important to do all distribution checks before the change is
- * made locally.
- */
-List *
-PreprocessDropTextSearchConfigurationStmt(Node *node, const char *queryString,
-										  ProcessUtilityContext processUtilityContext)
-{
-	DropStmt *stmt = castNode(DropStmt, node);
-	Assert(stmt->removeType == OBJECT_TSCONFIGURATION);
-
-	if (!ShouldPropagate())
-	{
-		return NIL;
-	}
-
-	List *distributedObjects = GetDistributedTextSearchConfigurationNames(stmt);
-	if (list_length(distributedObjects) == 0)
-	{
-		/* no distributed objects to remove */
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	/*
-	 * Temporarily replace the list of objects being dropped with only the list
-	 * containing the distributed objects. After we have created the sql statement we
-	 * restore the original list of objects to execute on locally.
-	 *
-	 * Because searchpaths on coordinator and workers might not be in sync we fully
-	 * qualify the list before deparsing. This is safe because qualification doesn't
-	 * change the original names in place, but insteads creates new ones.
-	 */
-	List *originalObjects = stmt->objects;
-	stmt->objects = distributedObjects;
-	QualifyTreeNode((Node *) stmt);
-	const char *dropStmtSql = DeparseTreeNode((Node *) stmt);
-	stmt->objects = originalObjects;
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) dropStmtSql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessDropTextSearchDictionaryStmt prepares the statements we need to send to
- * the workers. After we have dropped the dictionaries locally they also got removed from
- * pg_dist_object so it is important to do all distribution checks before the change is
- * made locally.
- */
-List *
-PreprocessDropTextSearchDictionaryStmt(Node *node, const char *queryString,
-									   ProcessUtilityContext processUtilityContext)
-{
-	DropStmt *stmt = castNode(DropStmt, node);
-	Assert(stmt->removeType == OBJECT_TSDICTIONARY);
-
-	if (!ShouldPropagate())
-	{
-		return NIL;
-	}
-
-	List *distributedObjects = GetDistributedTextSearchDictionaryNames(stmt);
-	if (list_length(distributedObjects) == 0)
-	{
-		/* no distributed objects to remove */
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	/*
-	 * Temporarily replace the list of objects being dropped with only the list
-	 * containing the distributed objects. After we have created the sql statement we
-	 * restore the original list of objects to execute on locally.
-	 *
-	 * Because searchpaths on coordinator and workers might not be in sync we fully
-	 * qualify the list before deparsing. This is safe because qualification doesn't
-	 * change the original names in place, but insteads creates new ones.
-	 */
-	List *originalObjects = stmt->objects;
-	stmt->objects = distributedObjects;
-	QualifyTreeNode((Node *) stmt);
-	const char *dropStmtSql = DeparseTreeNode((Node *) stmt);
-	stmt->objects = originalObjects;
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) dropStmtSql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * GetDistributedTextSearchConfigurationNames iterates over all text search configurations
- * dropped, and create a list containing all configurations that are distributed.
- */
-static List *
-GetDistributedTextSearchConfigurationNames(DropStmt *stmt)
-{
-	List *objName = NULL;
-	List *distributedObjects = NIL;
-	foreach_ptr(objName, stmt->objects)
-	{
-		Oid tsconfigOid = get_ts_config_oid(objName, stmt->missing_ok);
-		if (!OidIsValid(tsconfigOid))
-		{
-			/* skip missing configuration names, they can't be distributed */
-			continue;
-		}
-
-		ObjectAddress address = { 0 };
-		ObjectAddressSet(address, TSConfigRelationId, tsconfigOid);
-		if (!IsObjectDistributed(&address))
-		{
-			continue;
-		}
-		distributedObjects = lappend(distributedObjects, objName);
-	}
-	return distributedObjects;
-}
-
-
-/*
- * GetDistributedTextSearchDictionaryNames iterates over all text search dictionaries
- * dropped, and create a list containing all dictionaries that are distributed.
- */
-static List *
-GetDistributedTextSearchDictionaryNames(DropStmt *stmt)
-{
-	List *objName = NULL;
-	List *distributedObjects = NIL;
-	foreach_ptr(objName, stmt->objects)
-	{
-		Oid tsdictOid = get_ts_dict_oid(objName, stmt->missing_ok);
-		if (!OidIsValid(tsdictOid))
-		{
-			/* skip missing dictionary names, they can't be distributed */
-			continue;
-		}
-
-		ObjectAddress address = { 0 };
-		ObjectAddressSet(address, TSDictionaryRelationId, tsdictOid);
-		if (!IsObjectDistributed(&address))
-		{
-			continue;
-		}
-		distributedObjects = lappend(distributedObjects, objName);
-	}
-	return distributedObjects;
-}
-
-
-/*
- * PreprocessAlterTextSearchConfigurationStmt verifies if the configuration being altered
- * is distributed in the cluster. If that is the case it will prepare the list of commands
- * to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchConfigurationStmt(Node *node, const char *queryString,
-										   ProcessUtilityContext processUtilityContext)
-{
-	AlterTSConfigurationStmt *stmt = castNode(AlterTSConfigurationStmt, node);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *alterStmtSql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) alterStmtSql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessAlterTextSearchDictionaryStmt verifies if the dictionary being altered is
- * distributed in the cluster. If that is the case it will prepare the list of commands to
- * send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchDictionaryStmt(Node *node, const char *queryString,
-										ProcessUtilityContext processUtilityContext)
-{
-	AlterTSDictionaryStmt *stmt = castNode(AlterTSDictionaryStmt, node);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *alterStmtSql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) alterStmtSql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessRenameTextSearchConfigurationStmt verifies if the configuration being altered
- * is distributed in the cluster. If that is the case it will prepare the list of commands
- * to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessRenameTextSearchConfigurationStmt(Node *node, const char *queryString,
-											ProcessUtilityContext processUtilityContext)
-{
-	RenameStmt *stmt = castNode(RenameStmt, node);
-	Assert(stmt->renameType == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	QualifyTreeNode((Node *) stmt);
-
-	char *ddlCommand = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) ddlCommand,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessRenameTextSearchDictionaryStmt verifies if the dictionary being altered
- * is distributed in the cluster. If that is the case it will prepare the list of commands
- * to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessRenameTextSearchDictionaryStmt(Node *node, const char *queryString,
-										 ProcessUtilityContext processUtilityContext)
-{
-	RenameStmt *stmt = castNode(RenameStmt, node);
-	Assert(stmt->renameType == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	QualifyTreeNode((Node *) stmt);
-
-	char *ddlCommand = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) ddlCommand,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessAlterTextSearchConfigurationSchemaStmt verifies if the configuration being
- * altered is distributed in the cluster. If that is the case it will prepare the list of
- * commands to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchConfigurationSchemaStmt(Node *node, const char *queryString,
-												 ProcessUtilityContext
-												 processUtilityContext)
-{
-	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt,
-														  stmt->missing_ok);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessAlterTextSearchDictionarySchemaStmt verifies if the dictionary being
- * altered is distributed in the cluster. If that is the case it will prepare the list of
- * commands to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchDictionarySchemaStmt(Node *node, const char *queryString,
-											  ProcessUtilityContext
-											  processUtilityContext)
-{
-	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt,
-														  stmt->missing_ok);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PostprocessAlterTextSearchConfigurationSchemaStmt is invoked after the schema has been
- * changed locally. Since changing the schema could result in new dependencies being found
- * for this object we re-ensure all the dependencies for the configuration do exist. This
- * is solely to propagate the new schema (and all its dependencies) if it was not already
- * distributed in the cluster.
- */
-List *
-PostprocessAlterTextSearchConfigurationSchemaStmt(Node *node, const char *queryString)
-{
-	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt,
-														  stmt->missing_ok);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	/* dependencies have changed (schema) let's ensure they exist */
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	return NIL;
-}
-
-
-/*
- * PostprocessAlterTextSearchDictionarySchemaStmt is invoked after the schema has been
- * changed locally. Since changing the schema could result in new dependencies being found
- * for this object we re-ensure all the dependencies for the dictionary do exist. This
- * is solely to propagate the new schema (and all its dependencies) if it was not already
- * distributed in the cluster.
- */
-List *
-PostprocessAlterTextSearchDictionarySchemaStmt(Node *node, const char *queryString)
-{
-	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
-	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt,
-														  stmt->missing_ok);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	/* dependencies have changed (schema) let's ensure they exist */
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	return NIL;
-}
-
-
-/*
- * PreprocessTextSearchConfigurationCommentStmt propagates any comment on a distributed
- * configuration to the workers. Since comments for configurations are promenently shown
- * when listing all text search configurations this is purely a cosmetic thing when
- * running in MX.
- */
-List *
-PreprocessTextSearchConfigurationCommentStmt(Node *node, const char *queryString,
-											 ProcessUtilityContext processUtilityContext)
-{
-	CommentStmt *stmt = castNode(CommentStmt, node);
-	Assert(stmt->objtype == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessTextSearchDictionaryCommentStmt propagates any comment on a distributed
- * dictionary to the workers. Since comments for dictionaries are promenently shown
- * when listing all text search dictionaries this is purely a cosmetic thing when
- * running in MX.
- */
-List *
-PreprocessTextSearchDictionaryCommentStmt(Node *node, const char *queryString,
-										  ProcessUtilityContext processUtilityContext)
-{
-	CommentStmt *stmt = castNode(CommentStmt, node);
-	Assert(stmt->objtype == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	QualifyTreeNode((Node *) stmt);
-	const char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
-}
-
-
-/*
- * PreprocessAlterTextSearchConfigurationOwnerStmt verifies if the configuration being
- * altered is distributed in the cluster. If that is the case it will prepare the list of
- * commands to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchConfigurationOwnerStmt(Node *node, const char *queryString,
-												ProcessUtilityContext
-												processUtilityContext)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSCONFIGURATION);
-
-	QualifyTreeNode((Node *) stmt);
-	char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
-
-/*
- * PreprocessAlterTextSearchDictionaryOwnerStmt verifies if the dictionary being
- * altered is distributed in the cluster. If that is the case it will prepare the list of
- * commands to send to the worker to apply the same changes remote.
- */
-List *
-PreprocessAlterTextSearchDictionaryOwnerStmt(Node *node, const char *queryString,
-											 ProcessUtilityContext
-											 processUtilityContext)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-	EnsureSequentialMode(OBJECT_TSDICTIONARY);
-
-	QualifyTreeNode((Node *) stmt);
-	char *sql = DeparseTreeNode((Node *) stmt);
-
-	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) sql,
-								ENABLE_DDL_PROPAGATION);
-
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
-}
-
-
-/*
- * PostprocessAlterTextSearchConfigurationOwnerStmt is invoked after the owner has been
- * changed locally. Since changing the owner could result in new dependencies being found
- * for this object we re-ensure all the dependencies for the configuration do exist. This
- * is solely to propagate the new owner (and all its dependencies) if it was not already
- * distributed in the cluster.
- */
-List *
-PostprocessAlterTextSearchConfigurationOwnerStmt(Node *node, const char *queryString)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	/* dependencies have changed (owner) let's ensure they exist */
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	return NIL;
-}
-
-
-/*
- * PostprocessAlterTextSearchDictionaryOwnerStmt is invoked after the owner has been
- * changed locally. Since changing the owner could result in new dependencies being found
- * for this object we re-ensure all the dependencies for the dictionary do exist. This
- * is solely to propagate the new owner (and all its dependencies) if it was not already
- * distributed in the cluster.
- */
-List *
-PostprocessAlterTextSearchDictionaryOwnerStmt(Node *node, const char *queryString)
-{
-	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
-	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
-
-	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt, false);
-	if (!ShouldPropagateObject(&address))
-	{
-		return NIL;
-	}
-
-	/* dependencies have changed (owner) let's ensure they exist */
-	EnsureDependenciesExistOnAllNodes(&address);
-
-	return NIL;
 }
 
 
@@ -1257,17 +569,18 @@ get_ts_parser_namelist(Oid tsparserOid)
  * being created. If missing_pk is false the function will error, explaining to the user
  * the text search configuration described in the statement doesn't exist.
  */
-ObjectAddress
-CreateTextSearchConfigurationObjectAddress(Node *node, bool missing_ok)
+List *
+CreateTextSearchConfigurationObjectAddress(Node *node, bool missing_ok, bool
+										   isPostprocess)
 {
 	DefineStmt *stmt = castNode(DefineStmt, node);
 	Assert(stmt->kind == OBJECT_TSCONFIGURATION);
 
 	Oid objid = get_ts_config_oid(stmt->defnames, missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSConfigRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSConfigRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1276,17 +589,17 @@ CreateTextSearchConfigurationObjectAddress(Node *node, bool missing_ok)
  * being created. If missing_pk is false the function will error, explaining to the user
  * the text search dictionary described in the statement doesn't exist.
  */
-ObjectAddress
-CreateTextSearchDictObjectAddress(Node *node, bool missing_ok)
+List *
+CreateTextSearchDictObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	DefineStmt *stmt = castNode(DefineStmt, node);
 	Assert(stmt->kind == OBJECT_TSDICTIONARY);
 
 	Oid objid = get_ts_dict_oid(stmt->defnames, missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSDictionaryRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSDictionaryRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1295,17 +608,18 @@ CreateTextSearchDictObjectAddress(Node *node, bool missing_ok)
  * SEARCH CONFIGURATION being renamed. Optionally errors if the configuration does not
  * exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-RenameTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok)
+List *
+RenameTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok, bool
+											   isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_TSCONFIGURATION);
 
 	Oid objid = get_ts_config_oid(castNode(List, stmt->object), missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSConfigRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSConfigRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1314,17 +628,18 @@ RenameTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok)
  * SEARCH DICTIONARY being renamed. Optionally errors if the dictionary does not
  * exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-RenameTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok)
+List *
+RenameTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok, bool
+											isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_TSDICTIONARY);
 
 	Oid objid = get_ts_dict_oid(castNode(List, stmt->object), missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSDictionaryRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSDictionaryRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1333,16 +648,17 @@ RenameTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok)
  * SEARCH CONFIGURATION being altered. Optionally errors if the configuration does not
  * exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-AlterTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok, bool
+											  isPostprocess)
 {
 	AlterTSConfigurationStmt *stmt = castNode(AlterTSConfigurationStmt, node);
 
 	Oid objid = get_ts_config_oid(stmt->cfgname, missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSConfigRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSConfigRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1351,16 +667,17 @@ AlterTextSearchConfigurationStmtObjectAddress(Node *node, bool missing_ok)
  * SEARCH CONFIGURATION being altered. Optionally errors if the configuration does not
  * exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-AlterTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok, bool
+										   isPostprocess)
 {
 	AlterTSDictionaryStmt *stmt = castNode(AlterTSDictionaryStmt, node);
 
 	Oid objid = get_ts_dict_oid(stmt->dictname, missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSDictionaryRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSDictionaryRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1373,8 +690,9 @@ AlterTextSearchDictionaryStmtObjectAddress(Node *node, bool missing_ok)
  * the triple checking before the error might be thrown. Errors for non-existing schema's
  * in edgecases will be raised by postgres while executing the move.
  */
-ObjectAddress
-AlterTextSearchConfigurationSchemaStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchConfigurationSchemaStmtObjectAddress(Node *node, bool missing_ok, bool
+													isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
@@ -1411,9 +729,9 @@ AlterTextSearchConfigurationSchemaStmtObjectAddress(Node *node, bool missing_ok)
 		}
 	}
 
-	ObjectAddress sequenceAddress = { 0 };
-	ObjectAddressSet(sequenceAddress, TSConfigRelationId, objid);
-	return sequenceAddress;
+	ObjectAddress *sequenceAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*sequenceAddress, TSConfigRelationId, objid);
+	return list_make1(sequenceAddress);
 }
 
 
@@ -1426,8 +744,9 @@ AlterTextSearchConfigurationSchemaStmtObjectAddress(Node *node, bool missing_ok)
  * the triple checking before the error might be thrown. Errors for non-existing schema's
  * in edgecases will be raised by postgres while executing the move.
  */
-ObjectAddress
-AlterTextSearchDictionarySchemaStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchDictionarySchemaStmtObjectAddress(Node *node, bool missing_ok, bool
+												 isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
@@ -1464,9 +783,9 @@ AlterTextSearchDictionarySchemaStmtObjectAddress(Node *node, bool missing_ok)
 		}
 	}
 
-	ObjectAddress sequenceAddress = { 0 };
-	ObjectAddressSet(sequenceAddress, TSDictionaryRelationId, objid);
-	return sequenceAddress;
+	ObjectAddress *sequenceAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*sequenceAddress, TSDictionaryRelationId, objid);
+	return list_make1(sequenceAddress);
 }
 
 
@@ -1475,17 +794,18 @@ AlterTextSearchDictionarySchemaStmtObjectAddress(Node *node, bool missing_ok)
  * SEARCH CONFIGURATION on which the comment is placed. Optionally errors if the
  * configuration does not exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-TextSearchConfigurationCommentObjectAddress(Node *node, bool missing_ok)
+List *
+TextSearchConfigurationCommentObjectAddress(Node *node, bool missing_ok, bool
+											isPostprocess)
 {
 	CommentStmt *stmt = castNode(CommentStmt, node);
 	Assert(stmt->objtype == OBJECT_TSCONFIGURATION);
 
 	Oid objid = get_ts_config_oid(castNode(List, stmt->object), missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSConfigRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSConfigRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1494,17 +814,17 @@ TextSearchConfigurationCommentObjectAddress(Node *node, bool missing_ok)
  * DICTIONARY on which the comment is placed. Optionally errors if the dictionary does not
  * exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-TextSearchDictCommentObjectAddress(Node *node, bool missing_ok)
+List *
+TextSearchDictCommentObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	CommentStmt *stmt = castNode(CommentStmt, node);
 	Assert(stmt->objtype == OBJECT_TSDICTIONARY);
 
 	Oid objid = get_ts_dict_oid(castNode(List, stmt->object), missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, TSDictionaryRelationId, objid);
-	return address;
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, TSDictionaryRelationId, objid);
+	return list_make1(address);
 }
 
 
@@ -1513,16 +833,23 @@ TextSearchDictCommentObjectAddress(Node *node, bool missing_ok)
  * SEARCH CONFIGURATION for which the owner is changed. Optionally errors if the
  * configuration does not exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-AlterTextSearchConfigurationOwnerObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchConfigurationOwnerObjectAddress(Node *node, bool missing_ok, bool
+											   isPostprocess)
 {
 	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
 	Relation relation = NULL;
 
 	Assert(stmt->objectType == OBJECT_TSCONFIGURATION);
 
-	return get_object_address(stmt->objectType, stmt->object, &relation, AccessShareLock,
-							  missing_ok);
+	ObjectAddress objectAddress = get_object_address(stmt->objectType, stmt->object,
+													 &relation, AccessShareLock,
+													 missing_ok);
+
+	ObjectAddress *objectAddressCopy = palloc0(sizeof(ObjectAddress));
+	*objectAddressCopy = objectAddress;
+
+	return list_make1(objectAddressCopy);
 }
 
 
@@ -1531,16 +858,20 @@ AlterTextSearchConfigurationOwnerObjectAddress(Node *node, bool missing_ok)
  * SEARCH DICTIONARY for which the owner is changed. Optionally errors if the
  * configuration does not exist based on the missing_ok flag passed in by the caller.
  */
-ObjectAddress
-AlterTextSearchDictOwnerObjectAddress(Node *node, bool missing_ok)
+List *
+AlterTextSearchDictOwnerObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
 	Relation relation = NULL;
 
 	Assert(stmt->objectType == OBJECT_TSDICTIONARY);
+	ObjectAddress objectAddress = get_object_address(stmt->objectType, stmt->object,
+													 &relation, AccessShareLock,
+													 missing_ok);
+	ObjectAddress *objectAddressCopy = palloc0(sizeof(ObjectAddress));
+	*objectAddressCopy = objectAddress;
 
-	return get_object_address(stmt->objectType, stmt->object, &relation, AccessShareLock,
-							  missing_ok);
+	return list_make1(objectAddressCopy);
 }
 
 

@@ -10,6 +10,7 @@
 
 #include "postgres.h"
 
+#include "distributed/commands.h"
 #include "distributed/pg_version_constants.h"
 
 #include "access/genam.h"
@@ -20,19 +21,25 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_auth_members.h"
+#include "catalog/pg_authid_d.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_extension_d.h"
+#include "catalog/pg_foreign_data_wrapper_d.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc_d.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_rewrite_d.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_type.h"
-#if PG_VERSION_NUM >= PG_VERSION_13
+#include "commands/extension.h"
 #include "common/hashfn.h"
-#endif
+#include "distributed/citus_depended_object.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
@@ -43,6 +50,7 @@
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 /*
  * ObjectAddressCollector keeps track of collected ObjectAddresses. This can be used
@@ -127,8 +135,11 @@ static List * GetRelationTriggerFunctionDependencyList(Oid relationId);
 static List * GetRelationStatsSchemaDependencyList(Oid relationId);
 static List * GetRelationIndicesDependencyList(Oid relationId);
 static DependencyDefinition * CreateObjectAddressDependencyDef(Oid classId, Oid objectId);
+static List * GetTypeConstraintDependencyDefinition(Oid typeId);
 static List * CreateObjectAddressDependencyDefList(Oid classId, List *objectIdList);
 static ObjectAddress DependencyDefinitionObjectAddress(DependencyDefinition *definition);
+static DeferredErrorMessage * DeferErrorIfHasUnsupportedDependency(const ObjectAddress *
+																   objectAddress);
 
 /* forward declarations for functions to interact with the ObjectAddressCollector */
 static void InitObjectAddressCollector(ObjectAddressCollector *collector);
@@ -160,13 +171,25 @@ static bool FollowNewSupportedDependencies(ObjectAddressCollector *collector,
 										   DependencyDefinition *definition);
 static bool FollowAllDependencies(ObjectAddressCollector *collector,
 								  DependencyDefinition *definition);
+static bool FollowExtAndInternalDependencies(ObjectAddressCollector *collector,
+											 DependencyDefinition *definition);
 static void ApplyAddToDependencyList(ObjectAddressCollector *collector,
 									 DependencyDefinition *definition);
+static void ApplyAddCitusDependedObjectsToDependencyList(
+	ObjectAddressCollector *collector,
+	DependencyDefinition *definition);
+static List * GetViewRuleReferenceDependencyList(Oid relationId);
 static List * ExpandCitusSupportedTypes(ObjectAddressCollector *collector,
 										ObjectAddress target);
+static List * ExpandForPgVanilla(ObjectAddressCollector *collector,
+								 ObjectAddress target);
+static List * GetDependentRoleIdsFDW(Oid FDWOid);
+static List * ExpandRolesToGroups(Oid roleid);
 static ViewDependencyNode * BuildViewDependencyGraph(Oid relationId, HTAB *nodeMap);
-static Oid GetDependingView(Form_pg_depend pg_depend);
-
+static bool IsObjectAddressOwnedByExtension(const ObjectAddress *target,
+											ObjectAddress *extensionAddress);
+static bool ErrorOrWarnIfObjectHasUnsupportedDependency(const
+														ObjectAddress *objectAddress);
 
 /*
  * GetUniqueDependenciesList takes a list of object addresses and returns a new list
@@ -261,6 +284,26 @@ GetAllDependenciesForObject(const ObjectAddress *target)
 							  &ExpandCitusSupportedTypes,
 							  &FollowAllDependencies,
 							  &ApplyAddToDependencyList,
+							  &collector);
+
+	return collector.dependencyList;
+}
+
+
+/*
+ * GetAllCitusDependedDependenciesForObject returns all the dependencies
+ * which are owned by citus extension for the target.
+ */
+List *
+GetAllCitusDependedDependenciesForObject(const ObjectAddress *target)
+{
+	ObjectAddressCollector collector = { 0 };
+	InitObjectAddressCollector(&collector);
+
+	RecurseObjectDependencies(*target,
+							  &ExpandForPgVanilla,
+							  &FollowExtAndInternalDependencies,
+							  &ApplyAddCitusDependedObjectsToDependencyList,
 							  &collector);
 
 	return collector.dependencyList;
@@ -422,7 +465,7 @@ DependencyDefinitionFromPgDepend(ObjectAddress target)
 
 
 /*
- * DependencyDefinitionFromPgDepend loads all pg_shdepend records describing the
+ * DependencyDefinitionFromPgShDepend loads all pg_shdepend records describing the
  * dependencies of target.
  */
 static List *
@@ -489,18 +532,13 @@ DependencyDefinitionFromPgShDepend(ObjectAddress target)
 static void
 InitObjectAddressCollector(ObjectAddressCollector *collector)
 {
-	HASHCTL info;
-
-	memset(&info, 0, sizeof(info));
-	info.keysize = sizeof(ObjectAddress);
-	info.entrysize = sizeof(ObjectAddress);
-	info.hcxt = CurrentMemoryContext;
-	int hashFlags = (HASH_ELEM | HASH_CONTEXT | HASH_BLOBS);
-
-	collector->dependencySet = hash_create("dependency set", 128, &info, hashFlags);
+	assert_valid_hash_key3(ObjectAddress, classId, objectId, objectSubId);
+	collector->dependencySet = CreateSimpleHashSetWithName(ObjectAddress,
+														   "dependency set");
 	collector->dependencyList = NULL;
 
-	collector->visitedObjects = hash_create("visited object set", 128, &info, hashFlags);
+	collector->visitedObjects = CreateSimpleHashSetWithName(ObjectAddress,
+															"visited object set");
 }
 
 
@@ -600,7 +638,7 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 		{
 			case OCLASS_SCHEMA:
 			{
-				return true;
+				return !isTempNamespace(address->objectId);
 			}
 
 			default:
@@ -630,10 +668,23 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			return IsObjectAddressOwnedByExtension(address, NULL);
 		}
 
+		case OCLASS_CONSTRAINT:
+		{
+			/*
+			 * Constraints are only supported when on domain types. Other constraints have
+			 * their typid set to InvalidOid.
+			 */
+			return OidIsValid(get_constraint_typid(address->objectId));
+		}
+
 		case OCLASS_COLLATION:
-		case OCLASS_SCHEMA:
 		{
 			return true;
+		}
+
+		case OCLASS_SCHEMA:
+		{
+			return !isTempNamespace(address->objectId);
 		}
 
 		case OCLASS_PROC:
@@ -654,16 +705,13 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 
 		case OCLASS_ROLE:
 		{
-			/*
-			 * Community only supports the extension owner as a distributed object to
-			 * propagate alter statements for this user
-			 */
-			if (address->objectId == CitusExtensionOwner())
+			/* if it is a reserved role do not propagate */
+			if (IsReservedName(GetUserNameFromId(address->objectId, false)))
 			{
-				return true;
+				return false;
 			}
 
-			return false;
+			return true;
 		}
 
 		case OCLASS_EXTENSION:
@@ -687,6 +735,7 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 			{
 				case TYPTYPE_ENUM:
 				case TYPTYPE_COMPOSITE:
+				case TYPTYPE_DOMAIN:
 				{
 					return true;
 				}
@@ -730,7 +779,8 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 				relKind == RELKIND_FOREIGN_TABLE ||
 				relKind == RELKIND_SEQUENCE ||
 				relKind == RELKIND_INDEX ||
-				relKind == RELKIND_PARTITIONED_INDEX)
+				relKind == RELKIND_PARTITIONED_INDEX ||
+				relKind == RELKIND_VIEW)
 			{
 				return true;
 			}
@@ -748,10 +798,85 @@ SupportedDependencyByCitus(const ObjectAddress *address)
 
 
 /*
+ * ErrorOrWarnIfObjectHasUnsupportedDependency returns false without throwing any message if
+ * object doesn't have any unsupported dependency, else throws a message with proper level
+ * (except the cluster doesn't have any node) and return true.
+ */
+static bool
+ErrorOrWarnIfObjectHasUnsupportedDependency(const ObjectAddress *objectAddress)
+{
+	DeferredErrorMessage *errMsg = DeferErrorIfHasUnsupportedDependency(objectAddress);
+	if (errMsg != NULL)
+	{
+		/*
+		 * Don't need to give any messages if there is no worker nodes in
+		 * the cluster as user's experience won't be affected on the single node even
+		 * if the object won't be distributed.
+		 */
+		if (!HasAnyNodes())
+		{
+			return true;
+		}
+
+		/*
+		 * Since Citus drops and recreates some object while converting a table type
+		 * giving a DEBUG1 message is enough if the process in table type conversion
+		 * function call
+		 */
+		if (InTableTypeConversionFunctionCall)
+		{
+			RaiseDeferredError(errMsg, DEBUG1);
+		}
+		/*
+		 * If the view is object distributed, we should provide an error to not have
+		 * different definition of object on coordinator and worker nodes. If the object
+		 * is not distributed yet, we can create it locally to not affect user's local
+		 * usage experience.
+		 */
+		else if (IsAnyObjectDistributed(list_make1((ObjectAddress *) objectAddress)))
+		{
+			RaiseDeferredError(errMsg, ERROR);
+		}
+		else
+		{
+			if (EnableUnsupportedFeatureMessages)
+			{
+				RaiseDeferredError(errMsg, WARNING);
+			}
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * ErrorOrWarnIfAnyObjectHasUnsupportedDependency iteratively calls
+ * ErrorOrWarnIfObjectHasUnsupportedDependency for given addresses.
+ */
+bool
+ErrorOrWarnIfAnyObjectHasUnsupportedDependency(List *objectAddresses)
+{
+	ObjectAddress *objectAddress = NULL;
+	foreach_ptr(objectAddress, objectAddresses)
+	{
+		if (ErrorOrWarnIfObjectHasUnsupportedDependency(objectAddress))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
  * DeferErrorIfHasUnsupportedDependency returns deferred error message if the given
  * object has any undistributable dependency.
  */
-DeferredErrorMessage *
+static DeferredErrorMessage *
 DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
 {
 	ObjectAddress *undistributableDependency = GetUndistributableDependency(
@@ -776,10 +901,15 @@ DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
 	#endif
 
 	/*
-	 * If the given object is a procedure, we want to create it locally,
-	 * so provide that information in the error detail.
+	 * We expect callers to interpret the error returned from this function
+	 * as a warning if the object itself is just being created. In that case,
+	 * we expect them to report below error detail as well to indicate that
+	 * object itself will not be propagated but will still be created locally.
+	 *
+	 * Otherwise, callers are expected to throw the error returned from this
+	 * function as a hard one by ignoring the detail part.
 	 */
-	if (getObjectClass(objectAddress) == OCLASS_PROC)
+	if (!IsAnyObjectDistributed(list_make1((ObjectAddress *) objectAddress)))
 	{
 		appendStringInfo(detailInfo, "\"%s\" will be created only locally",
 						 objectDescription);
@@ -794,14 +924,22 @@ DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
 						 objectDescription,
 						 dependencyDescription);
 
-		appendStringInfo(hintInfo, "Distribute \"%s\" first to distribute \"%s\"",
-						 dependencyDescription,
-						 objectDescription);
+		if (IsAnyObjectDistributed(list_make1((ObjectAddress *) objectAddress)))
+		{
+			appendStringInfo(hintInfo,
+							 "Distribute \"%s\" first to modify \"%s\" on worker nodes",
+							 dependencyDescription,
+							 objectDescription);
+		}
+		else
+		{
+			appendStringInfo(hintInfo, "Distribute \"%s\" first to distribute \"%s\"",
+							 dependencyDescription,
+							 objectDescription);
+		}
 
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 errorInfo->data,
-							 strlen(detailInfo->data) == 0 ? NULL : detailInfo->data,
-							 hintInfo->data);
+							 errorInfo->data, detailInfo->data, hintInfo->data);
 	}
 
 	appendStringInfo(errorInfo, "\"%s\" has dependency on unsupported "
@@ -809,9 +947,29 @@ DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
 					 dependencyDescription);
 
 	return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-						 errorInfo->data,
-						 strlen(detailInfo->data) == 0 ? NULL : detailInfo->data,
-						 NULL);
+						 errorInfo->data, detailInfo->data, NULL);
+}
+
+
+/*
+ * DeferErrorIfAnyObjectHasUnsupportedDependency iteratively calls
+ * DeferErrorIfHasUnsupportedDependency for given addresses.
+ */
+DeferredErrorMessage *
+DeferErrorIfAnyObjectHasUnsupportedDependency(const List *objectAddresses)
+{
+	DeferredErrorMessage *deferredErrorMessage = NULL;
+	ObjectAddress *objectAddress = NULL;
+	foreach_ptr(objectAddress, objectAddresses)
+	{
+		deferredErrorMessage = DeferErrorIfHasUnsupportedDependency(objectAddress);
+		if (deferredErrorMessage)
+		{
+			return deferredErrorMessage;
+		}
+	}
+
+	return NULL;
 }
 
 
@@ -851,7 +1009,7 @@ GetUndistributableDependency(const ObjectAddress *objectAddress)
 		/*
 		 * If object is distributed already, ignore it.
 		 */
-		if (IsObjectDistributed(dependency))
+		if (IsAnyObjectDistributed(list_make1(dependency)))
 		{
 			continue;
 		}
@@ -878,7 +1036,9 @@ GetUndistributableDependency(const ObjectAddress *objectAddress)
 		{
 			char relKind = get_rel_relkind(dependency->objectId);
 
-			if (relKind == RELKIND_SEQUENCE || relKind == RELKIND_COMPOSITE_TYPE)
+			if (relKind == RELKIND_SEQUENCE ||
+				relKind == RELKIND_COMPOSITE_TYPE ||
+				relKind == RELKIND_VIEW)
 			{
 				/* citus knows how to auto-distribute these dependencies */
 				continue;
@@ -928,7 +1088,7 @@ IsTableOwnedByExtension(Oid relationId)
  * If extensionAddress is not set to a NULL pointer the function will write the extension
  * address this function depends on into this location.
  */
-bool
+static bool
 IsObjectAddressOwnedByExtension(const ObjectAddress *target,
 								ObjectAddress *extensionAddress)
 {
@@ -965,6 +1125,58 @@ IsObjectAddressOwnedByExtension(const ObjectAddress *target,
 	table_close(depRel, AccessShareLock);
 
 	return result;
+}
+
+
+/*
+ * IsAnyObjectAddressOwnedByExtension iteratively calls IsObjectAddressOwnedByExtension
+ * for given addresses to determine if any address is owned by an extension.
+ */
+bool
+IsAnyObjectAddressOwnedByExtension(const List *targets,
+								   ObjectAddress *extensionAddress)
+{
+	ObjectAddress *target = NULL;
+	foreach_ptr(target, targets)
+	{
+		if (IsObjectAddressOwnedByExtension(target, extensionAddress))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * IsObjectAddressOwnedByCitus returns true if the given object address
+ * is owned by the citus or citus_columnar extensions.
+ */
+bool
+IsObjectAddressOwnedByCitus(const ObjectAddress *objectAddress)
+{
+	Oid citusId = get_extension_oid("citus", true);
+	Oid citusColumnarId = get_extension_oid("citus_columnar", true);
+
+	/* return false because we could not find any citus extension */
+	if (!OidIsValid(citusId) && !OidIsValid(citusColumnarId))
+	{
+		return false;
+	}
+
+	ObjectAddress extObjectAddress = InvalidObjectAddress;
+	bool ownedByExt = IsObjectAddressOwnedByExtension(objectAddress,
+													  &extObjectAddress);
+	if (!ownedByExt)
+	{
+		return false;
+	}
+
+	bool ownedByCitus = extObjectAddress.objectId == citusId;
+	bool ownedByCitusColumnar = extObjectAddress.objectId == citusColumnarId;
+
+	return ownedByCitus || ownedByCitusColumnar;
 }
 
 
@@ -1010,7 +1222,9 @@ FollowNewSupportedDependencies(ObjectAddressCollector *collector,
 	 * If the object is already distributed it is not a `new` object that needs to be
 	 * distributed before we create a dependent object
 	 */
-	if (IsObjectDistributed(&address))
+	ObjectAddress *copyAddress = palloc0(sizeof(ObjectAddress));
+	*copyAddress = address;
+	if (IsAnyObjectDistributed(list_make1(copyAddress)))
 	{
 		return false;
 	}
@@ -1148,6 +1362,39 @@ FollowAllDependencies(ObjectAddressCollector *collector,
 
 
 /*
+ * FollowExtAndInternalDependencies applies filters on pg_depend entries to follow
+ * the dependency tree of objects in depth first order. We will visit all objects
+ * irrespective of it is supported by Citus or not and it is internal or not.
+ */
+static bool
+FollowExtAndInternalDependencies(ObjectAddressCollector *collector,
+								 DependencyDefinition *definition)
+{
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
+
+	/*
+	 * If the object is already in our dependency list we do not have to follow any
+	 * further
+	 */
+	if (IsObjectAddressCollected(address, collector))
+	{
+		return false;
+	}
+
+	if (CitusExtensionObject(&address))
+	{
+		/*
+		 * We do not need to follow citus extension because the purpose
+		 * of our walk is to find if an object is owned by citus.
+		 */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * ApplyAddToDependencyList is an apply function for RecurseObjectDependencies that will
  * collect all the ObjectAddresses for pg_depend entries to the context, except it is
  * extension owned one.
@@ -1178,6 +1425,30 @@ ApplyAddToDependencyList(ObjectAddressCollector *collector,
 
 
 /*
+ * ApplyAddCitusDependedObjectsToDependencyList is an apply function for
+ * RecurseObjectDependencies that will collect all the ObjectAddresses for
+ * pg_depend entries to the context if it is citus extension owned one.
+ *
+ * The context here is assumed to be a (ObjectAddressCollector *) to the location where
+ * all ObjectAddresses will be collected.
+ */
+static void
+ApplyAddCitusDependedObjectsToDependencyList(ObjectAddressCollector *collector,
+											 DependencyDefinition *definition)
+{
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
+
+	/*
+	 * We only collect the object if it is owned by citus extension.
+	 */
+	if (IsObjectAddressOwnedByCitus(&address))
+	{
+		CollectObjectAddress(collector, &address);
+	}
+}
+
+
+/*
  * ExpandCitusSupportedTypes base on supported types by citus we might want to expand
  * the list of objects to visit in pg_depend.
  *
@@ -1192,19 +1463,74 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 
 	switch (target.classId)
 	{
-		case TypeRelationId:
+		case AuthIdRelationId:
 		{
 			/*
-			 * types depending on other types are not captured in pg_depend, instead they
-			 * are described with their dependencies by the relation that describes the
-			 * composite type.
+			 * Roles are members of other roles. These relations are not recorded directly
+			 * but can be deduced from pg_auth_members
 			 */
-			if (get_typtype(target.objectId) == TYPTYPE_COMPOSITE)
+			return ExpandRolesToGroups(target.objectId);
+		}
+
+		case ExtensionRelationId:
+		{
+			/*
+			 * FDWs get propagated along with the extensions they belong to.
+			 * In case there are GRANTed privileges on FDWs to roles, those
+			 * GRANT statements will be propagated to. In order to make sure
+			 * that those GRANT statements work, the privileged roles should
+			 * exist on the worker nodes. Hence, here we find these dependent
+			 * roles and add them as dependencies.
+			 */
+
+			Oid extensionId = target.objectId;
+			List *FDWOids = GetDependentFDWsToExtension(extensionId);
+
+			Oid FDWOid = InvalidOid;
+			foreach_oid(FDWOid, FDWOids)
 			{
-				Oid typeRelationId = get_typ_typrelid(target.objectId);
-				DependencyDefinition *dependency =
-					CreateObjectAddressDependencyDef(RelationRelationId, typeRelationId);
-				result = lappend(result, dependency);
+				List *dependentRoleIds = GetDependentRoleIdsFDW(FDWOid);
+				List *dependencies =
+					CreateObjectAddressDependencyDefList(AuthIdRelationId,
+														 dependentRoleIds);
+				result = list_concat(result, dependencies);
+			}
+
+			break;
+		}
+
+		case TypeRelationId:
+		{
+			switch (get_typtype(target.objectId))
+			{
+				/*
+				 * types depending on other types are not captured in pg_depend, instead
+				 * they are described with their dependencies by the relation that
+				 * describes the composite type.
+				 */
+				case TYPTYPE_COMPOSITE:
+				{
+					Oid typeRelationId = get_typ_typrelid(target.objectId);
+					DependencyDefinition *dependency =
+						CreateObjectAddressDependencyDef(RelationRelationId,
+														 typeRelationId);
+					result = lappend(result, dependency);
+					break;
+				}
+
+				/*
+				 * Domains can have constraints associated with them. Constraints themself
+				 * can depend on things like functions. To support the propagation of
+				 * these functions we will add the constraints to the list of objects to
+				 * be created.
+				 */
+				case TYPTYPE_DOMAIN:
+				{
+					List *dependencies =
+						GetTypeConstraintDependencyDefinition(target.objectId);
+					result = list_concat(result, dependencies);
+					break;
+				}
 			}
 
 			/*
@@ -1273,9 +1599,26 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 			 * create all objects required by the indices before we create the table
 			 * including indices.
 			 */
-
 			List *indexDependencyList = GetRelationIndicesDependencyList(relationId);
 			result = list_concat(result, indexDependencyList);
+
+			/*
+			 * Get the dependencies of the rule for the given view. PG keeps internal
+			 * dependency between view and rule. As it is stated on the PG doc, if
+			 * there is an internal dependency, dependencies of the dependent object
+			 * behave much like they were dependencies of the referenced object.
+			 *
+			 * We need to expand dependencies by including dependencies of the rule
+			 * internally dependent to the view. PG doesn't keep any dependencies
+			 * from view to any object, but it keeps an internal dependency to the
+			 * rule and that rule has dependencies to other objects.
+			 */
+			char relKind = get_rel_relkind(relationId);
+			if (relKind == RELKIND_VIEW || relKind == RELKIND_MATVIEW)
+			{
+				List *ruleRefDepList = GetViewRuleReferenceDependencyList(relationId);
+				result = list_concat(result, ruleRefDepList);
+			}
 		}
 
 		default:
@@ -1289,18 +1632,182 @@ ExpandCitusSupportedTypes(ObjectAddressCollector *collector, ObjectAddress targe
 
 
 /*
+ * ExpandForPgVanilla only expands only comosite types because other types
+ * will find their dependencies in pg_depend. The method should only be called by
+ * is_citus_depended_object udf.
+ */
+static List *
+ExpandForPgVanilla(ObjectAddressCollector *collector,
+				   ObjectAddress target)
+{
+	/* should only be called if GUC is enabled */
+	Assert(HideCitusDependentObjects == true);
+
+	List *result = NIL;
+
+	if (target.classId == TypeRelationId && get_typtype(target.objectId) ==
+		TYPTYPE_COMPOSITE)
+	{
+		/*
+		 * types depending on other types are not captured in pg_depend, instead
+		 * they are described with their dependencies by the relation that
+		 * describes the composite type.
+		 */
+		Oid typeRelationId = get_typ_typrelid(target.objectId);
+		DependencyDefinition *dependency =
+			CreateObjectAddressDependencyDef(RelationRelationId,
+											 typeRelationId);
+		result = lappend(result, dependency);
+	}
+
+	return result;
+}
+
+
+/*
+ * GetDependentRoleIdsFDW returns a list of role oids that has privileges on the
+ * FDW with the given object id.
+ */
+static List *
+GetDependentRoleIdsFDW(Oid FDWOid)
+{
+	List *roleIds = NIL;
+
+	Acl *aclEntry = GetPrivilegesForFDW(FDWOid);
+
+	if (aclEntry == NULL)
+	{
+		return NIL;
+	}
+
+	AclItem *privileges = ACL_DAT(aclEntry);
+	int numberOfPrivsGranted = ACL_NUM(aclEntry);
+
+	for (int i = 0; i < numberOfPrivsGranted; i++)
+	{
+		roleIds = lappend_oid(roleIds, privileges[i].ai_grantee);
+	}
+
+	return roleIds;
+}
+
+
+/*
+ * ExpandRolesToGroups returns a list of object addresses pointing to roles that roleid
+ * depends on.
+ */
+static List *
+ExpandRolesToGroups(Oid roleid)
+{
+	Relation pgAuthMembers = table_open(AuthMemRelationId, AccessShareLock);
+	HeapTuple tuple = NULL;
+
+	ScanKeyData scanKey[1];
+	const int scanKeyCount = 1;
+
+	/* scan pg_auth_members for member = $1 via index pg_auth_members_member_role_index */
+	ScanKeyInit(&scanKey[0], Anum_pg_auth_members_member, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(roleid));
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgAuthMembers, AuthMemMemRoleIndexId,
+													true, NULL, scanKeyCount, scanKey);
+
+	List *roles = NIL;
+	while ((tuple = systable_getnext(scanDescriptor)) != NULL)
+	{
+		Form_pg_auth_members membership = (Form_pg_auth_members) GETSTRUCT(tuple);
+
+		DependencyDefinition *definition = palloc0(sizeof(DependencyDefinition));
+		definition->mode = DependencyObjectAddress;
+		ObjectAddressSet(definition->data.address, AuthIdRelationId, membership->roleid);
+
+		roles = lappend(roles, definition);
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgAuthMembers, AccessShareLock);
+
+	return roles;
+}
+
+
+/*
+ * GetViewRuleReferenceDependencyList returns the dependencies of the view's
+ * internal rule dependencies.
+ */
+static List *
+GetViewRuleReferenceDependencyList(Oid viewId)
+{
+	List *dependencyTupleList = GetPgDependTuplesForDependingObjects(RelationRelationId,
+																	 viewId);
+	List *nonInternalDependenciesOfDependingRules = NIL;
+
+	HeapTuple depTup = NULL;
+	foreach_ptr(depTup, dependencyTupleList)
+	{
+		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
+
+		/*
+		 * Dependencies of the internal rule dependency should be handled as the dependency
+		 * of referenced view object.
+		 *
+		 * PG doesn't keep dependency relation between views and dependent objects directly
+		 * but it keeps an internal dependency relation between the view and the rule, then
+		 * keeps the dependent objects of the view as non-internal dependencies of the
+		 * internally dependent rule object.
+		 */
+		if (pg_depend->deptype == DEPENDENCY_INTERNAL && pg_depend->classid ==
+			RewriteRelationId)
+		{
+			ObjectAddress ruleAddress = { 0 };
+			ObjectAddressSet(ruleAddress, RewriteRelationId, pg_depend->objid);
+
+			/* Expand results with the noninternal dependencies of it */
+			List *ruleDependencies = DependencyDefinitionFromPgDepend(ruleAddress);
+
+			DependencyDefinition *dependencyDef = NULL;
+			foreach_ptr(dependencyDef, ruleDependencies)
+			{
+				/*
+				 * Follow all dependencies of the internally dependent rule dependencies
+				 * except it is an internal dependency of view itself.
+				 */
+				if (dependencyDef->data.pg_depend.deptype == DEPENDENCY_INTERNAL ||
+					(dependencyDef->data.pg_depend.refclassid == RelationRelationId &&
+					 dependencyDef->data.pg_depend.refobjid == viewId))
+				{
+					continue;
+				}
+
+				nonInternalDependenciesOfDependingRules =
+					lappend(nonInternalDependenciesOfDependingRules, dependencyDef);
+			}
+		}
+	}
+
+	return nonInternalDependenciesOfDependingRules;
+}
+
+
+/*
  * GetRelationSequenceDependencyList returns the sequence dependency definition
  * list for the given relation.
  */
 static List *
 GetRelationSequenceDependencyList(Oid relationId)
 {
-	List *attnumList = NIL;
-	List *dependentSequenceList = NIL;
+	List *seqInfoList = NIL;
+	GetDependentSequencesWithRelation(relationId, &seqInfoList, 0);
 
-	GetDependentSequencesWithRelation(relationId, &attnumList, &dependentSequenceList, 0);
+	List *seqIdList = NIL;
+	SequenceInfo *seqInfo = NULL;
+	foreach_ptr(seqInfo, seqInfoList)
+	{
+		seqIdList = lappend_oid(seqIdList, seqInfo->sequenceOid);
+	}
+
 	List *sequenceDependencyDefList =
-		CreateObjectAddressDependencyDefList(RelationRelationId, dependentSequenceList);
+		CreateObjectAddressDependencyDefList(RelationRelationId, seqIdList);
 
 	return sequenceDependencyDefList;
 }
@@ -1376,6 +1883,49 @@ GetRelationTriggerFunctionDependencyList(Oid relationId)
 	}
 
 	return dependencyList;
+}
+
+
+/*
+ * GetTypeConstraintDependencyDefinition creates a list of constraint dependency
+ * definitions for a given type
+ */
+static List *
+GetTypeConstraintDependencyDefinition(Oid typeId)
+{
+	/* lookup and look all constraints to add them to the CreateDomainStmt */
+	Relation conRel = table_open(ConstraintRelationId, AccessShareLock);
+
+	/* Look for CHECK Constraints on this domain */
+	ScanKeyData key[1];
+	ScanKeyInit(&key[0],
+				Anum_pg_constraint_contypid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typeId));
+
+	SysScanDesc scan = systable_beginscan(conRel, ConstraintTypidIndexId, true, NULL, 1,
+										  key);
+
+	List *dependencies = NIL;
+	HeapTuple conTup = NULL;
+	while (HeapTupleIsValid(conTup = systable_getnext(scan)))
+	{
+		Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(conTup);
+
+		if (c->contype != CONSTRAINT_CHECK)
+		{
+			/* Ignore non-CHECK constraints, shouldn't be any */
+			continue;
+		}
+
+		dependencies = lappend(dependencies, CreateObjectAddressDependencyDef(
+								   ConstraintRelationId, c->oid));
+	}
+
+	systable_endscan(scan);
+	table_close(conRel, NoLock);
+
+	return dependencies;
 }
 
 
@@ -1546,13 +2096,8 @@ GetPgDependTuplesForDependingObjects(Oid targetObjectClassId, Oid targetObjectId
 List *
 GetDependingViews(Oid relationId)
 {
-	HASHCTL info;
-	memset(&info, 0, sizeof(info));
-	info.keysize = sizeof(Oid);
-	info.entrysize = sizeof(ViewDependencyNode);
-	info.hash = oid_hash;
-	uint32 hashFlags = (HASH_ELEM | HASH_FUNCTION);
-	HTAB *nodeMap = hash_create("view dependency map (oid)", 32, &info, hashFlags);
+	HTAB *nodeMap = CreateSimpleHashWithName(Oid, ViewDependencyNode,
+											 "view dependency map (oid)");
 
 	ViewDependencyNode *tableNode = BuildViewDependencyGraph(relationId, nodeMap);
 
@@ -1564,6 +2109,23 @@ GetDependingViews(Oid relationId)
 		ViewDependencyNode *dependingNode = NULL;
 		foreach_ptr(dependingNode, node->dependingNodes)
 		{
+			ObjectAddress relationAddress = { 0 };
+			ObjectAddressSet(relationAddress, RelationRelationId, dependingNode->id);
+
+			/*
+			 * This function does not catch views with circular dependencies,
+			 * because of the remaining dependency count check below.
+			 * Here we check if the view has a circular dependency or not.
+			 * If yes, we error out with a message that tells the user that
+			 * Citus does not handle circular dependencies.
+			 */
+			DeferredErrorMessage *depError =
+				DeferErrorIfCircularDependencyExists(&relationAddress);
+			if (depError != NULL)
+			{
+				RaiseDeferredError(depError, ERROR);
+			}
+
 			dependingNode->remainingDependencyCount--;
 			if (dependingNode->remainingDependencyCount == 0)
 			{

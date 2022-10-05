@@ -230,9 +230,7 @@ static List * FetchEqualityAttrNumsForRTEOpExpr(OpExpr *opExpr);
 static List * FetchEqualityAttrNumsForRTEBoolExpr(BoolExpr *boolExpr);
 static List * FetchEqualityAttrNumsForList(List *nodeList);
 static int PartitionColumnIndex(Var *targetVar, List *targetList);
-#if PG_VERSION_NUM >= PG_VERSION_13
 static List * GetColumnOriginalIndexes(Oid relationId);
-#endif
 
 
 /*
@@ -492,6 +490,10 @@ RangePartitionJoinBaseRelationId(MultiJoin *joinNode)
 	{
 		partitionNode = (MultiPartition *) rightChildNode;
 	}
+	else
+	{
+		Assert(false);
+	}
 
 	Index baseTableId = partitionNode->splitPointTableId;
 	MultiTable *baseTable = FindTableNode((MultiNode *) joinNode, baseTableId);
@@ -541,9 +543,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	List *sortClauseList = NIL;
 	Node *limitCount = NULL;
 	Node *limitOffset = NULL;
-#if PG_VERSION_NUM >= PG_VERSION_13
 	LimitOption limitOption = LIMIT_OPTION_DEFAULT;
-#endif
 	Node *havingQual = NULL;
 	bool hasDistinctOn = false;
 	List *distinctClause = NIL;
@@ -579,12 +579,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 		Job *job = (Job *) linitial(dependentJobList);
 		if (CitusIsA(job, MapMergeJob))
 		{
-			MapMergeJob *mapMergeJob = (MapMergeJob *) job;
 			isRepartitionJoin = true;
-			if (mapMergeJob->reduceQuery)
-			{
-				updateColumnAttributes = false;
-			}
 		}
 	}
 
@@ -625,9 +620,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 
 		limitCount = extendedOp->limitCount;
 		limitOffset = extendedOp->limitOffset;
-#if PG_VERSION_NUM >= PG_VERSION_13
 		limitOption = extendedOp->limitOption;
-#endif
 		sortClauseList = extendedOp->sortClauseList;
 		havingQual = extendedOp->havingQual;
 	}
@@ -683,9 +676,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependentJobList)
 	jobQuery->groupClause = groupClauseList;
 	jobQuery->limitOffset = limitOffset;
 	jobQuery->limitCount = limitCount;
-#if PG_VERSION_NUM >= PG_VERSION_13
 	jobQuery->limitOption = limitOption;
-#endif
 	jobQuery->havingQual = havingQual;
 	jobQuery->hasAggs = contain_aggs_of_level((Node *) targetList, 0) ||
 						contain_aggs_of_level((Node *) havingQual, 0);
@@ -735,6 +726,7 @@ BaseRangeTableList(MultiNode *multiNode)
 				rangeTableEntry->alias = multiTable->alias;
 				rangeTableEntry->relid = multiTable->relationId;
 				rangeTableEntry->inh = multiTable->includePartitions;
+				rangeTableEntry->tablesample = multiTable->tablesample;
 
 				SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_RELATION, NULL, NULL,
 									 list_make1_int(multiTable->rangeTableId),
@@ -797,7 +789,7 @@ DerivedColumnNameList(uint32 columnCount, uint64 generatingJobId)
 		appendStringInfo(columnName, UINT64_FORMAT "_", generatingJobId);
 		appendStringInfo(columnName, "%u", columnIndex);
 
-		Value *columnValue = makeString(columnName->data);
+		String *columnValue = makeString(columnName->data);
 		columnNameList = lappend(columnNameList, columnValue);
 	}
 
@@ -1337,8 +1329,6 @@ static void
 SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, Oid leftRelId, Oid rightRelId,
 							List *leftColumnVars, List *rightColumnVars)
 {
-	#if PG_VERSION_NUM >= PG_VERSION_13
-
 	/* We don't have any merged columns so set it to 0 */
 	rangeTableEntry->joinmergedcols = 0;
 
@@ -1361,12 +1351,8 @@ SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, Oid leftRelId, Oid r
 		int rightColsSize = list_length(rightColumnVars);
 		rangeTableEntry->joinrightcols = GeneratePositiveIntSequenceList(rightColsSize);
 	}
-
-	#endif
 }
 
-
-#if PG_VERSION_NUM >= PG_VERSION_13
 
 /*
  * GetColumnOriginalIndexes gets the original indexes of columns by taking column drops into account.
@@ -1390,8 +1376,6 @@ GetColumnOriginalIndexes(Oid relationId)
 	return originalIndexes;
 }
 
-
-#endif
 
 /*
  * ExtractRangeTableId gets the range table id from a node that could
@@ -2194,11 +2178,9 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 						 DeferredErrorMessage **planningError)
 {
 	List *sqlTaskList = NIL;
-	ListCell *restrictionCell = NULL;
 	uint32 taskIdIndex = 1; /* 0 is reserved for invalid taskId */
 	int shardCount = 0;
 	bool *taskRequiredForShardIndex = NULL;
-	ListCell *prunedRelationShardCell = NULL;
 
 	/* error if shards are not co-partitioned */
 	ErrorIfUnsupportedShardDistribution(query);
@@ -2216,14 +2198,13 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 	int minShardOffset = 0;
 	int maxShardOffset = 0;
 
-	forboth(prunedRelationShardCell, prunedRelationShardList,
-			restrictionCell, relationRestrictionContext->relationRestrictionList)
+	RelationRestriction *relationRestriction = NULL;
+	List *prunedShardList = NULL;
+
+	forboth_ptr(prunedShardList, prunedRelationShardList,
+				relationRestriction, relationRestrictionContext->relationRestrictionList)
 	{
-		RelationRestriction *relationRestriction =
-			(RelationRestriction *) lfirst(restrictionCell);
 		Oid relationId = relationRestriction->relationId;
-		List *prunedShardList = (List *) lfirst(prunedRelationShardCell);
-		ListCell *shardIntervalCell = NULL;
 
 		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 		if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_TABLE_WITH_NO_DIST_KEY))
@@ -2266,9 +2247,9 @@ QueryPushdownSqlTaskList(Query *query, uint64 jobId,
 			continue;
 		}
 
-		foreach(shardIntervalCell, prunedShardList)
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, prunedShardList)
 		{
-			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 			int shardIndex = shardInterval->shardIndex;
 
 			taskRequiredForShardIndex[shardIndex] = true;
@@ -2584,7 +2565,7 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 	{
 		pg_get_query_def(taskQuery, queryString);
 		ereport(DEBUG4, (errmsg("distributed statement: %s",
-								ApplyLogRedaction(queryString->data))));
+								queryString->data)));
 		SetTaskQueryString(subqueryTask, queryString->data);
 	}
 
@@ -2739,7 +2720,7 @@ SqlTaskList(Job *job)
 		/* log the query string we generated */
 		ereport(DEBUG4, (errmsg("generated sql query for task %d", sqlTask->taskId),
 						 errdetail("query string: \"%s\"",
-								   ApplyLogRedaction(sqlQueryString->data))));
+								   sqlQueryString->data)));
 
 		sqlTask->anchorShardId = INVALID_SHARD_ID;
 		if (anchorRangeTableBasedAssignment)
@@ -3250,45 +3231,6 @@ BinaryOpExpression(Expr *clause, Node **leftOperand, Node **rightOperand)
 		Assert(*rightOperand != NULL);
 		*rightOperand = strip_implicit_coercions(*rightOperand);
 	}
-	return true;
-}
-
-
-/*
- * SimpleOpExpression checks that given expression is a simple operator
- * expression. A simple operator expression is a binary operator expression with
- * operands of a var and a non-null constant.
- */
-bool
-SimpleOpExpression(Expr *clause)
-{
-	Const *constantClause = NULL;
-
-	Node *leftOperand;
-	Node *rightOperand;
-	if (!BinaryOpExpression(clause, &leftOperand, &rightOperand))
-	{
-		return false;
-	}
-
-	if (IsA(rightOperand, Const) && IsA(leftOperand, Var))
-	{
-		constantClause = (Const *) rightOperand;
-	}
-	else if (IsA(leftOperand, Const) && IsA(rightOperand, Var))
-	{
-		constantClause = (Const *) leftOperand;
-	}
-	else
-	{
-		return false;
-	}
-
-	if (constantClause->constisnull)
-	{
-		return false;
-	}
-
 	return true;
 }
 
@@ -4728,18 +4670,13 @@ MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList, uint32 taskIdIndex)
 	for (uint32 partitionId = initialPartitionId; partitionId < partitionCount;
 		 partitionId++)
 	{
-		Task *mergeTask = NULL;
 		List *mapOutputFetchTaskList = NIL;
 		ListCell *mapTaskCell = NULL;
 		uint32 mergeTaskId = taskIdIndex;
 
-		Query *reduceQuery = mapMergeJob->reduceQuery;
-		if (reduceQuery == NULL)
-		{
-			/* create logical merge task (not executed, but useful for bookkeeping) */
-			mergeTask = CreateBasicTask(jobId, mergeTaskId, MERGE_TASK,
-										"<merge>");
-		}
+		/* create logical merge task (not executed, but useful for bookkeeping) */
+		Task *mergeTask = CreateBasicTask(jobId, mergeTaskId, MERGE_TASK,
+										  "<merge>");
 		mergeTask->partitionId = partitionId;
 		taskIdIndex++;
 

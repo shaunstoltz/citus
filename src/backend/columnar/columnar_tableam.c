@@ -12,14 +12,11 @@
 #include "access/rewriteheap.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
-#if PG_VERSION_NUM >= 130000
 #include "access/detoast.h"
-#else
-#include "access/tuptoaster.h"
-#endif
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_publication.h"
@@ -27,6 +24,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "commands/defrem.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "commands/extension.h"
@@ -103,9 +101,6 @@ typedef struct IndexFetchColumnarData
 	MemoryContext scanContext;
 } IndexFetchColumnarData;
 
-
-ColumnarTableSetOptions_hook_type ColumnarTableSetOptions_hook = NULL;
-
 static object_access_hook_type PrevObjectAccessHook = NULL;
 static ProcessUtility_hook_type PrevProcessUtilityHook = NULL;
 
@@ -116,6 +111,8 @@ static void ColumnarTriggerCreateHook(Oid tgid);
 static void ColumnarTableAMObjectAccessHook(ObjectAccessType access, Oid classId,
 											Oid objectId, int subId,
 											void *arg);
+static RangeVar * ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt,
+											List **columnarOptions);
 static void ColumnarProcessUtility(PlannedStmt *pstmt,
 								   const char *queryString,
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -125,7 +122,7 @@ static void ColumnarProcessUtility(PlannedStmt *pstmt,
 								   ParamListInfo params,
 								   struct QueryEnvironment *queryEnv,
 								   DestReceiver *dest,
-								   QueryCompletionCompat *completionTag);
+								   QueryCompletion *completionTag);
 static bool ConditionalLockRelationWithTimeout(Relation rel, LOCKMODE lockMode,
 											   int timeout, int retryInterval);
 static List * NeededColumnsList(TupleDesc tupdesc, Bitmapset *attr_needed);
@@ -742,7 +739,9 @@ columnar_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	 */
 	ColumnarWriteState *writeState = columnar_init_write_state(relation,
 															   RelationGetDescr(relation),
+															   slot->tts_tableOid,
 															   GetCurrentSubTransactionId());
+
 	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
 														 writeState));
 
@@ -784,8 +783,14 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	CheckCitusColumnarVersion(ERROR);
 
+	/*
+	 * The callback to .multi_insert is table_multi_insert() and this is only used for the COPY
+	 * command, so slot[i]->tts_tableoid will always be equal to relation->id. Thus, we can send
+	 * RelationGetRelid(relation) as the tupSlotTableOid
+	 */
 	ColumnarWriteState *writeState = columnar_init_write_state(relation,
 															   RelationGetDescr(relation),
+															   RelationGetRelid(relation),
 															   GetCurrentSubTransactionId());
 
 	ColumnarCheckLogicalReplication(relation);
@@ -881,7 +886,7 @@ columnar_relation_set_new_filenode(Relation rel,
 
 	*freezeXid = RecentXmin;
 	*minmulti = GetOldestMultiXactId();
-	SMgrRelation srel = RelationCreateStorage(*newrnode, persistence);
+	SMgrRelation srel = RelationCreateStorage_compat(*newrnode, persistence, true);
 
 	ColumnarStorageInit(srel, ColumnarMetadataNewStorageId());
 	InitColumnarOptions(rel->rd_id);
@@ -913,8 +918,7 @@ columnar_relation_nontransactional_truncate(Relation rel)
 	RelationTruncate(rel, 0);
 
 	uint64 storageId = ColumnarMetadataNewStorageId();
-	RelationOpenSmgr(rel);
-	ColumnarStorageInit(rel->rd_smgr, storageId);
+	ColumnarStorageInit(RelationGetSmgr(rel), storageId);
 }
 
 
@@ -1034,6 +1038,27 @@ NeededColumnsList(TupleDesc tupdesc, Bitmapset *attr_needed)
 
 
 /*
+ * ColumnarTableTupleCount returns the number of tuples that columnar
+ * table with relationId has by using stripe metadata.
+ */
+static uint64
+ColumnarTableTupleCount(Relation relation)
+{
+	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	uint64 tupleCount = 0;
+
+	ListCell *lc = NULL;
+	foreach(lc, stripeList)
+	{
+		StripeMetadata *stripe = lfirst(lc);
+		tupleCount += stripe->rowCount;
+	}
+
+	return tupleCount;
+}
+
+
+/*
  * columnar_vacuum_rel implements VACUUM without FULL option.
  */
 static void
@@ -1048,6 +1073,9 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 		 */
 		return;
 	}
+
+	pgstat_progress_start_command(PROGRESS_COMMAND_VACUUM,
+								  RelationGetRelid(rel));
 
 	/*
 	 * If metapage version of relation is older, then we hint users to VACUUM
@@ -1072,6 +1100,78 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	{
 		TruncateColumnar(rel, elevel);
 	}
+
+	BlockNumber new_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+
+	/* get the number of indexes */
+	List *indexList = RelationGetIndexList(rel);
+	int nindexes = list_length(indexList);
+
+	TransactionId oldestXmin;
+	TransactionId freezeLimit;
+	MultiXactId multiXactCutoff;
+
+	/* initialize xids */
+#if PG_VERSION_NUM >= PG_VERSION_15
+	MultiXactId oldestMxact;
+	vacuum_set_xid_limits(rel,
+						  params->freeze_min_age,
+						  params->freeze_table_age,
+						  params->multixact_freeze_min_age,
+						  params->multixact_freeze_table_age,
+						  &oldestXmin, &oldestMxact,
+						  &freezeLimit, &multiXactCutoff);
+
+	Assert(MultiXactIdPrecedesOrEquals(multiXactCutoff, oldestMxact));
+#else
+	TransactionId xidFullScanLimit;
+	MultiXactId mxactFullScanLimit;
+	vacuum_set_xid_limits(rel,
+						  params->freeze_min_age,
+						  params->freeze_table_age,
+						  params->multixact_freeze_min_age,
+						  params->multixact_freeze_table_age,
+						  &oldestXmin, &freezeLimit, &xidFullScanLimit,
+						  &multiXactCutoff, &mxactFullScanLimit);
+#endif
+
+	Assert(TransactionIdPrecedesOrEquals(freezeLimit, oldestXmin));
+
+	/*
+	 * Columnar storage doesn't hold any transaction IDs, so we can always
+	 * just advance to the most aggressive value.
+	 */
+	TransactionId newRelFrozenXid = oldestXmin;
+#if PG_VERSION_NUM >= PG_VERSION_15
+	MultiXactId newRelminMxid = oldestMxact;
+#else
+	MultiXactId newRelminMxid = multiXactCutoff;
+#endif
+
+	double new_live_tuples = ColumnarTableTupleCount(rel);
+
+	/* all visible pages are always 0 */
+	BlockNumber new_rel_allvisible = 0;
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+	bool frozenxid_updated;
+	bool minmulti_updated;
+
+	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
+						new_rel_allvisible, nindexes > 0,
+						newRelFrozenXid, newRelminMxid,
+						&frozenxid_updated, &minmulti_updated, false);
+#else
+	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
+						new_rel_allvisible, nindexes > 0,
+						newRelFrozenXid, newRelminMxid, false);
+#endif
+
+	pgstat_report_vacuum(RelationGetRelid(rel),
+						 rel->rd_rel->relisshared,
+						 Max(new_live_tuples, 0),
+						 0);
+	pgstat_progress_end_command();
 }
 
 
@@ -1136,8 +1236,7 @@ LogRelationStats(Relation rel, int elevel)
 		totalStripeLength += stripe->dataLength;
 	}
 
-	RelationOpenSmgr(rel);
-	uint64 relPages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	uint64 relPages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	RelationCloseSmgr(rel);
 
 	Datum storageId = DirectFunctionCall1(columnar_relation_storageid,
@@ -1239,8 +1338,7 @@ TruncateColumnar(Relation rel, int elevel)
 	uint64 newDataReservation = Max(GetHighestUsedAddress(rel->rd_node) + 1,
 									ColumnarFirstLogicalOffset);
 
-	RelationOpenSmgr(rel);
-	BlockNumber old_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber old_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 	if (!ColumnarStorageTruncate(rel, newDataReservation))
 	{
@@ -1248,8 +1346,7 @@ TruncateColumnar(Relation rel, int elevel)
 		return;
 	}
 
-	RelationOpenSmgr(rel);
-	BlockNumber new_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber new_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 	/*
 	 * We can release the exclusive lock as soon as we have truncated.
@@ -1583,15 +1680,8 @@ ColumnarReadRowsIntoIndex(TableScanDesc scan, Relation indexRelation,
 
 		/* currently, columnar tables can't have dead tuples */
 		bool tupleIsAlive = true;
-#if PG_VERSION_NUM >= PG_VERSION_13
 		indexCallback(indexRelation, &itemPointerData, indexValues, indexNulls,
 					  tupleIsAlive, indexCallbackState);
-#else
-		HeapTuple scanTuple = ExecCopySlotHeapTuple(slot);
-		scanTuple->t_self = itemPointerData;
-		indexCallback(indexRelation, scanTuple, indexValues, indexNulls,
-					  tupleIsAlive, indexCallbackState);
-#endif
 
 		reltuples++;
 	}
@@ -1784,20 +1874,17 @@ columnar_relation_size(Relation rel, ForkNumber forkNumber)
 
 	uint64 nblocks = 0;
 
-	/* Open it at the smgr level if not already done */
-	RelationOpenSmgr(rel);
-
 	/* InvalidForkNumber indicates returning the size for all forks */
 	if (forkNumber == InvalidForkNumber)
 	{
 		for (int i = 0; i < MAX_FORKNUM; i++)
 		{
-			nblocks += smgrnblocks(rel->rd_smgr, i);
+			nblocks += smgrnblocks(RelationGetSmgr(rel), i);
 		}
 	}
 	else
 	{
-		nblocks = smgrnblocks(rel->rd_smgr, forkNumber);
+		nblocks = smgrnblocks(RelationGetSmgr(rel), forkNumber);
 	}
 
 	return nblocks * BLCKSZ;
@@ -1819,8 +1906,7 @@ columnar_estimate_rel_size(Relation rel, int32 *attr_widths,
 						   double *allvisfrac)
 {
 	CheckCitusColumnarVersion(ERROR);
-	RelationOpenSmgr(rel);
-	*pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	*pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	*tuples = ColumnarTableRowCount(rel);
 
 	/*
@@ -2084,6 +2170,71 @@ ColumnarTableAMObjectAccessHook(ObjectAccessType access, Oid classId, Oid object
 
 
 /*
+ * ColumnarProcessAlterTable - if modifying a columnar table, extract columnar
+ * options and return the table's RangeVar.
+ */
+static RangeVar *
+ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt, List **columnarOptions)
+{
+	RangeVar *columnarRangeVar = NULL;
+	Relation rel = relation_openrv_extended(alterTableStmt->relation, AccessShareLock,
+											alterTableStmt->missing_ok);
+
+	if (rel == NULL)
+	{
+		return NULL;
+	}
+
+	/* track separately in case of ALTER TABLE ... SET ACCESS METHOD */
+	bool srcIsColumnar = rel->rd_tableam == GetColumnarTableAmRoutine();
+	bool destIsColumnar = srcIsColumnar;
+
+	ListCell *lc = NULL;
+	foreach(lc, alterTableStmt->cmds)
+	{
+		AlterTableCmd *alterTableCmd = castNode(AlterTableCmd, lfirst(lc));
+
+		if (alterTableCmd->subtype == AT_SetRelOptions ||
+			alterTableCmd->subtype == AT_ResetRelOptions)
+		{
+			List *options = castNode(List, alterTableCmd->def);
+
+			alterTableCmd->def = (Node *) ExtractColumnarRelOptions(
+				options, columnarOptions);
+
+			if (destIsColumnar)
+			{
+				columnarRangeVar = alterTableStmt->relation;
+			}
+		}
+#if PG_VERSION_NUM >= PG_VERSION_15
+		else if (alterTableCmd->subtype == AT_SetAccessMethod)
+		{
+			if (columnarRangeVar || *columnarOptions)
+			{
+				ereport(ERROR, (errmsg(
+									"ALTER TABLE cannot alter the access method after altering storage parameters"),
+								errhint(
+									"Specify SET ACCESS METHOD before storage parameters, or use separate ALTER TABLE commands.")));
+			}
+
+			destIsColumnar = (strcmp(alterTableCmd->name, COLUMNAR_AM_NAME) == 0);
+
+			if (srcIsColumnar && !destIsColumnar)
+			{
+				DeleteColumnarTableOptions(RelationGetRelid(rel), true);
+			}
+		}
+#endif /* PG_VERSION_15 */
+	}
+
+	relation_close(rel, NoLock);
+
+	return columnarRangeVar;
+}
+
+
+/*
  * Utility hook for columnar tables.
  */
 static void
@@ -2096,7 +2247,7 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 					   ParamListInfo params,
 					   struct QueryEnvironment *queryEnv,
 					   DestReceiver *dest,
-					   QueryCompletionCompat *completionTag)
+					   QueryCompletion *completionTag)
 {
 #if PG_VERSION_NUM >= PG_VERSION_14
 	if (readOnlyTree)
@@ -2107,31 +2258,126 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 
 	Node *parsetree = pstmt->utilityStmt;
 
-	if (IsA(parsetree, IndexStmt))
+	RangeVar *columnarRangeVar = NULL;
+	List *columnarOptions = NIL;
+
+	switch (nodeTag(parsetree))
 	{
-		IndexStmt *indexStmt = (IndexStmt *) parsetree;
-
-		Relation rel = relation_openrv(indexStmt->relation,
-									   indexStmt->concurrent ? ShareUpdateExclusiveLock :
-									   ShareLock);
-
-		if (rel->rd_tableam == GetColumnarTableAmRoutine())
+		case T_IndexStmt:
 		{
-			CheckCitusColumnarVersion(ERROR);
-			if (!ColumnarSupportsIndexAM(indexStmt->accessMethod))
+			IndexStmt *indexStmt = (IndexStmt *) parsetree;
+
+			Relation rel = relation_openrv(indexStmt->relation,
+										   indexStmt->concurrent ?
+										   ShareUpdateExclusiveLock :
+										   ShareLock);
+
+			if (rel->rd_tableam == GetColumnarTableAmRoutine())
 			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("unsupported access method for the "
-									   "index on columnar table %s",
-									   RelationGetRelationName(rel))));
+				CheckCitusColumnarVersion(ERROR);
+				if (!ColumnarSupportsIndexAM(indexStmt->accessMethod))
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("unsupported access method for the "
+										   "index on columnar table %s",
+										   RelationGetRelationName(rel))));
+				}
 			}
+
+			RelationClose(rel);
+			break;
 		}
 
-		RelationClose(rel);
+		case T_CreateStmt:
+		{
+			CreateStmt *createStmt = castNode(CreateStmt, parsetree);
+			bool no_op = false;
+
+			if (createStmt->if_not_exists)
+			{
+				Oid existing_relid;
+
+				/* use same check as transformCreateStmt */
+				(void) RangeVarGetAndCheckCreationNamespace(
+					createStmt->relation, AccessShareLock, &existing_relid);
+
+				no_op = OidIsValid(existing_relid);
+			}
+
+			if (!no_op && createStmt->accessMethod != NULL &&
+				!strcmp(createStmt->accessMethod, COLUMNAR_AM_NAME))
+			{
+				columnarRangeVar = createStmt->relation;
+				createStmt->options = ExtractColumnarRelOptions(createStmt->options,
+																&columnarOptions);
+			}
+			break;
+		}
+
+		case T_CreateTableAsStmt:
+		{
+			CreateTableAsStmt *createTableAsStmt = castNode(CreateTableAsStmt, parsetree);
+			IntoClause *into = createTableAsStmt->into;
+			bool no_op = false;
+
+			if (createTableAsStmt->if_not_exists)
+			{
+				Oid existing_relid;
+
+				/* use same check as transformCreateStmt */
+				(void) RangeVarGetAndCheckCreationNamespace(
+					into->rel, AccessShareLock, &existing_relid);
+
+				no_op = OidIsValid(existing_relid);
+			}
+
+			if (!no_op && into->accessMethod != NULL &&
+				!strcmp(into->accessMethod, COLUMNAR_AM_NAME))
+			{
+				columnarRangeVar = into->rel;
+				into->options = ExtractColumnarRelOptions(into->options,
+														  &columnarOptions);
+			}
+			break;
+		}
+
+		case T_AlterTableStmt:
+		{
+			AlterTableStmt *alterTableStmt = castNode(AlterTableStmt, parsetree);
+			columnarRangeVar = ColumnarProcessAlterTable(alterTableStmt,
+														 &columnarOptions);
+			break;
+		}
+
+		default:
+
+			/* FALL THROUGH */
+			break;
+	}
+
+	if (columnarOptions != NIL && columnarRangeVar == NULL)
+	{
+		ereport(ERROR,
+				(errmsg("columnar storage parameters specified on non-columnar table")));
+	}
+
+	if (IsA(parsetree, CreateExtensionStmt))
+	{
+		CheckCitusColumnarCreateExtensionStmt(parsetree);
+	}
+
+	if (IsA(parsetree, AlterExtensionStmt))
+	{
+		CheckCitusColumnarAlterExtensionStmt(parsetree);
 	}
 
 	PrevProcessUtilityHook_compat(pstmt, queryString, false, context,
 								  params, queryEnv, dest, completionTag);
+
+	if (columnarOptions != NIL)
+	{
+		SetColumnarRelOptions(columnarRangeVar, columnarOptions);
+	}
 }
 
 
@@ -2168,6 +2414,66 @@ IsColumnarTableAmTable(Oid relationId)
 	relation_close(rel, NoLock);
 
 	return result;
+}
+
+
+/*
+ * CheckCitusColumnarCreateExtensionStmt determines whether can install
+ * citus_columnar per given CREATE extension statment
+ */
+void
+CheckCitusColumnarCreateExtensionStmt(Node *parseTree)
+{
+	CreateExtensionStmt *createExtensionStmt = castNode(CreateExtensionStmt,
+														parseTree);
+	if (get_extension_oid("citus_columnar", true) == InvalidOid)
+	{
+		if (strcmp(createExtensionStmt->extname, "citus_columnar") == 0)
+		{
+			DefElem *newVersionValue = GetExtensionOption(
+				createExtensionStmt->options,
+				"new_version");
+
+			/*we are not allowed to install citus_columnar as version 11.1-0 by cx*/
+			if (newVersionValue)
+			{
+				const char *newVersion = defGetString(newVersionValue);
+				if (strcmp(newVersion, CITUS_COLUMNAR_INTERNAL_VERSION) == 0)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg(
+										"unsupported citus_columnar version 11.1-0")));
+				}
+			}
+		}
+	}
+}
+
+
+/*
+ * CheckCitusColumnarAlterExtensionStmt determines whether can alter
+ * citus_columnar per given ALTER extension statment
+ */
+void
+CheckCitusColumnarAlterExtensionStmt(Node *parseTree)
+{
+	AlterExtensionStmt *alterExtensionStmt = castNode(AlterExtensionStmt, parseTree);
+	if (strcmp(alterExtensionStmt->extname, "citus_columnar") == 0)
+	{
+		DefElem *newVersionValue = GetExtensionOption(alterExtensionStmt->options,
+													  "new_version");
+
+		/*we are not allowed cx to downgrade citus_columnar to 11.1-0*/
+		if (newVersionValue)
+		{
+			const char *newVersion = defGetString(newVersionValue);
+			if (strcmp(newVersion, CITUS_COLUMNAR_INTERNAL_VERSION) == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("unsupported citus_columnar version 11.1-0")));
+			}
+		}
+	}
 }
 
 
@@ -2295,18 +2601,30 @@ detoast_values(TupleDesc tupleDesc, Datum *orig_values, bool *isnull)
 static void
 ColumnarCheckLogicalReplication(Relation rel)
 {
+	bool pubActionInsert = false;
+
 	if (!is_publishable_relation(rel))
 	{
 		return;
 	}
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	{
+		PublicationDesc pubdesc;
+
+		RelationBuildPublicationDesc(rel, &pubdesc);
+		pubActionInsert = pubdesc.pubactions.pubinsert;
+	}
+#else
 	if (rel->rd_pubactions == NULL)
 	{
 		GetRelationPublicationActions(rel);
 		Assert(rel->rd_pubactions != NULL);
 	}
+	pubActionInsert = rel->rd_pubactions->pubinsert;
+#endif
 
-	if (rel->rd_pubactions->pubinsert)
+	if (pubActionInsert)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg(
@@ -2316,219 +2634,36 @@ ColumnarCheckLogicalReplication(Relation rel)
 
 
 /*
- * alter_columnar_table_set is a UDF exposed in postgres to change settings on a columnar
- * table. Calling this function on a non-columnar table gives an error.
+ * alter_columnar_table_set()
  *
- * sql syntax:
- *   pg_catalog.alter_columnar_table_set(
- *        table_name regclass,
- *        chunk_group_row_limit int DEFAULT NULL,
- *        stripe_row_limit int DEFAULT NULL,
- *        compression name DEFAULT null)
+ * Deprecated in 11.1-1: should issue ALTER TABLE ... SET instead. Function
+ * still available, but implemented in PL/pgSQL instead of C.
  *
- * All arguments except the table name are optional. The UDF is supposed to be called
- * like:
- *   SELECT alter_columnar_table_set('table', compression => 'pglz');
- *
- * This will only update the compression of the table, keeping all other settings the
- * same. Multiple settings can be changed at the same time by providing multiple
- * arguments. Calling the argument with the NULL value will be interperted as not having
- * provided the argument.
+ * C code is removed -- the symbol may still be required in some
+ * upgrade/downgrade paths, but it should not be called.
  */
 PG_FUNCTION_INFO_V1(alter_columnar_table_set);
 Datum
 alter_columnar_table_set(PG_FUNCTION_ARGS)
 {
-	CheckCitusColumnarVersion(ERROR);
-
-	Oid relationId = PG_GETARG_OID(0);
-
-	Relation rel = table_open(relationId, AccessExclusiveLock); /* ALTER TABLE LOCK */
-	if (!IsColumnarTableAmTable(relationId))
-	{
-		ereport(ERROR, (errmsg("table %s is not a columnar table",
-							   quote_identifier(RelationGetRelationName(rel)))));
-	}
-
-	if (!pg_class_ownercheck(relationId, GetUserId()))
-	{
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
-					   get_rel_name(relationId));
-	}
-
-	ColumnarOptions options = { 0 };
-	if (!ReadColumnarOptions(relationId, &options))
-	{
-		ereport(ERROR, (errmsg("unable to read current options for table")));
-	}
-
-	/* chunk_group_row_limit => not null */
-	if (!PG_ARGISNULL(1))
-	{
-		options.chunkRowCount = PG_GETARG_INT32(1);
-		if (options.chunkRowCount < CHUNK_ROW_COUNT_MINIMUM ||
-			options.chunkRowCount > CHUNK_ROW_COUNT_MAXIMUM)
-		{
-			ereport(ERROR, (errmsg("chunk group row count limit out of range"),
-							errhint("chunk group row count limit must be between "
-									UINT64_FORMAT " and " UINT64_FORMAT,
-									(uint64) CHUNK_ROW_COUNT_MINIMUM,
-									(uint64) CHUNK_ROW_COUNT_MAXIMUM)));
-		}
-		ereport(DEBUG1,
-				(errmsg("updating chunk row count to %d", options.chunkRowCount)));
-	}
-
-	/* stripe_row_limit => not null */
-	if (!PG_ARGISNULL(2))
-	{
-		options.stripeRowCount = PG_GETARG_INT32(2);
-		if (options.stripeRowCount < STRIPE_ROW_COUNT_MINIMUM ||
-			options.stripeRowCount > STRIPE_ROW_COUNT_MAXIMUM)
-		{
-			ereport(ERROR, (errmsg("stripe row count limit out of range"),
-							errhint("stripe row count limit must be between "
-									UINT64_FORMAT " and " UINT64_FORMAT,
-									(uint64) STRIPE_ROW_COUNT_MINIMUM,
-									(uint64) STRIPE_ROW_COUNT_MAXIMUM)));
-		}
-		ereport(DEBUG1, (errmsg(
-							 "updating stripe row count to " UINT64_FORMAT,
-							 options.stripeRowCount)));
-	}
-
-	/* compression => not null */
-	if (!PG_ARGISNULL(3))
-	{
-		Name compressionName = PG_GETARG_NAME(3);
-		options.compressionType = ParseCompressionType(NameStr(*compressionName));
-		if (options.compressionType == COMPRESSION_TYPE_INVALID)
-		{
-			ereport(ERROR, (errmsg("unknown compression type for columnar table: %s",
-								   quote_identifier(NameStr(*compressionName)))));
-		}
-		ereport(DEBUG1, (errmsg("updating compression to %s",
-								CompressionTypeStr(options.compressionType))));
-	}
-
-	/* compression_level => not null */
-	if (!PG_ARGISNULL(4))
-	{
-		options.compressionLevel = PG_GETARG_INT32(4);
-		if (options.compressionLevel < COMPRESSION_LEVEL_MIN ||
-			options.compressionLevel > COMPRESSION_LEVEL_MAX)
-		{
-			ereport(ERROR, (errmsg("compression level out of range"),
-							errhint("compression level must be between %d and %d",
-									COMPRESSION_LEVEL_MIN,
-									COMPRESSION_LEVEL_MAX)));
-		}
-
-		ereport(DEBUG1, (errmsg("updating compression level to %d",
-								options.compressionLevel)));
-	}
-
-	if (ColumnarTableSetOptions_hook != NULL)
-	{
-		ColumnarTableSetOptions_hook(relationId, options);
-	}
-
-	SetColumnarOptions(relationId, &options);
-
-	table_close(rel, NoLock);
-
-	PG_RETURN_VOID();
+	elog(ERROR, "alter_columnar_table_set is deprecated");
 }
 
 
 /*
- * alter_columnar_table_reset is a UDF exposed in postgres to reset the settings on a
- * columnar table. Calling this function on a non-columnar table gives an error.
+ * alter_columnar_table_reset()
  *
- * sql syntax:
- *   pg_catalog.alter_columnar_table_re
- *   teset(
- *        table_name regclass,
- *        chunk_group_row_limit bool DEFAULT FALSE,
- *        stripe_row_limit bool DEFAULT FALSE,
- *        compression bool DEFAULT FALSE)
+ * Deprecated in 11.1-1: should issue ALTER TABLE ... RESET instead. Function
+ * still available, but implemented in PL/pgSQL instead of C.
  *
- * All arguments except the table name are optional. The UDF is supposed to be called
- * like:
- *   SELECT alter_columnar_table_set('table', compression => true);
- *
- * All options set to true will be reset to the default system value.
+ * C code is removed -- the symbol may still be required in some
+ * upgrade/downgrade paths, but it should not be called.
  */
 PG_FUNCTION_INFO_V1(alter_columnar_table_reset);
 Datum
 alter_columnar_table_reset(PG_FUNCTION_ARGS)
 {
-	CheckCitusColumnarVersion(ERROR);
-
-	Oid relationId = PG_GETARG_OID(0);
-
-	Relation rel = table_open(relationId, AccessExclusiveLock); /* ALTER TABLE LOCK */
-	if (!IsColumnarTableAmTable(relationId))
-	{
-		ereport(ERROR, (errmsg("table %s is not a columnar table",
-							   quote_identifier(RelationGetRelationName(rel)))));
-	}
-
-	if (!pg_class_ownercheck(relationId, GetUserId()))
-	{
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
-					   get_rel_name(relationId));
-	}
-
-	ColumnarOptions options = { 0 };
-	if (!ReadColumnarOptions(relationId, &options))
-	{
-		ereport(ERROR, (errmsg("unable to read current options for table")));
-	}
-
-	/* chunk_group_row_limit => true */
-	if (!PG_ARGISNULL(1) && PG_GETARG_BOOL(1))
-	{
-		options.chunkRowCount = columnar_chunk_group_row_limit;
-		ereport(DEBUG1,
-				(errmsg("resetting chunk row count to %d", options.chunkRowCount)));
-	}
-
-	/* stripe_row_limit => true */
-	if (!PG_ARGISNULL(2) && PG_GETARG_BOOL(2))
-	{
-		options.stripeRowCount = columnar_stripe_row_limit;
-		ereport(DEBUG1,
-				(errmsg("resetting stripe row count to " UINT64_FORMAT,
-						options.stripeRowCount)));
-	}
-
-	/* compression => true */
-	if (!PG_ARGISNULL(3) && PG_GETARG_BOOL(3))
-	{
-		options.compressionType = columnar_compression;
-		ereport(DEBUG1, (errmsg("resetting compression to %s",
-								CompressionTypeStr(options.compressionType))));
-	}
-
-	/* compression_level => true */
-	if (!PG_ARGISNULL(4) && PG_GETARG_BOOL(4))
-	{
-		options.compressionLevel = columnar_compression_level;
-		ereport(DEBUG1, (errmsg("reseting compression level to %d",
-								columnar_compression_level)));
-	}
-
-	if (ColumnarTableSetOptions_hook != NULL)
-	{
-		ColumnarTableSetOptions_hook(relationId, options);
-	}
-
-	SetColumnarOptions(relationId, &options);
-
-	table_close(rel, NoLock);
-
-	PG_RETURN_VOID();
+	elog(ERROR, "alter_columnar_table_reset is deprecated");
 }
 
 
@@ -2829,7 +2964,7 @@ AvailableExtensionVersionColumnar(void)
 	/* pg_available_extensions returns result set containing all available extensions */
 	(*pg_available_extensions)(fcinfo);
 
-	TupleTableSlot *tupleTableSlot = MakeSingleTupleTableSlotCompat(
+	TupleTableSlot *tupleTableSlot = MakeSingleTupleTableSlot(
 		extensionsResultSet->setDesc,
 		&TTSOpsMinimalTuple);
 	bool hasTuple = tuplestore_gettupleslot(extensionsResultSet->setResult, goForward,
@@ -2916,4 +3051,24 @@ InstalledExtensionVersionColumnar(void)
 	table_close(relation, AccessShareLock);
 
 	return installedExtensionVersion;
+}
+
+
+/*
+ * GetExtensionOption returns DefElem * node with "defname" from "options" list
+ */
+DefElem *
+GetExtensionOption(List *extensionOptions, const char *defname)
+{
+	DefElem *defElement = NULL;
+	foreach_ptr(defElement, extensionOptions)
+	{
+		if (IsA(defElement, DefElem) &&
+			strncmp(defElement->defname, defname, NAMEDATALEN) == 0)
+		{
+			return defElement;
+		}
+	}
+
+	return NULL;
 }

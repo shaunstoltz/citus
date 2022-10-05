@@ -18,6 +18,7 @@
 #include "distributed/listutils.h"
 #include "distributed/log_utils.h"
 #include "distributed/remote_commands.h"
+#include "distributed/errormessage.h"
 #include "distributed/cancel_utils.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -257,10 +258,6 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 
 	if (messageDetail)
 	{
-		/*
-		 * We don't use ApplyLogRedaction(messageDetail) as we expect any error
-		 * detail that requires log reduction should have done it locally.
-		 */
 		ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
 						 errmsg("connection to the remote node %s:%d failed with the "
 								"following error: %s", nodeName, nodePort,
@@ -314,7 +311,7 @@ ReportResultError(MultiConnection *connection, PGresult *result, int elevel)
 
 		ereport(elevel, (errcode(sqlState), errmsg("%s", messagePrimary),
 						 messageDetail ?
-						 errdetail("%s", ApplyLogRedaction(messageDetail)) : 0,
+						 errdetail("%s", messageDetail) : 0,
 						 messageHint ? errhint("%s", messageHint) : 0,
 						 messageContext ? errcontext("%s", messageContext) : 0,
 						 errcontext("while executing command on %s:%d",
@@ -348,7 +345,7 @@ LogRemoteCommand(MultiConnection *connection, const char *command)
 		return;
 	}
 
-	ereport(NOTICE, (errmsg("issuing %s", ApplyLogRedaction(command)),
+	ereport(NOTICE, (errmsg("issuing %s", command),
 					 errdetail("on server %s@%s:%d connectionId: %ld", connection->user,
 							   connection->hostname,
 							   connection->port, connection->connectionId)));
@@ -906,8 +903,20 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 					else if (sendStatus == 0)
 					{
 						/* done writing, only wait for read events */
-						ModifyWaitEvent(waitEventSet, event->pos, WL_SOCKET_READABLE,
-										NULL);
+						bool success =
+							CitusModifyWaitEvent(waitEventSet, event->pos,
+												 WL_SOCKET_READABLE, NULL);
+						if (!success)
+						{
+							ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+											errmsg("connection establishment for "
+												   "node %s:%d failed",
+												   connection->hostname,
+												   connection->port),
+											errhint("Check both the local and remote "
+													"server logs for the connection "
+													"establishment errors.")));
+						}
 					}
 				}
 
@@ -1052,8 +1061,17 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 		 * and writeability (server is ready to receive bytes).
 		 */
 		int eventMask = WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE;
-
-		AddWaitEventToSet(waitEventSet, eventMask, sock, NULL, (void *) connection);
+		int waitEventSetIndex =
+			CitusAddWaitEventSetToSet(waitEventSet, eventMask, sock,
+									  NULL, (void *) connection);
+		if (waitEventSetIndex == WAIT_EVENT_SET_INDEX_FAILED)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("connection establishment for node %s:%d failed",
+								   connection->hostname, connection->port),
+							errhint("Check both the local and remote server logs for the "
+									"connection establishment errors.")));
+		}
 	}
 
 	/*
@@ -1093,4 +1111,93 @@ SendCancelationRequest(MultiConnection *connection)
 	PQfreeCancel(cancelObject);
 
 	return cancelSent;
+}
+
+
+/*
+ * EvaluateSingleQueryResult gets the query result from connection and returns
+ * true if the query is executed successfully, false otherwise. A query result
+ * or an error message is returned in queryResultString. The function requires
+ * that the query returns a single column/single row result. It returns an
+ * error otherwise.
+ */
+bool
+EvaluateSingleQueryResult(MultiConnection *connection, PGresult *queryResult,
+						  StringInfo queryResultString)
+{
+	bool success = false;
+
+	ExecStatusType resultStatus = PQresultStatus(queryResult);
+	if (resultStatus == PGRES_COMMAND_OK)
+	{
+		char *commandStatus = PQcmdStatus(queryResult);
+		appendStringInfo(queryResultString, "%s", commandStatus);
+		success = true;
+	}
+	else if (resultStatus == PGRES_TUPLES_OK)
+	{
+		int ntuples = PQntuples(queryResult);
+		int nfields = PQnfields(queryResult);
+
+		/* error if query returns more than 1 rows, or more than 1 fields */
+		if (nfields != 1)
+		{
+			appendStringInfo(queryResultString,
+							 "expected a single column in query target");
+		}
+		else if (ntuples > 1)
+		{
+			appendStringInfo(queryResultString,
+							 "expected a single row in query result");
+		}
+		else
+		{
+			int row = 0;
+			int column = 0;
+			if (!PQgetisnull(queryResult, row, column))
+			{
+				char *queryResultValue = PQgetvalue(queryResult, row, column);
+				appendStringInfo(queryResultString, "%s", queryResultValue);
+			}
+			success = true;
+		}
+	}
+	else
+	{
+		StoreErrorMessage(connection, queryResultString);
+	}
+
+	return success;
+}
+
+
+/*
+ * StoreErrorMessage gets the error message from connection and stores it
+ * in queryResultString. It should be called only when error is present
+ * otherwise it would return a default error message.
+ */
+void
+StoreErrorMessage(MultiConnection *connection, StringInfo queryResultString)
+{
+	char *errorMessage = PQerrorMessage(connection->pgConn);
+	if (errorMessage != NULL)
+	{
+		/* copy the error message to a writable memory */
+		errorMessage = pnstrdup(errorMessage, strlen(errorMessage));
+
+		char *firstNewlineIndex = strchr(errorMessage, '\n');
+
+		/* trim the error message at the line break */
+		if (firstNewlineIndex != NULL)
+		{
+			*firstNewlineIndex = '\0';
+		}
+	}
+	else
+	{
+		/* put a default error message if no error message is reported */
+		errorMessage = "An error occurred while running the query";
+	}
+
+	appendStringInfo(queryResultString, "%s", errorMessage);
 }

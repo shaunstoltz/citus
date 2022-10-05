@@ -10,11 +10,15 @@
 
 #include "postgres.h"
 
+#include "pg_version_compat.h"
+
 #include "distributed/pg_version_constants.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/genam.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
@@ -31,6 +35,9 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/metadata/distobject.h"
+#include "distributed/multi_executor.h"
+#include "distributed/relation_access_tracking.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_transaction.h"
 #include "miscadmin.h"
@@ -40,6 +47,7 @@
 #include "parser/scansup.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc_tables.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
@@ -53,7 +61,11 @@ static char * CreateCreateOrAlterRoleCommand(const char *roleName,
 											 CreateRoleStmt *createRoleStmt,
 											 AlterRoleStmt *alterRoleStmt);
 static DefElem * makeDefElemInt(char *name, int value);
+static DefElem * makeDefElemBool(char *name, bool value);
 static List * GenerateRoleOptionsList(HeapTuple tuple);
+static List * GenerateGrantRoleStmtsFromOptions(RoleSpec *roleSpec, List *options);
+static List * GenerateGrantRoleStmtsOfRole(Oid roleid);
+static void EnsureSequentialModeForRoleDDL(void);
 
 static char * GetRoleNameFromDbRoleSetting(HeapTuple tuple,
 										   TupleDesc DbRoleSettingDescription);
@@ -65,9 +77,10 @@ static Node * makeFloatConst(char *str, int location);
 static const char * WrapQueryInAlterRoleIfExistsCall(const char *query, RoleSpec *role);
 static VariableSetStmt * MakeVariableSetStmt(const char *config);
 static int ConfigGenericNameCompare(const void *lhs, const void *rhs);
-static ObjectAddress RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok);
+static List * RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok);
 
 /* controlled via GUC */
+bool EnableCreateRolePropagation = true;
 bool EnableAlterRolePropagation = true;
 bool EnableAlterRoleSetPropagation = true;
 
@@ -77,8 +90,8 @@ bool EnableAlterRoleSetPropagation = true;
  * AlterRoleStmt. If missing_ok is set to false an error will be raised if postgres
  * was unable to find the role that was the target of the statement.
  */
-ObjectAddress
-AlterRoleStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterRoleStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterRoleStmt *stmt = castNode(AlterRoleStmt, node);
 	return RoleSpecToObjectAddress(stmt->role, missing_ok);
@@ -90,8 +103,8 @@ AlterRoleStmtObjectAddress(Node *node, bool missing_ok)
  * AlterRoleSetStmt. If missing_ok is set to false an error will be raised if postgres
  * was unable to find the role that was the target of the statement.
  */
-ObjectAddress
-AlterRoleSetStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterRoleSetStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterRoleSetStmt *stmt = castNode(AlterRoleSetStmt, node);
 	return RoleSpecToObjectAddress(stmt->role, missing_ok);
@@ -103,19 +116,19 @@ AlterRoleSetStmtObjectAddress(Node *node, bool missing_ok)
  * RoleSpec. If missing_ok is set to false an error will be raised by postgres
  * explaining the Role could not be found.
  */
-static ObjectAddress
+static List *
 RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok)
 {
-	ObjectAddress address = { 0 };
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
 
 	if (role != NULL)
 	{
 		/* roles can be NULL for statements on ALL roles eg. ALTER ROLE ALL SET ... */
 		Oid roleOid = get_rolespec_oid(role, missing_ok);
-		ObjectAddressSet(address, AuthIdRelationId, roleOid);
+		ObjectAddressSet(*address, AuthIdRelationId, roleOid);
 	}
 
-	return address;
+	return list_make1(address);
 }
 
 
@@ -127,16 +140,22 @@ RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok)
 List *
 PostprocessAlterRoleStmt(Node *node, const char *queryString)
 {
-	ObjectAddress address = GetObjectAddressFromParseTree(node, false);
-	if (!ShouldPropagateObject(&address))
+	List *addresses = GetObjectAddressListFromParseTree(node, false, true);
+
+	/*  the code-path only supports a single object */
+	Assert(list_length(addresses) == 1);
+
+	if (!ShouldPropagateAnyObject(addresses))
 	{
 		return NIL;
 	}
 
-	if (!EnableAlterRolePropagation || !IsCoordinator())
+	if (!EnableAlterRolePropagation)
 	{
 		return NIL;
 	}
+
+	EnsureCoordinator();
 
 	AlterRoleStmt *stmt = castNode(AlterRoleStmt, node);
 
@@ -150,7 +169,7 @@ PostprocessAlterRoleStmt(Node *node, const char *queryString)
 
 			if (encryptedPassword != NULL)
 			{
-				Value *encryptedPasswordValue = makeString((char *) encryptedPassword);
+				String *encryptedPasswordValue = makeString((char *) encryptedPassword);
 				option->arg = (Node *) encryptedPasswordValue;
 			}
 			else
@@ -161,7 +180,9 @@ PostprocessAlterRoleStmt(Node *node, const char *queryString)
 			break;
 		}
 	}
-	List *commands = list_make1((void *) CreateAlterRoleIfExistsCommand(stmt));
+	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
+								(void *) CreateAlterRoleIfExistsCommand(stmt),
+								ENABLE_DDL_PROPAGATION);
 
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
@@ -194,26 +215,22 @@ PreprocessAlterRoleSetStmt(Node *node, const char *queryString,
 		return NIL;
 	}
 
-	ObjectAddress address = GetObjectAddressFromParseTree(node, false);
+	List *addresses = GetObjectAddressListFromParseTree(node, false, false);
+
+	/*  the code-path only supports a single object */
+	Assert(list_length(addresses) == 1);
 
 	/*
 	 * stmt->role could be NULL when the statement is on 'ALL' roles, we do propagate for
 	 * ALL roles. If it is not NULL the role is for a specific role. If that role is not
 	 * distributed we will not propagate the statement
 	 */
-	if (stmt->role != NULL && !IsObjectDistributed(&address))
+	if (stmt->role != NULL && !IsAnyObjectDistributed(addresses))
 	{
 		return NIL;
 	}
 
-	/*
-	 * Since roles need to be handled manually on community, we need to support such queries
-	 * by handling them locally on worker nodes
-	 */
-	if (!IsCoordinator())
-	{
-		return NIL;
-	}
+	EnsureCoordinator();
 
 	QualifyTreeNode((Node *) stmt);
 	const char *sql = DeparseTreeNode((Node *) stmt);
@@ -337,6 +354,7 @@ ExtractEncryptedPassword(Oid roleOid)
 
 	Datum passwordDatum = heap_getattr(tuple, Anum_pg_authid_rolpassword,
 									   pgAuthIdDescription, &isNull);
+	char *passwordCstring = TextDatumGetCString(passwordDatum);
 
 	table_close(pgAuthId, AccessShareLock);
 	ReleaseSysCache(tuple);
@@ -346,7 +364,7 @@ ExtractEncryptedPassword(Oid roleOid)
 		return NULL;
 	}
 
-	return pstrdup(TextDatumGetCString(passwordDatum));
+	return pstrdup(passwordCstring);
 }
 
 
@@ -439,13 +457,13 @@ GenerateRoleOptionsList(HeapTuple tuple)
 	Form_pg_authid role = ((Form_pg_authid) GETSTRUCT(tuple));
 
 	List *options = NIL;
-	options = lappend(options, makeDefElemInt("superuser", role->rolsuper));
-	options = lappend(options, makeDefElemInt("createdb", role->rolcreatedb));
-	options = lappend(options, makeDefElemInt("createrole", role->rolcreaterole));
-	options = lappend(options, makeDefElemInt("inherit", role->rolinherit));
-	options = lappend(options, makeDefElemInt("canlogin", role->rolcanlogin));
-	options = lappend(options, makeDefElemInt("isreplication", role->rolreplication));
-	options = lappend(options, makeDefElemInt("bypassrls", role->rolbypassrls));
+	options = lappend(options, makeDefElemBool("superuser", role->rolsuper));
+	options = lappend(options, makeDefElemBool("createdb", role->rolcreatedb));
+	options = lappend(options, makeDefElemBool("createrole", role->rolcreaterole));
+	options = lappend(options, makeDefElemBool("inherit", role->rolinherit));
+	options = lappend(options, makeDefElemBool("canlogin", role->rolcanlogin));
+	options = lappend(options, makeDefElemBool("isreplication", role->rolreplication));
+	options = lappend(options, makeDefElemBool("bypassrls", role->rolbypassrls));
 	options = lappend(options, makeDefElemInt("connectionlimit", role->rolconnlimit));
 
 	/* load password from heap tuple, use NULL if not set */
@@ -492,6 +510,14 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 	Form_pg_authid role = ((Form_pg_authid) GETSTRUCT(roleTuple));
 
 	CreateRoleStmt *createRoleStmt = NULL;
+	if (EnableCreateRolePropagation)
+	{
+		createRoleStmt = makeNode(CreateRoleStmt);
+		createRoleStmt->stmt_type = ROLESTMT_ROLE;
+		createRoleStmt->role = pstrdup(NameStr(role->rolname));
+		createRoleStmt->options = GenerateRoleOptionsList(roleTuple);
+	}
+
 	AlterRoleStmt *alterRoleStmt = NULL;
 	if (EnableAlterRolePropagation)
 	{
@@ -523,6 +549,16 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 		/* append ALTER ROLE ... SET commands fot this specific user */
 		List *alterRoleSetCommands = GenerateAlterRoleSetCommandForRole(roleOid);
 		completeRoleList = list_concat(completeRoleList, alterRoleSetCommands);
+	}
+
+	if (EnableCreateRolePropagation)
+	{
+		List *grantRoleStmts = GenerateGrantRoleStmtsOfRole(roleOid);
+		Node *stmt = NULL;
+		foreach_ptr(stmt, grantRoleStmts)
+		{
+			completeRoleList = lappend(completeRoleList, DeparseTreeNode(stmt));
+		}
 	}
 
 	return completeRoleList;
@@ -580,6 +616,16 @@ static DefElem *
 makeDefElemInt(char *name, int value)
 {
 	return makeDefElem(name, (Node *) makeInteger(value), -1);
+}
+
+
+/*
+ * makeDefElemBool creates a DefElem with boolean typed value with -1 as location.
+ */
+static DefElem *
+makeDefElemBool(char *name, bool value)
+{
+	return makeDefElem(name, (Node *) makeBoolean(value), -1);
 }
 
 
@@ -732,6 +778,157 @@ MakeSetStatementArguments(char *configurationName, char *configurationValue)
 
 
 /*
+ * GenerateGrantRoleStmtsFromOptions gets a RoleSpec of a role that is being
+ * created and a list of options of CreateRoleStmt to generate GrantRoleStmts
+ * for the role's memberships.
+ */
+static List *
+GenerateGrantRoleStmtsFromOptions(RoleSpec *roleSpec, List *options)
+{
+	List *stmts = NIL;
+
+	DefElem *option = NULL;
+	foreach_ptr(option, options)
+	{
+		if (strcmp(option->defname, "adminmembers") != 0 &&
+			strcmp(option->defname, "rolemembers") != 0 &&
+			strcmp(option->defname, "addroleto") != 0)
+		{
+			continue;
+		}
+
+		GrantRoleStmt *grantRoleStmt = makeNode(GrantRoleStmt);
+		grantRoleStmt->is_grant = true;
+
+		if (strcmp(option->defname, "adminmembers") == 0 || strcmp(option->defname,
+																   "rolemembers") == 0)
+		{
+			grantRoleStmt->granted_roles = list_make1(roleSpec);
+			grantRoleStmt->grantee_roles = (List *) option->arg;
+		}
+		else
+		{
+			grantRoleStmt->granted_roles = (List *) option->arg;
+			grantRoleStmt->grantee_roles = list_make1(roleSpec);
+		}
+
+		if (strcmp(option->defname, "adminmembers") == 0)
+		{
+			grantRoleStmt->admin_opt = true;
+		}
+
+		stmts = lappend(stmts, grantRoleStmt);
+	}
+	return stmts;
+}
+
+
+/*
+ * GenerateGrantRoleStmtsOfRole generates the GrantRoleStmts for the memberships
+ * of the role whose oid is roleid.
+ */
+static List *
+GenerateGrantRoleStmtsOfRole(Oid roleid)
+{
+	Relation pgAuthMembers = table_open(AuthMemRelationId, AccessShareLock);
+	HeapTuple tuple = NULL;
+	List *stmts = NIL;
+
+	ScanKeyData skey[1];
+
+	ScanKeyInit(&skey[0], Anum_pg_auth_members_member, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(roleid));
+	SysScanDesc scan = systable_beginscan(pgAuthMembers, AuthMemMemRoleIndexId, true,
+										  NULL, 1, &skey[0]);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_auth_members membership = (Form_pg_auth_members) GETSTRUCT(tuple);
+
+		GrantRoleStmt *grantRoleStmt = makeNode(GrantRoleStmt);
+		grantRoleStmt->is_grant = true;
+
+		RoleSpec *grantedRole = makeNode(RoleSpec);
+		grantedRole->roletype = ROLESPEC_CSTRING;
+		grantedRole->location = -1;
+		grantedRole->rolename = GetUserNameFromId(membership->roleid, true);
+		grantRoleStmt->granted_roles = list_make1(grantedRole);
+
+		RoleSpec *granteeRole = makeNode(RoleSpec);
+		granteeRole->roletype = ROLESPEC_CSTRING;
+		granteeRole->location = -1;
+		granteeRole->rolename = GetUserNameFromId(membership->member, true);
+		grantRoleStmt->grantee_roles = list_make1(granteeRole);
+
+		grantRoleStmt->grantor = NULL;
+
+		grantRoleStmt->admin_opt = membership->admin_option;
+
+		stmts = lappend(stmts, grantRoleStmt);
+	}
+
+	systable_endscan(scan);
+	table_close(pgAuthMembers, AccessShareLock);
+
+	return stmts;
+}
+
+
+/*
+ * PreprocessCreateRoleStmt creates a worker_create_or_alter_role query for the
+ * role that is being created. With that query we can create the role in the
+ * workers or if they exist we alter them to the way they are being created
+ * right now.
+ */
+List *
+PreprocessCreateRoleStmt(Node *node, const char *queryString,
+						 ProcessUtilityContext processUtilityContext)
+{
+	if (!EnableCreateRolePropagation || !ShouldPropagate())
+	{
+		return NIL;
+	}
+
+	EnsureCoordinator();
+	EnsureSequentialModeForRoleDDL();
+
+	LockRelationOid(DistNodeRelationId(), RowShareLock);
+
+	CreateRoleStmt *createRoleStmt = castNode(CreateRoleStmt, node);
+
+	AlterRoleStmt *alterRoleStmt = makeNode(AlterRoleStmt);
+	alterRoleStmt->role = makeNode(RoleSpec);
+	alterRoleStmt->role->roletype = ROLESPEC_CSTRING;
+	alterRoleStmt->role->location = -1;
+	alterRoleStmt->role->rolename = pstrdup(createRoleStmt->role);
+	alterRoleStmt->action = 1;
+	alterRoleStmt->options = createRoleStmt->options;
+
+	List *grantRoleStmts = GenerateGrantRoleStmtsFromOptions(alterRoleStmt->role,
+															 createRoleStmt->options);
+
+	char *createOrAlterRoleQuery = CreateCreateOrAlterRoleCommand(createRoleStmt->role,
+																  createRoleStmt,
+																  alterRoleStmt);
+
+	List *commands = NIL;
+	commands = lappend(commands, DISABLE_DDL_PROPAGATION);
+	commands = lappend(commands, createOrAlterRoleQuery);
+
+	/* deparse all grant statements and add them to the to commands list */
+	Node *stmt = NULL;
+	foreach_ptr(stmt, grantRoleStmts)
+	{
+		commands = lappend(commands, DeparseTreeNode(stmt));
+	}
+
+	commands = lappend(commands, ENABLE_DDL_PROPAGATION);
+
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
+}
+
+
+/*
  * makeStringConst creates a Const Node that stores a given string
  *
  * copied from backend/parser/gram.c
@@ -741,8 +938,13 @@ makeStringConst(char *str, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	n->val.sval.type = T_String;
+	n->val.sval.sval = str;
+#else
 	n->val.type = T_String;
 	n->val.val.str = str;
+#endif
 	n->location = location;
 
 	return (Node *) n;
@@ -759,8 +961,13 @@ makeIntConst(int val, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	n->val.ival.type = T_Integer;
+	n->val.ival.ival = val;
+#else
 	n->val.type = T_Integer;
 	n->val.val.ival = val;
+#endif
 	n->location = location;
 
 	return (Node *) n;
@@ -777,11 +984,189 @@ makeFloatConst(char *str, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	n->val.fval.type = T_Float;
+	n->val.fval.fval = str;
+#else
 	n->val.type = T_Float;
 	n->val.val.str = str;
+#endif
 	n->location = location;
 
 	return (Node *) n;
+}
+
+
+/*
+ * PreprocessDropRoleStmt finds the distributed role out of the ones
+ * being dropped and unmarks them distributed and creates the drop statements
+ * for the workers.
+ */
+List *
+PreprocessDropRoleStmt(Node *node, const char *queryString,
+					   ProcessUtilityContext processUtilityContext)
+{
+	DropRoleStmt *stmt = castNode(DropRoleStmt, node);
+	List *allDropRoles = stmt->roles;
+
+	List *distributedDropRoles = FilterDistributedRoles(allDropRoles);
+	if (list_length(distributedDropRoles) <= 0)
+	{
+		return NIL;
+	}
+
+	if (!EnableCreateRolePropagation || !ShouldPropagate())
+	{
+		return NIL;
+	}
+
+	EnsureCoordinator();
+	EnsureSequentialModeForRoleDDL();
+
+
+	stmt->roles = distributedDropRoles;
+	char *sql = DeparseTreeNode((Node *) stmt);
+	stmt->roles = allDropRoles;
+
+	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
+								sql,
+								ENABLE_DDL_PROPAGATION);
+
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
+}
+
+
+/*
+ * UnmarkRolesDistributed unmarks the roles in the RoleSpec list distributed.
+ */
+void
+UnmarkRolesDistributed(List *roles)
+{
+	Node *roleNode = NULL;
+	foreach_ptr(roleNode, roles)
+	{
+		RoleSpec *role = castNode(RoleSpec, roleNode);
+		ObjectAddress roleAddress = { 0 };
+		Oid roleOid = get_rolespec_oid(role, true);
+
+		if (roleOid == InvalidOid)
+		{
+			/*
+			 * If the role is dropped (concurrently), we might get an inactive oid for the
+			 * role. If it is invalid oid, skip.
+			 */
+			continue;
+		}
+
+		ObjectAddressSet(roleAddress, AuthIdRelationId, roleOid);
+		UnmarkObjectDistributed(&roleAddress);
+	}
+}
+
+
+/*
+ * FilterDistributedRoles filters the list of RoleSpecs and returns the ones
+ * that are distributed.
+ */
+List *
+FilterDistributedRoles(List *roles)
+{
+	List *distributedRoles = NIL;
+	Node *roleNode = NULL;
+	foreach_ptr(roleNode, roles)
+	{
+		RoleSpec *role = castNode(RoleSpec, roleNode);
+		Oid roleOid = get_rolespec_oid(role, true);
+		if (roleOid == InvalidOid)
+		{
+			/*
+			 * Non-existing roles are ignored silently here. Postgres will
+			 * handle to give an error or not for these roles.
+			 */
+			continue;
+		}
+		ObjectAddress *roleAddress = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*roleAddress, AuthIdRelationId, roleOid);
+		if (IsAnyObjectDistributed(list_make1(roleAddress)))
+		{
+			distributedRoles = lappend(distributedRoles, role);
+		}
+	}
+	return distributedRoles;
+}
+
+
+/*
+ * PreprocessGrantRoleStmt finds the distributed grantee roles and creates the
+ * query to run on the workers.
+ */
+List *
+PreprocessGrantRoleStmt(Node *node, const char *queryString,
+						ProcessUtilityContext processUtilityContext)
+{
+	if (!EnableCreateRolePropagation || !ShouldPropagate())
+	{
+		return NIL;
+	}
+
+	EnsureCoordinator();
+
+	GrantRoleStmt *stmt = castNode(GrantRoleStmt, node);
+	List *allGranteeRoles = stmt->grantee_roles;
+	RoleSpec *grantor = stmt->grantor;
+
+	List *distributedGranteeRoles = FilterDistributedRoles(allGranteeRoles);
+	if (list_length(distributedGranteeRoles) <= 0)
+	{
+		return NIL;
+	}
+
+	/*
+	 * Postgres don't seem to use the grantor. Even dropping the grantor doesn't
+	 * seem to affect the membership. If this changes, we might need to add grantors
+	 * to the dependency resolution too. For now we just don't propagate it.
+	 */
+	stmt->grantor = NULL;
+	stmt->grantee_roles = distributedGranteeRoles;
+	char *sql = DeparseTreeNode((Node *) stmt);
+	stmt->grantee_roles = allGranteeRoles;
+	stmt->grantor = grantor;
+
+	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
+								sql,
+								ENABLE_DDL_PROPAGATION);
+
+	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
+}
+
+
+/*
+ * PostprocessGrantRoleStmt actually creates the plan we need to execute for grant
+ * role statement.
+ */
+List *
+PostprocessGrantRoleStmt(Node *node, const char *queryString)
+{
+	if (!EnableCreateRolePropagation || !IsCoordinator() || !ShouldPropagate())
+	{
+		return NIL;
+	}
+
+	GrantRoleStmt *stmt = castNode(GrantRoleStmt, node);
+
+	RoleSpec *role = NULL;
+	foreach_ptr(role, stmt->grantee_roles)
+	{
+		Oid roleOid = get_rolespec_oid(role, false);
+		ObjectAddress *roleAddress = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*roleAddress, AuthIdRelationId, roleOid);
+
+		if (IsAnyObjectDistributed(list_make1(roleAddress)))
+		{
+			EnsureAllObjectDependenciesExistOnAllNodes(list_make1(roleAddress));
+		}
+	}
+	return NIL;
 }
 
 
@@ -804,4 +1189,65 @@ ConfigGenericNameCompare(const void *a, const void *b)
 	 * not use this function to order the guc list.
 	 */
 	return pg_strcasecmp(confa->name, confb->name);
+}
+
+
+/*
+ * CreateRoleStmtObjectAddress finds the ObjectAddress for the role described
+ * by the CreateRoleStmt. If missing_ok is false this function throws an error if the
+ * role does not exist.
+ *
+ * Never returns NULL, but the objid in the address could be invalid if missing_ok was set
+ * to true.
+ */
+List *
+CreateRoleStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
+{
+	CreateRoleStmt *stmt = castNode(CreateRoleStmt, node);
+	Oid roleOid = get_role_oid(stmt->role, missing_ok);
+	ObjectAddress *roleAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*roleAddress, AuthIdRelationId, roleOid);
+
+	return list_make1(roleAddress);
+}
+
+
+/*
+ * EnsureSequentialModeForRoleDDL makes sure that the current transaction is already in
+ * sequential mode, or can still safely be put in sequential mode, it errors if that is
+ * not possible. The error contains information for the user to retry the transaction with
+ * sequential mode set from the begining.
+ *
+ * As roles are node scoped objects there exists only 1 instance of the role used by
+ * potentially multiple shards. To make sure all shards in the transaction can interact
+ * with the role the role needs to be visible on all connections used by the transaction,
+ * meaning we can only use 1 connection per node.
+ */
+static void
+EnsureSequentialModeForRoleDDL(void)
+{
+	if (!IsTransactionBlock())
+	{
+		/* we do not need to switch to sequential mode if we are not in a transaction */
+		return;
+	}
+
+	if (ParallelQueryExecutedInTransaction())
+	{
+		ereport(ERROR, (errmsg("cannot create or modify role because there was a "
+							   "parallel operation on a distributed table in the "
+							   "transaction"),
+						errdetail("When creating or altering a role, Citus needs to "
+								  "perform all operations over a single connection per "
+								  "node to ensure consistency."),
+						errhint("Try re-running the transaction with "
+								"\"SET LOCAL citus.multi_shard_modify_mode TO "
+								"\'sequential\';\"")));
+	}
+
+	ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
+					 errdetail("Role is created or altered. To make sure subsequent "
+							   "commands see the role correctly we need to make sure to "
+							   "use only one connection for all future commands")));
+	SetLocalMultiShardModifyModeToSequential();
 }

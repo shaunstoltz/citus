@@ -40,7 +40,7 @@
 #include "utils/relcache.h"
 
 
-static ObjectAddress GetObjectAddressBySchemaName(char *schemaName, bool missing_ok);
+static List * GetObjectAddressBySchemaName(char *schemaName, bool missing_ok);
 static List * FilterDistributedSchemas(List *schemas);
 static bool SchemaHasDistributedTableWithFKey(char *schemaName);
 static bool ShouldPropagateCreateSchemaStmt(void);
@@ -107,7 +107,7 @@ PreprocessDropSchemaStmt(Node *node, const char *queryString,
 
 	EnsureSequentialMode(OBJECT_SCHEMA);
 
-	Value *schemaVal = NULL;
+	String *schemaVal = NULL;
 	foreach_ptr(schemaVal, distributedSchemas)
 	{
 		if (SchemaHasDistributedTableWithFKey(strVal(schemaVal)))
@@ -151,6 +151,11 @@ List *
 PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
 							ProcessUtilityContext processUtilityContext)
 {
+	if (!ShouldPropagate())
+	{
+		return NIL;
+	}
+
 	GrantStmt *stmt = castNode(GrantStmt, node);
 	Assert(stmt->objtype == OBJECT_SCHEMA);
 
@@ -161,14 +166,7 @@ PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
 		return NIL;
 	}
 
-	/*
-	 * Since access control needs to be handled manually on community, we need to support
-	 * such queries by handling them locally on worker nodes.
-	 */
-	if (!IsCoordinator())
-	{
-		return NIL;
-	}
+	EnsureCoordinator();
 
 	List *originalObjects = stmt->objects;
 
@@ -178,41 +176,8 @@ PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
 
 	stmt->objects = originalObjects;
 
-	return NodeDDLTaskList(NON_COORDINATOR_NODES, list_make1(sql));
-}
-
-
-/*
- * PreprocessAlterSchemaRenameStmt is called when the user is renaming a schema.
- * The invocation happens before the statement is applied locally.
- *
- * As the schema already exists we have access to the ObjectAddress for the schema, this
- * is used to check if the schmea is distributed. If the schema is distributed the rename
- * is executed on all the workers to keep the schemas in sync across the cluster.
- */
-List *
-PreprocessAlterSchemaRenameStmt(Node *node, const char *queryString,
-								ProcessUtilityContext processUtilityContext)
-{
-	ObjectAddress schemaAddress = GetObjectAddressFromParseTree(node, false);
-	if (!ShouldPropagateObject(&schemaAddress))
-	{
-		return NIL;
-	}
-
-	EnsureCoordinator();
-
-	/* fully qualify */
-	QualifyTreeNode(node);
-
-	/* deparse sql*/
-	const char *renameStmtSql = DeparseTreeNode(node);
-
-	EnsureSequentialMode(OBJECT_SCHEMA);
-
-	/* to prevent recursion with mx we disable ddl propagation */
 	List *commands = list_make3(DISABLE_DDL_PROPAGATION,
-								(void *) renameStmtSql,
+								(void *) sql,
 								ENABLE_DDL_PROPAGATION);
 
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
@@ -223,8 +188,8 @@ PreprocessAlterSchemaRenameStmt(Node *node, const char *queryString,
  * CreateSchemaStmtObjectAddress returns the ObjectAddress of the schema that is
  * the object of the CreateSchemaStmt. Errors if missing_ok is false.
  */
-ObjectAddress
-CreateSchemaStmtObjectAddress(Node *node, bool missing_ok)
+List *
+CreateSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	CreateSchemaStmt *stmt = castNode(CreateSchemaStmt, node);
 
@@ -253,8 +218,8 @@ CreateSchemaStmtObjectAddress(Node *node, bool missing_ok)
  * AlterSchemaRenameStmtObjectAddress returns the ObjectAddress of the schema that is
  * the object of the RenameStmt. Errors if missing_ok is false.
  */
-ObjectAddress
-AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok)
+List *
+AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_SCHEMA);
@@ -267,15 +232,15 @@ AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok)
  * GetObjectAddressBySchemaName returns the ObjectAddress of the schema with the
  * given name. Errors out if schema is not found and missing_ok is false.
  */
-ObjectAddress
+List *
 GetObjectAddressBySchemaName(char *schemaName, bool missing_ok)
 {
 	Oid schemaOid = get_namespace_oid(schemaName, missing_ok);
 
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, NamespaceRelationId, schemaOid);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, NamespaceRelationId, schemaOid);
 
-	return address;
+	return list_make1(address);
 }
 
 
@@ -288,7 +253,7 @@ FilterDistributedSchemas(List *schemas)
 {
 	List *distributedSchemas = NIL;
 
-	Value *schemaValue = NULL;
+	String *schemaValue = NULL;
 	foreach_ptr(schemaValue, schemas)
 	{
 		const char *schemaName = strVal(schemaValue);
@@ -299,10 +264,9 @@ FilterDistributedSchemas(List *schemas)
 			continue;
 		}
 
-		ObjectAddress address = { 0 };
-		ObjectAddressSet(address, NamespaceRelationId, schemaOid);
-
-		if (!IsObjectDistributed(&address))
+		ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*address, NamespaceRelationId, schemaOid);
+		if (!IsAnyObjectDistributed(list_make1(address)))
 		{
 			continue;
 		}

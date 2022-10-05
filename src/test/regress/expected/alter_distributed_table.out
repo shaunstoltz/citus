@@ -1,11 +1,3 @@
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS server_version_above_eleven;
- server_version_above_eleven
----------------------------------------------------------------------
- t
-(1 row)
-
-\gset
 CREATE SCHEMA alter_distributed_table;
 SET search_path TO alter_distributed_table;
 SET citus.shard_count TO 4;
@@ -329,6 +321,55 @@ SELECT * FROM partitioned_table_6_10 ORDER BY 1, 2;
   7 | 2
 (1 row)
 
+-- test altering partitioned table colocate_with:none
+CREATE TABLE foo (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_1 PARTITION of foo for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_2 PARTITION of foo for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+SELECT create_distributed_table('foo','x');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+CREATE TABLE foo_bar (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_bar_1 PARTITION of foo_bar for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_bar_2 PARTITION of foo_bar for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+SELECT create_distributed_table('foo_bar','x');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
+ count
+---------------------------------------------------------------------
+     1
+(1 row)
+
+SELECT alter_distributed_table('foo', colocate_with => 'none');
+NOTICE:  converting the partitions of alter_distributed_table.foo
+NOTICE:  creating a new table for alter_distributed_table.foo_1
+NOTICE:  moving the data of alter_distributed_table.foo_1
+NOTICE:  dropping the old alter_distributed_table.foo_1
+NOTICE:  renaming the new table to alter_distributed_table.foo_1
+NOTICE:  creating a new table for alter_distributed_table.foo_2
+NOTICE:  moving the data of alter_distributed_table.foo_2
+NOTICE:  dropping the old alter_distributed_table.foo_2
+NOTICE:  renaming the new table to alter_distributed_table.foo_2
+NOTICE:  creating a new table for alter_distributed_table.foo
+NOTICE:  dropping the old alter_distributed_table.foo
+NOTICE:  renaming the new table to alter_distributed_table.foo
+ alter_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
+ count
+---------------------------------------------------------------------
+     2
+(1 row)
+
 -- test references
 CREATE TABLE referenced_dist_table (a INT UNIQUE);
 CREATE TABLE referenced_ref_table (a INT UNIQUE);
@@ -469,7 +510,6 @@ SELECT alter_distributed_table('col_with_ref_to_dist', shard_count:=6, cascade_t
 
 (1 row)
 
-\if :server_version_above_eleven
 -- test altering columnar table
 CREATE TABLE columnar_table (a INT) USING columnar;
 SELECT create_distributed_table('columnar_table', 'a', colocate_with:='none');
@@ -496,7 +536,6 @@ SELECT table_name::text, shard_count, access_method FROM public.citus_tables WHE
  columnar_table |           6 | columnar
 (1 row)
 
-\endif
 -- test complex cascade operations
 CREATE TABLE cas_1 (a INT UNIQUE);
 CREATE TABLE cas_2 (a INT UNIQUE);
@@ -627,6 +666,74 @@ NOTICE:  renaming the new table to alter_distributed_table.par_table
  alter_distributed_table
 ---------------------------------------------------------------------
 
+(1 row)
+
+-- test changing shard count into a default colocation group with shard split
+-- ensure there is no colocation group with 23 shards
+SELECT count(*) FROM pg_dist_colocation WHERE shardcount = 23;
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+SET citus.shard_count TO 23;
+CREATE TABLE shard_split_table (a int, b int);
+SELECT create_distributed_table ('shard_split_table', 'a');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5, shard_transfer_mode => 'block_writes');
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+-- show the difference in pg_dist_colocation and citus_tables shard counts
+SELECT
+	(
+		SELECT shardcount FROM pg_dist_colocation WHERE colocationid IN
+		(
+			SELECT colocation_id FROM public.citus_tables WHERE table_name = 'shard_split_table'::regclass
+		)
+	) AS "pg_dist_colocation",
+	(SELECT shard_count FROM public.citus_tables WHERE table_name = 'shard_split_table'::regclass) AS "citus_tables";
+ pg_dist_colocation | citus_tables
+---------------------------------------------------------------------
+                 23 |           25
+(1 row)
+
+SET citus.shard_count TO 4;
+-- distribute another table and then change shard count to 23
+CREATE TABLE shard_split_table_2 (a int, b int);
+SELECT create_distributed_table ('shard_split_table_2', 'a');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT alter_distributed_table ('shard_split_table_2', shard_count:=23, cascade_to_colocated:=false);
+NOTICE:  creating a new table for alter_distributed_table.shard_split_table_2
+NOTICE:  moving the data of alter_distributed_table.shard_split_table_2
+NOTICE:  dropping the old alter_distributed_table.shard_split_table_2
+NOTICE:  renaming the new table to alter_distributed_table.shard_split_table_2
+ alter_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT a.colocation_id = b.colocation_id FROM public.citus_tables a, public.citus_tables b
+	WHERE a.table_name = 'shard_split_table'::regclass AND b.table_name = 'shard_split_table_2'::regclass;
+ ?column?
+---------------------------------------------------------------------
+ f
+(1 row)
+
+SELECT shard_count FROM public.citus_tables WHERE table_name = 'shard_split_table_2'::regclass;
+ shard_count
+---------------------------------------------------------------------
+          23
 (1 row)
 
 -- test messages
@@ -904,5 +1011,82 @@ SELECT amname FROM pg_am WHERE oid IN (SELECT relam FROM pg_class WHERE relname 
  columnar
 (1 row)
 
+-- verify that alter_distributed_table works if it has dependent views and materialized views
+-- set colocate_with explicitly to not to affect other tables
+CREATE SCHEMA schema_to_test_alter_dist_table;
+SET search_path to schema_to_test_alter_dist_table;
+CREATE TABLE test_alt_dist_table_1(a int, b int);
+SELECT create_distributed_table('test_alt_dist_table_1', 'a', colocate_with => 'None');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+CREATE TABLE test_alt_dist_table_2(a int, b int);
+SELECT create_distributed_table('test_alt_dist_table_2', 'a', colocate_with => 'test_alt_dist_table_1');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+CREATE VIEW dependent_view_1 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2;
+CREATE VIEW dependent_view_2 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2 JOIN test_alt_dist_table_1 USING(a);
+CREATE MATERIALIZED VIEW dependent_mat_view_1 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2;
+-- Alter owner to make sure that alter_distributed_table doesn't change view's owner
 SET client_min_messages TO WARNING;
+CREATE USER alter_dist_table_test_user;
+SELECT 1 FROM run_command_on_workers($$CREATE USER alter_dist_table_test_user$$);
+ ?column?
+---------------------------------------------------------------------
+        1
+        1
+(2 rows)
+
+ALTER VIEW dependent_view_1 OWNER TO alter_dist_table_test_user;
+ALTER VIEW dependent_view_2 OWNER TO alter_dist_table_test_user;
+ALTER MATERIALIZED VIEW dependent_mat_view_1 OWNER TO alter_dist_table_test_user;
+SELECT alter_distributed_table('test_alt_dist_table_1', shard_count:=12, cascade_to_colocated:=true);
+ alter_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT viewowner FROM pg_views WHERE viewname IN ('dependent_view_1', 'dependent_view_2');
+         viewowner
+---------------------------------------------------------------------
+ alter_dist_table_test_user
+ alter_dist_table_test_user
+(2 rows)
+
+SELECT matviewowner FROM pg_matviews WHERE matviewname = 'dependent_mat_view_1';
+        matviewowner
+---------------------------------------------------------------------
+ alter_dist_table_test_user
+(1 row)
+
+-- Check the existence of the view on the worker node as well
+SELECT run_command_on_workers($$SELECT viewowner FROM pg_views WHERE viewname = 'dependent_view_1'$$);
+             run_command_on_workers
+---------------------------------------------------------------------
+ (localhost,57637,t,alter_dist_table_test_user)
+ (localhost,57638,t,alter_dist_table_test_user)
+(2 rows)
+
+SELECT run_command_on_workers($$SELECT viewowner FROM pg_views WHERE viewname = 'dependent_view_2'$$);
+             run_command_on_workers
+---------------------------------------------------------------------
+ (localhost,57637,t,alter_dist_table_test_user)
+ (localhost,57638,t,alter_dist_table_test_user)
+(2 rows)
+
+-- It is expected to not have mat view on worker node
+SELECT run_command_on_workers($$SELECT count(*) FROM pg_matviews WHERE matviewname = 'dependent_mat_view_1';$$);
+ run_command_on_workers
+---------------------------------------------------------------------
+ (localhost,57637,t,0)
+ (localhost,57638,t,0)
+(2 rows)
+
+RESET search_path;
 DROP SCHEMA alter_distributed_table CASCADE;
+DROP SCHEMA schema_to_test_alter_dist_table CASCADE;

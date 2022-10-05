@@ -28,3 +28,6 @@
 
 # core dumps
 core
+
+# pg_vanilla output folders
+pg_vanilla_outputs

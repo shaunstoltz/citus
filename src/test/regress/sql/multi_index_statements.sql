@@ -8,7 +8,6 @@
 --
 -- CREATE TEST TABLES
 --
-
 CREATE SCHEMA multi_index_statements;
 CREATE SCHEMA multi_index_statements_2;
 SET search_path TO multi_index_statements;
@@ -22,7 +21,7 @@ SELECT master_create_empty_shard('index_test_range');
 
 SET citus.shard_count TO 8;
 SET citus.shard_replication_factor TO 2;
-CREATE TABLE index_test_hash(a int, b int, c int);
+CREATE TABLE index_test_hash(a int, b int, c int, a_text text, b_text text);
 SELECT create_distributed_table('index_test_hash', 'a', 'hash');
 
 CREATE TABLE index_test_append(a int, b int, c int);
@@ -74,9 +73,27 @@ END;
 $$ LANGUAGE plpgsql;
 SELECT create_distributed_function('multi_index_statements_2.value_plus_one(int)');
 
+CREATE FUNCTION predicate_stable() RETURNS bool IMMUTABLE
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'SELECT txid_current()';
+  RETURN true;
+END; $$;
+
 CREATE INDEX ON index_test_hash ((value_plus_one(b)));
+CREATE INDEX ON index_test_hash ((value_plus_one(b) + value_plus_one(c))) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash (a) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash (abs(a)) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash (value_plus_one(a)) WHERE c > 10;
 CREATE INDEX ON index_test_hash ((multi_index_statements.value_plus_one(b)));
 CREATE INDEX ON index_test_hash ((multi_index_statements_2.value_plus_one(b)));
+CREATE INDEX ON index_test_hash (a) INCLUDE (b) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash (c, (c+0)) INCLUDE (a);
+CREATE INDEX ON index_test_hash (value_plus_one(a)) INCLUDE (c,b) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash ((a_text || b_text));
+CREATE INDEX ON index_test_hash ((a_text || b_text)) WHERE value_plus_one(c) > 10;
+CREATE INDEX ON index_test_hash ((a_text || b_text)) WHERE (a_text || b_text) = 'ttt';
+CREATE INDEX CONCURRENTLY ON index_test_hash (a) WHERE predicate_stable();
 
 -- Verify that we handle if not exists statements correctly
 CREATE INDEX lineitem_orderkey_index on public.lineitem(l_orderkey);
@@ -94,15 +111,20 @@ CREATE INDEX CONCURRENTLY lineitem_concurrently_index ON public.lineitem (l_orde
 CREATE TABLE local_table (id integer, name text);
 CREATE INDEX CONCURRENTLY ON local_table(id);
 
--- Verify that we warn out on CLUSTER command for distributed tables and no parameter
-CLUSTER index_test_hash USING index_test_hash_index_a;
-CLUSTER;
-
 -- Vefify we don't warn out on CLUSTER command for local tables
 CREATE INDEX CONCURRENTLY local_table_index ON local_table(id);
 CLUSTER local_table USING local_table_index;
 
 DROP TABLE local_table;
+
+-- Verify that we can run CLUSTER command
+CLUSTER index_test_hash USING index_test_hash_index_a;
+
+-- Verify that we ERROR on CLUSTER VERBOSE
+CLUSTER VERBOSE index_test_hash USING index_test_hash_index_a;
+
+-- Verify that we WARN on CLUSTER ALL
+CLUSTER;
 
 -- Verify that all indexes got created on the master node and one of the workers
 SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_test_%' ORDER BY indexname;
@@ -111,6 +133,10 @@ SELECT count(*) FROM pg_indexes WHERE tablename = (SELECT relname FROM pg_class 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_hash_%';
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_range_%';
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_append_%';
+
+-- Verify that we actually run the CLUSTER COMMAND
+SELECT sum(indisclustered::integer) FROM pg_index WHERE indrelid::regclass::text SIMILAR TO '%\d';
+
 \c - - - :master_port
 SET search_path TO multi_index_statements, public;
 
@@ -137,9 +163,6 @@ CREATE INDEX try_index ON lineitem (non_existent_column);
 CREATE INDEX ON lineitem (l_orderkey);
 CREATE UNIQUE INDEX ON index_test_hash(a);
 CREATE INDEX CONCURRENTLY ON lineitem USING hash (l_shipdate);
-
--- Verify that none of failed indexes got created on the master node
-SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_test_%' ORDER BY indexname;
 
 --
 -- REINDEX
@@ -182,6 +205,30 @@ DROP INDEX index_test_hash_index_a_b_partial;
 
 -- Verify that we can drop indexes concurrently
 DROP INDEX CONCURRENTLY lineitem_concurrently_index;
+
+-- Verify that all indexes got created on the coordinator node and on the workers
+-- by dropping the indexes. We do this because in different PG versions,
+-- the expression indexes are named differently
+-- and, being able to drop the index ensures that the index names are
+-- proper
+CREATE OR REPLACE FUNCTION drop_all_indexes(table_name regclass) RETURNS INTEGER AS $$
+DECLARE
+  i RECORD;
+BEGIN
+  FOR i IN
+    (SELECT indexrelid::regclass::text as relname FROM pg_index
+     WHERE indrelid = table_name and indexrelid::regclass::text not ilike '%pkey%')
+  LOOP
+    EXECUTE 'DROP INDEX ' || i.relname;
+  END LOOP;
+RETURN 1;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT drop_all_indexes('public.lineitem');
+SELECT drop_all_indexes('index_test_range');
+SELECT drop_all_indexes('index_test_hash');
+SELECT drop_all_indexes('index_test_append');
 
 -- Verify that all the indexes are dropped from the master and one worker node.
 -- As there's a primary key, so exclude those from this check.
@@ -397,6 +444,41 @@ BEGIN
     CREATE INDEX ON distributed_table(last_column);
 END;
 $BODY$ LANGUAGE plpgsql;
+
+
+CREATE TABLE test_for_func(
+    a int
+);
+
+SELECT create_distributed_table('test_for_func', 'a');
+
+-- create a function that depends on a relation that depends on an extension
+CREATE OR REPLACE FUNCTION function_on_table_depends_on_extension (
+    p_table_name text)
+RETURNS TABLE (LIKE pg_dist_partition)
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT * FROM pg_dist_partition WHERE logicalrelid::regclass::text = p_table_name;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT logicalrelid FROM function_on_table_depends_on_extension('test_for_func');
+
+
+-- create a function that depends on a relation that does not depend on an extension
+CREATE TABLE local_test(a int);
+CREATE OR REPLACE FUNCTION function_on_table_does_not_depend_on_extension (
+    input int)
+RETURNS TABLE (LIKE local_test)
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT * FROM local_test WHERE a = input;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT * FROM function_on_table_does_not_depend_on_extension(5);
 
 -- hide plpgsql messages as they differ across pg versions
 \set VERBOSITY terse

@@ -14,12 +14,8 @@
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
 #include "access/tsmapi.h"
-#if PG_VERSION_NUM >= 130000
 #include "access/heaptoast.h"
 #include "common/hashfn.h"
-#else
-#include "access/tuptoaster.h"
-#endif
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
@@ -117,6 +113,7 @@ CleanupWriteStateMap(void *arg)
 
 ColumnarWriteState *
 columnar_init_write_state(Relation relation, TupleDesc tupdesc,
+						  Oid tupSlotRelationId,
 						  SubTransactionId currentSubXid)
 {
 	bool found;
@@ -180,7 +177,16 @@ columnar_init_write_state(Relation relation, TupleDesc tupdesc,
 	MemoryContext oldContext = MemoryContextSwitchTo(WriteStateContext);
 
 	ColumnarOptions columnarOptions = { 0 };
-	ReadColumnarOptions(relation->rd_id, &columnarOptions);
+
+	/*
+	 * In case of a table rewrite, we need to fetch table options based on the
+	 * relation id of the source tuple slot.
+	 *
+	 * For this reason, we always pass tupSlotRelationId here; which should be
+	 * same as the target table if the write operation is not related to a table
+	 * rewrite etc.
+	 */
+	ReadColumnarOptions(tupSlotRelationId, &columnarOptions);
 
 	SubXidWriteState *stackEntry = palloc0(sizeof(SubXidWriteState));
 	stackEntry->writeState = ColumnarBeginWrite(relation->rd_node,

@@ -181,8 +181,13 @@ WorkerCreateOrReplaceObject(List *sqlStatements)
 	 * same subject.
 	 */
 	Node *parseTree = ParseTreeNode(linitial(sqlStatements));
-	ObjectAddress address = GetObjectAddressFromParseTree(parseTree, true);
-	if (ObjectExists(&address))
+	List *addresses = GetObjectAddressListFromParseTree(parseTree, true, false);
+	Assert(list_length(addresses) == 1);
+
+	/* We have already asserted that we have exactly 1 address in the addresses. */
+	ObjectAddress *address = linitial(addresses);
+
+	if (ObjectExists(address))
 	{
 		/*
 		 * Object with name from statement is already found locally, check if states are
@@ -195,7 +200,7 @@ WorkerCreateOrReplaceObject(List *sqlStatements)
 		 * recreate our version of the object. This we can compare to what the coordinator
 		 * sent us. If they match we don't do anything.
 		 */
-		List *localSqlStatements = CreateStmtListByObjectAddress(&address);
+		List *localSqlStatements = CreateStmtListByObjectAddress(address);
 		if (CompareStringList(sqlStatements, localSqlStatements))
 		{
 			/*
@@ -208,9 +213,9 @@ WorkerCreateOrReplaceObject(List *sqlStatements)
 			return false;
 		}
 
-		char *newName = GenerateBackupNameForCollision(&address);
+		char *newName = GenerateBackupNameForCollision(address);
 
-		RenameStmt *renameStmt = CreateRenameStatement(&address, newName);
+		RenameStmt *renameStmt = CreateRenameStatement(address, newName);
 		const char *sqlRenameStmt = DeparseTreeNode((Node *) renameStmt);
 		ProcessUtilityParseTree((Node *) renameStmt, sqlRenameStmt,
 								PROCESS_UTILITY_QUERY,
@@ -244,13 +249,10 @@ CompareStringList(List *list1, List *list2)
 		return false;
 	}
 
-	ListCell *cell1 = NULL;
-	ListCell *cell2 = NULL;
-	forboth(cell1, list1, cell2, list2)
+	const char *str1 = NULL;
+	const char *str2 = NULL;
+	forboth_ptr(str1, list1, str2, list2)
 	{
-		const char *str1 = lfirst(cell1);
-		const char *str2 = lfirst(cell2);
-
 		if (strcmp(str1, str2) != 0)
 		{
 			return false;

@@ -1,10 +1,3 @@
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS server_version_above_eleven
-\gset
-\if :server_version_above_eleven
-\else
-\q
-\endif
 SET citus.shard_replication_factor to 1;
 SET citus.next_shard_id TO 60000;
 SET citus.next_placement_id TO 60000;
@@ -595,8 +588,12 @@ NOTICE:  renaming the new table to test_pg12.generated_stored_ref
 ROLLBACK;
 BEGIN;
   -- drop some of the columns not having "generated always as stored" expressions
-  -- this would drop generated columns too
-  ALTER TABLE generated_stored_ref DROP COLUMN col_1;
+  -- PRE PG15, this would drop generated columns too
+  -- In PG15, CASCADE option must be specified
+  -- Relevant PG Commit: cb02fcb4c95bae08adaca1202c2081cfc81a28b5
+  SET client_min_messages TO WARNING;
+  ALTER TABLE generated_stored_ref DROP COLUMN col_1 CASCADE;
+  RESET client_min_messages;
   ALTER TABLE generated_stored_ref DROP COLUMN col_4;
   -- show that undistribute_table works fine
   SELECT undistribute_table('generated_stored_ref');
@@ -653,15 +650,13 @@ SELECT citus_remove_node('localhost', :master_port);
 
 CREATE TABLE superuser_columnar_table (a int) USING columnar;
 CREATE USER read_access;
-NOTICE:  not propagating CREATE ROLE/USER commands to worker nodes
-HINT:  Connect to worker nodes directly to manually create all necessary users and roles.
 SET ROLE read_access;
--- user shouldn't be able to execute alter_columnar_table_set
--- or alter_columnar_table_reset for a columnar table that it
+-- user shouldn't be able to execute ALTER TABLE ... SET
+-- or ALTER TABLE ... RESET for a columnar table that it
 -- doesn't own
-SELECT alter_columnar_table_set('test_pg12.superuser_columnar_table', chunk_group_row_limit => 100);
+ALTER TABLE test_pg12.superuser_columnar_table SET(columnar.chunk_group_row_limit = 100);
 ERROR:  permission denied for schema test_pg12
-SELECT alter_columnar_table_reset('test_pg12.superuser_columnar_table');
+ALTER TABLE test_pg12.superuser_columnar_table RESET (columnar.chunk_group_row_limit);
 ERROR:  permission denied for schema test_pg12
 RESET ROLE;
 DROP USER read_access;

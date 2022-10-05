@@ -1,7 +1,7 @@
 SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 13 AS server_version_above_thirteen
+SELECT substring(:'server_version', '\d+')::int >= 14 AS server_version_ge_14
 \gset
-\if :server_version_above_thirteen
+\if :server_version_ge_14
 \else
 \q
 \endif
@@ -12,7 +12,7 @@ SET citus.shard_replication_factor TO 1;
 SET citus.next_shard_id TO 980000;
 SET citus.shard_count TO 2;
 
--- test the new vacuum option, process_toast
+-- test the new vacuum option, process_toast and also auto option for index_cleanup
 CREATE TABLE t1 (a int);
 SELECT create_distributed_table('t1','a');
 SET citus.log_remote_commands TO ON;
@@ -21,6 +21,34 @@ VACUUM (FULL, PROCESS_TOAST) t1;
 VACUUM (FULL, PROCESS_TOAST true) t1;
 VACUUM (FULL, PROCESS_TOAST false) t1;
 VACUUM (PROCESS_TOAST false) t1;
+VACUUM (INDEX_CLEANUP AUTO) t1;
+VACUUM (INDEX_CLEANUP) t1;
+VACUUM (INDEX_CLEANUP AuTo) t1;
+VACUUM (INDEX_CLEANUP false) t1;
+VACUUM (INDEX_CLEANUP true) t1;
+VACUUM (INDEX_CLEANUP "AUTOX") t1;
+VACUUM (FULL, FREEZE, VERBOSE false, ANALYZE, SKIP_LOCKED, INDEX_CLEANUP, PROCESS_TOAST, TRUNCATE) t1;
+VACUUM (FULL, FREEZE false, VERBOSE false, ANALYZE false, SKIP_LOCKED false, INDEX_CLEANUP "Auto", PROCESS_TOAST true, TRUNCATE false) t1;
+
+-- vacuum (process_toast true) should be vacuuming toast tables (default is true)
+CREATE TABLE local_vacuum_table(name text);
+select reltoastrelid from pg_class where relname='local_vacuum_table'
+\gset
+
+SELECT relfrozenxid AS frozenxid FROM pg_class WHERE oid=:reltoastrelid::regclass
+\gset
+VACUUM (FREEZE, PROCESS_TOAST true) local_vacuum_table;
+SELECT relfrozenxid::text::integer > :frozenxid AS frozen_performed FROM pg_class
+WHERE oid=:reltoastrelid::regclass;
+
+-- vacuum (process_toast false) should not be vacuuming toast tables (default is true)
+SELECT relfrozenxid AS frozenxid FROM pg_class WHERE oid=:reltoastrelid::regclass
+\gset
+VACUUM (FREEZE, PROCESS_TOAST false) local_vacuum_table;
+SELECT relfrozenxid::text::integer = :frozenxid AS frozen_not_performed FROM pg_class
+WHERE oid=:reltoastrelid::regclass;
+
+DROP TABLE local_vacuum_table;
 SET citus.log_remote_commands TO OFF;
 
 create table dist(a int, b int);
@@ -64,31 +92,31 @@ SET citus.shard_replication_factor TO 1;
 CREATE TABLE col_compression (a TEXT COMPRESSION pglz, b TEXT);
 SELECT create_distributed_table('col_compression', 'a', shard_count:=4);
 
-SELECT attname || ' ' || attcompression AS column_compression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'col\_compression%' AND attnum > 0 ORDER BY 1;
+SELECT attname || ' ' || attcompression::text AS column_compression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'col\_compression%' AND attnum > 0 ORDER BY 1;
 SELECT result AS column_compression FROM run_command_on_workers($$SELECT ARRAY(
-SELECT attname || ' ' || attcompression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
+SELECT attname || ' ' || attcompression::text FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
 )$$);
 
 -- test column compression propagation in rebalance
 SELECT shardid INTO moving_shard FROM citus_shards WHERE table_name='col_compression'::regclass AND nodeport=:worker_1_port LIMIT 1;
-SELECT citus_move_shard_placement((SELECT * FROM moving_shard), :'public_worker_1_host', :worker_1_port, :'public_worker_2_host', :worker_2_port);
-SELECT rebalance_table_shards('col_compression', rebalance_strategy := 'by_shard_count');
+SELECT citus_move_shard_placement((SELECT * FROM moving_shard), :'public_worker_1_host', :worker_1_port, :'public_worker_2_host', :worker_2_port, shard_transfer_mode := 'block_writes');
+SELECT rebalance_table_shards('col_compression', rebalance_strategy := 'by_shard_count', shard_transfer_mode := 'block_writes');
 CALL citus_cleanup_orphaned_shards();
 SELECT result AS column_compression FROM run_command_on_workers($$SELECT ARRAY(
-SELECT attname || ' ' || attcompression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
+SELECT attname || ' ' || attcompression::text FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
 )$$);
 
 -- test propagation of ALTER TABLE .. ALTER COLUMN .. SET COMPRESSION ..
 ALTER TABLE col_compression ALTER COLUMN b SET COMPRESSION pglz;
 ALTER TABLE col_compression ALTER COLUMN a SET COMPRESSION default;
 SELECT result AS column_compression FROM run_command_on_workers($$SELECT ARRAY(
-SELECT attname || ' ' || attcompression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
+SELECT attname || ' ' || attcompression::text FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
 )$$);
 
 -- test propagation of ALTER TABLE .. ADD COLUMN .. COMPRESSION ..
 ALTER TABLE col_compression ADD COLUMN c TEXT COMPRESSION pglz;
 SELECT result AS column_compression FROM run_command_on_workers($$SELECT ARRAY(
-SELECT attname || ' ' || attcompression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
+SELECT attname || ' ' || attcompression::text FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_compression%' AND attnum > 0 ORDER BY 1
 )$$);
 
 -- test attaching to a partitioned table with column compression
@@ -98,7 +126,7 @@ SELECT create_distributed_table('col_comp_par', 'a');
 CREATE TABLE col_comp_par_1 PARTITION OF col_comp_par FOR VALUES FROM ('abc') TO ('def');
 
 SELECT result AS column_compression FROM run_command_on_workers($$SELECT ARRAY(
-SELECT attname || ' ' || attcompression FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_comp\_par\_1\_%' AND attnum > 0 ORDER BY 1
+SELECT attname || ' ' || attcompression::text FROM pg_attribute WHERE attrelid::regclass::text LIKE 'pg14.col\_comp\_par\_1\_%' AND attnum > 0 ORDER BY 1
 )$$);
 
 RESET citus.multi_shard_modify_mode;
@@ -394,10 +422,7 @@ CREATE TABLE st1 (a int, b int);
 CREATE STATISTICS role_s1 ON a, b FROM st1;
 SELECT create_distributed_table('st1','a');
 ALTER STATISTICS role_s1 OWNER TO CURRENT_ROLE;
-SET citus.enable_ddl_propagation TO off; -- for enterprise
 CREATE ROLE role_1 WITH LOGIN SUPERUSER;
-SET citus.enable_ddl_propagation TO on;
-SELECT run_command_on_workers($$CREATE ROLE role_1 WITH LOGIN SUPERUSER;$$);
 ALTER STATISTICS role_s1 OWNER TO CURRENT_ROLE;
 SELECT run_command_on_workers($$SELECT rolname FROM pg_roles WHERE oid IN (SELECT stxowner FROM pg_statistic_ext WHERE stxname LIKE 'role\_s1%');$$);
 SET ROLE role_1;
@@ -671,6 +696,36 @@ SELECT citus_add_local_table_to_metadata('foreign_table');
 
 SELECT count(*) FROM foreign_table;
 TRUNCATE foreign_table;
+
+-- test truncating foreign tables in the same statement with
+-- other distributed tables
+
+CREATE TABLE foreign_table_test_2 (id integer NOT NULL, data text, a bigserial);
+CREATE FOREIGN TABLE foreign_table_2
+(
+    id integer NOT NULL,
+    data text,
+    a bigserial
+)
+        SERVER foreign_server
+        OPTIONS (schema_name 'pg14', table_name 'foreign_table_test_2');
+
+SELECT citus_add_local_table_to_metadata('foreign_table_2');
+
+CREATE TABLE dist_table_1(a int);
+CREATE TABLE dist_table_2(a int);
+CREATE TABLE dist_table_3(a int);
+
+SELECT create_distributed_table('dist_table_1', 'a');
+SELECT create_distributed_table('dist_table_2', 'a');
+SELECT create_reference_table('dist_table_3');
+
+TRUNCATE foreign_table, foreign_table_2;
+TRUNCATE dist_table_1, foreign_table, dist_table_2, foreign_table_2, dist_table_3;
+TRUNCATE dist_table_1, dist_table_2, foreign_table, dist_table_3;
+TRUNCATE dist_table_1, foreign_table, foreign_table_2, dist_table_3;
+TRUNCATE dist_table_1, foreign_table, foreign_table_2, dist_table_3, dist_table_2;
+
 \c - - - :worker_1_port
 set search_path to pg14;
 -- verify the foreign table is truncated
@@ -679,6 +734,53 @@ SELECT count(*) FROM pg14.foreign_table;
 -- should error out
 TRUNCATE foreign_table;
 \c - - - :master_port
+SET search_path TO pg14;
+-- an example with CREATE TABLE LIKE, with statistics with expressions
+CREATE TABLE ctlt1 (a text CHECK (length(a) > 2) PRIMARY KEY, b text);
+CREATE STATISTICS ctlt1_expr_stat ON (a || b) FROM ctlt1;
+CREATE TABLE ctlt_all (LIKE ctlt1 INCLUDING ALL);
+SELECT create_distributed_table('ctlt1', 'a');
+CREATE TABLE ctlt_all_2 (LIKE ctlt1 INCLUDING ALL);
+
+CREATE TABLE compression_and_defaults (
+    data text COMPRESSION lz4 DEFAULT '"{}"'::text COLLATE "C" NOT NULL PRIMARY KEY,
+    rev text
+)
+WITH (
+    autovacuum_vacuum_scale_factor='0.01',
+    fillfactor='75'
+);
+
+SELECT create_distributed_table('compression_and_defaults', 'data', colocate_with:='none');
+
+CREATE TABLE compression_and_generated_col (
+    data text COMPRESSION lz4 GENERATED ALWAYS AS (rev || '{]') STORED COLLATE "C" NOT NULL,
+    rev text
+)
+WITH (
+    autovacuum_vacuum_scale_factor='0.01',
+    fillfactor='75'
+);
+SELECT create_distributed_table('compression_and_generated_col', 'rev', colocate_with:='none');
+
+-- See that it's enabling the binary option for logical replication
+BEGIN;
+SET LOCAL citus.log_remote_commands TO ON;
+SET LOCAL citus.grep_remote_commands = '%CREATE SUBSCRIPTION%';
+SELECT citus_move_shard_placement(980042, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode := 'force_logical');
+ROLLBACK;
+
+-- See that it doesn't enable the binary option for logical replication if we
+-- disable binary protocol.
+BEGIN;
+SET LOCAL citus.log_remote_commands TO ON;
+SET LOCAL citus.grep_remote_commands = '%CREATE SUBSCRIPTION%';
+SET LOCAL citus.enable_binary_protocol = FALSE;
+SELECT citus_move_shard_placement(980042, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode := 'force_logical');
+ROLLBACK;
+
+DROP TABLE compression_and_defaults, compression_and_generated_col;
+
 -- cleanup
 set client_min_messages to error;
 drop extension postgres_fdw cascade;

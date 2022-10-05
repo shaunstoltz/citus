@@ -20,7 +20,7 @@
 #include "distributed/deparse_shard_query.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_executor.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
@@ -41,14 +41,11 @@ typedef struct CitusVacuumParams
 	int options;
 	VacOptValue truncate;
 	VacOptValue index_cleanup;
-
-	#if PG_VERSION_NUM >= PG_VERSION_13
 	int nworkers;
-	#endif
 } CitusVacuumParams;
 
 /* Local functions forward declarations for processing distributed table commands */
-static bool IsDistributedVacuumStmt(int vacuumOptions, List *VacuumCitusRelationIdList);
+static bool IsDistributedVacuumStmt(List *vacuumRelationIdList);
 static List * VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams,
 							 List *vacuumColumnList);
 static char * DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams);
@@ -57,44 +54,28 @@ static List * VacuumColumnList(VacuumStmt *vacuumStmt, int relationIndex);
 static List * ExtractVacuumTargetRels(VacuumStmt *vacuumStmt);
 static void ExecuteVacuumOnDistributedTables(VacuumStmt *vacuumStmt, List *relationIdList,
 											 CitusVacuumParams vacuumParams);
+static void ExecuteUnqualifiedVacuumTasks(VacuumStmt *vacuumStmt,
+										  CitusVacuumParams vacuumParams);
 static CitusVacuumParams VacuumStmtParams(VacuumStmt *vacstmt);
-static List * VacuumCitusRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams
-										vacuumParams);
+static List * VacuumRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams
+								   vacuumParams);
 
 /*
  * PostprocessVacuumStmt processes vacuum statements that may need propagation to
- * distributed tables. If a VACUUM or ANALYZE command references a distributed
- * table, it is propagated to all involved nodes; otherwise, this function will
- * immediately exit after some error checking.
+ * citus tables only if ddl propagation is enabled. If a VACUUM or ANALYZE command
+ * references a citus table or no table, it is propagated to all involved nodes; otherwise,
+ * the statements will not be propagated.
  *
  * Unlike most other Process functions within this file, this function does not
  * return a modified parse node, as it is expected that the local VACUUM or
  * ANALYZE has already been processed.
  */
-void
-PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
+List *
+PostprocessVacuumStmt(Node *node, const char *vacuumCommand)
 {
+	VacuumStmt *vacuumStmt = castNode(VacuumStmt, node);
+
 	CitusVacuumParams vacuumParams = VacuumStmtParams(vacuumStmt);
-	const char *stmtName = (vacuumParams.options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
-
-	/*
-	 * No table in the vacuum statement means vacuuming all relations
-	 * which is not supported by citus.
-	 */
-	if (list_length(vacuumStmt->rels) == 0)
-	{
-		/* WARN for unqualified VACUUM commands */
-		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
-						  errhint("Provide a specific table in order to %s "
-								  "distributed tables.", stmtName)));
-	}
-
-
-	List *citusRelationIdList = VacuumCitusRelationIdList(vacuumStmt, vacuumParams);
-	if (list_length(citusRelationIdList) == 0)
-	{
-		return;
-	}
 
 	if (vacuumParams.options & VACOPT_VACUUM)
 	{
@@ -109,31 +90,41 @@ PostprocessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
 	}
 
 	/*
-	 * Here we get the relation list again because we might have
-	 * closed the current transaction and the memory context got reset.
-	 * Vacuum's context is PortalContext, which lasts for the whole session
-	 * so committing/starting a new transaction doesn't affect it.
+	 * when no table is specified propagate the command as it is;
+	 * otherwise, only propagate when there is at least 1 citus table
 	 */
-	citusRelationIdList = VacuumCitusRelationIdList(vacuumStmt, vacuumParams);
-	bool distributedVacuumStmt = IsDistributedVacuumStmt(vacuumParams.options,
-														 citusRelationIdList);
-	if (!distributedVacuumStmt)
+	List *relationIdList = VacuumRelationIdList(vacuumStmt, vacuumParams);
+
+	if (list_length(vacuumStmt->rels) == 0)
 	{
-		return;
+		/* no table is specified (unqualified vacuum) */
+
+		ExecuteUnqualifiedVacuumTasks(vacuumStmt, vacuumParams);
+	}
+	else if (IsDistributedVacuumStmt(relationIdList))
+	{
+		/* there is at least 1 citus table specified */
+
+		ExecuteVacuumOnDistributedTables(vacuumStmt, relationIdList,
+										 vacuumParams);
 	}
 
-	ExecuteVacuumOnDistributedTables(vacuumStmt, citusRelationIdList, vacuumParams);
+	/* else only local tables are specified */
+
+	return NIL;
 }
 
 
 /*
- * VacuumCitusRelationIdList returns the oid of the relations in the given vacuum statement.
+ * VacuumRelationIdList returns the oid of the relations in the given vacuum statement.
  */
 static List *
-VacuumCitusRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams vacuumParams)
+VacuumRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams vacuumParams)
 {
 	LOCKMODE lockMode = (vacuumParams.options & VACOPT_FULL) ? AccessExclusiveLock :
 						ShareUpdateExclusiveLock;
+
+	bool skipLocked = (vacuumParams.options & VACOPT_SKIP_LOCKED);
 
 	List *vacuumRelationList = ExtractVacuumTargetRels(vacuumStmt);
 
@@ -142,15 +133,42 @@ VacuumCitusRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams vacuumParams
 	RangeVar *vacuumRelation = NULL;
 	foreach_ptr(vacuumRelation, vacuumRelationList)
 	{
-		Oid relationId = RangeVarGetRelid(vacuumRelation, lockMode, false);
-		if (!IsCitusTable(relationId))
+		/*
+		 * If skip_locked option is enabled, we are skipping that relation
+		 * if the lock for it is currently not available; else, we get the lock.
+		 */
+		Oid relationId = RangeVarGetRelidExtended(vacuumRelation,
+												  lockMode,
+												  skipLocked ? RVR_SKIP_LOCKED : 0, NULL,
+												  NULL);
+
+		if (OidIsValid(relationId))
 		{
-			continue;
+			relationIdList = lappend_oid(relationIdList, relationId);
 		}
-		relationIdList = lappend_oid(relationIdList, relationId);
 	}
 
 	return relationIdList;
+}
+
+
+/*
+ * IsDistributedVacuumStmt returns true if there is any citus table in the relation id list;
+ * otherwise, it returns false.
+ */
+static bool
+IsDistributedVacuumStmt(List *vacuumRelationIdList)
+{
+	Oid relationId = InvalidOid;
+	foreach_oid(relationId, vacuumRelationIdList)
+	{
+		if (OidIsValid(relationId) && IsCitusTable(relationId))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -184,59 +202,15 @@ ExecuteVacuumOnDistributedTables(VacuumStmt *vacuumStmt, List *relationIdList,
 
 
 /*
- * IsDistributedVacuumStmt returns whether distributed execution of a
- * given VacuumStmt is supported. The provided relationId list represents
- * the list of tables targeted by the provided statement.
- *
- * Returns true if the statement requires distributed execution and returns
- * false otherwise.
- */
-static bool
-IsDistributedVacuumStmt(int vacuumOptions, List *VacuumCitusRelationIdList)
-{
-	bool distributeStmt = false;
-	int distributedRelationCount = 0;
-
-	const char *stmtName = (vacuumOptions & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
-
-
-	Oid relationId = InvalidOid;
-	foreach_oid(relationId, VacuumCitusRelationIdList)
-	{
-		if (OidIsValid(relationId) && IsCitusTable(relationId))
-		{
-			distributedRelationCount++;
-		}
-	}
-
-	if (distributedRelationCount == 0)
-	{
-		/* nothing to do here */
-	}
-	else if (!EnableDDLPropagation)
-	{
-		/* WARN if DDL propagation is not enabled */
-		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
-						  errhint("Set citus.enable_ddl_propagation to true in order to "
-								  "send targeted %s commands to worker nodes.",
-								  stmtName)));
-	}
-	else
-	{
-		distributeStmt = true;
-	}
-
-	return distributeStmt;
-}
-
-
-/*
  * VacuumTaskList returns a list of tasks to be executed as part of processing
  * a VacuumStmt which targets a distributed relation.
  */
 static List *
 VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams, List *vacuumColumnList)
 {
+	LOCKMODE lockMode = (vacuumParams.options & VACOPT_FULL) ? AccessExclusiveLock :
+						ShareUpdateExclusiveLock;
+
 	/* resulting task list */
 	List *taskList = NIL;
 
@@ -255,8 +229,20 @@ VacuumTaskList(Oid relationId, CitusVacuumParams vacuumParams, List *vacuumColum
 	 * RowExclusiveLock. However if VACUUM FULL is used, we already obtain
 	 * AccessExclusiveLock before reaching to that point and INSERT's will be
 	 * blocked anyway. This is inline with PostgreSQL's own behaviour.
+	 * Also note that if skip locked option is enabled, we try to acquire the lock
+	 * in nonblocking way. If lock is not available, vacuum just skip that relation.
 	 */
-	LockRelationOid(relationId, ShareUpdateExclusiveLock);
+	if (!(vacuumParams.options & VACOPT_SKIP_LOCKED))
+	{
+		LockRelationOid(relationId, lockMode);
+	}
+	else
+	{
+		if (!ConditionalLockRelationOid(relationId, lockMode))
+		{
+			return NIL;
+		}
+	}
 
 	List *shardIntervalList = LoadShardIntervalList(relationId);
 
@@ -334,10 +320,8 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 	/* if no flags remain, exit early */
 	if (vacuumFlags == 0 &&
 		vacuumParams.truncate == VACOPTVALUE_UNSPECIFIED &&
-		vacuumParams.index_cleanup == VACOPTVALUE_UNSPECIFIED
-#if PG_VERSION_NUM >= PG_VERSION_13
-		&& vacuumParams.nworkers == VACUUM_PARALLEL_NOTSET
-#endif
+		vacuumParams.index_cleanup == VACOPTVALUE_UNSPECIFIED &&
+		vacuumParams.nworkers == VACUUM_PARALLEL_NOTSET
 		)
 	{
 		return vacuumPrefix->data;
@@ -391,18 +375,39 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 
 	if (vacuumParams.index_cleanup != VACOPTVALUE_UNSPECIFIED)
 	{
-		appendStringInfoString(vacuumPrefix,
-							   vacuumParams.index_cleanup == VACOPTVALUE_ENABLED ?
-							   "INDEX_CLEANUP," : "INDEX_CLEANUP false,"
-							   );
+		switch (vacuumParams.index_cleanup)
+		{
+			case VACOPTVALUE_ENABLED:
+			{
+				appendStringInfoString(vacuumPrefix, "INDEX_CLEANUP true,");
+				break;
+			}
+
+			case VACOPTVALUE_DISABLED:
+			{
+				appendStringInfoString(vacuumPrefix, "INDEX_CLEANUP false,");
+				break;
+			}
+
+			#if PG_VERSION_NUM >= PG_VERSION_14
+			case VACOPTVALUE_AUTO:
+			{
+				appendStringInfoString(vacuumPrefix, "INDEX_CLEANUP auto,");
+				break;
+			}
+			#endif
+
+			default:
+			{
+				break;
+			}
+		}
 	}
 
-#if PG_VERSION_NUM >= PG_VERSION_13
 	if (vacuumParams.nworkers != VACUUM_PARALLEL_NOTSET)
 	{
 		appendStringInfo(vacuumPrefix, "PARALLEL %d,", vacuumParams.nworkers);
 	}
-#endif
 
 	vacuumPrefix->data[vacuumPrefix->len - 1] = ')';
 
@@ -432,7 +437,7 @@ DeparseVacuumColumnNames(List *columnNameList)
 
 	appendStringInfoString(columnNames, " (");
 
-	Value *columnName = NULL;
+	String *columnName = NULL;
 	foreach_ptr(columnName, columnNameList)
 	{
 		appendStringInfo(columnNames, "%s,", strVal(columnName));
@@ -503,9 +508,7 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 	/* Set default value */
 	params.index_cleanup = VACOPTVALUE_UNSPECIFIED;
 	params.truncate = VACOPTVALUE_UNSPECIFIED;
-	#if PG_VERSION_NUM >= PG_VERSION_13
 	params.nworkers = VACUUM_PARALLEL_NOTSET;
-	#endif
 
 	/* Parse options list */
 	DefElem *opt = NULL;
@@ -552,15 +555,38 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 		#endif
 		else if (strcmp(opt->defname, "index_cleanup") == 0)
 		{
+			#if PG_VERSION_NUM >= PG_VERSION_14
+
+			/* Interpret no string as the default, which is 'auto' */
+			if (!opt->arg)
+			{
+				params.index_cleanup = VACOPTVALUE_AUTO;
+			}
+			else
+			{
+				char *sval = defGetString(opt);
+
+				/* Try matching on 'auto' string, or fall back on boolean */
+				if (pg_strcasecmp(sval, "auto") == 0)
+				{
+					params.index_cleanup = VACOPTVALUE_AUTO;
+				}
+				else
+				{
+					params.index_cleanup = defGetBoolean(opt) ? VACOPTVALUE_ENABLED :
+										   VACOPTVALUE_DISABLED;
+				}
+			}
+			#else
 			params.index_cleanup = defGetBoolean(opt) ? VACOPTVALUE_ENABLED :
 								   VACOPTVALUE_DISABLED;
+			#endif
 		}
 		else if (strcmp(opt->defname, "truncate") == 0)
 		{
 			params.truncate = defGetBoolean(opt) ? VACOPTVALUE_ENABLED :
 							  VACOPTVALUE_DISABLED;
 		}
-		#if PG_VERSION_NUM >= PG_VERSION_13
 		else if (strcmp(opt->defname, "parallel") == 0)
 		{
 			if (opt->arg == NULL)
@@ -584,7 +610,6 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 				params.nworkers = nworkers;
 			}
 		}
-		#endif
 		else
 		{
 			ereport(ERROR,
@@ -605,4 +630,63 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 					 #endif
 					 (disable_page_skipping ? VACOPT_DISABLE_PAGE_SKIPPING : 0);
 	return params;
+}
+
+
+/*
+ * ExecuteUnqualifiedVacuumTasks executes tasks for unqualified vacuum commands
+ */
+static void
+ExecuteUnqualifiedVacuumTasks(VacuumStmt *vacuumStmt, CitusVacuumParams vacuumParams)
+{
+	/* don't allow concurrent node list changes that require an exclusive lock */
+	List *workerNodes = TargetWorkerSetNodeList(ALL_SHARD_NODES, RowShareLock);
+
+	if (list_length(workerNodes) == 0)
+	{
+		return;
+	}
+
+	const char *vacuumStringPrefix = DeparseVacuumStmtPrefix(vacuumParams);
+
+	StringInfo vacuumCommand = makeStringInfo();
+	appendStringInfoString(vacuumCommand, vacuumStringPrefix);
+
+	List *unqualifiedVacuumCommands = list_make3(DISABLE_DDL_PROPAGATION,
+												 vacuumCommand->data,
+												 ENABLE_DDL_PROPAGATION);
+
+	Task *task = CitusMakeNode(Task);
+	task->jobId = INVALID_JOB_ID;
+	task->taskType = VACUUM_ANALYZE_TASK;
+	SetTaskQueryStringList(task, unqualifiedVacuumCommands);
+	task->dependentTaskList = NULL;
+	task->replicationModel = REPLICATION_MODEL_INVALID;
+	task->cannotBeExecutedInTransction = ((vacuumParams.options) & VACOPT_VACUUM);
+
+
+	bool hasPeerWorker = false;
+	int32 localNodeGroupId = GetLocalGroupId();
+
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodes)
+	{
+		if (workerNode->groupId != localNodeGroupId)
+		{
+			ShardPlacement *targetPlacement = CitusMakeNode(ShardPlacement);
+			targetPlacement->nodeName = workerNode->workerName;
+			targetPlacement->nodePort = workerNode->workerPort;
+			targetPlacement->groupId = workerNode->groupId;
+
+			task->taskPlacementList = lappend(task->taskPlacementList,
+											  targetPlacement);
+			hasPeerWorker = true;
+		}
+	}
+
+	if (hasPeerWorker)
+	{
+		bool localExecution = false;
+		ExecuteUtilityTaskList(list_make1(task), localExecution);
+	}
 }

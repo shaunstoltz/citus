@@ -48,6 +48,7 @@
 #include "distributed/metadata_sync.h"
 #include "distributed/namespace_utils.h"
 #include "distributed/pg_dist_shard.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_manager.h"
 #include "foreign/foreign.h"
@@ -169,7 +170,7 @@ master_get_table_ddl_events(PG_FUNCTION_ARGS)
 		Assert(CitusIsA(ddlStatement, TableDDLCommand));
 		text *ddlStatementText = cstring_to_text(GetTableDDLCommand(ddlStatement));
 
-		wrapper->listCell = lnext_compat(wrapper->list, wrapper->listCell);
+		wrapper->listCell = lnext(wrapper->list, wrapper->listCell);
 
 		SRF_RETURN_NEXT(functionContext, PointerGetDatum(ddlStatementText));
 	}
@@ -613,12 +614,23 @@ GetPreLoadTableCreationCommands(Oid relationId,
 
 
 	/* add columnar options for cstore tables */
-	if (accessMethod == NULL && IsColumnarTableAmTable(relationId))
+	if (accessMethod == NULL && extern_IsColumnarTableAmTable(relationId))
 	{
 		TableDDLCommand *cstoreOptionsDDL = ColumnarGetTableOptionsDDL(relationId);
 		if (cstoreOptionsDDL != NULL)
 		{
 			tableDDLEventList = lappend(tableDDLEventList, cstoreOptionsDDL);
+		}
+	}
+
+	List *tableACLList = pg_get_table_grants(relationId);
+	if (tableACLList != NIL)
+	{
+		char *tableACLCommand = NULL;
+		foreach_ptr(tableACLCommand, tableACLList)
+		{
+			tableDDLEventList = lappend(tableDDLEventList,
+										makeTableDDLCommandString(tableACLCommand));
 		}
 	}
 
@@ -628,6 +640,9 @@ GetPreLoadTableCreationCommands(Oid relationId,
 		tableDDLEventList = lappend(tableDDLEventList, makeTableDDLCommandString(
 										tableOwnerDef));
 	}
+
+	List *tableRowLevelSecurityCommands = GetTableRowLevelSecurityCommands(relationId);
+	tableDDLEventList = list_concat(tableDDLEventList, tableRowLevelSecurityCommands);
 
 	List *policyCommands = CreatePolicyCommands(relationId);
 	tableDDLEventList = list_concat(tableDDLEventList, policyCommands);
@@ -774,6 +789,29 @@ GatherIndexAndConstraintDefinitionList(Form_pg_index indexForm, List **indexDDLE
 
 	/* revert back to original search_path */
 	PopOverrideSearchPath();
+}
+
+
+/*
+ * GetTableRowLevelSecurityCommands takes in a relationId, and returns the list of
+ * commands needed to reconstruct the row level security policy.
+ */
+List *
+GetTableRowLevelSecurityCommands(Oid relationId)
+{
+	List *rowLevelSecurityCommandList = NIL;
+
+	List *rowLevelSecurityEnableCommands = pg_get_row_level_security_commands(relationId);
+
+	char *rowLevelSecurityCommand = NULL;
+	foreach_ptr(rowLevelSecurityCommand, rowLevelSecurityEnableCommands)
+	{
+		rowLevelSecurityCommandList = lappend(
+			rowLevelSecurityCommandList,
+			makeTableDDLCommandString(rowLevelSecurityCommand));
+	}
+
+	return rowLevelSecurityCommandList;
 }
 
 
@@ -1038,16 +1076,17 @@ CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
 	initStringInfo(&buf);
 
 	appendStringInfo(&buf,
-					 "SELECT alter_columnar_table_set(%s, "
-					 "chunk_group_row_limit => %d, "
-					 "stripe_row_limit => %lu, "
-					 "compression_level => %d, "
-					 "compression => %s);",
-					 quote_literal_cstr(qualifiedRelationName),
+					 "ALTER TABLE %s SET ("
+					 "columnar.chunk_group_row_limit = %d, "
+					 "columnar.stripe_row_limit = %lu, "
+					 "columnar.compression_level = %d, "
+					 "columnar.compression = %s);",
+					 qualifiedRelationName,
 					 options->chunkRowCount,
 					 options->stripeRowCount,
 					 options->compressionLevel,
-					 quote_literal_cstr(CompressionTypeStr(options->compressionType)));
+					 quote_literal_cstr(extern_CompressionTypeStr(
+											options->compressionType)));
 
 	return buf.data;
 }
@@ -1136,7 +1175,7 @@ ColumnarGetTableOptionsDDL(Oid relationId)
 	char *relationName = get_rel_name(relationId);
 
 	ColumnarOptions options = { 0 };
-	ReadColumnarOptions(relationId, &options);
+	extern_ReadColumnarOptions(relationId, &options);
 
 	return ColumnarGetCustomTableOptionsDDL(schemaName, relationName, options);
 }

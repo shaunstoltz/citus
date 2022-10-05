@@ -102,15 +102,15 @@ PlannedStmt *
 GeneratePlaceHolderPlannedStmt(Query *parse)
 {
 	PlannedStmt *result = makeNode(PlannedStmt);
-	SeqScan *seqScanNode = makeNode(SeqScan);
-	Plan *plan = &seqScanNode->plan;
+	Scan *scanNode = makeNode(Scan);
+	Plan *plan = &scanNode->plan;
 
 	Node *distKey PG_USED_FOR_ASSERTS_ONLY = NULL;
 
 	AssertArg(FastPathRouterQuery(parse, &distKey));
 
 	/* there is only a single relation rte */
-	seqScanNode->scanrelid = 1;
+	scanNode->scanrelid = 1;
 
 	plan->targetlist =
 		copyObject(FetchStatementTargetList((Node *) parse));
@@ -161,6 +161,17 @@ FastPathRouterQuery(Query *query, Node **distributionKeyValue)
 	{
 		return false;
 	}
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+	if (query->commandType == CMD_MERGE)
+	{
+		/*
+		 * Citus doesn't support MERGE command, lets return
+		 * early and explicitly for fast-path queries.
+		 */
+		return false;
+	}
+#endif
 
 	/*
 	 * We want to deal with only very simple queries. Some of the

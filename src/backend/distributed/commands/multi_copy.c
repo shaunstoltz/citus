@@ -30,11 +30,7 @@
  * By default, COPY uses normal transactions on the workers. In the case of
  * hash or range-partitioned tables, this can cause a problem when some of the
  * transactions fail to commit while others have succeeded. To ensure no data
- * is lost, COPY can use two-phase commit, by increasing max_prepared_transactions
- * on the worker and setting citus.multi_shard_commit_protocol to '2pc'. The default
- * is '1pc'. This is not a problem for append-partitioned tables because new
- * shards are created and in the case of failure, metadata changes are rolled
- * back on the master node.
+ * is lost, COPY uses two-phase commit.
  *
  * Parsing options are processed and enforced on the node where copy command
  * is run, while constraints are enforced on the worker. In either case,
@@ -73,10 +69,12 @@
 #include "distributed/commands/multi_copy.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/intermediate_results.h"
+#include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/log_utils.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/multi_executor.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_planner.h"
@@ -102,10 +100,9 @@
 #include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parse_func.h"
 #include "parser/parse_type.h"
-#if PG_VERSION_NUM >= PG_VERSION_13
 #include "tcop/cmdtag.h"
-#endif
 #include "tsearch/ts_locale.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -116,6 +113,9 @@
 
 /* constant used in binary protocol */
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
+
+/* if true, skip validation of JSONB columns during COPY */
+bool SkipJsonbValidationInCopy = true;
 
 /* custom Citus option for appending to a shard */
 #define APPEND_TO_SHARD_OPTION "append_to_shard"
@@ -217,15 +217,6 @@ struct CopyShardState
 	List *placementStateList;
 };
 
-/* ShardConnections represents a set of connections for each placement of a shard */
-typedef struct ShardConnections
-{
-	int64 shardId;
-
-	/* list of MultiConnection structs */
-	List *connectionList;
-} ShardConnections;
-
 
 /*
  * Represents the state for allowing copy via local
@@ -241,7 +232,10 @@ typedef enum LocalCopyStatus
 
 /* Local functions forward declarations */
 static void CopyToExistingShards(CopyStmt *copyStatement,
-								 QueryCompletionCompat *completionTag);
+								 QueryCompletion *completionTag);
+static bool IsCopyInBinaryFormat(CopyStmt *copyStatement);
+static List * FindJsonbInputColumns(TupleDesc tupleDescriptor,
+									List *inputColumnNameList);
 static List * RemoveOptionFromList(List *optionList, char *optionName);
 static bool BinaryOutputFunctionDefined(Oid typeId);
 static bool BinaryInputFunctionDefined(Oid typeId);
@@ -253,7 +247,6 @@ static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
 static void SendCopyDataToAll(StringInfo dataBuffer, int64 shardId, List *connectionList);
 static void SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId,
 									MultiConnection *connection);
-static void ReportCopyError(MultiConnection *connection, PGresult *result);
 static uint32 AvailableColumnCount(TupleDesc tupleDescriptor);
 
 static Oid TypeForColumnName(Oid relationId, TupleDesc tupleDescriptor, char *columnName);
@@ -268,7 +261,7 @@ static FmgrInfo * TypeOutputFunctions(uint32 columnCount, Oid *typeIdArray,
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
 #endif
 static bool CopyStatementHasFormat(CopyStmt *copyStatement, char *formatName);
-static void CitusCopyFrom(CopyStmt *copyStatement, QueryCompletionCompat *completionTag);
+static void CitusCopyFrom(CopyStmt *copyStatement, QueryCompletion *completionTag);
 static void EnsureCopyCanRunOnRelation(Oid relationId);
 static HTAB * CreateConnectionStateHash(MemoryContext memoryContext);
 static HTAB * CreateShardStateHash(MemoryContext memoryContext);
@@ -302,7 +295,7 @@ static void UnclaimCopyConnections(List *connectionStateList);
 static void ShutdownCopyConnectionState(CopyConnectionState *connectionState,
 										CitusCopyDestReceiver *copyDest);
 static SelectStmt * CitusCopySelect(CopyStmt *copyStatement);
-static void CitusCopyTo(CopyStmt *copyStatement, QueryCompletionCompat *completionTag);
+static void CitusCopyTo(CopyStmt *copyStatement, QueryCompletion *completionTag);
 static int64 ForwardCopyDataFromConnection(CopyOutState copyOutState,
 										   MultiConnection *connection);
 
@@ -339,7 +332,7 @@ static bool CitusCopyDestReceiverReceive(TupleTableSlot *slot,
 static void CitusCopyDestReceiverShutdown(DestReceiver *destReceiver);
 static void CitusCopyDestReceiverDestroy(DestReceiver *destReceiver);
 static bool ContainsLocalPlacement(int64 shardId);
-static void CompleteCopyQueryTagCompat(QueryCompletionCompat *completionTag, uint64
+static void CompleteCopyQueryTagCompat(QueryCompletion *completionTag, uint64
 									   processedRowCount);
 static void FinishLocalCopy(CitusCopyDestReceiver *copyDest);
 static void CreateLocalColocatedIntermediateFile(CitusCopyDestReceiver *copyDest,
@@ -362,7 +355,7 @@ PG_FUNCTION_INFO_V1(citus_text_send_as_jsonb);
  * and the partition method of the distributed table.
  */
 static void
-CitusCopyFrom(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
+CitusCopyFrom(CopyStmt *copyStatement, QueryCompletion *completionTag)
 {
 	UseCoordinatedTransaction();
 
@@ -444,7 +437,7 @@ EnsureCopyCanRunOnRelation(Oid relationId)
  * rows.
  */
 static void
-CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
+CopyToExistingShards(CopyStmt *copyStatement, QueryCompletion *completionTag)
 {
 	Oid tableId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
 
@@ -452,6 +445,7 @@ CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionT
 	List *columnNameList = NIL;
 	int partitionColumnIndex = INVALID_PARTITION_COLUMN_INDEX;
 
+	bool isInputFormatBinary = IsCopyInBinaryFormat(copyStatement);
 	uint64 processedRowCount = 0;
 
 	ErrorContextCallback errorCallback;
@@ -464,8 +458,8 @@ CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionT
 	bool *columnNulls = palloc0(columnCount * sizeof(bool));
 
 	/* set up a virtual tuple table slot */
-	TupleTableSlot *tupleTableSlot = MakeSingleTupleTableSlotCompat(tupleDescriptor,
-																	&TTSOpsVirtual);
+	TupleTableSlot *tupleTableSlot = MakeSingleTupleTableSlot(tupleDescriptor,
+															  &TTSOpsVirtual);
 	tupleTableSlot->tts_nvalid = columnCount;
 	tupleTableSlot->tts_values = columnValues;
 	tupleTableSlot->tts_isnull = columnNulls;
@@ -543,6 +537,72 @@ CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionT
 		copiedDistributedRelationTuple->relkind = RELKIND_RELATION;
 	}
 
+	/*
+	 * We make an optimisation to skip JSON parsing for JSONB columns, because many
+	 * Citus users have large objects in this column and parsing it on the coordinator
+	 * causes significant CPU overhead. We do this by forcing BeginCopyFrom and
+	 * NextCopyFrom to parse the column as text and then encoding it as JSON again
+	 * by using citus_text_send_as_jsonb as the binary output function.
+	 *
+	 * The main downside of enabling this optimisation is that it defers validation
+	 * until the object is parsed by the worker, which is unable to give an accurate
+	 * line number.
+	 */
+	if (SkipJsonbValidationInCopy && !isInputFormatBinary)
+	{
+		CopyOutState copyOutState = copyDest->copyOutState;
+		ListCell *jsonbColumnIndexCell = NULL;
+
+		/* get the column indices for all JSONB columns that appear in the input */
+		List *jsonbColumnIndexList = FindJsonbInputColumns(
+			copiedDistributedRelation->rd_att,
+			copyStatement->attlist);
+
+		foreach(jsonbColumnIndexCell, jsonbColumnIndexList)
+		{
+			int jsonbColumnIndex = lfirst_int(jsonbColumnIndexCell);
+			Form_pg_attribute currentColumn =
+				TupleDescAttr(copiedDistributedRelation->rd_att, jsonbColumnIndex);
+
+			if (jsonbColumnIndex == partitionColumnIndex)
+			{
+				/*
+				 * In the curious case of using a JSONB column as partition column,
+				 * we leave it as is because we want to make sure the hashing works
+				 * correctly.
+				 */
+				continue;
+			}
+
+			ereport(DEBUG1, (errmsg("parsing JSONB column %s as text",
+									NameStr(currentColumn->attname))));
+
+			/* parse the column as text instead of JSONB */
+			currentColumn->atttypid = TEXTOID;
+
+			if (copyOutState->binary)
+			{
+				Oid textSendAsJsonbFunctionId = CitusTextSendAsJsonbFunctionId();
+
+				/*
+				 * If we're using binary encoding between coordinator and workers
+				 * then we should honour the format expected by jsonb_recv, which
+				 * is a version number followed by text. We therefore use an output
+				 * function which sends the text as if it were jsonb, namely by
+				 * prepending a version number.
+				 */
+				fmgr_info(textSendAsJsonbFunctionId,
+						  &copyDest->columnOutputFunctions[jsonbColumnIndex]);
+			}
+			else
+			{
+				Oid textoutFunctionId = TextOutFunctionId();
+				fmgr_info(textoutFunctionId,
+						  &copyDest->columnOutputFunctions[jsonbColumnIndex]);
+			}
+		}
+	}
+
 	/* initialize copy state to read from COPY data source */
 	CopyFromState copyState = BeginCopyFrom_compat(NULL,
 												   copiedDistributedRelation,
@@ -566,8 +626,8 @@ CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionT
 		MemoryContext oldContext = MemoryContextSwitchTo(executorTupleContext);
 
 		/* parse a row from the input */
-		bool nextRowFound = NextCopyFromCompat(copyState, executorExpressionContext,
-											   columnValues, columnNulls);
+		bool nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
+										 columnValues, columnNulls);
 
 		if (!nextRowFound)
 		{
@@ -610,15 +670,86 @@ CopyToExistingShards(CopyStmt *copyStatement, QueryCompletionCompat *completionT
 }
 
 
-static void
-CompleteCopyQueryTagCompat(QueryCompletionCompat *completionTag, uint64 processedRowCount)
+/*
+ * IsCopyInBinaryFormat determines whether the given COPY statement has the
+ * WITH (format binary) option.
+ */
+static bool
+IsCopyInBinaryFormat(CopyStmt *copyStatement)
 {
-	#if PG_VERSION_NUM >= PG_VERSION_13
+	ListCell *optionCell = NULL;
+
+	foreach(optionCell, copyStatement->options)
+	{
+		DefElem *defel = lfirst_node(DefElem, optionCell);
+		if (strcmp(defel->defname, "format") == 0 &&
+			strcmp(defGetString(defel), "binary") == 0)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * FindJsonbInputColumns finds columns in the tuple descriptor that have
+ * the JSONB type and appear in inputColumnNameList. If the list is empty then
+ * all JSONB columns are returned.
+ */
+static List *
+FindJsonbInputColumns(TupleDesc tupleDescriptor, List *inputColumnNameList)
+{
+	List *jsonbColumnIndexList = NIL;
+	int columnCount = tupleDescriptor->natts;
+
+	for (int columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
+		if (currentColumn->attisdropped)
+		{
+			continue;
+		}
+
+		if (currentColumn->atttypid != JSONBOID)
+		{
+			continue;
+		}
+
+		if (inputColumnNameList != NIL)
+		{
+			ListCell *inputColumnCell = NULL;
+			bool isInputColumn = false;
+
+			foreach(inputColumnCell, inputColumnNameList)
+			{
+				char *inputColumnName = strVal(lfirst(inputColumnCell));
+
+				if (namestrcmp(&currentColumn->attname, inputColumnName) == 0)
+				{
+					isInputColumn = true;
+					break;
+				}
+			}
+
+			if (!isInputColumn)
+			{
+				continue;
+			}
+		}
+
+		jsonbColumnIndexList = lappend_int(jsonbColumnIndexList, columnIndex);
+	}
+
+	return jsonbColumnIndexList;
+}
+
+
+static void
+CompleteCopyQueryTagCompat(QueryCompletion *completionTag, uint64 processedRowCount)
+{
 	SetQueryCompletion(completionTag, CMDTAG_COPY, processedRowCount);
-	#else
-	SafeSnprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-				 "COPY " UINT64_FORMAT, processedRowCount);
-	#endif
 }
 
 
@@ -630,20 +761,14 @@ static List *
 RemoveOptionFromList(List *optionList, char *optionName)
 {
 	ListCell *optionCell = NULL;
-	#if PG_VERSION_NUM < PG_VERSION_13
-	ListCell *previousCell = NULL;
-	#endif
 	foreach(optionCell, optionList)
 	{
 		DefElem *option = (DefElem *) lfirst(optionCell);
 
 		if (strncmp(option->defname, optionName, NAMEDATALEN) == 0)
 		{
-			return list_delete_cell_compat(optionList, optionCell, previousCell);
+			return list_delete_cell(optionList, optionCell);
 		}
-		#if PG_VERSION_NUM < PG_VERSION_13
-		previousCell = optionCell;
-		#endif
 	}
 
 	return optionList;
@@ -1049,7 +1174,7 @@ EndRemoteCopy(int64 shardId, List *connectionList)
  * ReportCopyError tries to report a useful error message for the user from
  * the remote COPY error messages.
  */
-static void
+void
 ReportCopyError(MultiConnection *connection, PGresult *result)
 {
 	char *remoteMessage = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
@@ -1061,7 +1186,7 @@ ReportCopyError(MultiConnection *connection, PGresult *result)
 		bool haveDetail = remoteDetail != NULL;
 
 		ereport(ERROR, (errmsg("%s", remoteMessage),
-						haveDetail ? errdetail("%s", ApplyLogRedaction(remoteDetail)) :
+						haveDetail ? errdetail("%s", remoteDetail) :
 						0));
 	}
 	else
@@ -1072,7 +1197,7 @@ ReportCopyError(MultiConnection *connection, PGresult *result)
 		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
 						errmsg("failed to complete COPY on %s:%d", connection->hostname,
 							   connection->port),
-						errdetail("%s", ApplyLogRedaction(remoteMessage))));
+						errdetail("%s", remoteMessage)));
 	}
 }
 
@@ -1249,7 +1374,7 @@ ColumnCoercionPaths(TupleDesc destTupleDescriptor, TupleDesc inputTupleDescripto
 		ConversionPathForTypes(inputTupleType, destTupleType,
 							   &coercePaths[columnIndex]);
 
-		currentColumnName = lnext_compat(columnNameList, currentColumnName);
+		currentColumnName = lnext(columnNameList, currentColumnName);
 
 		if (currentColumnName == NULL)
 		{
@@ -2009,7 +2134,7 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	foreach(columnNameCell, columnNameList)
 	{
 		char *columnName = (char *) lfirst(columnNameCell);
-		Value *columnNameValue = makeString(columnName);
+		String *columnNameValue = makeString(columnName);
 
 		attributeList = lappend(attributeList, columnNameValue);
 	}
@@ -2726,7 +2851,7 @@ CopyStatementHasFormat(CopyStmt *copyStatement, char *formatName)
  * further processing is needed.
  */
 Node *
-ProcessCopyStmt(CopyStmt *copyStatement, QueryCompletionCompat *completionTag, const
+ProcessCopyStmt(CopyStmt *copyStatement, QueryCompletion *completionTag, const
 				char *queryString)
 {
 	/*
@@ -2878,7 +3003,7 @@ CitusCopySelect(CopyStmt *copyStatement)
  * table dump.
  */
 static void
-CitusCopyTo(CopyStmt *copyStatement, QueryCompletionCompat *completionTag)
+CitusCopyTo(CopyStmt *copyStatement, QueryCompletion *completionTag)
 {
 	ListCell *shardIntervalCell = NULL;
 	int64 tuplesSent = 0;
@@ -3343,7 +3468,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 	bool hasRemoteCopy = false;
 
 	MemoryContext localContext =
-		AllocSetContextCreateExtended(CurrentMemoryContext,
+		AllocSetContextCreateInternal(CurrentMemoryContext,
 									  "InitializeCopyShardState",
 									  ALLOCSET_DEFAULT_MINSIZE,
 									  ALLOCSET_DEFAULT_INITSIZE,
@@ -3430,10 +3555,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		ereport(ERROR, (errmsg("could not connect to any active placements")));
 	}
 
-	if (hasRemoteCopy)
-	{
-		EnsureRemoteTaskExecutionAllowed();
-	}
+	EnsureTaskExecutionAllowed(hasRemoteCopy);
 
 	/*
 	 * We just error out and code execution should never reach to this

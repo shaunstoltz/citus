@@ -81,12 +81,14 @@ static char * GetRenameShardTriggerCommand(Oid shardRelationId, char *triggerNam
 										   uint64 shardId);
 static void DropRelationTruncateTriggers(Oid relationId);
 static char * GetDropTriggerCommand(Oid relationId, char *triggerName);
+static void DropViewsOnTable(Oid relationId);
 static List * GetRenameStatsCommandList(List *statsOidList, uint64 shardId);
+static List * ReversedOidList(List *oidList);
 static void AppendExplicitIndexIdsToList(Form_pg_index indexForm,
 										 List **explicitIndexIdList,
 										 int flags);
-static void DropDefaultExpressionsAndMoveOwnedSequenceOwnerships(Oid sourceRelationId,
-																 Oid targetRelationId);
+static void DropNextValExprsAndMoveOwnedSeqOwnerships(Oid sourceRelationId,
+													  Oid targetRelationId);
 static void DropDefaultColumnDefinition(Oid relationId, char *columnName);
 static void TransferSequenceOwnership(Oid ownedSequenceId, Oid targetRelationId,
 									  char *columnName);
@@ -125,6 +127,9 @@ static void
 citus_add_local_table_to_metadata_internal(Oid relationId, bool cascadeViaForeignKeys)
 {
 	CheckCitusVersion(ERROR);
+
+	/* enable citus_add_local_table_to_metadata on an empty node */
+	InsertCoordinatorIfClusterEmpty();
 
 	bool autoConverted = false;
 	CreateCitusLocalTable(relationId, cascadeViaForeignKeys, autoConverted);
@@ -305,8 +310,8 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 		}
 	}
 
-	ObjectAddress tableAddress = { 0 };
-	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+	ObjectAddress *tableAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*tableAddress, RelationRelationId, relationId);
 
 	/*
 	 * Ensure that the sequences used in column defaults of the table
@@ -318,7 +323,7 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 	 * Ensure dependencies exist as we will create shell table on the other nodes
 	 * in the MX case.
 	 */
-	EnsureDependenciesExistOnAllNodes(&tableAddress);
+	EnsureAllObjectDependenciesExistOnAllNodes(list_make1(tableAddress));
 
 	/*
 	 * Make sure that existing reference tables have been replicated to all
@@ -328,6 +333,7 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 	EnsureReferenceTablesExistOnAllNodes();
 
 	List *shellTableDDLEvents = GetShellTableDDLEventsForCitusLocalTable(relationId);
+	List *tableViewCreationCommands = GetViewCreationCommandsOfTable(relationId);
 
 	char *relationName = get_rel_name(relationId);
 	Oid relationSchemaId = get_rel_namespace(relationId);
@@ -343,6 +349,12 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 	ExecuteAndLogUtilityCommandList(shellTableDDLEvents);
 
 	/*
+	 * Execute the view creation commands with the shell table.
+	 * Views will be distributed via FinalizeCitusLocalTableCreation below.
+	 */
+	ExecuteAndLogUtilityCommandListInTableTypeConversionViaSPI(tableViewCreationCommands);
+
+	/*
 	 * Set shellRelationId as the relation with relationId now points
 	 * to the shard relation.
 	 */
@@ -354,11 +366,11 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 
 	/*
 	 * Move sequence ownerships from shard table to shell table and also drop
-	 * DEFAULT expressions from shard relation as we should evaluate such columns
-	 * in shell table when needed.
+	 * DEFAULT expressions based on sequences from shard relation as we should
+	 * evaluate such columns in shell table when needed.
 	 */
-	DropDefaultExpressionsAndMoveOwnedSequenceOwnerships(shardRelationId,
-														 shellRelationId);
+	DropNextValExprsAndMoveOwnedSeqOwnerships(shardRelationId,
+											  shellRelationId);
 
 	InsertMetadataForCitusLocalTable(shellRelationId, shardId, autoConverted);
 
@@ -699,6 +711,9 @@ ConvertLocalTableToShard(Oid relationId)
 	 */
 	DropRelationTruncateTriggers(relationId);
 
+	/* drop views that depend on the shard table */
+	DropViewsOnTable(relationId);
+
 	/*
 	 * We create INSERT|DELETE|UPDATE triggers on shard relation too.
 	 * This is because citus prevents postgres executor to fire those
@@ -879,6 +894,11 @@ static void
 RenameShardRelationStatistics(Oid shardRelationId, uint64 shardId)
 {
 	Relation shardRelation = RelationIdGetRelation(shardRelationId);
+	if (!RelationIsValid(shardRelation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", shardRelationId)));
+	}
+
 	List *statsOidList = RelationGetStatExtList(shardRelation);
 	RelationClose(shardRelation);
 
@@ -1020,6 +1040,55 @@ GetDropTriggerCommand(Oid relationId, char *triggerName)
 
 
 /*
+ * DropViewsOnTable drops the views that depend on the given relation.
+ */
+static void
+DropViewsOnTable(Oid relationId)
+{
+	List *views = GetDependingViews(relationId);
+
+	/*
+	 * GetDependingViews returns views in the dependency order. We should drop views
+	 * in the reversed order since dropping views can cascade to other views below.
+	 */
+	List *reverseOrderedViews = ReversedOidList(views);
+
+	Oid viewId = InvalidOid;
+	foreach_oid(viewId, reverseOrderedViews)
+	{
+		char *viewName = get_rel_name(viewId);
+		char *schemaName = get_namespace_name(get_rel_namespace(viewId));
+		char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
+
+		StringInfo dropCommand = makeStringInfo();
+		appendStringInfo(dropCommand, "DROP %sVIEW IF EXISTS %s",
+						 get_rel_relkind(viewId) == RELKIND_MATVIEW ? "MATERIALIZED " :
+						 "",
+						 qualifiedViewName);
+
+		ExecuteAndLogUtilityCommand(dropCommand->data);
+	}
+}
+
+
+/*
+ * ReversedOidList takes a list of oids and returns the reverse ordered version of it.
+ */
+static List *
+ReversedOidList(List *oidList)
+{
+	List *reversed = NIL;
+	Oid oid = InvalidOid;
+	foreach_oid(oid, oidList)
+	{
+		reversed = lcons_oid(oid, reversed);
+	}
+
+	return reversed;
+}
+
+
+/*
  * GetExplicitIndexOidList returns a list of index oids defined "explicitly"
  * on the relation with relationId by the "CREATE INDEX" commands. That means,
  * all the constraints defined on the relation except:
@@ -1092,30 +1161,47 @@ GetRenameStatsCommandList(List *statsOidList, uint64 shardId)
 
 
 /*
- * DropDefaultExpressionsAndMoveOwnedSequenceOwnerships drops default column
- * definitions for relation with sourceRelationId. Also, for each column that
- * defaults to an owned sequence, it grants ownership to the same named column
- * of the relation with targetRelationId.
+ * DropNextValExprsAndMoveOwnedSeqOwnerships drops default column definitions
+ * that are based on sequences for relation with sourceRelationId.
+ *
+ * Also, for each such column that owns a sequence, it grants ownership to the
+ * same named column of the relation with targetRelationId.
  */
 static void
-DropDefaultExpressionsAndMoveOwnedSequenceOwnerships(Oid sourceRelationId,
-													 Oid targetRelationId)
+DropNextValExprsAndMoveOwnedSeqOwnerships(Oid sourceRelationId,
+										  Oid targetRelationId)
 {
 	List *columnNameList = NIL;
 	List *ownedSequenceIdList = NIL;
 	ExtractDefaultColumnsAndOwnedSequences(sourceRelationId, &columnNameList,
 										   &ownedSequenceIdList);
 
-	ListCell *columnNameCell = NULL;
-	ListCell *ownedSequenceIdCell = NULL;
-	forboth(columnNameCell, columnNameList, ownedSequenceIdCell, ownedSequenceIdList)
+	char *columnName = NULL;
+	Oid ownedSequenceId = InvalidOid;
+	forboth_ptr_oid(columnName, columnNameList, ownedSequenceId, ownedSequenceIdList)
 	{
-		char *columnName = (char *) lfirst(columnNameCell);
-		Oid ownedSequenceId = lfirst_oid(ownedSequenceIdCell);
+		/*
+		 * We drop nextval() expressions because Citus currently evaluates
+		 * nextval() on the shell table, not on the shards. Hence, there is
+		 * no reason for keeping nextval(). Also, distributed/reference table
+		 * shards do not have - so be consistent with those.
+		 *
+		 * Note that we keep other kind of DEFAULT expressions on shards
+		 * because we still want to be able to evaluate DEFAULT expressions
+		 * that are not based on sequences on shards, e.g., for foreign key
+		 * - SET DEFAULT actions.
+		 */
+		AttrNumber columnAttrNumber = get_attnum(sourceRelationId, columnName);
+		if (ColumnDefaultsToNextVal(sourceRelationId, columnAttrNumber))
+		{
+			DropDefaultColumnDefinition(sourceRelationId, columnName);
+		}
 
-		DropDefaultColumnDefinition(sourceRelationId, columnName);
-
-		/* column might not own a sequence */
+		/*
+		 * Column might own a sequence without having a nextval() expr on it
+		 * --e.g., due to ALTER SEQUENCE OWNED BY .. --, so check if that is
+		 * the case even if the column doesn't have a DEFAULT.
+		 */
 		if (OidIsValid(ownedSequenceId))
 		{
 			TransferSequenceOwnership(ownedSequenceId, targetRelationId, columnName);

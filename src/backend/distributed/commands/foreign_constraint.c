@@ -23,13 +23,16 @@
 #include "catalog/pg_type.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
+#include "distributed/commands/sequence.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/listutils.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/namespace_utils.h"
 #include "distributed/reference_table_utils.h"
+#include "distributed/utils/array_type.h"
 #include "distributed/version_compat.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -56,6 +59,8 @@ typedef bool (*CheckRelationFunc)(Oid);
 /* Local functions forward declarations */
 static void EnsureReferencingTableNotReplicated(Oid referencingTableId);
 static void EnsureSupportedFKeyOnDistKey(Form_pg_constraint constraintForm);
+static bool ForeignKeySetsNextValColumnToDefault(HeapTuple pgConstraintTuple);
+static List * ForeignKeyGetDefaultingAttrs(HeapTuple pgConstraintTuple);
 static void EnsureSupportedFKeyBetweenCitusLocalAndRefTable(Form_pg_constraint
 															constraintForm,
 															char
@@ -78,7 +83,6 @@ static List * GetForeignKeyIdsForColumn(char *columnName, Oid relationId,
 										int searchForeignKeyColumnFlags);
 static List * GetForeignKeysWithLocalTables(Oid relationId);
 static bool IsTableTypeIncluded(Oid relationId, int flags);
-static void UpdateConstraintIsValid(Oid constraintId, bool isValid);
 
 
 /*
@@ -94,6 +98,66 @@ ConstraintIsAForeignKeyToReferenceTable(char *inputConstaintName, Oid relationId
 	Oid foreignKeyOid = FindForeignKeyOidWithName(foreignKeyOids, inputConstaintName);
 
 	return OidIsValid(foreignKeyOid);
+}
+
+
+/*
+ * EnsureNoFKeyFromTableType ensures that given relation is not referenced by any table specified
+ * by table type flag.
+ */
+void
+EnsureNoFKeyFromTableType(Oid relationId, int tableTypeFlag)
+{
+	int flags = INCLUDE_REFERENCED_CONSTRAINTS | EXCLUDE_SELF_REFERENCES |
+				tableTypeFlag;
+	List *referencedFKeyOids = GetForeignKeyOids(relationId, flags);
+
+	if (list_length(referencedFKeyOids) > 0)
+	{
+		Oid referencingFKeyOid = linitial_oid(referencedFKeyOids);
+		Oid referencingTableId = GetReferencingTableId(referencingFKeyOid);
+
+		char *referencingRelName = get_rel_name(referencingTableId);
+		char *referencedRelName = get_rel_name(relationId);
+		char *referencingTableTypeName = GetTableTypeName(referencingTableId);
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("relation %s is referenced by a foreign key from %s",
+							   referencedRelName, referencingRelName),
+						errdetail(
+							"foreign keys from a %s to a distributed table are not supported.",
+							referencingTableTypeName)));
+	}
+}
+
+
+/*
+ * EnsureNoFKeyToTableType ensures that given relation is not referencing by any table specified
+ * by table type flag.
+ */
+void
+EnsureNoFKeyToTableType(Oid relationId, int tableTypeFlag)
+{
+	int flags = INCLUDE_REFERENCING_CONSTRAINTS | EXCLUDE_SELF_REFERENCES |
+				tableTypeFlag;
+	List *referencingFKeyOids = GetForeignKeyOids(relationId, flags);
+
+	if (list_length(referencingFKeyOids) > 0)
+	{
+		Oid referencedFKeyOid = linitial_oid(referencingFKeyOids);
+		Oid referencedTableId = GetReferencedTableId(referencedFKeyOid);
+
+		char *referencedRelName = get_rel_name(referencedTableId);
+		char *referencingRelName = get_rel_name(relationId);
+		char *referencedTableTypeName = GetTableTypeName(referencedTableId);
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("relation %s is referenced by a foreign key from %s",
+							   referencedRelName, referencingRelName),
+						errdetail(
+							"foreign keys from a distributed table to a %s are not supported.",
+							referencedTableTypeName)));
+	}
 }
 
 
@@ -196,6 +260,23 @@ ErrorIfUnsupportedForeignConstraintExists(Relation relation, char referencingDis
 			referencedReplicationModel = referencingReplicationModel;
 		}
 
+		/*
+		 * Given that we drop DEFAULT nextval('sequence') expressions from
+		 * shard relation columns, allowing ON DELETE/UPDATE SET DEFAULT
+		 * on such columns causes inserting NULL values to referencing relation
+		 * as a result of a delete/update operation on referenced relation.
+		 *
+		 * For this reason, we disallow ON DELETE/UPDATE SET DEFAULT actions
+		 * on columns that default to sequences.
+		 */
+		if (ForeignKeySetsNextValColumnToDefault(heapTuple))
+		{
+			ereport(ERROR, (errmsg("cannot create foreign key constraint "
+								   "since Citus does not support ON DELETE "
+								   "/ UPDATE SET DEFAULT actions on the "
+								   "columns that default to sequences")));
+		}
+
 		bool referencingIsCitusLocalOrRefTable =
 			(referencingDistMethod == DISTRIBUTE_BY_NONE);
 		bool referencedIsCitusLocalOrRefTable =
@@ -294,6 +375,104 @@ ErrorIfUnsupportedForeignConstraintExists(Relation relation, char referencingDis
 		EnsureReferencingTableNotReplicated(referencingTableId);
 
 		ReleaseSysCache(heapTuple);
+	}
+}
+
+
+/*
+ * ForeignKeySetsNextValColumnToDefault returns true if at least one of the
+ * columns specified in ON DELETE / UPDATE SET DEFAULT clauses default to
+ * nextval().
+ */
+static bool
+ForeignKeySetsNextValColumnToDefault(HeapTuple pgConstraintTuple)
+{
+	Form_pg_constraint pgConstraintForm =
+		(Form_pg_constraint) GETSTRUCT(pgConstraintTuple);
+
+	List *setDefaultAttrs = ForeignKeyGetDefaultingAttrs(pgConstraintTuple);
+	AttrNumber setDefaultAttr = InvalidAttrNumber;
+	foreach_int(setDefaultAttr, setDefaultAttrs)
+	{
+		if (ColumnDefaultsToNextVal(pgConstraintForm->conrelid, setDefaultAttr))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * ForeignKeyGetDefaultingAttrs returns a list of AttrNumbers
+ * might be set to default ON DELETE or ON UPDATE.
+ *
+ * For example; if the foreign key has SET DEFAULT clause for
+ * both actions, then returns a superset of the attributes that
+ * might be set to DEFAULT on either of those actions.
+ */
+static List *
+ForeignKeyGetDefaultingAttrs(HeapTuple pgConstraintTuple)
+{
+	bool isNull = false;
+	Datum referencingColumnsDatum = SysCacheGetAttr(CONSTROID, pgConstraintTuple,
+													Anum_pg_constraint_conkey, &isNull);
+	if (isNull)
+	{
+		ereport(ERROR, (errmsg("got NULL conkey from catalog")));
+	}
+
+	List *referencingColumns =
+		IntegerArrayTypeToList(DatumGetArrayTypeP(referencingColumnsDatum));
+
+	Form_pg_constraint pgConstraintForm =
+		(Form_pg_constraint) GETSTRUCT(pgConstraintTuple);
+	if (pgConstraintForm->confupdtype == FKCONSTR_ACTION_SETDEFAULT)
+	{
+		/*
+		 * Postgres doesn't allow specifying SET DEFAULT for a subset of
+		 * the referencing columns for ON UPDATE action, so in that case
+		 * we return all referencing columns regardless of what ON DELETE
+		 * action says.
+		 */
+		return referencingColumns;
+	}
+
+	if (pgConstraintForm->confdeltype != FKCONSTR_ACTION_SETDEFAULT)
+	{
+		return NIL;
+	}
+
+	List *onDeleteSetDefColumnList = NIL;
+#if PG_VERSION_NUM >= PG_VERSION_15
+	Datum onDeleteSetDefColumnsDatum = SysCacheGetAttr(CONSTROID, pgConstraintTuple,
+													   Anum_pg_constraint_confdelsetcols,
+													   &isNull);
+
+	/*
+	 * confdelsetcols being NULL means that "ON DELETE SET DEFAULT" doesn't
+	 * specify which subset of columns should be set to DEFAULT, so fetching
+	 * NULL from the catalog is also possible.
+	 */
+	if (!isNull)
+	{
+		onDeleteSetDefColumnList =
+			IntegerArrayTypeToList(DatumGetArrayTypeP(onDeleteSetDefColumnsDatum));
+	}
+#endif
+
+	if (list_length(onDeleteSetDefColumnList) == 0)
+	{
+		/*
+		 * That means that all referencing columns need to be set to
+		 * DEFAULT.
+		 */
+		return referencingColumns;
+	}
+	else
+	{
+		return onDeleteSetDefColumnList;
 	}
 }
 
@@ -410,9 +589,8 @@ EnsureReferencingTableNotReplicated(Oid referencingTableId)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot create foreign key constraint"),
-						errdetail("Citus Community Edition currently supports "
-								  "foreign key constraints only for "
-								  "\"citus.shard_replication_factor = 1\"."),
+						errdetail("Citus currently supports foreign key constraints "
+								  "only for \"citus.shard_replication_factor = 1\"."),
 						errhint("Please change \"citus.shard_replication_factor to "
 								"1\". To learn more about using foreign keys with "
 								"other replication factors, please contact us at "
@@ -743,19 +921,6 @@ GetForeignKeysFromLocalTables(Oid relationId)
 	List *referencingFKeyList = GetForeignKeyOids(relationId, referencedFKeysFlag);
 
 	return referencingFKeyList;
-}
-
-
-/*
- * HasForeignKeyToCitusLocalTable returns true if any of the foreign key constraints
- * on the relation with relationId references to a citus local table.
- */
-bool
-HasForeignKeyToCitusLocalTable(Oid relationId)
-{
-	int flags = INCLUDE_REFERENCING_CONSTRAINTS | INCLUDE_CITUS_LOCAL_TABLES;
-	List *foreignKeyOidList = GetForeignKeyOids(relationId, flags);
-	return list_length(foreignKeyOidList) > 0;
 }
 
 
@@ -1147,192 +1312,15 @@ IsTableTypeIncluded(Oid relationId, int flags)
 
 
 /*
- * GetForeignConstraintCommandsToReferenceTable takes in a shardInterval, and
- * returns the list of commands that are required to create the foreign
- * constraints for that shardInterval.
- *
- * The function does the following hack:
- *    - Create the foreign constraints as INVALID on the shards
- *    - Manually update pg_constraint to mark the same foreign
- *      constraints as VALID
- *
- * We implement the above hack because we aim to skip the validation phase
- * of foreign keys to reference tables. The validation is pretty costly and
- * given that the source placements already valid, the validation in the
- * target nodes is useless.
- *
- * The function does not apply the same logic for the already invalid foreign
- * constraints.
+ * EnableSkippingConstraintValidation is simply a C interface for setting the following:
+ *      SET LOCAL citus.skip_constraint_validation TO on;
  */
-List *
-GetForeignConstraintCommandsToReferenceTable(ShardInterval *shardInterval)
+void
+EnableSkippingConstraintValidation()
 {
-	ScanKeyData scanKey[1];
-	int scanKeyCount = 1;
-	uint64 shardId = shardInterval->shardId;
-	Oid relationId = shardInterval->relationId;
-
-	List *commandList = NIL;
-
-	/*
-	 * Set search_path to NIL so that all objects outside of pg_catalog will be
-	 * schema-prefixed. pg_catalog will be added automatically when we call
-	 * PushOverrideSearchPath(), since we set addCatalog to true;
-	 */
-	OverrideSearchPath *overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-	overridePath->schemas = NIL;
-	overridePath->addCatalog = true;
-	PushOverrideSearchPath(overridePath);
-
-	/* open system catalog and scan all constraints that belong to this table */
-	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
-	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid, BTEqualStrategyNumber, F_OIDEQ,
-				relationId);
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint,
-													ConstraintRelidTypidNameIndexId,
-													true, NULL, scanKeyCount, scanKey);
-
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	while (HeapTupleIsValid(heapTuple))
-	{
-		Form_pg_constraint constraintForm = (Form_pg_constraint) GETSTRUCT(heapTuple);
-		char *constraintDefinition = NULL;
-
-
-		if (constraintForm->contype != CONSTRAINT_FOREIGN)
-		{
-			heapTuple = systable_getnext(scanDescriptor);
-			continue;
-		}
-
-		Oid referencedRelationId = constraintForm->confrelid;
-		if (PartitionMethod(referencedRelationId) != DISTRIBUTE_BY_NONE)
-		{
-			heapTuple = systable_getnext(scanDescriptor);
-			continue;
-		}
-
-		Oid constraintId = get_relation_constraint_oid(relationId,
-													   constraintForm->conname.data,
-													   true);
-
-		int64 referencedShardId = GetFirstShardId(referencedRelationId);
-		Oid referencedSchemaId = get_rel_namespace(referencedRelationId);
-		char *referencedSchemaName = get_namespace_name(referencedSchemaId);
-		char *escapedReferencedSchemaName = quote_literal_cstr(referencedSchemaName);
-
-		Oid schemaId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(schemaId);
-		char *escapedSchemaName = quote_literal_cstr(schemaName);
-
-		/*
-		 * We're first marking the constraint's valid field as invalid
-		 * and get the constraint definition. Later, we mark the constraint
-		 * as valid back with directly updating to pg_constraint.
-		 */
-		if (constraintForm->convalidated == true)
-		{
-			UpdateConstraintIsValid(constraintId, false);
-			constraintDefinition = pg_get_constraintdef_command(constraintId);
-			UpdateConstraintIsValid(constraintId, true);
-		}
-		else
-		{
-			/* if the constraint is not valid, simply do nothing special */
-			constraintDefinition = pg_get_constraintdef_command(constraintId);
-		}
-
-		StringInfo applyForeignConstraintCommand = makeStringInfo();
-		appendStringInfo(applyForeignConstraintCommand,
-						 WORKER_APPLY_INTER_SHARD_DDL_COMMAND, shardId,
-						 escapedSchemaName, referencedShardId,
-						 escapedReferencedSchemaName,
-						 quote_literal_cstr(constraintDefinition));
-		commandList = lappend(commandList, applyForeignConstraintCommand->data);
-
-		/* mark the constraint as valid again on the shard */
-		if (constraintForm->convalidated == true)
-		{
-			StringInfo markConstraintValid = makeStringInfo();
-			char *qualifiedReferencingShardName =
-				ConstructQualifiedShardName(shardInterval);
-
-			char *shardConstraintName = pstrdup(constraintForm->conname.data);
-			AppendShardIdToName(&shardConstraintName, shardId);
-
-			appendStringInfo(markConstraintValid,
-							 "UPDATE pg_constraint SET convalidated = true WHERE "
-							 "conrelid = %s::regclass AND conname = '%s'",
-							 quote_literal_cstr(qualifiedReferencingShardName),
-							 shardConstraintName);
-			commandList = lappend(commandList, markConstraintValid->data);
-		}
-
-		heapTuple = systable_getnext(scanDescriptor);
-	}
-
-	/* clean up scan and close system catalog */
-	systable_endscan(scanDescriptor);
-	table_close(pgConstraint, AccessShareLock);
-
-	/* revert back to original search_path */
-	PopOverrideSearchPath();
-
-	return commandList;
-}
-
-
-/*
- * UpdateConstraintIsValid is a utility function with sets the
- * pg_constraint.convalidated to the given isValid for the given
- * constraintId.
- *
- * This function should be called with caution because if used wrong
- * could lead to data inconsistencies.
- */
-static void
-UpdateConstraintIsValid(Oid constraintId, bool isValid)
-{
-	ScanKeyData scankey[1];
-	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
-	TupleDesc tupleDescriptor = RelationGetDescr(pgConstraint);
-	Datum values[Natts_pg_constraint];
-	bool isnull[Natts_pg_constraint];
-	bool replace[Natts_pg_constraint];
-
-	ScanKeyInit(&scankey[0],
-				Anum_pg_constraint_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(constraintId));
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint,
-													ConstraintOidIndexId,
-													true,
-													NULL,
-													1,
-													scankey);
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	if (!HeapTupleIsValid(heapTuple))
-	{
-		elog(ERROR, "could not find tuple for constraint %u", constraintId);
-	}
-
-	memset(replace, 0, sizeof(replace));
-
-	values[Anum_pg_constraint_convalidated - 1] = BoolGetDatum(isValid);
-	isnull[Anum_pg_constraint_convalidated - 1] = false;
-	replace[Anum_pg_constraint_convalidated - 1] = true;
-
-	heapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull, replace);
-
-	CatalogTupleUpdate(pgConstraint, &heapTuple->t_self, heapTuple);
-
-	CacheInvalidateHeapTuple(pgConstraint, heapTuple, NULL);
-	CommandCounterIncrement();
-
-	systable_endscan(scanDescriptor);
-	table_close(pgConstraint, NoLock);
+	set_config_option("citus.skip_constraint_validation", "true",
+					  PGC_SUSET, PGC_S_SESSION,
+					  GUC_ACTION_LOCAL, true, 0, false);
 }
 
 

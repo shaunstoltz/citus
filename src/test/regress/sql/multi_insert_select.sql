@@ -1,6 +1,12 @@
 --
 -- MULTI_INSERT_SELECT
 --
+-- This test file has an alternative output because of the change in the
+-- display of SQL-standard function's arguments in INSERT/SELECT in PG15.
+-- The alternative output can be deleted when we drop support for PG14
+--
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15;
 
 SET citus.next_shard_id TO 13300000;
 SET citus.next_placement_id TO 13300000;
@@ -2336,6 +2342,40 @@ INSERT INTO raw_events_first
 SELECT * FROM raw_events_first OFFSET 0
 ON CONFLICT DO NOTHING;
 ABORT;
+
+-- test fix for issue https://github.com/citusdata/citus/issues/5891
+CREATE TABLE dist_table_1(
+dist_col integer,
+int_col integer,
+text_col_1 text,
+text_col_2 text
+);
+
+SELECT create_distributed_table('dist_table_1', 'dist_col');
+
+INSERT INTO dist_table_1 VALUES (1, 1, 'string', 'string');
+
+CREATE TABLE dist_table_2(
+dist_col integer,
+int_col integer
+);
+
+SELECT create_distributed_table('dist_table_2', 'dist_col');
+
+INSERT INTO dist_table_2 VALUES (1, 1);
+
+with a as (select random()) INSERT INTO dist_table_1
+SELECT
+t1.dist_col,
+1,
+'string',
+'string'
+FROM a, dist_table_1 t1
+join dist_table_2 t2 using (dist_col)
+limit 1
+returning text_col_1;
+
+DROP TABLE dist_table_1, dist_table_2;
 
 -- wrap in a transaction to improve performance
 BEGIN;

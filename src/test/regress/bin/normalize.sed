@@ -43,6 +43,11 @@ s/"citus_local_table_([0-9]+)_[0-9]+"/"citus_local_table_\1_xxxxxxx"/g
 # normalize relation oid suffix for the truncate triggers created by citus
 s/truncate_trigger_[0-9]+/truncate_trigger_xxxxxxx/g
 
+# shard move subscription and publication names contain the oid of the
+# table owner, which can change across runs
+s/(citus_shard_(move|split)_subscription_)[0-9]+/\1xxxxxxx/g
+s/(citus_shard_(move|split)_(slot|publication)_)[0-9]+_[0-9]+/\1xxxxxxx_xxxxxxx/g
+
 # In foreign_key_restriction_enforcement, normalize shard names
 s/"(on_update_fkey_table_|fkey_)[0-9]+"/"\1xxxxxxx"/g
 
@@ -75,9 +80,6 @@ s/(job_[0-9]+\/task_[0-9]+\/p_[0-9]+\.)[0-9]+/\1xxxx/g
 # isolation_ref2ref_foreign_keys
 s/"(ref_table_[0-9]_|ref_table_[0-9]_value_fkey_)[0-9]+"/"\1xxxxxxx"/g
 
-# pg11/pg12 varies in isolation debug output
-s/s1: DEBUG:/DEBUG:/g
-
 # commands cascading to shard relations
 s/(NOTICE:  .*_)[0-9]{5,}( CASCADE)/\1xxxxx\2/g
 s/(NOTICE:  [a-z]+ cascades to table ".*)_[0-9]{5,}"/\1_xxxxx"/g
@@ -93,29 +95,37 @@ s/connectionId: [0-9]+/connectionId: xxxxxxx/g
 s/ *$//g
 
 # pg12 changes
-s/Partitioned table "/Table "/g
-s/\) TABLESPACE pg_default$/\)/g
-s/invalid input syntax for type /invalid input syntax for /g
-s/_id_ref_id_fkey/_id_fkey/g
-s/_ref_id_id_fkey_/_ref_id_fkey_/g
-s/fk_test_2_col1_col2_fkey/fk_test_2_col1_fkey/g
-s/_id_other_column_ref_fkey/_id_fkey/g
 s/"(collections_list_|collection_users_|collection_users_fkey_)[0-9]+"/"\1xxxxxxx"/g
 
 # pg13 changes
 s/of relation ".*" violates not-null constraint/violates not-null constraint/g
-s/varnosyn/varnoold/g
-s/varattnosyn/varoattno/g
 /DEBUG:  index ".*" can safely use deduplication.*$/d
 /DEBUG:  index ".*" cannot use deduplication.*$/d
 /DEBUG:  building index ".*" on table ".*" serially.*$/d
 s/partition ".*" would be violated by some row/partition would be violated by some row/g
-/.*Peak Memory Usage:.*$/d
 s/of relation ".*" contains null values/contains null values/g
-s/of relation "t1" is violated by some row/is violated by some row/g
 
-# pg13.1 changes
-s/^ERROR:  insufficient columns in PRIMARY KEY constraint definition$/ERROR:  unique constraint on partitioned table must include all partitioning columns/g
+#if (PG_VERSION_NUM >= PG_VERSION_13) && (PG_VERSION_NUM < PG_VERSION_14)
+# (This is not preprocessor directive, but a reminder for the developer that will drop PG13 support )
+# libpq message changes for minor versions of pg13
+# We ignore multiline error messages, and substitute first line with a single line
+# alternative that is used in some older libpq versions.
+s/(ERROR: |WARNING: |error:) server closed the connection unexpectedly/\1 connection not open/g
+/^\s*This probably means the server terminated abnormally$/d
+/^\s*before or while processing the request.$/d
+/^\s*connection not open$/d
+#endif /* (PG_VERSION_NUM >= PG_VERSION_13) && (PG_VERSION_NUM < PG_VERSION_14) */
+
+# Changed outputs after minor bump to PG14.5 and PG13.8
+s/(ERROR: |WARNING: |error:) invalid socket/\1 connection not open/g
+
+# Extra outputs after minor bump to PG14.5 and PG13.8
+/^\s*invalid socket$/d
+
+# pg15 changes
+s/is not a PostgreSQL server process/is not a PostgreSQL backend process/g
+s/ AS "\?column\?"//g
+s/".*\.(.*)": (found .* removable)/"\1": \2/g
 
 # intermediate_results
 s/(ERROR.*)pgsql_job_cache\/([0-9]+_[0-9]+_[0-9]+)\/(.*).data/\1pgsql_job_cache\/xx_x_xxx\/\3.data/g
@@ -155,21 +165,6 @@ s/Citus.*currently supports/Citus currently supports/g
 # Warnings in multi_explain
 s/prepared transaction with identifier .* does not exist/prepared transaction with identifier "citus_x_yyyyyy_zzz_w" does not exist/g
 s/failed to roll back prepared transaction '.*'/failed to roll back prepared transaction 'citus_x_yyyyyy_zzz_w'/g
-
-# Table aliases for partitioned tables in explain outputs might change
-# regardless of postgres appended an _int suffix to alias, we always append _xxx suffix
-# Can be removed when we remove support for pg11 and pg12.
-# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>_<aliasId>" and
-# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>" becomes
-# "->  <scanMethod> Scan on <tableName>_<partitionId>_<shardId> <tableName>_xxx"
-s/(->.*Scan on\ +)(.*)(_[0-9]+)(_[0-9]+) \2(_[0-9]+|_xxx)?/\1\2\3\4 \2_xxx/g
-
-# Table aliases for partitioned tables in "Hash Cond:" lines of explain outputs might change
-# This is only for multi_partitioning.sql test file
-# regardless of postgres appended an _int suffix to alias, we always append _xxx suffix
-# Can be removed when we remove support for pg11 and pg12.
-s/(partitioning_hash_join_test)(_[0-9]|_xxx)?(\.[a-zA-Z]+)/\1_xxx\3/g
-s/(partitioning_hash_test)(_[0-9]|_xxx)?(\.[a-zA-Z]+)/\1_xxx\3/g
 
 # Errors with binary decoding where OIDs should be normalized
 s/wrong data type: [0-9]+, expected [0-9]+/wrong data type: XXXX, expected XXXX/g
@@ -222,6 +217,7 @@ s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
 # normalize long table shard name errors for alter_table_set_access_method and alter_distributed_table
 s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
 s/^(DEBUG:  the name of the shard \(abcde_01234567890123456789012345678901234567890_f7ff6612)_([0-9])+/\1_xxxxxx/g
+s/^(ERROR:  cannot distribute relation: numeric_negative_scale)_([0-9]+)/\1_xxxxxx"/g
 
 # normalize long index name errors for multi_index_statements
 s/^(ERROR:  The index name \(test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g
@@ -236,6 +232,8 @@ s/ERROR:  parallel workers for vacuum must/ERROR:  parallel vacuum degree must/g
 s/(CONTEXT:  PL\/pgSQL function .* line )([0-9]+)/\1XX/g
 s/^(PL\/pgSQL function .* line) [0-9]+ (.*)/\1 XX \2/g
 
+# normalize a test difference in multi_move_mx
+s/ connection to server at "\w+" \(127\.0\.0\.1\), port [0-9]+ failed://g
 # can be removed after dropping PG13 support
 s/ERROR:  parallel workers for vacuum must be between/ERROR:  parallel vacuum degree must be between/g
 s/ERROR:  fake_fetch_row_version not implemented/ERROR:  fake_tuple_update not implemented/g
@@ -251,6 +249,8 @@ s/TRIM\(BOTH FROM value\)/btrim\(value\)/g
 s/pg14\.idx.*/pg14\.xxxxx/g
 
 s/CREATE TABLESPACE test_tablespace LOCATION.*/CREATE TABLESPACE test_tablespace LOCATION XXXX/g
+/DETAIL:  Subqueries are not supported in policies on distributed tables/d
+s/ERROR:  unexpected non-SELECT command in SubLink/ERROR:  cannot create policy/g
 
 # columnar log for var correlation
 s/(.*absolute correlation \()([0,1]\.[0-9]+)(\) of var attribute [0-9]+ is smaller than.*)/\1X\.YZ\3/g
@@ -263,3 +263,28 @@ s/issuing SELECT pg_cancel_backend\([0-9]+::integer\)/issuing SELECT pg_cancel_b
 
 # node id in run_command_on_all_nodes warning
 s/Error on node with node id [0-9]+/Error on node with node id xxxxx/g
+
+# Temp schema names in error messages regarding dependencies that we cannot distribute
+#
+# 1) Schema of the depending object in the error message:
+#
+# e.g.:
+#   WARNING:  "function pg_temp_3.f(bigint)" has dependency on unsupported object "<foo>"
+# will be replaced with
+#   WARNING:  "function pg_temp_xxx.f(bigint)" has dependency on unsupported object "<foo>"
+s/^(WARNING|ERROR)(:  "[a-z\ ]+ )pg_temp_[0-9]+(\..*" has dependency on unsupported object ".*")$/\1\2pg_temp_xxx\3/g
+
+# 2) Schema of the depending object in the error detail:
+s/^(DETAIL:  "[a-z\ ]+ )pg_temp_[0-9]+(\..*" will be created only locally)$/\1pg_temp_xxx\2/g
+
+# 3) Schema that the object depends in the error message:
+# e.g.:
+#   WARNING:  "function func(bigint)" has dependency on unsupported object "schema pg_temp_3"
+# will be replaced with
+#   WARNING:  "function func(bigint)" has dependency on unsupported object "schema pg_temp_xxx"
+s/^(WARNING|ERROR)(:  "[a-z\ ]+ .*" has dependency on unsupported object) "schema pg_temp_[0-9]+"$/\1\2 "schema pg_temp_xxx"/g
+
+# remove jobId's from the messages of the background rebalancer
+s/^ERROR:  A rebalance is already running as job [0-9]+$/ERROR:  A rebalance is already running as job xxx/g
+s/^NOTICE:  Scheduled ([0-9]+) moves as job [0-9]+$/NOTICE:  Scheduled \1 moves as job xxx/g
+s/^HINT: (.*) job_id = [0-9]+ (.*)$/HINT: \1 job_id = xxx \2/g

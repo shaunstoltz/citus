@@ -1,6 +1,11 @@
 --
 -- GRANT_ON_SCHEMA_PROPAGATION
 --
+-- this test has different output for PG13/14 compared to PG15
+-- In PG15, public schema is owned by pg_database_owner role
+-- Relevant PG commit: b073c3ccd06e4cb845e121387a43faa8c68a7b62
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15;
 
 -- test grants are propagated when the schema is
 CREATE SCHEMA dist_schema;
@@ -12,9 +17,9 @@ CREATE SCHEMA non_dist_schema;
 SET citus.enable_ddl_propagation TO on;
 
 -- create roles on all nodes
-SELECT run_command_on_coordinator_and_workers('CREATE USER role_1');
-SELECT run_command_on_coordinator_and_workers('CREATE USER role_2');
-SELECT run_command_on_coordinator_and_workers('CREATE USER role_3');
+CREATE USER role_1;
+CREATE USER role_2;
+CREATE USER role_3;
 
 -- do some varying grants
 GRANT USAGE, CREATE ON SCHEMA dist_schema TO role_1 WITH GRANT OPTION;
@@ -220,4 +225,4 @@ SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public' ORDER BY nspna
 
 DROP TABLE public_schema_table;
 
-SELECT run_command_on_coordinator_and_workers('DROP ROLE role_1, role_2, role_3');
+DROP ROLE role_1, role_2, role_3;

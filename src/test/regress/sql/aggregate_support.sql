@@ -355,7 +355,6 @@ select array_collect_sort(val) from aggdata;
 
 -- Test multiuser scenario
 create user notsuper;
-select run_command_on_workers($$create user notsuper$$);
 grant all on schema aggregate_support to notsuper;
 grant all on all tables in schema aggregate_support to notsuper;
 select 1 from run_command_on_workers($$
@@ -603,6 +602,31 @@ SELECT run_command_on_workers($$select aggfnoid from pg_aggregate where aggfnoid
 
 DROP TABLE dummy_tbl CASCADE;
 
+-- Show that polymorphic aggregates with zero-argument works
+CREATE FUNCTION stfnp_zero_arg(int[]) RETURNS int[] AS
+'select $1' LANGUAGE SQL;
+
+CREATE FUNCTION ffp_zero_arg(anyarray) RETURNS anyarray AS
+'select $1' LANGUAGE SQL;
+
+CREATE AGGREGATE zero_arg_agg(*) (SFUNC = stfnp_zero_arg, STYPE = int4[],
+  FINALFUNC = ffp_zero_arg, INITCOND = '{}');
+
+CREATE TABLE zero_arg_agg_table(f1 int, f2 int[]);
+SELECT create_distributed_table('zero_arg_agg_table','f1');
+INSERT INTO zero_arg_agg_table VALUES(1, array[1]);
+INSERT INTO zero_arg_agg_table VALUES(1, array[11]);
+
+SELECT zero_arg_agg(*) from zero_arg_agg_table;
+
+-- Show that after dropping a table on which functions and aggregates depending on
+-- pg_dist_object is consistent on coordinator and worker node.
+SELECT pg_identify_object_as_address(classid, objid, objsubid)::text
+FROM pg_catalog.pg_dist_object
+    EXCEPT
+SELECT unnest(result::text[]) AS unnested_result
+FROM run_command_on_workers($$SELECT array_agg(pg_identify_object_as_address(classid, objid, objsubid)) from pg_catalog.pg_dist_object$$);
+
 SET citus.create_object_propagation TO automatic;
 begin;
     create type typ1 as (a int);
@@ -612,6 +636,14 @@ commit;
 RESET citus.create_object_propagation;
 
 SELECT run_command_on_workers($$select aggfnoid from pg_aggregate where aggfnoid::text like '%dependent_agg%';$$);
+
+CREATE AGGREGATE newavg (
+   sfunc = int4_avg_accum, basetype = int4, stype = _int8,
+   finalfunc = int8_avg,
+   initcond1 = '{0,0}'
+);
+
+SELECT run_command_on_workers($$select aggfnoid from pg_aggregate where aggfnoid::text like '%newavg%';$$);
 
 set client_min_messages to error;
 drop schema aggregate_support cascade;

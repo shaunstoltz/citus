@@ -1,4 +1,5 @@
 SET citus.shard_count = 2;
+SET citus.shard_replication_factor TO 1;
 SET citus.next_shard_id TO 4754000;
 CREATE SCHEMA binary_protocol;
 SET search_path TO binary_protocol, public;
@@ -46,8 +47,8 @@ CREATE TYPE nested_composite_type AS (
     a composite_type,
     b composite_type
 );
-select run_command_on_master_and_workers($$CREATE DOMAIN binary_protocol.composite_type_domain AS binary_protocol.composite_type$$);
-select run_command_on_master_and_workers($$CREATE DOMAIN binary_protocol.nested_composite_type_domain AS binary_protocol.nested_composite_type$$);
+CREATE DOMAIN binary_protocol.composite_type_domain AS binary_protocol.composite_type;
+CREATE DOMAIN binary_protocol.nested_composite_type_domain AS binary_protocol.nested_composite_type;
 
 
 INSERT INTO composite_type_table(col) VALUES  ((1, 2)::composite_type);
@@ -63,6 +64,8 @@ SELECT ARRAY[(col, col)::nested_composite_type] FROM composite_type_table;
 SELECT ARRAY[(col, col)::nested_composite_type_domain] FROM composite_type_table;
 
 
+-- Confirm that aclitem doesn't have receive and send functions
+SELECT typreceive, typsend FROM pg_type WHERE typname = 'aclitem';
 CREATE TABLE binaryless_builtin (
 col1 aclitem NOT NULL,
 col2 character varying(255) NOT NULL
@@ -74,8 +77,8 @@ CREATE TYPE binaryless_composite_type AS (
     b aclitem
 );
 
-select run_command_on_master_and_workers($$CREATE DOMAIN binary_protocol.binaryless_domain AS aclitem$$);
-select run_command_on_master_and_workers($$CREATE DOMAIN binary_protocol.binaryless_composite_domain AS binary_protocol.binaryless_composite_type$$);
+CREATE DOMAIN binary_protocol.binaryless_domain AS aclitem;
+CREATE DOMAIN binary_protocol.binaryless_composite_domain AS binary_protocol.binaryless_composite_type;
 
 INSERT INTO binaryless_builtin VALUES ('user postgres=r/postgres', 'test');
 SELECT col1 FROM binaryless_builtin;

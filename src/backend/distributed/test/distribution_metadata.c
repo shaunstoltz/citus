@@ -29,6 +29,7 @@
 #include "distributed/pg_dist_shard.h"
 #include "distributed/query_utils.h"
 #include "distributed/resource_lock.h"
+#include "distributed/utils/array_type.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
@@ -258,9 +259,9 @@ relation_count_in_query(PG_FUNCTION_ARGS)
 	Node *parsetree = NULL;
 	foreach_ptr(parsetree, parseTreeList)
 	{
-		List *queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree,
-													 queryStringChar,
-													 NULL, 0, NULL);
+		List *queryTreeList = pg_analyze_and_rewrite_fixedparams((RawStmt *) parsetree,
+																 queryStringChar,
+																 NULL, 0, NULL);
 
 		Query *query = NULL;
 		foreach_ptr(query, queryTreeList)

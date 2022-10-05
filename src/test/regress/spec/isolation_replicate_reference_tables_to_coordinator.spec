@@ -1,8 +1,6 @@
 setup
 {
-  SELECT citus_internal.replace_isolation_tester_func();
-  SELECT citus_internal.refresh_isolation_tester_prepared_statement();
-
+  SET citus.next_shard_id TO 1500877;
   CREATE TABLE ref_table(a int primary key);
   SELECT create_reference_table('ref_table');
   INSERT INTO ref_table VALUES (1), (3), (5), (7);
@@ -13,7 +11,6 @@ setup
 
 teardown
 {
-  SELECT citus_internal.restore_isolation_tester_func();
   DROP TABLE ref_table, dist_table;
   SELECT master_remove_node('localhost', 57636);
 }
@@ -89,12 +86,14 @@ step "s2-view-worker"
 	SELECT query, state, wait_event_type, wait_event, usename, datname
     FROM citus_stat_activity
     WHERE query NOT ILIKE ALL(VALUES
+      ('%application_name%'),
       ('%pg_prepared_xacts%'),
       ('%COMMIT%'),
       ('%dump_local_%'),
       ('%citus_internal_local_blocked_processes%'),
       ('%add_node%'),
-      ('%csa_from_one_node%'))
+      ('%csa_from_one_node%'),
+      ('%pg_locks%'))
     AND is_worker_query = true
     AND backend_type = 'client backend'
     AND query != ''
@@ -139,7 +138,7 @@ step "add-node"
 
 // verify that locks on the placement of the reference table on the coordinator is
 // taken into account when looking for distributed deadlocks
-permutation "add-node" "s1-begin" "s2-begin" "s1-update-dist-table" "s2-lock-ref-table-placement-on-coordinator" "s1-lock-ref-table-placement-on-coordinator" "s2-update-dist-table" "deadlock-checker-call" "s1-end" "s2-end"
+permutation "add-node" "s1-begin" "s2-begin" "s1-update-dist-table" "s2-lock-ref-table-placement-on-coordinator" "s1-lock-ref-table-placement-on-coordinator" "s2-update-dist-table" ("s1-lock-ref-table-placement-on-coordinator") "deadlock-checker-call" "s1-end" "s2-end"
 
 // verify that *_dist_stat_activity() functions return the correct result when query
 // has a task on the coordinator.

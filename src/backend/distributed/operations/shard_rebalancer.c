@@ -6,6 +6,8 @@
  *
  * Copyright (c) Citus Data, Inc.
  *
+ * $Id$
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -24,6 +26,7 @@
 #include "commands/dbcommands.h"
 #include "commands/sequence.h"
 #include "distributed/argutils.h"
+#include "distributed/background_jobs.h"
 #include "distributed/citus_safe_lib.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
@@ -36,16 +39,18 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_logical_replication.h"
 #include "distributed/multi_progress.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/pg_dist_rebalance_strategy.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
-#include "distributed/repair_shards.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_rebalancer.h"
 #include "distributed/shard_cleaner.h"
+#include "distributed/shard_transfer.h"
 #include "distributed/tuplestore.h"
+#include "distributed/utils/array_type.h"
 #include "distributed/worker_protocol.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -53,15 +58,12 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
-#include "utils/int8.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/pg_lsn.h"
 #include "utils/syscache.h"
-
-#if PG_VERSION_NUM >= PG_VERSION_13
 #include "common/hashfn.h"
-#endif
 
 
 /* RebalanceOptions are the options used to control the rebalance algorithm */
@@ -74,6 +76,7 @@ typedef struct RebalanceOptions
 	bool drainOnly;
 	float4 improvementThreshold;
 	Form_pg_dist_rebalance_strategy rebalanceStrategy;
+	const char *operationName;
 } RebalanceOptions;
 
 
@@ -165,6 +168,7 @@ typedef struct ShardStatistics
 
 	/* The shard its size in bytes. */
 	uint64 totalSize;
+	XLogRecPtr shardLSN;
 } ShardStatistics;
 
 /*
@@ -174,6 +178,7 @@ typedef struct ShardStatistics
 typedef struct WorkerShardStatistics
 {
 	WorkerHashKey worker;
+	XLogRecPtr workerLSN;
 
 	/*
 	 * Statistics for each shard on this worker:
@@ -228,7 +233,9 @@ static float4 NodeCapacity(WorkerNode *workerNode, void *context);
 static ShardCost GetShardCost(uint64 shardId, void *context);
 static List * NonColocatedDistRelationIdList(void);
 static void RebalanceTableShards(RebalanceOptions *options, Oid shardReplicationModeOid);
-static void AcquireColocationLock(Oid relationId, const char *operationName);
+static int64 RebalanceTableShardsBackground(RebalanceOptions *options, Oid
+											shardReplicationModeOid);
+static void AcquireRebalanceColocationLock(Oid relationId, const char *operationName);
 static void ExecutePlacementUpdates(List *placementUpdateList, Oid
 									shardReplicationModeOid, char *noticeOperation);
 static float4 CalculateUtilization(float4 totalCost, float4 capacity);
@@ -236,7 +243,6 @@ static Form_pg_dist_rebalance_strategy GetRebalanceStrategy(Name name);
 static void EnsureShardCostUDF(Oid functionOid);
 static void EnsureNodeCapacityUDF(Oid functionOid);
 static void EnsureShardAllowedOnNodeUDF(Oid functionOid);
-static void ConflictShardPlacementUpdateOnlyWithIsolationTesting(uint64 shardId);
 static HTAB * BuildWorkerShardStatisticsHash(PlacementUpdateEventProgress *steps,
 											 int stepCount);
 static HTAB * GetShardStatistics(MultiConnection *connection, HTAB *shardIds);
@@ -244,9 +250,15 @@ static HTAB * GetMovedShardIdsByWorker(PlacementUpdateEventProgress *steps,
 									   int stepCount, bool fromSource);
 static uint64 WorkerShardSize(HTAB *workerShardStatistics,
 							  char *workerName, int workerPort, uint64 shardId);
+static XLogRecPtr WorkerShardLSN(HTAB *workerShardStatisticsHash, char *workerName,
+								 int workerPort, uint64 shardId);
+static XLogRecPtr WorkerLSN(HTAB *workerShardStatisticsHash,
+							char *workerName, int workerPort);
 static void AddToWorkerShardIdSet(HTAB *shardsByWorker, char *workerName, int workerPort,
 								  uint64 shardId);
 static HTAB * BuildShardSizesHash(ProgressMonitorData *monitor, HTAB *shardStatistics);
+static void ErrorOnConcurrentRebalance(RebalanceOptions *);
+
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(rebalance_table_shards);
@@ -258,18 +270,18 @@ PG_FUNCTION_INFO_V1(master_drain_node);
 PG_FUNCTION_INFO_V1(citus_shard_cost_by_disk_size);
 PG_FUNCTION_INFO_V1(citus_validate_rebalance_strategy_functions);
 PG_FUNCTION_INFO_V1(pg_dist_rebalance_strategy_enterprise_check);
+PG_FUNCTION_INFO_V1(citus_rebalance_start);
+PG_FUNCTION_INFO_V1(citus_rebalance_stop);
+PG_FUNCTION_INFO_V1(citus_rebalance_wait);
 
 bool RunningUnderIsolationTest = false;
 int MaxRebalancerLoggedIgnoredMoves = 5;
 
-/*
- * This is randomly generated hardcoded number. It's used as the first part of
- * the advisory lock identifier that's used during isolation tests. See the
- * comments on ConflictShardPlacementUpdateOnlyWithIsolationTesting, for more
- * information.
- */
-#define SHARD_PLACEMENT_UPDATE_ADVISORY_LOCK_FIRST_KEY 29279
-
+static const char *PlacementUpdateTypeNames[] = {
+	[PLACEMENT_UPDATE_INVALID_FIRST] = "unknown",
+	[PLACEMENT_UPDATE_MOVE] = "move",
+	[PLACEMENT_UPDATE_COPY] = "copy",
+};
 
 #ifdef USE_ASSERT_CHECKING
 
@@ -317,7 +329,7 @@ CheckRebalanceStateInvariants(const RebalanceState *state)
 
 		/* Check that utilization field is up to date. */
 		Assert(fillState->utilization == CalculateUtilization(fillState->totalCost,
-															  fillState->capacity));
+															  fillState->capacity)); /* lgtm[cpp/equality-on-floats] */
 
 		/*
 		 * Check that fillState->totalCost is within 0.1% difference of
@@ -617,13 +629,13 @@ GetColocatedRebalanceSteps(List *placementUpdateList)
 
 
 /*
- * AcquireColocationLock tries to acquire a lock for rebalance/replication. If
- * this is it not possible it fails instantly because this means another
- * rebalance/replication is currently happening. This would really mess up
- * planning.
+ * AcquireRelationColocationLock tries to acquire a lock for
+ * rebalance/replication. If this is it not possible it fails
+ * instantly because this means another rebalance/replication
+ * is currently happening. This would really mess up planning.
  */
 static void
-AcquireColocationLock(Oid relationId, const char *operationName)
+AcquireRebalanceColocationLock(Oid relationId, const char *operationName)
 {
 	uint32 lockId = relationId;
 	LOCKTAG tag;
@@ -640,8 +652,48 @@ AcquireColocationLock(Oid relationId, const char *operationName)
 	if (!lockAcquired)
 	{
 		ereport(ERROR, (errmsg("could not acquire the lock required to %s %s",
-							   operationName, generate_qualified_relation_name(
-								   relationId))));
+							   operationName,
+							   generate_qualified_relation_name(relationId)),
+						errdetail("It means that either a concurrent shard move "
+								  "or shard copy is happening."),
+						errhint("Make sure that the concurrent operation has "
+								"finished and re-run the command")));
+	}
+}
+
+
+/*
+ * AcquirePlacementColocationLock tries to acquire a lock for
+ * rebalance/replication while moving/copying the placement. If this
+ * is it not possible it fails instantly because this means
+ * another move/copy is currently happening. This would really mess up planning.
+ */
+void
+AcquirePlacementColocationLock(Oid relationId, int lockMode,
+							   const char *operationName)
+{
+	uint32 lockId = relationId;
+	LOCKTAG tag;
+
+	CitusTableCacheEntry *citusTableCacheEntry = GetCitusTableCacheEntry(relationId);
+	if (citusTableCacheEntry->colocationId != INVALID_COLOCATION_ID)
+	{
+		lockId = citusTableCacheEntry->colocationId;
+	}
+
+	SET_LOCKTAG_REBALANCE_PLACEMENT_COLOCATION(tag, (int64) lockId);
+
+	LockAcquireResult lockAcquired = LockAcquire(&tag, lockMode, false, true);
+	if (!lockAcquired)
+	{
+		ereport(ERROR, (errmsg("could not acquire the lock required to %s %s",
+							   operationName,
+							   generate_qualified_relation_name(relationId)),
+						errdetail("It means that either a concurrent shard move "
+								  "or colocated distributed table creation is "
+								  "happening."),
+						errhint("Make sure that the concurrent operation has "
+								"finished and re-run the command")));
 	}
 }
 
@@ -698,14 +750,6 @@ ExecutePlacementUpdates(List *placementUpdateList, Oid shardReplicationModeOid,
 
 	ListCell *placementUpdateCell = NULL;
 
-	char shardReplicationMode = LookupShardTransferMode(shardReplicationModeOid);
-	if (shardReplicationMode == TRANSFER_MODE_FORCE_LOGICAL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("the force_logical transfer mode is currently "
-							   "unsupported")));
-	}
-
 	DropOrphanedShardsInSeparateTransaction();
 
 	foreach(placementUpdateCell, placementUpdateList)
@@ -743,8 +787,10 @@ ExecutePlacementUpdates(List *placementUpdateList, Oid shardReplicationModeOid,
  * a magic number to the first progress field as an indicator. Finally we return the
  * dsm handle so that it can be used for updating the progress and cleaning things up.
  */
-static void
-SetupRebalanceMonitor(List *placementUpdateList, Oid relationId)
+void
+SetupRebalanceMonitor(List *placementUpdateList,
+					  Oid relationId,
+					  uint64 initialProgressState)
 {
 	List *colocatedUpdateList = GetColocatedRebalanceSteps(placementUpdateList);
 	ListCell *colocatedUpdateCell = NULL;
@@ -768,7 +814,8 @@ SetupRebalanceMonitor(List *placementUpdateList, Oid relationId)
 		event->shardId = colocatedUpdate->shardId;
 		event->sourcePort = colocatedUpdate->sourceNode->workerPort;
 		event->targetPort = colocatedUpdate->targetNode->workerPort;
-		pg_atomic_init_u64(&event->progress, REBALANCE_PROGRESS_WAITING);
+		event->updateType = colocatedUpdate->updateType;
+		pg_atomic_init_u64(&event->progress, initialProgressState);
 
 		eventIndex++;
 	}
@@ -830,6 +877,93 @@ rebalance_table_shards(PG_FUNCTION_ARGS)
 	};
 	Oid shardTransferModeOid = PG_GETARG_OID(4);
 	RebalanceTableShards(&options, shardTransferModeOid);
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_rebalance_start rebalances the shards across the workers.
+ *
+ * SQL signature:
+ *
+ * citus_rebalance_start(
+ *     rebalance_strategy name DEFAULT NULL,
+ *     drain_only boolean DEFAULT false,
+ *     shard_transfer_mode citus.shard_transfer_mode default 'auto'
+ * ) RETURNS VOID
+ */
+Datum
+citus_rebalance_start(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	List *relationIdList = NonColocatedDistRelationIdList();
+	Form_pg_dist_rebalance_strategy strategy =
+		GetRebalanceStrategy(PG_GETARG_NAME_OR_NULL(0));
+
+	PG_ENSURE_ARGNOTNULL(1, "drain_only");
+	bool drainOnly = PG_GETARG_BOOL(1);
+
+	PG_ENSURE_ARGNOTNULL(2, "shard_transfer_mode");
+	Oid shardTransferModeOid = PG_GETARG_OID(2);
+
+	RebalanceOptions options = {
+		.relationIdList = relationIdList,
+		.threshold = strategy->defaultThreshold,
+		.maxShardMoves = 10000000,
+		.excludedShardArray = construct_empty_array(INT4OID),
+		.drainOnly = drainOnly,
+		.rebalanceStrategy = strategy,
+		.improvementThreshold = strategy->improvementThreshold,
+	};
+	int jobId = RebalanceTableShardsBackground(&options, shardTransferModeOid);
+
+	if (jobId == 0)
+	{
+		PG_RETURN_NULL();
+	}
+	PG_RETURN_INT64(jobId);
+}
+
+
+/*
+ * citus_rebalance_stop stops any ongoing background rebalance that is executing.
+ * Raises an error when there is no backgound rebalance ongoing at the moment.
+ */
+Datum
+citus_rebalance_stop(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	int64 jobId = 0;
+	if (!HasNonTerminalJobOfType("rebalance", &jobId))
+	{
+		ereport(ERROR, (errmsg("no ongoing rebalance that can be stopped")));
+	}
+
+	DirectFunctionCall1(citus_job_cancel, Int64GetDatum(jobId));
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_rebalance_wait waits till an ongoing background rebalance has finished execution.
+ * A warning will be displayed if no rebalance is ongoing.
+ */
+Datum
+citus_rebalance_wait(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	int64 jobId = 0;
+	if (!HasNonTerminalJobOfType("rebalance", &jobId))
+	{
+		ereport(WARNING, (errmsg("no ongoing rebalance that can be waited on")));
+		PG_RETURN_VOID();
+	}
+
+	citus_job_wait_internal(jobId, NULL);
+
 	PG_RETURN_VOID();
 }
 
@@ -951,7 +1085,7 @@ replicate_table_shards(PG_FUNCTION_ARGS)
 	char transferMode = LookupShardTransferMode(shardReplicationModeOid);
 	EnsureReferenceTablesExistOnAllNodesExtended(transferMode);
 
-	AcquireColocationLock(relationId, "replicate");
+	AcquireRebalanceColocationLock(relationId, "replicate");
 
 	List *activeWorkerList = SortedActiveWorkers();
 	List *shardPlacementList = FullShardPlacementList(relationId, excludedShardArray);
@@ -1106,6 +1240,11 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 			uint64 targetSize = WorkerShardSize(shardStatistics, step->targetName,
 												step->targetPort, shardId);
 
+			XLogRecPtr sourceLSN = WorkerLSN(shardStatistics, step->sourceName,
+											 step->sourcePort);
+			XLogRecPtr targetLSN = WorkerShardLSN(shardStatistics, step->targetName,
+												  step->targetPort, shardId);
+
 			uint64 shardSize = 0;
 			ShardStatistics *shardSizesStat =
 				hash_search(shardSizes, &shardId, HASH_FIND, NULL);
@@ -1114,8 +1253,8 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 				shardSize = shardSizesStat->totalSize;
 			}
 
-			Datum values[11];
-			bool nulls[11];
+			Datum values[14];
+			bool nulls[14];
 
 			memset(values, 0, sizeof(values));
 			memset(nulls, 0, sizeof(nulls));
@@ -1131,6 +1270,10 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 			values[8] = UInt64GetDatum(pg_atomic_read_u64(&step->progress));
 			values[9] = UInt64GetDatum(sourceSize);
 			values[10] = UInt64GetDatum(targetSize);
+			values[11] = PointerGetDatum(
+				cstring_to_text(PlacementUpdateTypeNames[step->updateType]));
+			values[12] = LSNGetDatum(sourceLSN);
+			values[13] = LSNGetDatum(targetLSN);
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
@@ -1265,6 +1408,59 @@ WorkerShardSize(HTAB *workerShardStatisticsHash, char *workerName, int workerPor
 
 
 /*
+ * WorkerShardLSN returns the LSN of a shard on a worker, based on
+ * the workerShardStatisticsHash. If there is no LSN data in the
+ * statistics object, returns InvalidXLogRecPtr.
+ */
+static XLogRecPtr
+WorkerShardLSN(HTAB *workerShardStatisticsHash, char *workerName, int workerPort,
+			   uint64 shardId)
+{
+	WorkerHashKey workerKey = { 0 };
+	strlcpy(workerKey.hostname, workerName, MAX_NODE_LENGTH);
+	workerKey.port = workerPort;
+
+	WorkerShardStatistics *workerStats =
+		hash_search(workerShardStatisticsHash, &workerKey, HASH_FIND, NULL);
+	if (!workerStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	ShardStatistics *shardStats =
+		hash_search(workerStats->statistics, &shardId, HASH_FIND, NULL);
+	if (!shardStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	return shardStats->shardLSN;
+}
+
+
+/*
+ * WorkerLSN returns the LSN of a worker, based on the workerShardStatisticsHash.
+ * If there is no LSN data in the statistics object, returns InvalidXLogRecPtr.
+ */
+static XLogRecPtr
+WorkerLSN(HTAB *workerShardStatisticsHash, char *workerName, int workerPort)
+{
+	WorkerHashKey workerKey = { 0 };
+	strlcpy(workerKey.hostname, workerName, MAX_NODE_LENGTH);
+	workerKey.port = workerPort;
+
+	WorkerShardStatistics *workerStats =
+		hash_search(workerShardStatisticsHash, &workerKey, HASH_FIND, NULL);
+	if (!workerStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	return workerStats->workerLSN;
+}
+
+
+/*
  * BuildWorkerShardStatisticsHash returns a shard id -> shard statistics hash containing
  * sizes of shards on the source node and destination node.
  */
@@ -1302,6 +1498,7 @@ BuildWorkerShardStatisticsHash(PlacementUpdateEventProgress *steps, int stepCoun
 		WorkerShardStatistics *moveStat =
 			hash_search(workerShardStatistics, &entry->worker, HASH_ENTER, NULL);
 		moveStat->statistics = statistics;
+		moveStat->workerLSN = GetRemoteLogPosition(connection);
 	}
 
 	return workerShardStatistics;
@@ -1353,15 +1550,17 @@ GetShardStatistics(MultiConnection *connection, HTAB *shardIds)
 	appendStringInfoString(query, "))");
 	appendStringInfoString(
 		query,
-		" SELECT shard_id, coalesce(pg_total_relation_size(tables.relid),0)"
+		" SELECT shard_id, coalesce(pg_total_relation_size(tables.relid),0), tables.lsn"
 
 		/* for each shard in shardIds */
 		" FROM shard_names"
 
 		/* check if its name can be found in pg_class, if so return size */
 		" LEFT JOIN"
-		" (SELECT c.oid AS relid, c.relname, n.nspname"
-		" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace) tables"
+		" (SELECT c.oid AS relid, c.relname, n.nspname, ss.latest_end_lsn AS lsn"
+		" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+		" LEFT JOIN pg_subscription_rel sr ON sr.srrelid = c.oid "
+		" LEFT JOIN pg_stat_subscription ss ON sr.srsubid = ss.subid) tables"
 		" ON tables.relname = shard_names.table_name AND"
 		" tables.nspname = shard_names.schema_name ");
 
@@ -1395,13 +1594,24 @@ GetShardStatistics(MultiConnection *connection, HTAB *shardIds)
 	for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
 	{
 		char *shardIdString = PQgetvalue(result, rowIndex, 0);
-		uint64 shardId = pg_strtouint64(shardIdString, NULL, 10);
+		uint64 shardId = strtou64(shardIdString, NULL, 10);
 		char *sizeString = PQgetvalue(result, rowIndex, 1);
-		uint64 totalSize = pg_strtouint64(sizeString, NULL, 10);
+		uint64 totalSize = strtou64(sizeString, NULL, 10);
 
 		ShardStatistics *statistics =
 			hash_search(shardStatistics, &shardId, HASH_ENTER, NULL);
 		statistics->totalSize = totalSize;
+
+		if (PQgetisnull(result, rowIndex, 2))
+		{
+			statistics->shardLSN = InvalidXLogRecPtr;
+		}
+		else
+		{
+			char *LSNString = PQgetvalue(result, rowIndex, 2);
+			Datum LSNDatum = DirectFunctionCall1(pg_lsn_in, CStringGetDatum(LSNString));
+			statistics->shardLSN = DatumGetLSN(LSNDatum);
+		}
 	}
 
 	PQclear(result);
@@ -1555,17 +1765,14 @@ RebalanceTableShards(RebalanceOptions *options, Oid shardReplicationModeOid)
 		return;
 	}
 
-	Oid relationId = InvalidOid;
 	char *operationName = "rebalance";
 	if (options->drainOnly)
 	{
 		operationName = "move";
 	}
 
-	foreach_oid(relationId, options->relationIdList)
-	{
-		AcquireColocationLock(relationId, operationName);
-	}
+	options->operationName = operationName;
+	ErrorOnConcurrentRebalance(options);
 
 	List *placementUpdateList = GetRebalanceSteps(options);
 
@@ -1578,45 +1785,172 @@ RebalanceTableShards(RebalanceOptions *options, Oid shardReplicationModeOid)
 	 * This uses the first relationId from the list, it's only used for display
 	 * purposes so it does not really matter which to show
 	 */
-	SetupRebalanceMonitor(placementUpdateList, linitial_oid(options->relationIdList));
+	SetupRebalanceMonitor(placementUpdateList, linitial_oid(options->relationIdList),
+						  REBALANCE_PROGRESS_WAITING);
 	ExecutePlacementUpdates(placementUpdateList, shardReplicationModeOid, "Moving");
 	FinalizeCurrentProgressMonitor();
 }
 
 
 /*
- * ConflictShardPlacementUpdateOnlyWithIsolationTesting is only useful for
- * testing and should not be called by any code-path except for
- * UpdateShardPlacement().
- *
- * To be able to test the rebalance monitor functionality correctly, we need to
- * be able to pause the rebalancer at a specific place in time. We cannot do
- * this by block the shard move itself someway (e.g. by calling truncate on the
- * distributed table). The reason for this is that we do the shard move in a
- * newly opened connection. This causes our isolation tester block detection to
- * not realise that the rebalance_table_shards call is blocked.
- *
- * So instead, before opening a connection we lock an advisory lock that's
- * based on the shard id (shard id mod 1000). By locking this advisory lock in
- * a different session we can block the rebalancer in a way that the isolation
- * tester block detection is able to detect.
+ * ErrorOnConcurrentRebalance raises an error with extra information when there is already
+ * a rebalance running.
  */
 static void
-ConflictShardPlacementUpdateOnlyWithIsolationTesting(uint64 shardId)
+ErrorOnConcurrentRebalance(RebalanceOptions *options)
 {
-	LOCKTAG tag;
-	const bool sessionLock = false;
-	const bool dontWait = false;
-
-	if (RunningUnderIsolationTest)
+	Oid relationId = InvalidOid;
+	foreach_oid(relationId, options->relationIdList)
 	{
-		/* we've picked a random lock */
-		SET_LOCKTAG_ADVISORY(tag, MyDatabaseId,
-							 SHARD_PLACEMENT_UPDATE_ADVISORY_LOCK_FIRST_KEY,
-							 shardId % 1000, 2);
-
-		(void) LockAcquire(&tag, ExclusiveLock, sessionLock, dontWait);
+		/* this provides the legacy error when the lock can't be acquired */
+		AcquireRebalanceColocationLock(relationId, options->operationName);
 	}
+
+	int64 jobId = 0;
+	if (HasNonTerminalJobOfType("rebalance", &jobId))
+	{
+		ereport(ERROR, (
+					errmsg("A rebalance is already running as job %ld", jobId),
+					errdetail("A rebalance was already scheduled as background job"),
+					errhint("To monitor progress, run: SELECT * FROM "
+							"pg_dist_background_task WHERE job_id = %ld ORDER BY task_id "
+							"ASC; or SELECT * FROM get_rebalance_progress();",
+							jobId)));
+	}
+}
+
+
+/*
+ * RebalanceTableShardsBackground rebalances the shards for the relations
+ * inside the relationIdList across the different workers. It does so using our
+ * background job+task infrastructure.
+ */
+static int64
+RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationModeOid)
+{
+	if (list_length(options->relationIdList) == 0)
+	{
+		ereport(NOTICE, (errmsg("No tables to rebalance")));
+		return 0;
+	}
+
+	char *operationName = "rebalance";
+	if (options->drainOnly)
+	{
+		operationName = "move";
+	}
+
+	options->operationName = operationName;
+	ErrorOnConcurrentRebalance(options);
+
+	const char shardTransferMode = LookupShardTransferMode(shardReplicationModeOid);
+	List *colocatedTableList = NIL;
+	Oid relationId = InvalidOid;
+	foreach_oid(relationId, options->relationIdList)
+	{
+		colocatedTableList = list_concat(colocatedTableList,
+										 ColocatedTableList(relationId));
+	}
+	Oid colocatedTableId = InvalidOid;
+	foreach_oid(colocatedTableId, colocatedTableList)
+	{
+		EnsureTableOwner(colocatedTableId);
+	}
+
+	if (shardTransferMode == TRANSFER_MODE_AUTOMATIC)
+	{
+		/* make sure that all tables included in the rebalance have a replica identity*/
+		VerifyTablesHaveReplicaIdentity(colocatedTableList);
+	}
+
+	List *placementUpdateList = GetRebalanceSteps(options);
+
+	if (list_length(placementUpdateList) == 0)
+	{
+		ereport(NOTICE, (errmsg("No moves available for rebalancing")));
+		return 0;
+	}
+
+	DropOrphanedShardsInSeparateTransaction();
+
+	/* find the name of the shard transfer mode to interpolate in the scheduled command */
+	Datum shardTranferModeLabelDatum =
+		DirectFunctionCall1(enum_out, shardReplicationModeOid);
+	char *shardTranferModeLabel = DatumGetCString(shardTranferModeLabelDatum);
+
+	/* schedule planned moves */
+	int64 jobId = CreateBackgroundJob("rebalance", "Rebalance all colocation groups");
+
+	/* buffer used to construct the sql command for the tasks */
+	StringInfoData buf = { 0 };
+	initStringInfo(&buf);
+
+	/*
+	 * Currently we only have two tasks that any move can depend on:
+	 *  - replicating reference tables
+	 *  - the previous move
+	 *
+	 * prevJobIdx tells what slot to write the id of the task into. We only use both slots
+	 * if we are actually replicating reference tables.
+	 */
+	int64 prevJobId[2] = { 0 };
+	int prevJobIdx = 0;
+
+	List *referenceTableIdList = NIL;
+
+	if (HasNodesWithMissingReferenceTables(&referenceTableIdList))
+	{
+		VerifyTablesHaveReplicaIdentity(referenceTableIdList);
+
+		/*
+		 * Reference tables need to be copied to (newly-added) nodes, this needs to be the
+		 * first task before we can move any other table.
+		 */
+		appendStringInfo(&buf,
+						 "SELECT pg_catalog.replicate_reference_tables(%s)",
+						 quote_literal_cstr(shardTranferModeLabel));
+		BackgroundTask *task = ScheduleBackgroundTask(jobId, GetUserId(), buf.data,
+													  prevJobIdx, prevJobId);
+		prevJobId[prevJobIdx] = task->taskid;
+		prevJobIdx++;
+	}
+
+	PlacementUpdateEvent *move = NULL;
+	bool first = true;
+	int prevMoveIndex = prevJobIdx;
+	foreach_ptr(move, placementUpdateList)
+	{
+		resetStringInfo(&buf);
+
+		appendStringInfo(&buf,
+						 "SELECT pg_catalog.citus_move_shard_placement(%ld,%s,%u,%s,%u,%s)",
+						 move->shardId,
+						 quote_literal_cstr(move->sourceNode->workerName),
+						 move->sourceNode->workerPort,
+						 quote_literal_cstr(move->targetNode->workerName),
+						 move->targetNode->workerPort,
+						 quote_literal_cstr(shardTranferModeLabel));
+
+		BackgroundTask *task = ScheduleBackgroundTask(jobId, GetUserId(), buf.data,
+													  prevJobIdx, prevJobId);
+		prevJobId[prevMoveIndex] = task->taskid;
+		if (first)
+		{
+			first = false;
+			prevJobIdx++;
+		}
+	}
+
+	ereport(NOTICE,
+			(errmsg("Scheduled %d moves as job %ld",
+					list_length(placementUpdateList), jobId),
+			 errdetail("Rebalance scheduled as background job"),
+			 errhint("To monitor progress, run: "
+					 "SELECT * FROM pg_dist_background_task WHERE job_id = %ld ORDER BY "
+					 "task_id ASC; or SELECT * FROM get_rebalance_progress();",
+					 jobId)));
+
+	return jobId;
 }
 
 
@@ -1632,7 +1966,6 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 	uint64 shardId = placementUpdateEvent->shardId;
 	WorkerNode *sourceNode = placementUpdateEvent->sourceNode;
 	WorkerNode *targetNode = placementUpdateEvent->targetNode;
-	const char *doRepair = "false";
 
 	Datum shardTranferModeLabelDatum =
 		DirectFunctionCall1(enum_out, shardReplicationModeOid);
@@ -1676,13 +2009,12 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 	else if (updateType == PLACEMENT_UPDATE_COPY)
 	{
 		appendStringInfo(placementUpdateCommand,
-						 "SELECT citus_copy_shard_placement(%ld,%s,%u,%s,%u,%s,%s)",
+						 "SELECT citus_copy_shard_placement(%ld,%s,%u,%s,%u,%s)",
 						 shardId,
 						 quote_literal_cstr(sourceNode->workerName),
 						 sourceNode->workerPort,
 						 quote_literal_cstr(targetNode->workerName),
 						 targetNode->workerPort,
-						 doRepair,
 						 quote_literal_cstr(shardTranferModeLabel));
 	}
 	else
@@ -1695,8 +2027,6 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 										  sourceNode->workerName,
 										  sourceNode->workerPort,
 										  REBALANCE_PROGRESS_MOVING);
-
-	ConflictShardPlacementUpdateOnlyWithIsolationTesting(shardId);
 
 	/*
 	 * In case of failure, we throw an error such that rebalance_table_shards
@@ -2341,7 +2671,7 @@ FindAndMoveShardCost(float4 utilizationLowerBound,
 				}
 				if (newTargetUtilization == sourceFillState->utilization &&
 					newSourceUtilization <= targetFillState->utilization
-					)
+					) /* lgtm[cpp/equality-on-floats] */
 				{
 					/*
 					 * this can trigger when capacity of the nodes is not the
@@ -2603,7 +2933,8 @@ ShardPlacementsListToHash(List *shardPlacementList)
 	info.entrysize = sizeof(ShardPlacement);
 	info.hash = PlacementsHashHashCode;
 	info.match = PlacementsHashCompare;
-	int hashFlags = (HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+	info.hcxt = CurrentMemoryContext;
+	int hashFlags = (HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
 	HTAB *shardPlacementsHash = hash_create("ActivePlacements Hash",
 											shardPlacementCount, &info, hashFlags);

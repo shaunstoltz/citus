@@ -5,12 +5,8 @@
 --
 -- It'd be nice to script generation of this file, but alas, that's
 -- not done yet.
-
--- differentiate the output file for pg11 and versions above, with regards to objects
--- created per citus version depending on the postgres version. Upgrade tests verify the
--- objects are added in citus_finish_pg_upgrade()
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS version_above_eleven;
+--
+-- Upgrade tests verify the objects are added in citus_finish_pg_upgrade()
 
 SET citus.next_shard_id TO 580000;
 CREATE SCHEMA multi_extension;
@@ -92,12 +88,13 @@ FROM pg_depend AS pgd,
 WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pgd.refobjid   = pge.oid AND
 	  pge.extname    = 'citus' AND
-	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar')
+	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar', 'columnar_internal')
 ORDER BY 1, 2;
 
 
 -- DROP EXTENSION pre-created by the regression suite
 DROP EXTENSION citus;
+DROP EXTENSION citus_columnar;
 \c
 
 -- these tests switch between citus versions and call ddl's that require pg_dist_object to be created
@@ -297,6 +294,14 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- recreate public schema, and recreate citus_tables in the public schema by default
 CREATE SCHEMA public;
+-- In PG15, public schema is owned by pg_database_owner role
+-- Relevant PG commit: b073c3ccd06e4cb845e121387a43faa8c68a7b62
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
+\gset
+\if :server_version_ge_15
+ALTER SCHEMA public OWNER TO pg_database_owner;
+\endif
 GRANT ALL ON SCHEMA public TO public;
 ALTER EXTENSION citus UPDATE TO '9.5-1';
 ALTER EXTENSION citus UPDATE TO '10.0-4';
@@ -315,8 +320,8 @@ VACUUM columnar_table;
 TRUNCATE columnar_table;
 DROP TABLE columnar_table;
 CREATE INDEX ON columnar_table (a);
-SELECT alter_columnar_table_set('columnar_table', compression => 'pglz');
-SELECT alter_columnar_table_reset('columnar_table');
+ALTER TABLE columnar_table SET(columnar.compression = pglz);
+ALTER TABLE columnar_table RESET (columnar.compression);
 INSERT INTO columnar_table SELECT * FROM columnar_table;
 
 SELECT 1 FROM columnar_table; -- columnar custom scan
@@ -395,6 +400,22 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '10.2-4';
 SELECT * FROM multi_extension.print_extension_changes();
 
+-- There was a bug when downgrading to 10.2-2 from 10.2-4
+-- Test that we do not have any issues with this particular downgrade
+ALTER EXTENSION citus UPDATE TO '10.2-2';
+ALTER EXTENSION citus UPDATE TO '10.2-4';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 10.2-4 from 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-5';
+ALTER EXTENSION citus UPDATE TO '10.2-4';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-5';
+SELECT * FROM multi_extension.print_extension_changes();
+
 -- Make sure that we defined dependencies from all rel objects (tables,
 -- indexes, sequences ..) to columnar table access method ...
 SELECT pg_class.oid INTO columnar_schema_members
@@ -439,7 +460,7 @@ SELECT
 FROM
 	pg_dist_node_metadata;
 
--- Test downgrade to 10.2-4 from 11.0-1
+-- Test downgrade to 10.2-5 from 11.0-1
 ALTER EXTENSION citus UPDATE TO '11.0-1';
 
 SELECT
@@ -451,12 +472,65 @@ FROM
 DELETE FROM pg_dist_partition WHERE logicalrelid = 'e_transactions'::regclass;
 DROP TABLE e_transactions;
 
-ALTER EXTENSION citus UPDATE TO '10.2-4';
+ALTER EXTENSION citus UPDATE TO '10.2-5';
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
 
 -- Snapshot of state at 11.0-1
 ALTER EXTENSION citus UPDATE TO '11.0-1';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.0-1 from 11.0-2
+ALTER EXTENSION citus UPDATE TO '11.0-2';
+ALTER EXTENSION citus UPDATE TO '11.0-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.0-2
+ALTER EXTENSION citus UPDATE TO '11.0-2';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.0-2 from 11.0-3
+ALTER EXTENSION citus UPDATE TO '11.0-3';
+ALTER EXTENSION citus UPDATE TO '11.0-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.0-3
+ALTER EXTENSION citus UPDATE TO '11.0-3';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.0-3 from 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+ALTER EXTENSION citus UPDATE TO '11.0-3';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.0-4 from 11.1-1
+ALTER EXTENSION citus UPDATE TO '11.1-1';
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test CREATE EXTENSION when Citus already exists but Citus_Columnar does not. Should skip
+CREATE EXTENSION IF NOT EXISTS citus;
+CREATE EXTENSION citus;
+-- Snapshot of state at 11.1-1
+ALTER EXTENSION citus UPDATE TO '11.1-1';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.1-1 from 11.2-1
+ALTER EXTENSION citus UPDATE TO '11.2-1';
+ALTER EXTENSION citus UPDATE TO '11.1-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.2-1
+ALTER EXTENSION citus UPDATE TO '11.2-1';
 SELECT * FROM multi_extension.print_extension_changes();
 
 DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
@@ -472,13 +546,14 @@ FROM pg_depend AS pgd,
 WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pgd.refobjid   = pge.oid AND
 	  pge.extname    = 'citus' AND
-	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar')
+	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar', 'columnar_internal')
 ORDER BY 1, 2;
 
 -- see incompatible version errors out
 RESET citus.enable_version_checks;
 RESET columnar.enable_version_checks;
 DROP EXTENSION citus;
+DROP EXTENSION citus_columnar;
 CREATE EXTENSION citus VERSION '8.0-1';
 
 -- Test non-distributed queries work even in version mismatch
@@ -543,6 +618,7 @@ ALTER EXTENSION citus UPDATE;
 
 -- re-create in newest version
 DROP EXTENSION citus;
+DROP EXTENSION citus_columnar;
 \c
 CREATE EXTENSION citus;
 
@@ -550,6 +626,7 @@ CREATE EXTENSION citus;
 \c - - - :worker_1_port
 
 DROP EXTENSION citus;
+DROP EXTENSION citus_columnar;
 SET citus.enable_version_checks TO 'false';
 SET columnar.enable_version_checks TO 'false';
 CREATE EXTENSION citus VERSION '8.0-1';
@@ -735,6 +812,40 @@ FROM test.maintenance_worker();
 
 -- confirm that there is only one maintenance daemon
 SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+-- confirm that we can create a distributed table concurrently on an empty node
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SET citus.defer_drop_after_shard_split TO off;
+SELECT create_distributed_table_concurrently('test','x');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a distributed table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('test','x');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a reference table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT create_reference_table('test');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a local table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT citus_add_local_table_to_metadata('test');
+DROP TABLE test;
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
 
 DROP TABLE version_mismatch_table;
 DROP SCHEMA multi_extension;

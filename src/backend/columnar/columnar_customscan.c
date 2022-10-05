@@ -121,10 +121,8 @@ static void ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestor
 static const char * ColumnarPushdownClausesStr(List *context, List *clauses);
 static const char * ColumnarProjectedColumnsStr(List *context,
 												List *projectedColumns);
-#if PG_VERSION_NUM >= 130000
 static List * set_deparse_context_planstate(List *dpcontext, Node *node,
 											List *ancestors);
-#endif
 
 /* other helpers */
 static List * ColumnarVarNeeded(ColumnarScanState *columnarScanState);
@@ -277,6 +275,11 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * into the scan of the table to minimize the data read.
 	 */
 	Relation relation = RelationIdGetRelation(rte->relid);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", rte->relid)));
+	}
+
 	if (relation->rd_tableam == GetColumnarTableAmRoutine())
 	{
 		if (rte->tablesample != NULL)
@@ -501,6 +504,11 @@ ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 				   &indexCorrelation, &fakeIndexPages);
 
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	uint64 rowCount = ColumnarTableRowCount(relation);
 	RelationClose(relation);
 	double estimatedRows = rowCount * indexSelectivity;
@@ -596,6 +604,11 @@ static int
 RelationIdGetNumberOfAttributes(Oid relationId)
 {
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	int nattrs = relation->rd_att->natts;
 	RelationClose(relation);
 	return nattrs;
@@ -807,6 +820,18 @@ ExtractPushdownClause(PlannerInfo *root, RelOptInfo *rel, Node *node)
 		else
 		{
 			/* already discarded NOT expr, so should not be reachable */
+			return NULL;
+		}
+	}
+
+	if (IsA(node, ScalarArrayOpExpr))
+	{
+		if (!contain_volatile_functions(node))
+		{
+			return (Expr *) node;
+		}
+		else
+		{
 			return NULL;
 		}
 	}
@@ -1278,6 +1303,12 @@ AddColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 	cpath->methods = &ColumnarScanPathMethods;
 
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+	/* necessary to avoid extra Result node in PG15 */
+	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+#endif
+
 	/*
 	 * populate generic path information
 	 */
@@ -1399,6 +1430,11 @@ static Cost
 ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead)
 {
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *stripeList = StripesForRelfilenode(relation->rd_node);
 	RelationClose(relation);
 
@@ -1451,6 +1487,11 @@ static uint64
 ColumnarTableStripeCount(Oid relationId)
 {
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *stripeList = StripesForRelfilenode(relation->rd_node);
 	int stripeCount = list_length(stripeList);
 	RelationClose(relation);
@@ -1509,6 +1550,12 @@ ColumnarScanPath_PlanCustomPath(PlannerInfo *root,
 		clauses, false /* no pseudoconstants */);
 	cscan->scan.plan.targetlist = list_copy(tlist);
 	cscan->scan.scanrelid = best_path->path.parent->relid;
+
+#if (PG_VERSION_NUM >= 150000)
+
+	/* necessary to avoid extra Result node in PG15 */
+	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+#endif
 
 	return (Plan *) cscan;
 }
@@ -1961,8 +2008,6 @@ ColumnarVarNeeded(ColumnarScanState *columnarScanState)
 }
 
 
-#if PG_VERSION_NUM >= 130000
-
 /*
  * set_deparse_context_planstate is a compatibility wrapper for versions 13+.
  */
@@ -1972,6 +2017,3 @@ set_deparse_context_planstate(List *dpcontext, Node *node, List *ancestors)
 	PlanState *ps = (PlanState *) node;
 	return set_deparse_context_plan(dpcontext, ps->plan, ancestors);
 }
-
-
-#endif

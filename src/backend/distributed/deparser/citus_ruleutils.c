@@ -79,8 +79,8 @@ static void deparse_index_columns(StringInfo buffer, List *indexParameterList,
 								  List *deparseContext);
 static void AppendStorageParametersToString(StringInfo stringBuffer,
 											List *optionList);
+static const char * convert_aclright_to_string(int aclright);
 static void simple_quote_literal(StringInfo buf, const char *val);
-static char * flatten_reloptions(Oid relid);
 static void AddVacuumParams(ReindexStmt *reindexStmt, StringInfo buffer);
 
 
@@ -256,7 +256,12 @@ pg_get_sequencedef_string(Oid sequenceRelationId)
 	char *qualifiedSequenceName = generate_qualified_relation_name(sequenceRelationId);
 	char *typeName = format_type_be(pgSequenceForm->seqtypid);
 
-	char *sequenceDef = psprintf(CREATE_SEQUENCE_COMMAND, qualifiedSequenceName,
+	char *sequenceDef = psprintf(CREATE_SEQUENCE_COMMAND,
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+								 get_rel_persistence(sequenceRelationId) ==
+								 RELPERSISTENCE_UNLOGGED ? "UNLOGGED " : "",
+#endif
+								 qualifiedSequenceName,
 								 typeName,
 								 pgSequenceForm->seqincrement, pgSequenceForm->seqmin,
 								 pgSequenceForm->seqmax, pgSequenceForm->seqstart,
@@ -377,6 +382,14 @@ pg_get_tableschemadef_string(Oid tableRelationId, IncludeSequenceDefaults
 				atttypmod);
 			appendStringInfoString(&buffer, attributeTypeName);
 
+#if PG_VERSION_NUM >= PG_VERSION_14
+			if (CompressionMethodIsValid(attributeForm->attcompression))
+			{
+				appendStringInfo(&buffer, " COMPRESSION %s",
+								 GetCompressionMethodName(attributeForm->attcompression));
+			}
+#endif
+
 			/* if this column has a default value, append the default value */
 			if (attributeForm->atthasdef)
 			{
@@ -448,14 +461,6 @@ pg_get_tableschemadef_string(Oid tableRelationId, IncludeSequenceDefaults
 				appendStringInfoString(&buffer, " NOT NULL");
 			}
 
-#if PG_VERSION_NUM >= PG_VERSION_14
-			if (CompressionMethodIsValid(attributeForm->attcompression))
-			{
-				appendStringInfo(&buffer, " COMPRESSION %s",
-								 GetCompressionMethodName(attributeForm->attcompression));
-			}
-#endif
-
 			if (attributeForm->attcollation != InvalidOid &&
 				attributeForm->attcollation != DEFAULT_COLLATION_OID)
 			{
@@ -526,7 +531,7 @@ pg_get_tableschemadef_string(Oid tableRelationId, IncludeSequenceDefaults
 	}
 
 	/*
-	 * Add table access methods for pg12 and higher when the table is configured with an
+	 * Add table access methods when the table is configured with an
 	 * access method
 	 */
 	if (accessMethod)
@@ -800,6 +805,13 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 		appendStringInfoString(buffer, ") ");
 	}
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	if (indexStmt->nulls_not_distinct)
+	{
+		appendStringInfoString(buffer, "NULLS NOT DISTINCT ");
+	}
+#endif /* PG_VERSION_15 */
+
 	if (indexStmt->options != NIL)
 	{
 		appendStringInfoString(buffer, "WITH (");
@@ -999,7 +1011,6 @@ deparse_index_columns(StringInfo buffer, List *indexParameterList, List *deparse
 			appendStringInfo(buffer, "%s ",
 							 NameListToQuotedString(indexElement->opclass));
 		}
-#if PG_VERSION_NUM >= PG_VERSION_13
 
 		/* Commit on postgres: 911e70207703799605f5a0e8aad9f06cff067c63*/
 		if (indexElement->opclassopts != NIL)
@@ -1008,7 +1019,6 @@ deparse_index_columns(StringInfo buffer, List *indexParameterList, List *deparse
 			AppendStorageParametersToString(buffer, indexElement->opclassopts);
 			appendStringInfoString(buffer, ") ");
 		}
-#endif
 
 		if (indexElement->ordering != SORTBY_DEFAULT)
 		{
@@ -1060,6 +1070,138 @@ pg_get_indexclusterdef_string(Oid indexRelationId)
 	ReleaseSysCache(indexTuple);
 
 	return (buffer.data);
+}
+
+
+/*
+ * pg_get_table_grants returns a list of sql statements which recreate the
+ * permissions for a specific table.
+ *
+ * This function is modeled after aclexplode(), don't change too heavily.
+ */
+List *
+pg_get_table_grants(Oid relationId)
+{
+	/* *INDENT-OFF* */
+	StringInfoData buffer;
+	List *defs = NIL;
+	bool isNull = false;
+
+	Relation relation = relation_open(relationId, AccessShareLock);
+	char *relationName = generate_relation_name(relationId, NIL);
+
+	initStringInfo(&buffer);
+
+	/* lookup all table level grants */
+	HeapTuple classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
+	if (!HeapTupleIsValid(classTuple))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist",
+						relationId)));
+	}
+
+	Datum aclDatum = SysCacheGetAttr(RELOID, classTuple, Anum_pg_class_relacl,
+							   &isNull);
+
+	ReleaseSysCache(classTuple);
+
+	if (!isNull)
+	{
+
+		/*
+		 * First revoke all default permissions, so we can start adding the
+		 * exact permissions from the master. Note that we only do so if there
+		 * are any actual grants; an empty grant set signals default
+		 * permissions.
+		 *
+		 * Note: This doesn't work correctly if default permissions have been
+		 * changed with ALTER DEFAULT PRIVILEGES - but that's hard to fix
+		 * properly currently.
+		 */
+		appendStringInfo(&buffer, "REVOKE ALL ON %s FROM PUBLIC",
+						 relationName);
+		defs = lappend(defs, pstrdup(buffer.data));
+		resetStringInfo(&buffer);
+
+		/* iterate through the acl datastructure, emit GRANTs */
+
+		Acl *acl = DatumGetAclP(aclDatum);
+		AclItem *aidat = ACL_DAT(acl);
+
+		int offtype = -1;
+		int i = 0;
+		while (i < ACL_NUM(acl))
+		{
+			AclItem    *aidata = NULL;
+			AclMode		priv_bit = 0;
+
+			offtype++;
+
+			if (offtype == N_ACL_RIGHTS)
+			{
+				offtype = 0;
+				i++;
+				if (i >= ACL_NUM(acl)) /* done */
+				{
+					break;
+				}
+			}
+
+			aidata = &aidat[i];
+			priv_bit = 1 << offtype;
+
+			if (ACLITEM_GET_PRIVS(*aidata) & priv_bit)
+			{
+				const char *roleName = NULL;
+				const char *withGrant = "";
+
+				if (aidata->ai_grantee != 0)
+				{
+
+					HeapTuple htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aidata->ai_grantee));
+					if (HeapTupleIsValid(htup))
+					{
+						Form_pg_authid authForm = ((Form_pg_authid) GETSTRUCT(htup));
+
+						roleName = quote_identifier(NameStr(authForm->rolname));
+
+						ReleaseSysCache(htup);
+					}
+					else
+					{
+						elog(ERROR, "cache lookup failed for role %u", aidata->ai_grantee);
+					}
+				}
+				else
+				{
+					roleName = "PUBLIC";
+				}
+
+				if ((ACLITEM_GET_GOPTIONS(*aidata) & priv_bit) != 0)
+				{
+					withGrant = " WITH GRANT OPTION";
+				}
+
+				appendStringInfo(&buffer, "GRANT %s ON %s TO %s%s",
+								 convert_aclright_to_string(priv_bit),
+								 relationName,
+								 roleName,
+								 withGrant);
+
+				defs = lappend(defs, pstrdup(buffer.data));
+
+				resetStringInfo(&buffer);
+			}
+		}
+	}
+
+	resetStringInfo(&buffer);
+
+	relation_close(relation, NoLock);
+	return defs;
+	/* *INDENT-ON* */
 }
 
 
@@ -1157,6 +1299,45 @@ AppendStorageParametersToString(StringInfo stringBuffer, List *optionList)
 }
 
 
+/* copy of postgresql's function, which is static as well */
+static const char *
+convert_aclright_to_string(int aclright)
+{
+	/* *INDENT-OFF* */
+	switch (aclright)
+	{
+		case ACL_INSERT:
+			return "INSERT";
+		case ACL_SELECT:
+			return "SELECT";
+		case ACL_UPDATE:
+			return "UPDATE";
+		case ACL_DELETE:
+			return "DELETE";
+		case ACL_TRUNCATE:
+			return "TRUNCATE";
+		case ACL_REFERENCES:
+			return "REFERENCES";
+		case ACL_TRIGGER:
+			return "TRIGGER";
+		case ACL_EXECUTE:
+			return "EXECUTE";
+		case ACL_USAGE:
+			return "USAGE";
+		case ACL_CREATE:
+			return "CREATE";
+		case ACL_CREATE_TEMP:
+			return "TEMPORARY";
+		case ACL_CONNECT:
+			return "CONNECT";
+		default:
+			elog(ERROR, "unrecognized aclright: %d", aclright);
+			return NULL;
+	}
+	/* *INDENT-ON* */
+}
+
+
 /*
  * contain_nextval_expression_walker walks over expression tree and returns
  * true if it contains call to 'nextval' function.
@@ -1226,12 +1407,52 @@ pg_get_replica_identity_command(Oid tableRelationId)
 
 
 /*
+ * pg_get_row_level_security_commands function returns the required ALTER .. TABLE
+ * commands to define the row level security settings for a relation.
+ */
+List *
+pg_get_row_level_security_commands(Oid relationId)
+{
+	StringInfoData buffer;
+	List *commands = NIL;
+
+	initStringInfo(&buffer);
+
+	Relation relation = table_open(relationId, AccessShareLock);
+
+	if (relation->rd_rel->relrowsecurity)
+	{
+		char *relationName = generate_qualified_relation_name(relationId);
+
+		appendStringInfo(&buffer, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY",
+						 relationName);
+		commands = lappend(commands, pstrdup(buffer.data));
+		resetStringInfo(&buffer);
+	}
+
+	if (relation->rd_rel->relforcerowsecurity)
+	{
+		char *relationName = generate_qualified_relation_name(relationId);
+
+		appendStringInfo(&buffer, "ALTER TABLE %s FORCE ROW LEVEL SECURITY",
+						 relationName);
+		commands = lappend(commands, pstrdup(buffer.data));
+		resetStringInfo(&buffer);
+	}
+
+	table_close(relation, AccessShareLock);
+
+	return commands;
+}
+
+
+/*
  * Generate a C string representing a relation's reloptions, or NULL if none.
  *
  * This function comes from PostgreSQL source code in
  * src/backend/utils/adt/ruleutils.c
  */
-static char *
+char *
 flatten_reloptions(Oid relid)
 {
 	char *result = NULL;

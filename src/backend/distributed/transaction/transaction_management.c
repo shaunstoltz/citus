@@ -31,15 +31,19 @@
 #include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/maintenanced.h"
 #include "distributed/multi_executor.h"
+#include "distributed/multi_logical_replication.h"
 #include "distributed/multi_explain.h"
 #include "distributed/repartition_join_execution.h"
 #include "distributed/transaction_management.h"
 #include "distributed/placement_connection.h"
+#include "distributed/relation_access_tracking.h"
 #include "distributed/shared_connection_stats.h"
+#include "distributed/shard_cleaner.h"
 #include "distributed/subplan_execution.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_log_messages.h"
 #include "distributed/commands.h"
+#include "distributed/metadata_cache.h"
 #include "utils/hsearch.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -115,8 +119,8 @@ AllowedDistributionColumn AllowedDistributionColumnValue;
 /* if disabled, distributed statements in a function may run as separate transactions */
 bool FunctionOpensTransactionBlock = true;
 
-/* if true, we should trigger metadata sync on commit */
-bool MetadataSyncOnCommit = false;
+/* if true, we should trigger node metadata sync on commit */
+bool NodeMetadataSyncOnCommit = false;
 
 
 /* transaction management functions */
@@ -205,8 +209,17 @@ InCoordinatedTransaction(void)
 void
 Use2PCForCoordinatedTransaction(void)
 {
-	Assert(InCoordinatedTransaction());
-
+	/*
+	 * If this transaction is also a coordinated
+	 * transaction, use 2PC. Otherwise, this
+	 * state change does nothing.
+	 *
+	 * In other words, when this flag is set,
+	 * we "should" use 2PC when needed (e.g.,
+	 * we are in a coordinated transaction and
+	 * the coordinated transaction does a remote
+	 * modification).
+	 */
 	ShouldCoordinatedTransactionUse2PC = true;
 }
 
@@ -232,7 +245,7 @@ InitializeTransactionManagement(void)
 	AdjustMaxPreparedTransactions();
 
 	/* set aside 8kb of memory for use in CoordinatedTransactionCallback */
-	CommitContext = AllocSetContextCreateExtended(TopMemoryContext,
+	CommitContext = AllocSetContextCreateInternal(TopMemoryContext,
 												  "CommitContext",
 												  8 * 1024,
 												  8 * 1024,
@@ -288,14 +301,15 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 
 			/*
 			 * Changes to catalog tables are now visible to the metadata sync
-			 * daemon, so we can trigger metadata sync if necessary.
+			 * daemon, so we can trigger node metadata sync if necessary.
 			 */
-			if (MetadataSyncOnCommit)
+			if (NodeMetadataSyncOnCommit)
 			{
-				TriggerMetadataSync(MyDatabaseId);
+				TriggerNodeMetadataSync(MyDatabaseId);
 			}
 
 			ResetGlobalVariables();
+			ResetRelationAccessHash();
 
 			/*
 			 * Make sure that we give the shared connections back to the shared
@@ -306,9 +320,22 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 
 			UnSetDistributedTransactionId();
 
+			PlacementMovedUsingLogicalReplicationInTX = false;
+
 			/* empty the CommitContext to ensure we're not leaking memory */
 			MemoryContextSwitchTo(previousContext);
 			MemoryContextReset(CommitContext);
+
+			/* Set CreateCitusTransactionLevel to 0 since original transaction is about to be
+			 * committed.
+			 */
+
+			if (GetCitusCreationLevel() > 0)
+			{
+				/* Check CitusCreationLevel was correctly decremented to 1 */
+				Assert(GetCitusCreationLevel() == 1);
+				SetCreateCitusTransactionLevel(0);
+			}
 			break;
 		}
 
@@ -317,7 +344,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			/* stop propagating notices from workers, we know the query is failed */
 			DisableWorkerMessagePropagation();
 
-			RemoveIntermediateResultsDirectory();
+			RemoveIntermediateResultsDirectories();
 
 			/* handles both already prepared and open transactions */
 			if (CurrentCoordinatedTransactionState > COORD_TRANS_IDLE)
@@ -352,6 +379,21 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			AfterXactConnectionHandling(false);
 
 			ResetGlobalVariables();
+			ResetRelationAccessHash();
+
+			/*
+			 * Clear MetadataCache table if we're aborting from a CREATE EXTENSION Citus
+			 * so that any created OIDs from the table are cleared and invalidated. We
+			 * also set CreateCitusTransactionLevel to 0 since that process has been aborted
+			 */
+			if (GetCitusCreationLevel() > 0)
+			{
+				/* Checks CitusCreationLevel correctly decremented to 1 */
+				Assert(GetCitusCreationLevel() == 1);
+
+				InvalidateMetadataSystemCache();
+				SetCreateCitusTransactionLevel(0);
+			}
 
 			/*
 			 * Make sure that we give the shared connections back to the shared
@@ -378,6 +420,8 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 */
 			SubPlanLevel = 0;
 			UnSetDistributedTransactionId();
+
+			PlacementMovedUsingLogicalReplicationInTX = false;
 			break;
 		}
 
@@ -403,7 +447,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 * existing folders that are associated with distributed transaction
 			 * ids on the worker nodes.
 			 */
-			RemoveIntermediateResultsDirectory();
+			RemoveIntermediateResultsDirectories();
 
 			UnSetDistributedTransactionId();
 			break;
@@ -415,10 +459,10 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 * If the distributed query involves 2PC, we already removed
 			 * the intermediate result directory on XACT_EVENT_PREPARE. However,
 			 * if not, we should remove it here on the COMMIT. Since
-			 * RemoveIntermediateResultsDirectory() is idempotent, we're safe
+			 * RemoveIntermediateResultsDirectories() is idempotent, we're safe
 			 * to call it here again even if the transaction involves 2PC.
 			 */
-			RemoveIntermediateResultsDirectory();
+			RemoveIntermediateResultsDirectories();
 
 			/* nothing further to do if there's no managed remote xacts */
 			if (CurrentCoordinatedTransactionState == COORD_TRANS_NONE)
@@ -554,8 +598,10 @@ ResetGlobalVariables()
 	activeSetStmts = NULL;
 	ShouldCoordinatedTransactionUse2PC = false;
 	TransactionModifiedNodeMetadata = false;
-	MetadataSyncOnCommit = false;
+	NodeMetadataSyncOnCommit = false;
 	InTopLevelDelegatedFunctionCall = false;
+	InTableTypeConversionFunctionCall = false;
+	CurrentOperationId = INVALID_OPERATION_ID;
 	ResetWorkerErrorIndication();
 	memset(&AllowedDistributionColumnValue, 0,
 		   sizeof(AllowedDistributionColumn));
@@ -599,6 +645,13 @@ CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
 				CoordinatedRemoteTransactionsSavepointRelease(subId);
 			}
 			PopSubXact(subId);
+
+			/* Set CachedDuringCitusCreation to one level lower to represent citus creation is done */
+
+			if (GetCitusCreationLevel() == GetCurrentTransactionNestLevel())
+			{
+				SetCreateCitusTransactionLevel(GetCitusCreationLevel() - 1);
+			}
 			break;
 		}
 
@@ -621,6 +674,16 @@ CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
 			}
 			PopSubXact(subId);
 
+			/*
+			 * Clear MetadataCache table if we're aborting from a CREATE EXTENSION Citus
+			 * so that any created OIDs from the table are cleared and invalidated. We
+			 * also set CreateCitusTransactionLevel to 0 since subtransaction has been aborted
+			 */
+			if (GetCitusCreationLevel() == GetCurrentTransactionNestLevel())
+			{
+				InvalidateMetadataSystemCache();
+				SetCreateCitusTransactionLevel(0);
+			}
 			break;
 		}
 
@@ -800,14 +863,14 @@ MaybeExecutingUDF(void)
 
 
 /*
- * TriggerMetadataSyncOnCommit sets a flag to do metadata sync on commit.
- * This is because new metadata only becomes visible to the metadata sync
- * daemon after commit happens.
+ * TriggerNodeMetadataSyncOnCommit sets a flag to do node metadata sync
+ * on commit. This is because new metadata only becomes visible to the
+ * metadata sync daemon after commit happens.
  */
 void
-TriggerMetadataSyncOnCommit(void)
+TriggerNodeMetadataSyncOnCommit(void)
 {
-	MetadataSyncOnCommit = true;
+	NodeMetadataSyncOnCommit = true;
 }
 
 

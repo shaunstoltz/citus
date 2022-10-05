@@ -55,9 +55,7 @@ static char * GenerateAlterIndexColumnSetStatsCommand(char *indexNameWithSchema,
 													  int32 attstattarget);
 static Oid GetRelIdByStatsOid(Oid statsOid);
 static char * CreateAlterCommandIfOwnerNotDefault(Oid statsOid);
-#if PG_VERSION_NUM >= PG_VERSION_13
 static char * CreateAlterCommandIfTargetNotDefault(Oid statsOid);
-#endif
 
 /*
  * PreprocessCreateStatisticsStmt is called during the planning phase for
@@ -92,7 +90,7 @@ PreprocessCreateStatisticsStmt(Node *node, const char *queryString,
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = relationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 	ddlJob->startNewTransaction = false;
 	ddlJob->metadataSyncCommand = ddlCommand;
 	ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -122,9 +120,13 @@ PostprocessCreateStatisticsStmt(Node *node, const char *queryString)
 	}
 
 	bool missingOk = false;
-	ObjectAddress objectAddress = GetObjectAddressFromParseTree((Node *) stmt, missingOk);
+	List *objectAddresses = GetObjectAddressListFromParseTree((Node *) stmt, missingOk,
+															  true);
 
-	EnsureDependenciesExistOnAllNodes(&objectAddress);
+	/*  the code-path only supports a single object */
+	Assert(list_length(objectAddresses) == 1);
+
+	EnsureAllObjectDependenciesExistOnAllNodes(objectAddresses);
 
 	return NIL;
 }
@@ -138,16 +140,16 @@ PostprocessCreateStatisticsStmt(Node *node, const char *queryString)
  * Never returns NULL, but the objid in the address can be invalid if missingOk
  * was set to true.
  */
-ObjectAddress
-CreateStatisticsStmtObjectAddress(Node *node, bool missingOk)
+List *
+CreateStatisticsStmtObjectAddress(Node *node, bool missingOk, bool isPostprocess)
 {
 	CreateStatsStmt *stmt = castNode(CreateStatsStmt, node);
 
-	ObjectAddress address = { 0 };
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
 	Oid statsOid = get_statistics_object_oid(stmt->defnames, missingOk);
-	ObjectAddressSet(address, StatisticExtRelationId, statsOid);
+	ObjectAddressSet(*address, StatisticExtRelationId, statsOid);
 
-	return address;
+	return list_make1(address);
 }
 
 
@@ -197,7 +199,7 @@ PreprocessDropStatisticsStmt(Node *node, const char *queryString,
 
 		DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-		ddlJob->targetRelationId = relationId;
+		ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 		ddlJob->startNewTransaction = false;
 		ddlJob->metadataSyncCommand = ddlCommand;
 		ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -206,6 +208,33 @@ PreprocessDropStatisticsStmt(Node *node, const char *queryString,
 	}
 
 	return ddlJobs;
+}
+
+
+/*
+ * DropStatisticsObjectAddress returns list of object addresses in the drop statistics
+ * statement.
+ */
+List *
+DropStatisticsObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
+{
+	DropStmt *dropStatisticsStmt = castNode(DropStmt, node);
+	Assert(dropStatisticsStmt->removeType == OBJECT_STATISTIC_EXT);
+
+	List *objectAddresses = NIL;
+
+	List *objectNameList = NULL;
+	foreach_ptr(objectNameList, dropStatisticsStmt->objects)
+	{
+		Oid statsOid = get_statistics_object_oid(objectNameList,
+												 dropStatisticsStmt->missing_ok);
+
+		ObjectAddress *objectAddress = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*objectAddress, StatisticExtRelationId, statsOid);
+		objectAddresses = lappend(objectAddresses, objectAddress);
+	}
+
+	return objectAddresses;
 }
 
 
@@ -236,7 +265,7 @@ PreprocessAlterStatisticsRenameStmt(Node *node, const char *queryString,
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = relationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 	ddlJob->startNewTransaction = false;
 	ddlJob->metadataSyncCommand = ddlCommand;
 	ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -274,7 +303,7 @@ PreprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString,
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = relationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 	ddlJob->startNewTransaction = false;
 	ddlJob->metadataSyncCommand = ddlCommand;
 	ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -295,7 +324,7 @@ PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString)
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_STATISTIC_EXT);
 
-	Value *statName = llast((List *) stmt->object);
+	String *statName = llast((List *) stmt->object);
 	Oid statsOid = get_statistics_object_oid(list_make2(makeString(stmt->newschema),
 														statName), false);
 	Oid relationId = GetRelIdByStatsOid(statsOid);
@@ -306,9 +335,13 @@ PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString)
 	}
 
 	bool missingOk = false;
-	ObjectAddress objectAddress = GetObjectAddressFromParseTree((Node *) stmt, missingOk);
+	List *objectAddresses = GetObjectAddressListFromParseTree((Node *) stmt, missingOk,
+															  true);
 
-	EnsureDependenciesExistOnAllNodes(&objectAddress);
+	/*  the code-path only supports a single object */
+	Assert(list_length(objectAddresses) == 1);
+
+	EnsureAllObjectDependenciesExistOnAllNodes(objectAddresses);
 
 	return NIL;
 }
@@ -322,22 +355,36 @@ PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString)
  * Never returns NULL, but the objid in the address can be invalid if missingOk
  * was set to true.
  */
-ObjectAddress
-AlterStatisticsSchemaStmtObjectAddress(Node *node, bool missingOk)
+List *
+AlterStatisticsSchemaStmtObjectAddress(Node *node, bool missingOk, bool isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 
-	ObjectAddress address = { 0 };
-	Value *statName = llast((List *) stmt->object);
-	Oid statsOid = get_statistics_object_oid(list_make2(makeString(stmt->newschema),
-														statName), missingOk);
-	ObjectAddressSet(address, StatisticExtRelationId, statsOid);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	Oid statsOid = InvalidOid;
 
-	return address;
+	List *statName = (List *) stmt->object;
+
+	if (isPostprocess)
+	{
+		/*
+		 * we should search the object in the new schema because the method is
+		 * called during postprocess, standard_utility should have already moved
+		 * the stat into new schema.
+		 */
+		List *newStatName = list_make2(makeString(stmt->newschema), llast(statName));
+		statsOid = get_statistics_object_oid(newStatName, missingOk);
+	}
+	else
+	{
+		statsOid = get_statistics_object_oid(statName, missingOk);
+	}
+
+	ObjectAddressSet(*address, StatisticExtRelationId, statsOid);
+
+	return list_make1(address);
 }
 
-
-#if PG_VERSION_NUM >= PG_VERSION_13
 
 /*
  * PreprocessAlterStatisticsStmt is called during the planning phase for
@@ -376,7 +423,7 @@ PreprocessAlterStatisticsStmt(Node *node, const char *queryString,
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = relationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 	ddlJob->startNewTransaction = false;
 	ddlJob->metadataSyncCommand = ddlCommand;
 	ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -386,8 +433,6 @@ PreprocessAlterStatisticsStmt(Node *node, const char *queryString,
 	return ddlJobs;
 }
 
-
-#endif
 
 /*
  * PreprocessAlterStatisticsOwnerStmt is called during the planning phase for
@@ -416,7 +461,7 @@ PreprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString,
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = relationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 	ddlJob->startNewTransaction = false;
 	ddlJob->metadataSyncCommand = ddlCommand;
 	ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
@@ -449,10 +494,9 @@ PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString)
 		return NIL;
 	}
 
-	ObjectAddress statisticsAddress = { 0 };
-	ObjectAddressSet(statisticsAddress, StatisticExtRelationId, statsOid);
-
-	EnsureDependenciesExistOnAllNodes(&statisticsAddress);
+	ObjectAddress *statisticsAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*statisticsAddress, StatisticExtRelationId, statsOid);
+	EnsureAllObjectDependenciesExistOnAllNodes(list_make1(statisticsAddress));
 
 	return NIL;
 }
@@ -469,6 +513,11 @@ GetExplicitStatisticsCommandList(Oid relationId)
 	List *explicitStatisticsCommandList = NIL;
 
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *statisticsIdList = RelationGetStatExtList(relation);
 	RelationClose(relation);
 
@@ -497,7 +546,6 @@ GetExplicitStatisticsCommandList(Oid relationId)
 		explicitStatisticsCommandList =
 			lappend(explicitStatisticsCommandList,
 					makeTableDDLCommandString(createStatisticsCommand));
-#if PG_VERSION_NUM >= PG_VERSION_13
 
 		/* we need to alter stats' target if it's getting distributed after creation */
 		char *alterStatisticsTargetCommand =
@@ -509,7 +557,6 @@ GetExplicitStatisticsCommandList(Oid relationId)
 				lappend(explicitStatisticsCommandList,
 						makeTableDDLCommandString(alterStatisticsTargetCommand));
 		}
-#endif
 
 		/* we need to alter stats' owner if it's getting distributed after creation */
 		char *alterStatisticsOwnerCommand =
@@ -540,6 +587,11 @@ GetExplicitStatisticsSchemaIdList(Oid relationId)
 	List *schemaIdList = NIL;
 
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *statsIdList = RelationGetStatExtList(relation);
 	RelationClose(relation);
 
@@ -694,8 +746,6 @@ CreateAlterCommandIfOwnerNotDefault(Oid statsOid)
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_13
-
 /*
  * CreateAlterCommandIfTargetNotDefault returns an ALTER STATISTICS .. SET STATISTICS
  * command if the stats object with given id has a target different than the default one.
@@ -730,6 +780,3 @@ CreateAlterCommandIfTargetNotDefault(Oid statsOid)
 
 	return DeparseAlterStatisticsStmt((Node *) alterStatsStmt);
 }
-
-
-#endif

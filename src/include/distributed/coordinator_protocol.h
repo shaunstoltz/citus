@@ -47,7 +47,7 @@
 #define CANDIDATE_NODE_FIELDS 2
 #define WORKER_NODE_FIELDS 2
 
-/* transfer mode for master_copy_shard_placement */
+/* transfer mode for citus_copy_shard_placement */
 #define TRANSFER_MODE_AUTOMATIC 'a'
 #define TRANSFER_MODE_FORCE_LOGICAL 'l'
 #define TRANSFER_MODE_BLOCK_WRITES 'b'
@@ -221,6 +221,7 @@ extern List * GetPostLoadTableCreationCommands(Oid relationId, bool includeIndex
 extern List * GetPreLoadTableCreationCommands(Oid relationId, IncludeSequenceDefaults
 											  includeSequenceDefaults,
 											  char *accessMethod);
+extern List * GetTableRowLevelSecurityCommands(Oid relationId);
 extern List * GetTableIndexAndConstraintCommands(Oid relationId, int indexFlags);
 extern List * GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(Oid relationId,
 																		 int indexFlags);
@@ -282,8 +283,8 @@ extern int MasterDropAllShards(Oid relationId, char *schemaName, char *relationN
 extern Datum master_create_worker_shards(PG_FUNCTION_ARGS);
 extern Datum isolate_tenant_to_new_shard(PG_FUNCTION_ARGS);
 
-/* function declarations for shard repair functionality */
-extern Datum master_copy_shard_placement(PG_FUNCTION_ARGS);
+/* function declarations for shard split functionality */
+extern Datum citus_split_shard_by_split_points(PG_FUNCTION_ARGS);
 
 /* function declarations for shard copy functinality */
 extern List * CopyShardCommandList(ShardInterval *shardInterval, const
@@ -305,7 +306,6 @@ extern void ErrorIfTargetNodeIsNotSafeToMove(const char *targetNodeName, int
 extern char LookupShardTransferMode(Oid shardReplicationModeOid);
 extern void BlockWritesToShardList(List *shardList);
 extern List * WorkerApplyShardDDLCommandList(List *ddlCommandList, int64 shardId);
-extern List * GetForeignConstraintCommandsToReferenceTable(ShardInterval *shardInterval);
 
 
 #endif   /* COORDINATOR_PROTOCOL_H */

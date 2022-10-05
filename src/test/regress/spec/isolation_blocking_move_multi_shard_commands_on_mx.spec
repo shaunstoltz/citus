@@ -3,6 +3,7 @@
 
 setup
 {
+  SET citus.enable_metadata_sync TO off;
   CREATE OR REPLACE FUNCTION start_session_level_connection_to_node(text, integer)
       RETURNS void
       LANGUAGE C STRICT VOLATILE
@@ -17,9 +18,7 @@ setup
       RETURNS void
       LANGUAGE C STRICT VOLATILE
       AS 'citus', $$stop_session_level_connection_to_node$$;
-
-  SELECT citus_internal.replace_isolation_tester_func();
-  SELECT citus_internal.refresh_isolation_tester_prepared_statement();
+  RESET citus.enable_metadata_sync;
 
   -- start_metadata_sync_to_node can not be run inside a transaction block
   -- following is a workaround to overcome that
@@ -46,8 +45,6 @@ teardown
 {
 	DROP TABLE selected_shard;
 	DROP TABLE logical_replicate_placement;
-
-  SELECT citus_internal.restore_isolation_tester_func();
 }
 
 

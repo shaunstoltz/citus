@@ -12,6 +12,7 @@
 #ifndef WORKER_TRANSACTION_H
 #define WORKER_TRANSACTION_H
 
+#include "distributed/connection_management.h"
 #include "distributed/worker_manager.h"
 #include "storage/lockdefs.h"
 
@@ -22,9 +23,27 @@
  */
 typedef enum TargetWorkerSet
 {
+	/*
+	 * All the active primary nodes in the metadata which have metadata
+	 * except the coordinator
+	 */
 	NON_COORDINATOR_METADATA_NODES,
+
+	/*
+	 * All the active primary nodes in the metadata except the coordinator
+	 */
 	NON_COORDINATOR_NODES,
-	ALL_SHARD_NODES
+
+	/*
+	 * All active primary nodes in the metadata
+	 */
+	ALL_SHARD_NODES,
+
+	/*
+	 * All the active primary nodes in the metadata which have metadata
+	 * (includes the coodinator if it is added)
+	 */
+	METADATA_NODES
 } TargetWorkerSet;
 
 
@@ -41,6 +60,10 @@ extern bool SendOptionalCommandListToWorkerOutsideTransaction(const char *nodeNa
 															  int32 nodePort,
 															  const char *nodeUser,
 															  List *commandList);
+extern bool SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+	MultiConnection *workerConnection,
+	List *
+	commandList);
 extern bool SendOptionalMetadataCommandListToWorkerInCoordinatedTransaction(const
 																			char *nodeName,
 																			int32 nodePort,
@@ -56,15 +79,14 @@ extern void SendCommandListToWorkerOutsideTransaction(const char *nodeName,
 													  int32 nodePort,
 													  const char *nodeUser,
 													  List *commandList);
-extern void SendMetadataCommandListToWorkerInCoordinatedTransaction(const char *nodeName,
-																	int32 nodePort,
-																	const char *nodeUser,
-																	List *commandList);
-extern void SendCommandToWorkersOptionalInParallel(TargetWorkerSet targetWorkerSet,
-												   const char *command,
-												   const char *user);
-void SendCommandToWorkersInParallel(TargetWorkerSet targetWorkerSet,
-									const char *command, const char *user);
+extern void SendCommandListToWorkerOutsideTransactionWithConnection(
+	MultiConnection *workerConnection,
+	List *commandList);
+extern void SendMetadataCommandListToWorkerListInCoordinatedTransaction(
+	List *workerNodeList,
+	const char *
+	nodeUser,
+	List *commandList);
 extern void RemoveWorkerTransaction(const char *nodeName, int32 nodePort);
 
 /* helper functions for worker transactions */

@@ -42,6 +42,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
+#include "parser/parse_utilcmd.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -74,7 +75,7 @@ static void RangeVarCallbackForReindexIndex(const RangeVar *rel, Oid relOid, Oid
 static void ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement);
 static void ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement);
 static List * DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt);
-
+static Oid ReindexStmtFindRelationOid(ReindexStmt *reindexStmt, bool missingOk);
 
 /*
  * This struct defines the state for the callback for drop statements.
@@ -184,9 +185,18 @@ PreprocessIndexStmt(Node *node, const char *createIndexCommand,
 		 */
 		ErrorIfCreateIndexHasTooManyColumns(createIndexStatement);
 
+		/*
+		 * If there are expressions on the index, we should first transform
+		 * the statement as the default index name depends on that. We do
+		 * it on a copy not to interfere with standard process utility.
+		 */
+		IndexStmt *copyCreateIndexStatement =
+			transformIndexStmt(relation->rd_id, copyObject(createIndexStatement),
+							   createIndexCommand);
+
 		/* ensure we copy string into proper context */
 		MemoryContext relationContext = GetMemoryChunkContext(relationRangeVar);
-		char *defaultIndexName = GenerateDefaultIndexName(createIndexStatement);
+		char *defaultIndexName = GenerateDefaultIndexName(copyCreateIndexStatement);
 		createIndexStatement->idxname = MemoryContextStrdup(relationContext,
 															defaultIndexName);
 	}
@@ -311,6 +321,11 @@ ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor pgIndexProcesso
 	List *result = NIL;
 
 	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
 	List *indexIdList = RelationGetIndexList(relation);
 	Oid indexId = InvalidOid;
 	foreach_oid(indexId, indexIdList)
@@ -464,7 +479,8 @@ GenerateCreateIndexDDLJob(IndexStmt *createIndexStatement, const char *createInd
 {
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 
-	ddlJob->targetRelationId = CreateIndexStmtGetRelationId(createIndexStatement);
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId,
+					 CreateIndexStmtGetRelationId(createIndexStatement));
 	ddlJob->startNewTransaction = createIndexStatement->concurrent;
 	ddlJob->metadataSyncCommand = createIndexCommand;
 	ddlJob->taskList = CreateIndexTaskList(createIndexStatement);
@@ -507,6 +523,49 @@ GetCreateIndexRelationLockMode(IndexStmt *createIndexStatement)
 
 
 /*
+ * ReindexStmtFindRelationOid returns the oid of the relation on which the index exist
+ * if the object is an index in the reindex stmt. It returns the oid of the relation
+ * if the object is a table in the reindex stmt. It also acquires the relevant lock
+ * for the statement.
+ */
+static Oid
+ReindexStmtFindRelationOid(ReindexStmt *reindexStmt, bool missingOk)
+{
+	Assert(reindexStmt->relation != NULL);
+
+	Assert(reindexStmt->kind == REINDEX_OBJECT_INDEX ||
+		   reindexStmt->kind == REINDEX_OBJECT_TABLE);
+
+	Oid relationId = InvalidOid;
+
+	LOCKMODE lockmode = IsReindexWithParam_compat(reindexStmt, "concurrently") ?
+						ShareUpdateExclusiveLock : AccessExclusiveLock;
+
+	if (reindexStmt->kind == REINDEX_OBJECT_INDEX)
+	{
+		struct ReindexIndexCallbackState state;
+		state.concurrent = IsReindexWithParam_compat(reindexStmt,
+													 "concurrently");
+		state.locked_table_oid = InvalidOid;
+
+		Oid indOid = RangeVarGetRelidExtended(reindexStmt->relation, lockmode,
+											  (missingOk) ? RVR_MISSING_OK : 0,
+											  RangeVarCallbackForReindexIndex,
+											  &state);
+		relationId = IndexGetRelation(indOid, missingOk);
+	}
+	else
+	{
+		relationId = RangeVarGetRelidExtended(reindexStmt->relation, lockmode,
+											  (missingOk) ? RVR_MISSING_OK : 0,
+											  RangeVarCallbackOwnsTable, NULL);
+	}
+
+	return relationId;
+}
+
+
+/*
  * PreprocessReindexStmt determines whether a given REINDEX statement involves
  * a distributed table. If so (and if the statement does not use unsupported
  * options), it modifies the input statement to ensure proper execution against
@@ -528,36 +587,17 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand,
 	 */
 	if (reindexStatement->relation != NULL)
 	{
-		Relation relation = NULL;
-		Oid relationId = InvalidOid;
-		LOCKMODE lockmode = IsReindexWithParam_compat(reindexStatement, "concurrently") ?
-							ShareUpdateExclusiveLock : AccessExclusiveLock;
+		Oid relationId = ReindexStmtFindRelationOid(reindexStatement, false);
 		MemoryContext relationContext = NULL;
-
-		Assert(reindexStatement->kind == REINDEX_OBJECT_INDEX ||
-			   reindexStatement->kind == REINDEX_OBJECT_TABLE);
-
+		Relation relation = NULL;
 		if (reindexStatement->kind == REINDEX_OBJECT_INDEX)
 		{
-			struct ReindexIndexCallbackState state;
-			state.concurrent = IsReindexWithParam_compat(reindexStatement,
-														 "concurrently");
-			state.locked_table_oid = InvalidOid;
-
-			Oid indOid = RangeVarGetRelidExtended(reindexStatement->relation,
-												  lockmode, 0,
-												  RangeVarCallbackForReindexIndex,
-												  &state);
+			Oid indOid = RangeVarGetRelid(reindexStatement->relation, NoLock, 0);
 			relation = index_open(indOid, NoLock);
-			relationId = IndexGetRelation(indOid, false);
 		}
 		else
 		{
-			RangeVarGetRelidExtended(reindexStatement->relation, lockmode, 0,
-									 RangeVarCallbackOwnsTable, NULL);
-
 			relation = table_openrv(reindexStatement->relation, NoLock);
-			relationId = RelationGetRelid(relation);
 		}
 
 		bool isCitusRelation = IsCitusTable(relationId);
@@ -598,7 +638,7 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand,
 			}
 
 			DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-			ddlJob->targetRelationId = relationId;
+			ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
 			ddlJob->startNewTransaction = IsReindexWithParam_compat(reindexStatement,
 																	"concurrently");
 			ddlJob->metadataSyncCommand = reindexCommand;
@@ -609,6 +649,30 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand,
 	}
 
 	return ddlJobs;
+}
+
+
+/*
+ * ReindexStmtObjectAddress returns list of object addresses in the reindex
+ * statement. We add the address if the object is either index or table;
+ * else, we add invalid address.
+ */
+List *
+ReindexStmtObjectAddress(Node *stmt, bool missing_ok, bool isPostprocess)
+{
+	ReindexStmt *reindexStatement = castNode(ReindexStmt, stmt);
+
+	Oid relationId = InvalidOid;
+	if (reindexStatement->relation != NULL)
+	{
+		/* we currently only support reindex commands on tables */
+		relationId = ReindexStmtFindRelationOid(reindexStatement, missing_ok);
+	}
+
+	ObjectAddress *objectAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*objectAddress, RelationRelationId, relationId);
+
+	return list_make1(objectAddress);
 }
 
 
@@ -695,7 +759,8 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand,
 			MarkInvalidateForeignKeyGraph();
 		}
 
-		ddlJob->targetRelationId = distributedRelationId;
+		ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId,
+						 distributedRelationId);
 
 		/*
 		 * We do not want DROP INDEX CONCURRENTLY to commit locally before
@@ -744,9 +809,9 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 	Oid indexRelationId = get_relname_relid(indexStmt->idxname, schemaId);
 
 	/* ensure dependencies of index exist on all nodes */
-	ObjectAddress address = { 0 };
-	ObjectAddressSet(address, RelationRelationId, indexRelationId);
-	EnsureDependenciesExistOnAllNodes(&address);
+	ObjectAddress *address = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*address, RelationRelationId, indexRelationId);
+	EnsureAllObjectDependenciesExistOnAllNodes(list_make1(address));
 
 	/* furtheron we are only processing CONCURRENT index statements */
 	if (!indexStmt->concurrent)
@@ -755,7 +820,7 @@ PostprocessIndexStmt(Node *node, const char *queryString)
 	}
 
 	/*
-	 * EnsureDependenciesExistOnAllNodes could have distributed objects that are required
+	 * EnsureAllObjectDependenciesExistOnAllNodes could have distributed objects that are required
 	 * by this index. During the propagation process an active snapshout might be left as
 	 * a side effect of inserting the local tuples via SPI. To not leak a snapshot like
 	 * that we will pop any snapshot if we have any right before we commit.
@@ -1135,6 +1200,15 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("creating unique indexes on append-partitioned tables "
 								   "is currently unsupported")));
+		}
+
+		if (AllowUnsafeConstraints)
+		{
+			/*
+			 * The user explicitly wants to allow the constraint without
+			 * distribution column.
+			 */
+			return;
 		}
 
 		Var *partitionKey = DistPartitionKeyOrError(relationId);

@@ -152,6 +152,7 @@
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/param_utils.h"
 #include "distributed/placement_access.h"
 #include "distributed/placement_connection.h"
 #include "distributed/relation_access_tracking.h"
@@ -171,15 +172,12 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
-#include "utils/int8.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #define SLOW_START_DISABLED 0
-#define WAIT_EVENT_SET_INDEX_NOT_INITIALIZED -1
-#define WAIT_EVENT_SET_INDEX_FAILED -2
 
 
 /*
@@ -678,10 +676,6 @@ static int UsableConnectionCount(WorkerPool *workerPool);
 static long NextEventTimeout(DistributedExecution *execution);
 static WaitEventSet * BuildWaitEventSet(List *sessionList);
 static void RebuildWaitEventSetFlags(WaitEventSet *waitEventSet, List *sessionList);
-static int CitusAddWaitEventSetToSet(WaitEventSet *set, uint32 events, pgsocket fd,
-									 Latch *latch, void *user_data);
-static bool CitusModifyWaitEvent(WaitEventSet *set, int pos, uint32 events,
-								 Latch *latch);
 static TaskPlacementExecution * PopPlacementExecution(WorkerSession *session);
 static TaskPlacementExecution * PopAssignedPlacementExecution(WorkerSession *session);
 static TaskPlacementExecution * PopUnassignedPlacementExecution(WorkerPool *workerPool);
@@ -837,6 +831,19 @@ AdaptiveExecutor(CitusScanState *scanState)
 		distributedPlan->modLevel, taskList, excludeFromXact);
 
 	bool localExecutionSupported = true;
+
+	/*
+	 * In some rare cases, we have prepared statements that pass a parameter
+	 * and never used in the query, mark such parameters' type as Invalid(0),
+	 * which will be used later in ExtractParametersFromParamList() to map them
+	 * to a generic datatype. Skip for dynamic parameters.
+	 */
+	if (paramListInfo && !paramListInfo->paramFetch)
+	{
+		paramListInfo = copyParamList(paramListInfo);
+		MarkUnreferencedExternParams((Node *) job->jobQuery, paramListInfo);
+	}
+
 	DistributedExecution *execution = CreateDistributedExecution(
 		distributedPlan->modLevel,
 		taskList,
@@ -1327,7 +1334,8 @@ StartDistributedExecution(DistributedExecution *execution)
 	/* make sure we are not doing remote execution from within a task */
 	if (execution->remoteTaskList != NIL)
 	{
-		EnsureRemoteTaskExecutionAllowed();
+		bool isRemote = true;
+		EnsureTaskExecutionAllowed(isRemote);
 	}
 }
 
@@ -1413,7 +1421,7 @@ DistributedExecutionRequiresRollback(List *taskList)
 		 * Do not check SelectOpensTransactionBlock, always open transaction block
 		 * if SELECT FOR UPDATE is executed inside a distributed transaction.
 		 */
-		return IsTransactionBlock();
+		return IsMultiStatementTransaction();
 	}
 
 	if (ReadOnlyTask(task->taskType))
@@ -1438,6 +1446,15 @@ DistributedExecutionRequiresRollback(List *taskList)
 		 * Single DML/DDL tasks with replicated tables (including
 		 * reference and non-reference tables) should require
 		 * BEGIN/COMMIT/ROLLBACK.
+		 */
+		return true;
+	}
+
+	if (task->queryCount > 1)
+	{
+		/*
+		 * When there are multiple sequential queries in a task
+		 * we need to run those as a transaction.
 		 */
 		return true;
 	}
@@ -1773,17 +1790,9 @@ AcquireExecutorShardLocksForExecution(DistributedExecution *execution)
 		/* Acquire additional locks for SELECT .. FOR UPDATE on reference tables */
 		AcquireExecutorShardLocksForRelationRowLockList(task->relationRowLockList);
 
-		/*
-		 * Due to PG commit 5ee190f8ec37c1bbfb3061e18304e155d600bc8e we copy the
-		 * second parameter in pre-13.
-		 */
 		relationRowLockList =
 			list_concat(relationRowLockList,
-#if (PG_VERSION_NUM >= PG_VERSION_12) && (PG_VERSION_NUM < PG_VERSION_13)
-						list_copy(task->relationRowLockList));
-#else
 						task->relationRowLockList);
-#endif
 
 		/*
 		 * If the task has a subselect, then we may need to lock the shards from which
@@ -1797,19 +1806,9 @@ AcquireExecutorShardLocksForExecution(DistributedExecution *execution)
 			 * and therefore prevents other modifications from running
 			 * concurrently.
 			 */
-
-			/*
-			 * Due to PG commit 5ee190f8ec37c1bbfb3061e18304e155d600bc8e we copy the
-			 * second parameter in pre-13.
-			 */
 			requiresConsistentSnapshotRelationShardList =
 				list_concat(requiresConsistentSnapshotRelationShardList,
-#if (PG_VERSION_NUM >= PG_VERSION_12) && (PG_VERSION_NUM < PG_VERSION_13)
-
-							list_copy(task->relationShardList));
-#else
 							task->relationShardList);
-#endif
 		}
 	}
 
@@ -4510,7 +4509,7 @@ ReceiveResults(WorkerSession *session, bool storeRows)
 			/* if there are multiple replicas, make sure to consider only one */
 			if (storeRows && *currentAffectedTupleString != '\0')
 			{
-				scanint8(currentAffectedTupleString, false, &currentAffectedTupleCount);
+				currentAffectedTupleCount = pg_strtoint64(currentAffectedTupleString);
 				Assert(currentAffectedTupleCount >= 0);
 				execution->rowsProcessed += currentAffectedTupleCount;
 			}
@@ -5367,6 +5366,19 @@ BuildWaitEventSet(List *sessionList)
 			CitusAddWaitEventSetToSet(waitEventSet, connection->waitFlags, sock,
 									  NULL, (void *) session);
 		session->waitEventSetIndex = waitEventSetIndex;
+
+		/*
+		 * Inform failed to add to wait event set with a debug message as this
+		 * is too detailed information for users.
+		 */
+		if (session->waitEventSetIndex == WAIT_EVENT_SET_INDEX_FAILED)
+		{
+			ereport(DEBUG1, (errcode(ERRCODE_CONNECTION_FAILURE),
+							 errmsg("Adding wait event for node %s:%d failed. "
+									"The socket was: %d",
+									session->workerPool->nodeName,
+									session->workerPool->nodePort, sock)));
+		}
 	}
 
 	CitusAddWaitEventSetToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL,
@@ -5375,64 +5387,6 @@ BuildWaitEventSet(List *sessionList)
 							  NULL);
 
 	return waitEventSet;
-}
-
-
-/*
- * CitusAddWaitEventSetToSet is a wrapper around Postgres' AddWaitEventToSet().
- *
- * AddWaitEventToSet() may throw hard errors. For example, when the
- * underlying socket for a connection is closed by the remote server
- * and already reflected by the OS, however Citus hasn't had a chance
- * to get this information. In that case, if replication factor is >1,
- * Citus can failover to other nodes for executing the query. Even if
- * replication factor = 1, Citus can give much nicer errors.
- *
- * So CitusAddWaitEventSetToSet simply puts ModifyWaitEvent into a
- * PG_TRY/PG_CATCH block in order to catch any hard errors, and
- * returns this information to the caller.
- */
-static int
-CitusAddWaitEventSetToSet(WaitEventSet *set, uint32 events, pgsocket fd,
-						  Latch *latch, void *user_data)
-{
-	volatile int waitEventSetIndex = WAIT_EVENT_SET_INDEX_NOT_INITIALIZED;
-	MemoryContext savedContext = CurrentMemoryContext;
-
-	PG_TRY();
-	{
-		waitEventSetIndex =
-			AddWaitEventToSet(set, events, fd, latch, (void *) user_data);
-	}
-	PG_CATCH();
-	{
-		/*
-		 * We might be in an arbitrary memory context when the
-		 * error is thrown and we should get back to one we had
-		 * at PG_TRY() time, especially because we are not
-		 * re-throwing the error.
-		 */
-		MemoryContextSwitchTo(savedContext);
-
-		FlushErrorState();
-
-		if (user_data != NULL)
-		{
-			WorkerSession *workerSession = (WorkerSession *) user_data;
-
-			ereport(DEBUG1, (errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("Adding wait event for node %s:%d failed. "
-									"The socket was: %d",
-									workerSession->workerPool->nodeName,
-									workerSession->workerPool->nodePort, fd)));
-		}
-
-		/* let the callers know about the failure */
-		waitEventSetIndex = WAIT_EVENT_SET_INDEX_FAILED;
-	}
-	PG_END_TRY();
-
-	return waitEventSetIndex;
 }
 
 
@@ -5485,7 +5439,7 @@ RebuildWaitEventSetFlags(WaitEventSet *waitEventSet, List *sessionList)
 		if (!success)
 		{
 			ereport(DEBUG1, (errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("Modifying wait event for node %s:%d failed. "
+							 errmsg("modifying wait event for node %s:%d failed. "
 									"The wait event index was: %d",
 									connection->hostname, connection->port,
 									waitEventSetIndex)));
@@ -5493,51 +5447,6 @@ RebuildWaitEventSetFlags(WaitEventSet *waitEventSet, List *sessionList)
 			session->waitEventSetIndex = WAIT_EVENT_SET_INDEX_FAILED;
 		}
 	}
-}
-
-
-/*
- * CitusModifyWaitEvent is a wrapper around Postgres' ModifyWaitEvent().
- *
- * ModifyWaitEvent may throw hard errors. For example, when the underlying
- * socket for a connection is closed by the remote server and already
- * reflected by the OS, however Citus hasn't had a chance to get this
- * information. In that case, if replication factor is >1, Citus can
- * failover to other nodes for executing the query. Even if replication
- * factor = 1, Citus can give much nicer errors.
- *
- * So CitusModifyWaitEvent simply puts ModifyWaitEvent into a PG_TRY/PG_CATCH
- * block in order to catch any hard errors, and returns this information to the
- * caller.
- */
-static bool
-CitusModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch)
-{
-	volatile bool success = true;
-	MemoryContext savedContext = CurrentMemoryContext;
-
-	PG_TRY();
-	{
-		ModifyWaitEvent(set, pos, events, latch);
-	}
-	PG_CATCH();
-	{
-		/*
-		 * We might be in an arbitrary memory context when the
-		 * error is thrown and we should get back to one we had
-		 * at PG_TRY() time, especially because we are not
-		 * re-throwing the error.
-		 */
-		MemoryContextSwitchTo(savedContext);
-
-		FlushErrorState();
-
-		/* let the callers know about the failure */
-		success = false;
-	}
-	PG_END_TRY();
-
-	return success;
 }
 
 

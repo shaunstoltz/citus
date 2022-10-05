@@ -36,22 +36,24 @@ PreprocessRenameStmt(Node *node, const char *renameCommand,
 
 	/*
 	 * We only support some of the PostgreSQL supported RENAME statements, and
-	 * our list include only renaming table and index (related) objects.
+	 * our list include only renaming table, index, policy and view (related) objects.
 	 */
 	if (!IsAlterTableRenameStmt(renameStmt) &&
 		!IsIndexRenameStmt(renameStmt) &&
-		!IsPolicyRenameStmt(renameStmt))
+		!IsPolicyRenameStmt(renameStmt) &&
+		!IsViewRenameStmt(renameStmt))
 	{
 		return NIL;
 	}
 
 	/*
 	 * The lock levels here should be same as the ones taken in
-	 * RenameRelation(), renameatt() and RenameConstraint(). However, since all
-	 * three statements have identical lock levels, we just use a single statement.
+	 * RenameRelation(), renameatt() and RenameConstraint(). All statements
+	 * have identical lock levels except alter index rename.
 	 */
-	objectRelationId = RangeVarGetRelid(renameStmt->relation,
-										AccessExclusiveLock,
+	LOCKMODE lockmode = (IsIndexRenameStmt(renameStmt)) ?
+						ShareUpdateExclusiveLock : AccessExclusiveLock;
+	objectRelationId = RangeVarGetRelid(renameStmt->relation, lockmode,
 										renameStmt->missing_ok);
 
 	/*
@@ -63,13 +65,30 @@ PreprocessRenameStmt(Node *node, const char *renameCommand,
 		return NIL;
 	}
 
-	/* check whether we are dealing with a sequence here */
-	if (get_rel_relkind(objectRelationId) == RELKIND_SEQUENCE)
+	/*
+	 * Check whether we are dealing with a sequence or view here and route queries
+	 * accordingly to the right processor function. We need to check both objects here
+	 * since PG supports targeting sequences and views with ALTER TABLE commands.
+	 */
+	char relKind = get_rel_relkind(objectRelationId);
+	if (relKind == RELKIND_SEQUENCE)
 	{
 		RenameStmt *stmtCopy = copyObject(renameStmt);
 		stmtCopy->renameType = OBJECT_SEQUENCE;
 		return PreprocessRenameSequenceStmt((Node *) stmtCopy, renameCommand,
 											processUtilityContext);
+	}
+	else if (relKind == RELKIND_VIEW)
+	{
+		RenameStmt *stmtCopy = copyObject(renameStmt);
+		stmtCopy->relationType = OBJECT_VIEW;
+		if (stmtCopy->renameType == OBJECT_TABLE)
+		{
+			stmtCopy->renameType = OBJECT_VIEW;
+		}
+
+		return PreprocessRenameViewStmt((Node *) stmtCopy, renameCommand,
+										processUtilityContext);
 	}
 
 	/* we have no planning to do unless the table is distributed */
@@ -81,6 +100,18 @@ PreprocessRenameStmt(Node *node, const char *renameCommand,
 		case OBJECT_TABCONSTRAINT:
 		case OBJECT_POLICY:
 		{
+			if (relKind == RELKIND_INDEX ||
+				relKind == RELKIND_PARTITIONED_INDEX)
+			{
+				/*
+				 * Although weird, postgres allows ALTER TABLE .. RENAME command
+				 * on indexes. We don't want to break non-distributed tables,
+				 * so allow.
+				 */
+				tableRelationId = IndexGetRelation(objectRelationId, false);
+				break;
+			}
+
 			/* the target object is our tableRelationId. */
 			tableRelationId = objectRelationId;
 			break;
@@ -88,6 +119,25 @@ PreprocessRenameStmt(Node *node, const char *renameCommand,
 
 		case OBJECT_INDEX:
 		{
+			if (relKind == RELKIND_RELATION ||
+				relKind == RELKIND_PARTITIONED_TABLE)
+			{
+				/*
+				 * Although weird, postgres allows ALTER INDEX .. RENAME command
+				 * on tables. We don't want to break non-distributed tables,
+				 * so allow.
+				 * Because of the weird syntax, we locked with wrong level, so relock
+				 * the relation to acquire true level of lock. Same logic
+				 * can be found in the function RenameRelation(RenameStmt) at tablecmds.c
+				 */
+				UnlockRelationOid(objectRelationId, lockmode);
+				objectRelationId = RangeVarGetRelid(renameStmt->relation,
+													AccessExclusiveLock,
+													renameStmt->missing_ok);
+				tableRelationId = objectRelationId;
+				break;
+			}
+
 			/*
 			 * here, objRelationId points to the index relation entry, and we
 			 * are interested into the entry of the table on which the index is
@@ -127,7 +177,7 @@ PreprocessRenameStmt(Node *node, const char *renameCommand,
 	}
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-	ddlJob->targetRelationId = tableRelationId;
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, tableRelationId);
 	ddlJob->metadataSyncCommand = renameCommand;
 	ddlJob->taskList = DDLTaskList(tableRelationId, renameCommand);
 

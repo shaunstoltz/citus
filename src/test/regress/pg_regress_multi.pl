@@ -65,6 +65,7 @@ my $bindir = "";
 my $libdir = undef;
 my $pgxsdir = "";
 my $postgresBuilddir = "";
+my $citusAbsSrcdir = "";
 my $postgresSrcdir = "";
 my $majorversion = "";
 my $synchronousReplication = "";
@@ -102,6 +103,7 @@ GetOptions(
     'pgxsdir=s' => \$pgxsdir,
     'postgres-builddir=s' => \$postgresBuilddir,
     'postgres-srcdir=s' => \$postgresSrcdir,
+    'citus_abs_srcdir=s' => \$citusAbsSrcdir,
     'majorversion=s' => \$majorversion,
     'load-extension=s' => \@extensions,
     'server-option=s' => \@userPgOptions,
@@ -285,6 +287,19 @@ sub revert_replace_postgres
     }
 }
 
+sub generate_hba
+{
+    my $nodename = shift;
+
+    open(my $fh, ">", catfile($TMP_CHECKDIR, $nodename, "data", "pg_hba.conf"))
+        or die "could not open pg_hba.conf";
+    print $fh "host all         alice,bob localhost      md5\n";
+    print $fh "host all         all       127.0.0.1/32 trust\n";
+    print $fh "host all         all       ::1/128      trust\n";
+    print $fh "host replication postgres  localhost    trust\n";
+    close $fh;
+}
+
 # always want to call initdb under normal postgres, so revert from a
 # partial run, even if we're now not using valgrind.
 revert_replace_postgres();
@@ -436,12 +451,16 @@ push(@pgOptions, "wal_level='logical'");
 
 # Faster logical replication status update so tests with logical replication
 # run faster
-push(@pgOptions, "wal_receiver_status_interval=1");
+push(@pgOptions, "wal_receiver_status_interval=0");
 
 # Faster logical replication apply worker launch so tests with logical
 # replication run faster. This is used in ApplyLauncherMain in
 # src/backend/replication/logical/launcher.c.
-push(@pgOptions, "wal_retrieve_retry_interval=1000");
+push(@pgOptions, "wal_retrieve_retry_interval=250");
+
+push(@pgOptions, "max_logical_replication_workers=50");
+push(@pgOptions, "max_wal_senders=50");
+push(@pgOptions, "max_worker_processes=50");
 
 if ($majorversion >= "14") {
     # disable compute_query_id so that we don't get Query Identifiers
@@ -464,12 +483,27 @@ push(@pgOptions, "citus.shard_replication_factor=2");
 push(@pgOptions, "citus.node_connection_timeout=${connectionTimeout}");
 push(@pgOptions, "citus.explain_analyze_sort_method='taskId'");
 push(@pgOptions, "citus.enable_manual_changes_to_shards=on");
+push(@pgOptions, "citus.allow_unsafe_locks_from_workers=on");
+push(@pgOptions, "citus.stat_statements_track = 'all'");
 
 # Some tests look at shards in pg_class, make sure we can usually see them:
-push(@pgOptions, "citus.hide_shards_from_app_name_prefixes='psql,pg_dump'");
+push(@pgOptions, "citus.show_shards_for_app_name_prefixes='pg_regress'");
 
 # we disable slow start by default to encourage parallelism within tests
 push(@pgOptions, "citus.executor_slow_start_interval=0ms");
+
+# we set some GUCs to not break postgres vanilla tests
+if($vanillatest)
+{
+    # we enable hiding the citus dependent objects from pg meta class queries to not break postgres vanilla test behaviour
+    push(@pgOptions, "citus.hide_citus_dependent_objects=true");
+
+    # we disable citus related unwanted messages to not break postgres vanilla test behaviour.
+    push(@pgOptions, "citus.enable_unsupported_feature_messages=false");
+
+    # we disable some restrictions for local objects like local views to not break postgres vanilla test behaviour.
+    push(@pgOptions, "citus.enforce_object_restrictions_for_local_objects=false");
+}
 
 if ($useMitmproxy)
 {
@@ -516,13 +550,21 @@ if($isolationtester)
 {
    push(@pgOptions, "citus.worker_min_messages='warning'");
    push(@pgOptions, "citus.log_distributed_deadlock_detection=on");
-   push(@pgOptions, "citus.distributed_deadlock_detection_factor=-1");
    push(@pgOptions, "citus.shard_count=4");
    push(@pgOptions, "citus.metadata_sync_interval=1000");
    push(@pgOptions, "citus.metadata_sync_retry_interval=100");
    push(@pgOptions, "client_min_messages='warning'"); # pg12 introduced notice showing during isolation tests
    push(@pgOptions, "citus.running_under_isolation_test=true");
 
+   # Disable all features of the maintenance daemon. Otherwise queries might
+   # randomly show temporarily as "waiting..." because they are waiting for the
+   # maintenance daemon.
+   push(@pgOptions, "citus.distributed_deadlock_detection_factor=-1");
+   push(@pgOptions, "citus.recover_2pc_interval=-1");
+   push(@pgOptions, "citus.enable_statistics_collection=-1");
+   push(@pgOptions, "citus.defer_shard_delete_interval=-1");
+   push(@pgOptions, "citus.stat_statements_purge_interval=-1");
+   push(@pgOptions, "citus.background_task_queue_interval=-1");
 }
 
 # Add externally added options last, so they overwrite the default ones above
@@ -603,6 +645,7 @@ print $fh "--variable=worker_2_proxy_port=$mitmPort ";
 print $fh "--variable=follower_master_port=$followerCoordPort ";
 print $fh "--variable=default_user=$user ";
 print $fh "--variable=SHOW_CONTEXT=always ";
+print $fh "--variable=abs_srcdir=$citusAbsSrcdir ";
 for my $workeroff (0 .. $#workerPorts)
 {
 	my $port = $workerPorts[$workeroff];
@@ -669,15 +712,18 @@ if (!$conninfo)
     # Create new data directories, copy workers for speed
     # --allow-group-access is used to ensure we set permissions on private keys
     # correctly
-    system(catfile("$bindir", "initdb"), ("--nosync", "--allow-group-access", "-U", $user, "--encoding", "UTF8", catfile($TMP_CHECKDIR, $MASTERDIR, "data"))) == 0
+    system(catfile("$bindir", "initdb"), ("--no-sync", "--allow-group-access", "-U", $user, "--encoding", "UTF8", "--locale", "POSIX", catfile($TMP_CHECKDIR, $MASTERDIR, "data"))) == 0
         or die "Could not create $MASTERDIR data directory";
+
+	generate_hba("master");
 
     if ($usingWindows)
     {
         for my $port (@workerPorts)
         {
-            system(catfile("$bindir", "initdb"), ("--nosync", "--allow-group-access", "-U", $user, "--encoding", "UTF8", catfile($TMP_CHECKDIR, "worker.$port", "data"))) == 0
+            system(catfile("$bindir", "initdb"), ("--no-sync", "--allow-group-access", "-U", $user, "--encoding", "UTF8", catfile($TMP_CHECKDIR, "worker.$port", "data"))) == 0
                 or die "Could not create worker data directory";
+			generate_hba("worker.$port");
         }
     }
     else
@@ -751,18 +797,17 @@ if ($useMitmproxy)
     die "a file already exists at $mitmFifoPath, delete it before trying again";
   }
 
-  system("lsof -i :$mitmPort");
-  if (! $?) {
-    die "cannot start mitmproxy because a process already exists on port $mitmPort";
-  }
-
   if ($Config{osname} eq "linux")
   {
-    system("netstat --tcp -n | grep $mitmPort");
+    system("netstat --tcp -n | grep :$mitmPort");
   }
   else
   {
-    system("netstat -p tcp -n | grep $mitmPort");
+    system("netstat -p tcp -n | grep :$mitmPort");
+  }
+
+  if (system("lsof -i :$mitmPort") == 0) {
+    die "cannot start mitmproxy because a process already exists on port $mitmPort";
   }
 
   my $childPid = fork();
@@ -902,14 +947,19 @@ if (!$conninfo)
         system(catfile($bindir, "psql"),
             ('-X', '-h', $host, '-p', $port, '-U', $user, "-d", "postgres",
                 '-c', "CREATE DATABASE regression;")) == 0
-            or die "Could not create regression database on worker";
+            or die "Could not create regression database on worker port $port.";
+
+        my $firstLib = `psql -h "$host" -p "$port" -U "$user" -d regression -AXqt \\
+                        -c "SHOW shared_preload_libraries;" | cut -d ',' -f1`;
+        ($firstLib =~ m/^citus$/)
+            or die "Could not find citus as first library in shared_preload_libraries on worker $port.";
 
         for my $extension (@extensions)
         {
             system(catfile($bindir, "psql"),
                 ('-X', '-h', $host, '-p', $port, '-U', $user, "-d", "regression",
                     '-c', "CREATE EXTENSION IF NOT EXISTS $extension;")) == 0
-                or die "Could not create extension on worker";
+                or die "Could not create extension $extension on worker port $port.";
         }
 
         foreach my $function (keys %functions)
@@ -917,7 +967,7 @@ if (!$conninfo)
             system(catfile($bindir, "psql"),
                     ('-X', '-h', $host, '-p', $port, '-U', $user, "-d", "regression",
                     '-c', "CREATE FUNCTION $function RETURNS $functions{$function};")) == 0
-                or die "Could not create FUNCTION $function on worker";
+                or die "Could not create function $function on worker port $port";
         }
 
         foreach my $fdw (keys %fdws)
@@ -925,25 +975,31 @@ if (!$conninfo)
             system(catfile($bindir, "psql"),
                     ('-X', '-h', $host, '-p', $port, '-U', $user, "-d", "regression",
                     '-c', "CREATE FOREIGN DATA WRAPPER $fdw HANDLER $fdws{$fdw};")) == 0
-                or die "Could not create foreign data wrapper $fdw on worker";
+                or die "Could not create foreign data wrapper $fdw on worker port $port";
         }
     }
 }
 else
 {
+    my $citusFirstLibCount = `psql -h "$host" -p "$masterPort" -U "$user" -d "$dbname" -AXqt \\
+                                -c "SELECT run_command_on_workers('SHOW shared_preload_libraries;');" \\
+                                | cut -d ',' -f4 | grep -e '\"citus' | wc -l`;
+    ($workerCount == $citusFirstLibCount)
+        or die "Could not find citus as first library in shared_preload_libraries on workers.";
+
     for my $extension (@extensions)
     {
         system(catfile($bindir, "psql"),
                 ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbname,
                 '-c', "SELECT run_command_on_workers('CREATE EXTENSION IF NOT EXISTS $extension;');")) == 0
-            or die "Could not create extension on worker";
+            or die "Could not create extension $extension on workers";
     }
     foreach my $function (keys %functions)
     {
         system(catfile($bindir, "psql"),
                 ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbname,
                     '-c', "SELECT run_command_on_workers('CREATE FUNCTION $function RETURNS $functions{$function};');")) == 0
-            or die "Could not create FUNCTION $function on worker";
+            or die "Could not create function $function on workers.";
     }
 
     foreach my $fdw (keys %fdws)
@@ -951,7 +1007,7 @@ else
         system(catfile($bindir, "psql"),
                 ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbname,
                     '-c', "SELECT run_command_on_workers('CREATE FOREIGN DATA WRAPPER $fdw HANDLER $fdws{$fdw};');")) == 0
-            or die "Could not create foreign data wrapper $fdw on worker";
+            or die "Could not create foreign data wrapper $fdw on workers.";
     }
 }
 
@@ -976,27 +1032,99 @@ my $startTime = time();
 
 my $exitcode = 0;
 
-# Finally run the tests
-if ($vanillatest)
+sub RunVanillaTests
 {
-    $ENV{PGHOST} = $host;
-    $ENV{PGPORT} = $masterPort;
-    $ENV{PGUSER} = $user;
-	$ENV{VANILLATEST} = "1";
+    ###
+    # We want to add is_citus_depended_object function to the default db.
+    # But without use-existing flag, pg_regress recreates the default db
+    # after dropping it if exists. Thus, we set use-existing flag and
+    # manually create the default db, citus extension and is_citus_depended_object
+    # function. When use-existing flag is set, pg_regress does not drop
+    # default db.
+    ###
 
-	if (-f "$vanillaSchedule")
+    $ENV{VANILLATEST} = "1";
+    my $dbName = "regression";
+
+    # create default db
+    system(catfile($bindir, "psql"),
+            ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", "postgres",
+                '-c', "CREATE DATABASE $dbName;")) == 0
+            or die "Could not create $dbName database on master";
+
+    # alter default db's lc_monetary to C
+    system(catfile($bindir, "psql"),
+            ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbName,
+                '-c', "ALTER DATABASE $dbName SET lc_monetary TO 'C';")) == 0
+            or die "Could not create $dbName database on master";
+
+    # create extension citus
+    system(catfile($bindir, "psql"),
+            ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbName,
+                '-c', "CREATE EXTENSION citus;")) == 0
+            or die "Could not create citus extension on master";
+
+    # we do not want to expose that udf other than vanilla tests
+    my $citus_depended_object_def = "CREATE OR REPLACE FUNCTION
+                                        pg_catalog.is_citus_depended_object(oid,oid)
+                                        RETURNS bool
+                                        LANGUAGE C
+                                        AS 'citus', \$\$is_citus_depended_object\$\$;";
+    system(catfile($bindir, "psql"),
+                    ('-X', '-h', $host, '-p', $masterPort, '-U', $user, "-d", $dbName,
+                    '-c', $citus_depended_object_def)) == 0
+                or die "Could not create FUNCTION is_citus_depended_object on master";
+
+    my $pgregressdir="";
+    if (-f "$vanillaSchedule")
 	{
-	    rmdir "./testtablespace";
-	    mkdir "./testtablespace";
-
-	    my $pgregressdir=catfile(dirname("$pgxsdir"), "regress");
-	    $exitcode = system("$plainRegress", ("--inputdir",  $pgregressdir),
-	           ("--schedule",  catfile("$pgregressdir", "parallel_schedule")))
+	    $pgregressdir=catfile(dirname("$pgxsdir"), "regress");
 	}
 	else
 	{
-	    $exitcode = system("make", ("-C", catfile("$postgresBuilddir", "src", "test", "regress"), "installcheck-parallel"))
+	    $pgregressdir=catfile("$postgresSrcdir", "src", "test", "regress");
 	}
+
+    # output dir
+    my $pgregressOutputdir = "$citusAbsSrcdir/pg_vanilla_outputs/$majorversion";
+
+    # prepare output and tablespace folder
+    system("rm", ("-rf", "$pgregressOutputdir")) == 0
+            or die "Could not remove vanilla output dir.";
+    system("mkdir", ("-p", "$pgregressOutputdir/testtablespace")) == 0
+            or die "Could not create vanilla testtablespace dir.";
+    system("mkdir", ("-p", "$pgregressOutputdir/expected")) == 0
+            or die "Could not create vanilla expected dir.";
+    system("mkdir", ("-p", "$pgregressOutputdir/sql")) == 0
+            or die "Could not create vanilla sql dir.";
+
+    $exitcode = system("$plainRegress",
+                        ("--inputdir",  $pgregressdir),
+                        ("--outputdir",  $pgregressOutputdir),
+                        ("--schedule",  catfile("$pgregressdir", "parallel_schedule")),
+                        ("--use-existing"),
+                        ("--host","$host"),
+                        ("--port","$masterPort"),
+                        ("--user","$user"),
+                        ("--dbname", "$dbName"));
+}
+
+if ($useMitmproxy) {
+    my $tries = 0;
+    until(system("lsof -i :$mitmPort") == 0) {
+        if ($tries > 60) {
+            die("waited for 60 seconds to start the mitmproxy, but it failed")
+        }
+        print("waiting: mitmproxy was not started yet\n");
+        sleep(1);
+        $tries++;
+    }
+}
+
+# Finally run the tests
+if ($vanillatest)
+{
+    RunVanillaTests();
 }
 elsif ($isolationtester)
 {

@@ -8,11 +8,13 @@
  */
 
 #include "postgres.h"
+#include "miscadmin.h"
 
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
+#include "distributed/backend_data.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/listutils.h"
@@ -39,14 +41,15 @@ typedef enum HideShardsMode
 bool OverrideTableVisibility = true;
 bool EnableManualChangesToShards = false;
 
-/* hide shards when the application_name starts with one of: */
-char *HideShardsFromAppNamePrefixes = "*";
+/* show shards when the application_name starts with one of: */
+char *ShowShardsForAppNamePrefixes = "";
 
 /* cache of whether or not to hide shards */
 static HideShardsMode HideShards = CHECK_APPLICATION_NAME;
 
 static bool ShouldHideShards(void);
 static bool ShouldHideShardsInternal(void);
+static bool IsPgBgWorker(void);
 static bool FilterShardsFromPgclass(Node *node, void *context);
 static Node * CreateRelationIsAKnownShardFilter(int pgClassVarno);
 
@@ -150,8 +153,10 @@ ErrorIfRelationIsAKnownShard(Oid relationId)
 void
 ErrorIfIllegallyChangingKnownShard(Oid relationId)
 {
-	if (LocalExecutorLevel > 0 ||
-		(IsCitusInternalBackend() || IsRebalancerInternalBackend()) ||
+	/* allow Citus to make changes, and allow the user if explicitly enabled */
+	if (LocalExecutorShardId != INVALID_SHARD_ID ||
+		IsCitusInternalBackend() ||
+		IsRebalancerInternalBackend() ||
 		EnableManualChangesToShards)
 	{
 		return;
@@ -202,12 +207,15 @@ RelationIsAKnownShard(Oid shardRelationId)
 		}
 	}
 
-	Relation relation = try_relation_open(shardRelationId, AccessShareLock);
-	if (relation == NULL)
+	/*
+	 * We do not take locks here, because that might block a query on pg_class.
+	 */
+
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(shardRelationId)))
 	{
+		/* relation does not exist */
 		return false;
 	}
-	relation_close(relation, NoLock);
 
 	/*
 	 * If the input relation is an index we simply replace the
@@ -266,8 +274,8 @@ RelationIsAKnownShard(Oid shardRelationId)
 
 /*
  * HideShardsFromSomeApplications transforms queries to pg_class to
- * filter out known shards if the application_name matches any of
- * the prefixes in citus.hide_shards_from_app_name_prefixes.
+ * filter out known shards if the application_name does not match any of
+ * the prefixes in citus.show_shards_for_app_name_prefix.
  */
 void
 HideShardsFromSomeApplications(Query *query)
@@ -289,7 +297,7 @@ HideShardsFromSomeApplications(Query *query)
  * ShouldHideShards returns whether we should hide shards in the current
  * session. It only checks the application_name once and then uses a
  * cached response unless either the application_name or
- * citus.hide_shards_from_app_name_prefixes changes.
+ * citus.show_shards_for_app_name_prefix changes.
  */
 static bool
 ShouldHideShards(void)
@@ -331,7 +339,30 @@ ResetHideShardsDecision(void)
 static bool
 ShouldHideShardsInternal(void)
 {
-	if (IsCitusInternalBackend() || IsRebalancerInternalBackend())
+	if (MyBackendType == B_BG_WORKER)
+	{
+		if (IsPgBgWorker())
+		{
+			/*
+			 * If a background worker belongs to Postgres, we should
+			 * never hide shards. For other background workers, enforce
+			 * the application_name check below.
+			 */
+			return false;
+		}
+	}
+	else if (MyBackendType != B_BACKEND)
+	{
+		/*
+		 * We are aiming only to hide shards from client
+		 * backends or certain background workers(see above),
+		 * not backends like walsender or checkpointer.
+		 */
+		return false;
+	}
+
+	if (IsCitusInternalBackend() || IsRebalancerInternalBackend() ||
+		IsCitusRunCommandBackend())
 	{
 		/* we never hide shards from Citus */
 		return false;
@@ -340,29 +371,48 @@ ShouldHideShardsInternal(void)
 	List *prefixList = NIL;
 
 	/* SplitGUCList scribbles on the input */
-	char *splitCopy = pstrdup(HideShardsFromAppNamePrefixes);
+	char *splitCopy = pstrdup(ShowShardsForAppNamePrefixes);
 
 	if (!SplitGUCList(splitCopy, ',', &prefixList))
 	{
 		/* invalid GUC value, ignore */
-		return false;
+		return true;
 	}
 
 	char *appNamePrefix = NULL;
 	foreach_ptr(appNamePrefix, prefixList)
 	{
-		/* always hide shards when one of the prefixes is * */
+		/* never hide shards when one of the prefixes is * */
 		if (strcmp(appNamePrefix, "*") == 0)
 		{
-			return true;
+			return false;
 		}
 
 		/* compare only the first first <prefixLength> characters */
 		int prefixLength = strlen(appNamePrefix);
 		if (strncmp(application_name, appNamePrefix, prefixLength) == 0)
 		{
-			return true;
+			return false;
 		}
+	}
+
+	/* default behaviour: hide shards */
+	return true;
+}
+
+
+/*
+ * IsPgBgWorker returns true if the current background worker
+ * belongs to Postgres.
+ */
+static bool
+IsPgBgWorker(void)
+{
+	Assert(MyBackendType == B_BG_WORKER);
+
+	if (MyBgworkerEntry)
+	{
+		return strcmp(MyBgworkerEntry->bgw_library_name, "postgres") == 0;
 	}
 
 	return false;

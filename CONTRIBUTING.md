@@ -13,6 +13,17 @@ why we ask this as well as instructions for how to proceed, see the
 
 ### Getting and building
 
+[PostgreSQL documentation](https://www.postgresql.org/support/versioning/) has a
+section on upgrade policy.
+
+	We always recommend that all users run the latest available minor release [for PostgreSQL] for whatever major version is in use.
+
+We expect Citus users to honor this recommendation and use latest available
+PostgreSQL minor release. Failure to do so may result in failures in our test
+suite. There are some known improvements in PG test architecture such as
+[this commit](https://github.com/postgres/postgres/commit/3f323956128ff8589ce4d3a14e8b950837831803)
+that are missing in earlier minor versions.
+
 #### Mac
 
 1. Install Xcode
@@ -35,6 +46,12 @@ why we ask this as well as instructions for how to proceed, see the
   # Optionally, you might instead want to use `make install-all`
   # since `multi_extension` regression test would fail due to missing downgrade scripts.
   cd src/test/regress
+
+  pip install pipenv
+  pipenv --rm
+  pipenv install
+  pipenv shell
+
   make check
   ```
 
@@ -53,7 +70,7 @@ why we ask this as well as instructions for how to proceed, see the
                           autoconf flex git libcurl4-gnutls-dev libicu-dev \
                           libkrb5-dev liblz4-dev libpam0g-dev libreadline-dev \
                           libselinux1-dev libssl-dev libxslt1-dev libzstd-dev \
-                          make uuid-dev mitmproxy
+                          make uuid-dev
   ```
 
 2. Get, build, and test the code
@@ -67,6 +84,12 @@ why we ask this as well as instructions for how to proceed, see the
   # Optionally, you might instead want to use `sudo make install-all`
   # since `multi_extension` regression test would fail due to missing downgrade scripts.
   cd src/test/regress
+
+  pip install pipenv
+  pipenv --rm
+  pipenv install
+  pipenv shell
+
   make check
   ```
 
@@ -111,6 +134,12 @@ why we ask this as well as instructions for how to proceed, see the
   # Optionally, you might instead want to use `sudo make install-all`
   # since `multi_extension` regression test would fail due to missing downgrade scripts.
   cd src/test/regress
+
+  pip install pipenv
+  pipenv --rm
+  pipenv install
+  pipenv shell
+
   make check
   ```
 

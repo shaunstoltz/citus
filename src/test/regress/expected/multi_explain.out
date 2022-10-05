@@ -18,6 +18,16 @@ BEGIN
   RETURN result;
 END;
 $BODY$ LANGUAGE plpgsql;
+CREATE FUNCTION explain_analyze_json(query text)
+RETURNS jsonb
+AS $BODY$
+DECLARE
+  result jsonb;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE TRUE, FORMAT JSON) %s', query) INTO result;
+  RETURN result;
+END;
+$BODY$ LANGUAGE plpgsql;
 -- Function that parses explain output as XML
 CREATE FUNCTION explain_xml(query text)
 RETURNS xml
@@ -26,6 +36,17 @@ DECLARE
   result xml;
 BEGIN
   EXECUTE format('EXPLAIN (FORMAT XML) %s', query) INTO result;
+  RETURN result;
+END;
+$BODY$ LANGUAGE plpgsql;
+-- Function that parses explain output as XML
+CREATE FUNCTION explain_analyze_xml(query text)
+RETURNS xml
+AS $BODY$
+DECLARE
+  result xml;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE true, FORMAT XML) %s', query) INTO result;
   RETURN result;
 END;
 $BODY$ LANGUAGE plpgsql;
@@ -135,6 +156,13 @@ SELECT true AS valid FROM explain_json($$
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity$$);
 t
+SELECT true AS valid FROM explain_analyze_json($$
+	WITH a AS (
+		SELECT l_quantity, count(*) count_quantity FROM lineitem
+		GROUP BY l_quantity ORDER BY count_quantity, l_quantity LIMIT 10)
+	SELECT count(*) FROM a
+$$);
+t
 -- Test XML format
 EXPLAIN (COSTS FALSE, FORMAT XML)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
@@ -208,6 +236,13 @@ SELECT true AS valid FROM explain_xml($$
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity$$);
 t
+SELECT true AS valid FROM explain_analyze_xml($$
+	WITH a AS (
+		SELECT l_quantity, count(*) count_quantity FROM lineitem
+		GROUP BY l_quantity ORDER BY count_quantity, l_quantity LIMIT 10)
+	SELECT count(*) FROM a
+$$);
+t
 -- Test YAML format
 EXPLAIN (COSTS FALSE, FORMAT YAML)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
@@ -266,12 +301,14 @@ Sort
                           Group Key: l_quantity
                           ->  Seq Scan on lineitem_360000 lineitem
 -- Test analyze (with TIMING FALSE and SUMMARY FALSE for consistent output)
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 Sort (actual rows=50 loops=1)
   Sort Key: (COALESCE((pg_catalog.sum(remote_scan.count_quantity))::bigint, '0'::bigint)), remote_scan.l_quantity
-  Sort Method: quicksort  Memory: 27kB
+  Sort Method: quicksort  Memory: xxx
   ->  HashAggregate (actual rows=50 loops=1)
         Group Key: remote_scan.l_quantity
         ->  Custom Scan (Citus Adaptive) (actual rows=100 loops=1)
@@ -334,13 +371,15 @@ Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
 END;
 DROP TABLE t1, t2;
 -- Test query text output, with ANALYZE ON
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE, VERBOSE TRUE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 Sort (actual rows=50 loops=1)
   Output: remote_scan.l_quantity, (COALESCE((pg_catalog.sum(remote_scan.count_quantity))::bigint, '0'::bigint))
   Sort Key: (COALESCE((pg_catalog.sum(remote_scan.count_quantity))::bigint, '0'::bigint)), remote_scan.l_quantity
-  Sort Method: quicksort  Memory: 27kB
+  Sort Method: quicksort  Memory: xxx
   ->  HashAggregate (actual rows=50 loops=1)
         Output: remote_scan.l_quantity, COALESCE((pg_catalog.sum(remote_scan.count_quantity))::bigint, '0'::bigint)
         Group Key: remote_scan.l_quantity
@@ -597,6 +636,21 @@ Aggregate
                                             ->  Seq Scan on events_1400285 events
                                                   Filter: ((event_type)::text = ANY ('{click,submit,pay}'::text[]))
 -- Union and left join subquery pushdown
+-- enable_group_by_reordering is a new GUC introduced in PG15
+-- it does some optimization of the order of group by keys which results
+-- in a different explain output plan between PG13/14 and PG15
+-- Hence we set that GUC to off.
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
+\gset
+\if :server_version_ge_15
+SET enable_group_by_reordering TO off;
+\endif
+SELECT DISTINCT 1 FROM run_command_on_workers($$ALTER SYSTEM SET enable_group_by_reordering TO off;$$);
+1
+SELECT run_command_on_workers($$SELECT pg_reload_conf()$$);
+(localhost,57637,t,t)
+(localhost,57638,t,t)
 EXPLAIN (COSTS OFF)
 SELECT
 	avg(array_length(events, 1)) AS event_average,
@@ -819,6 +873,14 @@ Sort
                                                                                 Sort Key: events_2.composite_id
                                                                                 ->  Seq Scan on events_1400285 events_2
                                                                                       Filter: ((composite_id >= '(1,-9223372036854775808)'::user_composite_type) AND (composite_id <= '(1,9223372036854775807)'::user_composite_type) AND ((event_type)::text = 'pay'::text))
+\if :server_version_ge_15
+RESET enable_group_by_reordering;
+\endif
+SELECT DISTINCT 1 FROM run_command_on_workers($$ALTER SYSTEM RESET enable_group_by_reordering;$$);
+1
+SELECT run_command_on_workers($$SELECT pg_reload_conf()$$);
+(localhost,57637,t,t)
+(localhost,57638,t,t)
 -- Lateral join subquery pushdown
 -- set subquery_pushdown due to limit in the query
 SET citus.subquery_pushdown to ON;
@@ -988,12 +1050,14 @@ Custom Scan (Citus Adaptive)
         ->  Delete on lineitem_hash_part_360044 lineitem_hash_part
               ->  Seq Scan on lineitem_hash_part_360044 lineitem_hash_part
 -- Test analyze (with TIMING FALSE and SUMMARY FALSE for consistent output)
+SELECT public.plan_normalize_memory($Q$
 EXPLAIN (COSTS FALSE, ANALYZE TRUE, TIMING FALSE, SUMMARY FALSE)
 	SELECT l_quantity, count(*) count_quantity FROM lineitem
 	GROUP BY l_quantity ORDER BY count_quantity, l_quantity;
+$Q$);
 Sort (actual rows=50 loops=1)
   Sort Key: (COALESCE((pg_catalog.sum(remote_scan.count_quantity))::bigint, '0'::bigint)), remote_scan.l_quantity
-  Sort Method: quicksort  Memory: 27kB
+  Sort Method: quicksort  Memory: xxx
   ->  HashAggregate (actual rows=50 loops=1)
         Group Key: remote_scan.l_quantity
         ->  Custom Scan (Citus Adaptive) (actual rows=100 loops=1)
@@ -1376,21 +1440,20 @@ WITH cte1 AS (SELECT * FROM cte1 WHERE EXISTS (SELECT * FROM cte1) LIMIT 5)
 SELECT s FROM cte1 WHERE EXISTS (SELECT * FROM cte1);
 Custom Scan (Citus INSERT ... SELECT)
   INSERT/SELECT method: pull to coordinator
-  ->  Subquery Scan on citus_insert_select_subquery
+  ->  Result
+        One-Time Filter: $3
         CTE cte1
           ->  Function Scan on generate_series s
-        ->  Result
-              One-Time Filter: $3
-              CTE cte1
-                ->  Limit
-                      InitPlan 2 (returns $1)
-                        ->  CTE Scan on cte1 cte1_1
-                      ->  Result
-                            One-Time Filter: $1
-                            ->  CTE Scan on cte1 cte1_2
-              InitPlan 4 (returns $3)
-                ->  CTE Scan on cte1 cte1_3
-              ->  CTE Scan on cte1
+        CTE cte1
+          ->  Limit
+                InitPlan 2 (returns $1)
+                  ->  CTE Scan on cte1 cte1_1
+                ->  Result
+                      One-Time Filter: $1
+                      ->  CTE Scan on cte1 cte1_2
+        InitPlan 4 (returns $3)
+          ->  CTE Scan on cte1 cte1_3
+        ->  CTE Scan on cte1
 EXPLAIN (COSTS OFF)
 INSERT INTO lineitem_hash_part
 ( SELECT s FROM generate_series(1,5) s) UNION
@@ -2912,7 +2975,7 @@ Custom Scan (Citus Adaptive)
         ->  Insert on users_table_2_570028 citus_table_alias
               Conflict Resolution: UPDATE
               Conflict Arbiter Indexes: users_table_2_pkey_570028
-              ->  Seq Scan on users_table_2_570028 users_table_xxx
+              ->  Seq Scan on users_table_2_570028 users_table_2
 EXPLAIN :default_analyze_flags execute p4(20,20);
 Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
   Task Count: 1
@@ -2924,7 +2987,7 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
               Conflict Arbiter Indexes: users_table_2_pkey_570028
               Tuples Inserted: 0
               Conflicting Tuples: 0
-              ->  Seq Scan on users_table_2_570028 users_table_xxx (actual rows=0 loops=1)
+              ->  Seq Scan on users_table_2_570028 users_table_2 (actual rows=0 loops=1)
 -- simple test to confirm we can fetch long (>4KB) plans
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM users_table_2 WHERE value_1::text = '00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000X';
 Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
@@ -2934,7 +2997,7 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
   ->  Task
         Tuple data received from node: 0 bytes
         Node: host=localhost port=xxxxx dbname=regression
-        ->  Seq Scan on users_table_2_570028 users_table_xxx (actual rows=0 loops=1)
+        ->  Seq Scan on users_table_2_570028 users_table_2 (actual rows=0 loops=1)
               Filter: ((value_1)::text = '00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000X'::text)
 -- sorted explain analyze output
 CREATE TABLE explain_analyze_execution_time (a int);
@@ -2995,7 +3058,7 @@ WindowAgg (actual rows=1 loops=1)
         Tasks Shown: One of 2
         ->  Task
               Node: host=localhost port=xxxxx dbname=regression
-              ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+              ->  Seq Scan on distributed_table_1_570032 distributed_table_1 (actual rows=1 loops=1)
 CREATE TABLE distributed_table_2(a int, b int);
 SELECT create_distributed_table('distributed_table_2','a');
 
@@ -3016,7 +3079,7 @@ Limit (actual rows=1 loops=1)
                           Tasks Shown: One of 2
                           ->  Task
                                 Node: host=localhost port=xxxxx dbname=regression
-                                ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+                                ->  Seq Scan on distributed_table_1_570032 distributed_table_1 (actual rows=1 loops=1)
         Task Count: 2
         Tuple data received from nodes: 16 bytes
         Tasks Shown: One of 2
@@ -3027,7 +3090,7 @@ Limit (actual rows=1 loops=1)
                     ->  Nested Loop (actual rows=1 loops=1)
                           Join Filter: (distributed_table_2.b = intermediate_result.r)
                           ->  Function Scan on read_intermediate_result intermediate_result (actual rows=1 loops=1)
-                          ->  Seq Scan on distributed_table_2_570034 distributed_table_xxx (actual rows=1 loops=1)
+                          ->  Seq Scan on distributed_table_2_570034 distributed_table_2 (actual rows=1 loops=1)
 EXPLAIN :default_analyze_flags SELECT FROM (SELECT * FROM reference_table) subquery;
 Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
   Task Count: 1
@@ -3042,7 +3105,7 @@ Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
   Tasks Shown: One of 2
   ->  Task
         Node: host=localhost port=xxxxx dbname=regression
-        ->  Seq Scan on distributed_table_1_570032 distributed_table_xxx (actual rows=1 loops=1)
+        ->  Seq Scan on distributed_table_1_570032 distributed_table_1 (actual rows=1 loops=1)
 CREATE TYPE multi_explain.int_wrapper_type AS (int_field int);
 CREATE TABLE tbl (a int, b multi_explain.int_wrapper_type);
 SELECT create_distributed_table('tbl', 'a');
@@ -3056,5 +3119,49 @@ Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
         Tuple data received from node: 0 bytes
         Node: host=localhost port=xxxxx dbname=regression
         ->  Seq Scan on tbl_570036 tbl (actual rows=0 loops=1)
+PREPARE q1(int_wrapper_type) AS WITH a AS (SELECT * FROM tbl WHERE b = $1 AND a = 1 OFFSET 0) SELECT * FROM a;
+EXPLAIN (COSTS false) EXECUTE q1('(1)');
+Custom Scan (Citus Adaptive)
+  Task Count: 1
+  Tasks Shown: All
+  ->  Task
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on tbl_570036 tbl
+              Filter: ((b = '(1)'::multi_explain.int_wrapper_type) AND (a = 1))
+EXPLAIN :default_analyze_flags EXECUTE q1('(1)');
+Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
+  Task Count: 1
+  Tuple data received from nodes: 0 bytes
+  Tasks Shown: All
+  ->  Task
+        Tuple data received from node: 0 bytes
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  Seq Scan on tbl_570036 tbl (actual rows=0 loops=1)
+              Filter: ((b = $1) AND (a = 1))
+PREPARE q2(int_wrapper_type) AS WITH a AS (UPDATE tbl SET b = $1 WHERE a = 1 RETURNING *) SELECT * FROM a;
+EXPLAIN (COSTS false) EXECUTE q2('(1)');
+Custom Scan (Citus Adaptive)
+  Task Count: 1
+  Tasks Shown: All
+  ->  Task
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  CTE Scan on a
+              CTE a
+                ->  Update on tbl_570036 tbl
+                      ->  Seq Scan on tbl_570036 tbl
+                            Filter: (a = 1)
+EXPLAIN :default_analyze_flags EXECUTE q2('(1)');
+Custom Scan (Citus Adaptive) (actual rows=0 loops=1)
+  Task Count: 1
+  Tuple data received from nodes: 0 bytes
+  Tasks Shown: All
+  ->  Task
+        Tuple data received from node: 0 bytes
+        Node: host=localhost port=xxxxx dbname=regression
+        ->  CTE Scan on a (actual rows=0 loops=1)
+              CTE a
+                ->  Update on tbl_570036 tbl (actual rows=0 loops=1)
+                      ->  Seq Scan on tbl_570036 tbl (actual rows=0 loops=1)
+                            Filter: (a = 1)
 SET client_min_messages TO ERROR;
 DROP SCHEMA multi_explain CASCADE;

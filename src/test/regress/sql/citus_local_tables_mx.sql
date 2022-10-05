@@ -409,6 +409,165 @@ SELECT logicalrelid, partmethod, partkey FROM pg_dist_partition
     WHERE logicalrelid IN ('parent_dropped_col'::regclass, 'parent_dropped_col_2'::regclass)
         ORDER BY logicalrelid;
 
+-- some tests for view propagation on citus local tables
+CREATE TABLE view_tbl_1 (a int);
+CREATE TABLE view_tbl_2 (a int);
+CREATE SCHEMA viewsc;
+-- create dependent views, in a different schema
+-- the first one depends on a citus metadata table
+CREATE VIEW viewsc.prop_view AS SELECT COUNT (*) FROM view_tbl_1 JOIN pg_dist_node ON view_tbl_1.a=pg_dist_node.nodeid;
+CREATE VIEW viewsc.prop_view2 AS SELECT COUNT (*) FROM view_tbl_1;
+SELECT citus_add_local_table_to_metadata('view_tbl_1');
+-- verify the shard view is dropped, and created&propagated the correct view
+SELECT viewname, definition FROM pg_views WHERE viewname LIKE 'prop_view%' ORDER BY viewname;
+
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_views WHERE viewname LIKE 'prop_view%';$$);
+SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid IN('viewsc.prop_view'::regclass::oid, 'viewsc.prop_view2'::regclass::oid);
+-- drop views
+DROP VIEW viewsc.prop_view;
+DROP VIEW viewsc.prop_view2;
+-- verify dropped on workers
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_views WHERE viewname LIKE 'prop_view%';$$);
+
+-- create a view that depends on a pg_ table
+CREATE VIEW viewsc.prop_view3 AS SELECT COUNT (*) FROM view_tbl_1 JOIN pg_namespace ON view_tbl_1.a=pg_namespace.nspowner;
+-- create a view that depends on two different tables, one of them is local for now
+CREATE VIEW viewsc.prop_view4 AS SELECT COUNT (*) FROM view_tbl_1 JOIN view_tbl_2 ON view_tbl_1.a=view_tbl_2.a;
+-- distribute the first table
+SELECT create_distributed_table('view_tbl_1','a');
+-- verify the last view is not distributed
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_views WHERE viewname LIKE 'prop_view%';$$);
+-- add the other table to metadata, so the local view gets distributed
+SELECT citus_add_local_table_to_metadata('view_tbl_2');
+-- verify both views are distributed
+SELECT run_command_on_workers($$SELECT COUNT(*) FROM pg_views WHERE viewname LIKE 'prop_view%';$$);
+SELECT pg_identify_object_as_address(classid, objid, objsubid) from pg_catalog.pg_dist_object where objid IN('viewsc.prop_view3'::regclass::oid, 'viewsc.prop_view4'::regclass::oid);
+
+-- test with fkey cascading
+create table ref_tb(a int primary key);
+SELECT create_reference_table('ref_tb');
+
+CREATE TABLE loc_tb (a int );
+
+CREATE VIEW v100 AS SELECT * FROM loc_tb;
+CREATE VIEW v101 AS SELECT * FROM loc_tb JOIN ref_tb USING (a);
+CREATE VIEW v102 AS SELECT * FROM v101;
+
+-- a regular matview that depends on local table
+CREATE MATERIALIZED VIEW matview_101 AS SELECT * from loc_tb;
+-- a matview and a view that depend on the local table + each other
+CREATE VIEW v103 AS SELECT * from loc_tb;
+CREATE MATERIALIZED VIEW matview_102 AS SELECT * from loc_tb JOIN v103 USING (a);
+CREATE OR REPLACE VIEW v103 AS SELECT * from loc_tb JOIN matview_102 USING (a);
+
+-- fails to add local table to metadata, because of the circular dependency
+ALTER TABLE loc_tb ADD CONSTRAINT fkey FOREIGN KEY (a) references ref_tb(a);
+-- drop the view&matview with circular dependency
+DROP VIEW v103 CASCADE;
+
+-- now it should successfully add to metadata and create the views on workers
+ALTER TABLE loc_tb ADD CONSTRAINT fkey FOREIGN KEY (a) references ref_tb(a);
+-- verify the views are created on workers
+select run_command_on_workers($$SELECT count(*)=0 from citus_local_tables_mx.v100$$);
+select run_command_on_workers($$SELECT count(*)=0 from citus_local_tables_mx.v101$$);
+select run_command_on_workers($$SELECT count(*)=0 from citus_local_tables_mx.v102$$);
+
+CREATE TABLE loc_tb_2 (a int);
+CREATE VIEW v104 AS SELECT * from loc_tb_2;
+
+SET client_min_messages TO DEBUG1;
+-- verify the CREATE command for the view is generated correctly
+ALTER TABLE loc_tb_2 ADD CONSTRAINT fkey_2 FOREIGN KEY (a) references ref_tb(a);
+SET client_min_messages TO WARNING;
+
+-- works fine
+select run_command_on_workers($$SELECT count(*) from citus_local_tables_mx.v100, citus_local_tables_mx.v101, citus_local_tables_mx.v102$$);
+
+-- auto undistribute
+ALTER TABLE loc_tb DROP CONSTRAINT fkey;
+-- fails because fkey is dropped and table is converted to local table
+select run_command_on_workers($$SELECT count(*) from citus_local_tables_mx.v100$$);
+select run_command_on_workers($$SELECT count(*) from citus_local_tables_mx.v101$$);
+select run_command_on_workers($$SELECT count(*) from citus_local_tables_mx.v102$$);
+
+INSERT INTO loc_tb VALUES (1), (2);
+-- test a matview with columnar
+CREATE MATERIALIZED VIEW matview_columnar USING COLUMNAR AS SELECT * FROM loc_tb WITH DATA;
+
+-- cant recreate matviews, because the size limit is set to zero, by the GUC
+SET citus.max_matview_size_to_auto_recreate TO 0;
+SELECT citus_add_local_table_to_metadata('loc_tb', true);
+-- remove the limit
+SET citus.max_matview_size_to_auto_recreate TO -1;
+SELECT citus_add_local_table_to_metadata('loc_tb', true);
+
+-- test REFRESH MAT VIEW
+SELECT * FROM matview_101 ORDER BY a;
+REFRESH MATERIALIZED VIEW matview_101;
+SELECT * FROM matview_101 ORDER BY a;
+
+-- verify columnar matview works on a table added to metadata
+SELECT * FROM matview_columnar;
+REFRESH MATERIALIZED VIEW matview_columnar;
+SELECT * FROM matview_columnar ORDER BY a;
+
+-- test with partitioned tables
+SET citus.use_citus_managed_tables TO ON;
+CREATE TABLE parent_1 (a INT UNIQUE) PARTITION BY RANGE(a);
+SET citus.use_citus_managed_tables TO OFF;
+
+CREATE MATERIALIZED VIEW part_matview1 as SELECT count(*) FROM parent_1 JOIN parent_1 p2 ON (true);
+CREATE MATERIALIZED VIEW part_matview2 as SELECT count(*) FROM parent_1 JOIN part_matview1 on (true);
+
+SELECT count(*) FROM citus_local_tables_mx.part_matview1 JOIN citus_local_tables_mx.part_matview2 ON (true);
+
+CREATE TABLE parent_1_child_1 (a int);
+CREATE TABLE parent_1_child_2 (a int);
+
+-- create matviews on partition tables
+CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM parent_1_child_1;
+CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM parent_1_child_2;
+CREATE MATERIALIZED VIEW mv3 AS SELECT parent_1_child_2.* FROM parent_1_child_2 JOIN parent_1_child_1 USING(a);
+CREATE MATERIALIZED VIEW mv4 AS SELECT * FROM mv3;
+
+alter table parent_1 attach partition parent_1_child_1 FOR VALUES FROM (0) TO (10) ;
+
+-- all matviews work
+SELECT count(*) FROM citus_local_tables_mx.mv1;
+SELECT count(*) FROM citus_local_tables_mx.mv2;
+SELECT count(*) FROM citus_local_tables_mx.mv3;
+SELECT count(*) FROM citus_local_tables_mx.mv4;
+
+-- recreate matviews and verify they still work
+alter table parent_1 attach partition parent_1_child_2 FOR VALUES FROM (10) TO (20);
+
+SELECT count(*) FROM citus_local_tables_mx.mv1;
+SELECT count(*) FROM citus_local_tables_mx.mv2;
+SELECT count(*) FROM citus_local_tables_mx.mv3;
+SELECT count(*) FROM citus_local_tables_mx.mv4;
+
+-- verify matviews work after undistributing
+SELECT undistribute_table('parent_1');
+SELECT count(*) FROM citus_local_tables_mx.mv1;
+SELECT count(*) FROM citus_local_tables_mx.mv2;
+SELECT count(*) FROM citus_local_tables_mx.mv3;
+SELECT count(*) FROM citus_local_tables_mx.mv4;
+
+-- test circular dependency detection among views
+create table root_tbl (a int);
+create materialized view chain_v1 as select * from root_tbl;
+create view chain_v2 as select * from chain_v1;
+create materialized view chain_v3 as select * from chain_v2;
+create or replace view chain_v2 as select * from chain_v1 join chain_v3 using (a);
+-- catch circular dependency and error out
+select citus_add_local_table_to_metadata('root_tbl');
+-- same for create_distributed_table
+select create_distributed_table('root_tbl','a');
+-- fix the circular dependency and add to metadata
+create or replace view chain_v2 as select * from chain_v1;
+select citus_add_local_table_to_metadata('root_tbl');
+-- todo: add more matview tests once 5968 and 6028 are fixed
+
 -- cleanup at exit
 set client_min_messages to error;
 DROP SCHEMA citus_local_tables_mx CASCADE;

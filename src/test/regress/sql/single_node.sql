@@ -1,3 +1,13 @@
+--
+-- SINGLE_NODE
+--
+-- This test file has an alternative output because of the change in the
+-- display of SQL-standard function's arguments in INSERT/SELECT in PG15.
+-- The alternative output can be deleted when we drop support for PG14
+--
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15;
+
 CREATE SCHEMA single_node;
 SET search_path TO single_node;
 SET citus.shard_count TO 4;
@@ -13,9 +23,15 @@ ALTER SYSTEM SET citus.max_cached_conns_per_worker TO 0;
 -- adding the coordinator as inactive is disallowed
 SELECT 1 FROM master_add_inactive_node('localhost', :master_port, groupid => 0);
 
+-- before adding a node we are not officially a coordinator
+SELECT citus_is_coordinator();
+
 -- idempotently add node to allow this test to run without add_coordinator
 SET client_min_messages TO WARNING;
 SELECT 1 FROM citus_set_coordinator_host('localhost', :master_port);
+
+-- after adding a node we are officially a coordinator
+SELECT citus_is_coordinator();
 
 -- coordinator cannot be disabled
 SELECT 1 FROM citus_disable_node('localhost', :master_port);
@@ -246,6 +262,42 @@ INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT ON CONST
 
 DROP TABLE upsert_test;
 
+CREATE TABLE relation_tracking_table_1(id int, nonid int);
+SELECT create_distributed_table('relation_tracking_table_1', 'id', colocate_with := 'none');
+INSERT INTO relation_tracking_table_1 select generate_series(6, 10000, 1), 0;
+
+CREATE or REPLACE function foo()
+returns setof relation_tracking_table_1
+AS $$
+BEGIN
+RETURN query select * from relation_tracking_table_1 order by 1 limit 10;
+end;
+$$ language plpgsql;
+
+CREATE TABLE relation_tracking_table_2 (id int, nonid int);
+
+-- use the relation-access in this session
+select foo();
+
+-- we should be able to use sequential mode, as the previous multi-shard
+-- relation access has been cleaned-up
+BEGIN;
+SET LOCAL citus.multi_shard_modify_mode TO sequential;
+INSERT INTO relation_tracking_table_2 select generate_series(6, 1000, 1), 0;
+SELECT create_distributed_table('relation_tracking_table_2', 'id', colocate_with := 'none');
+SELECT count(*) FROM relation_tracking_table_2;
+ROLLBACK;
+
+BEGIN;
+INSERT INTO relation_tracking_table_2 select generate_series(6, 1000, 1), 0;
+SELECT create_distributed_table('relation_tracking_table_2', 'id', colocate_with := 'none');
+SELECT count(*) FROM relation_tracking_table_2;
+COMMIT;
+
+SET client_min_messages TO ERROR;
+DROP TABLE relation_tracking_table_2, relation_tracking_table_1 CASCADE;
+RESET client_min_messages;
+
 CREATE SCHEMA "Quoed.Schema";
 SET search_path TO "Quoed.Schema";
 
@@ -274,7 +326,9 @@ ALTER TABLE simple_table_name RENAME CONSTRAINT "looo oooo ooooo ooooooooooooooo
 --INSERT INTO simple_table_name (part_key, other_col) VALUES (1, 1) ON CONFLICT ON CONSTRAINT  simple_constraint_name DO NOTHING RETURNING *;
 
 SET search_path TO single_node;
+SET client_min_messages TO ERROR;
 DROP SCHEMA  "Quoed.Schema" CASCADE;
+RESET client_min_messages;
 
 -- test partitioned index creation with long name
 CREATE TABLE test_index_creation1
@@ -1101,10 +1155,6 @@ BEGIN;
 	UPDATE another_schema_table SET b = b + 1 WHERE a = 1;
 	SELECT coordinated_transaction_should_use_2PC();
 ROLLBACK;
-
--- same without transaction block
-WITH cte_1 AS (UPDATE another_schema_table SET b = b + 1 WHERE a = 1 RETURNING *)
-SELECT coordinated_transaction_should_use_2PC() FROM cte_1;
 
 -- if the local execution is disabled, we cannot failover to
 -- local execution and the queries would fail

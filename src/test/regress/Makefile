@@ -16,15 +16,19 @@ MAKEFILE_DIR := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 export PATH := $(MAKEFILE_DIR)/bin:$(PATH)
 export PG_REGRESS_DIFF_OPTS = -dU10 -w
 # Use lower isolation test timeout, the 5 minute default is waaay too long for
-# us so we use 5 seconds instead. We should detect blockages very quickly and
-# the queries we run are also very fast.
-export PGISOLATIONTIMEOUT = 5
+# us so we use 60 seconds instead. We should detect blockages very quickly and
+# most queries that we run are also very fast. So fast even that 60 seconds is
+# usually too long. However, any commands involving logical replication can be
+# quite slow, especially shard splits and especially on CI. So we still keep
+# this value at the pretty high 60 seconds because even those slow commands are
+# definitly stuck when they take longer than that.
+export PGISOLATIONTIMEOUT = 60
 
 ##
 ## Citus regression support
 ##
 MULTI_INSTALLDIR=$(CURDIR)/tmp_check/install
-pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)"  --postgres-srcdir="$(postgres_abs_srcdir)"
+pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)" --postgres-srcdir="$(postgres_abs_srcdir)" --citus_abs_srcdir="$(citus_abs_srcdir)"
 MULTI_REGRESS_OPTS = --inputdir=$(citus_abs_srcdir) $(pg_regress_locale_flags) --launcher="$(citus_abs_srcdir)/log_test_times"
 
 pg_upgrade_check = $(citus_abs_srcdir)/citus_tests/upgrade/pg_upgrade_test.py
@@ -34,16 +38,15 @@ arbitrary_config_check = $(citus_abs_srcdir)/citus_tests/arbitrary_configs/citus
 template_isolation_files = $(shell find $(citus_abs_srcdir)/spec/ -name '*.spec')
 generated_isolation_files = $(patsubst $(citus_abs_srcdir)/spec/%,$(citus_abs_srcdir)/build/specs/%,$(template_isolation_files))
 
-# Test input and expected files.  These are created by pg_regress itself, so we
-# don't have a rule to create them.  We do need rules to clean them however.
-input_files := $(patsubst $(citus_abs_srcdir)/input/%.source,sql/%.sql, $(wildcard $(citus_abs_srcdir)/input/*.source))
-output_files := $(patsubst $(citus_abs_srcdir)/output/%.source,expected/%.out, $(wildcard $(citus_abs_srcdir)/output/*.source))
+vanilla_diffs_file = $(citus_abs_srcdir)/pg_vanilla_outputs/$(MAJORVERSION)/regression.diffs
 
 # have make check actually run all tests, but keep check-full as an
 # intermediate, for muscle memory backward compatibility.
-check: check-full
+check: check-full check-enterprise-full
 # check-full triggers all tests that ought to be run routinely
-check-full: check-multi check-multi-mx check-multi-1 check-worker check-operations check-follower-cluster check-isolation check-failure
+check-full: check-multi check-multi-mx check-multi-1 check-operations check-follower-cluster check-isolation check-failure check-split
+# check-enterprise-full triggers all enterprise specific tests
+check-enterprise-full: check-enterprise check-enterprise-isolation check-enterprise-failure
 
 
 ISOLATION_DEPDIR=.deps/isolation
@@ -98,12 +101,6 @@ ifndef CITUS_VALGRIND_LOG_FILE
 CITUS_VALGRIND_LOG_FILE := citus_valgrind_test_log.txt
 endif
 
-# using pg_regress_multi_check unnecessarily starts up multiple nodes, which isn't needed
-# for check-worker. But that's harmless besides a few cycles.
-check-worker: all
-	$(pg_regress_multi_check) --load-extension=citus \
-	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/worker_schedule $(EXTRA_TESTS)
-
 # check-base only sets up a testing environment so you can specify all your tests using EXTRA_TESTS
 check-base: all
 	$(pg_regress_multi_check) --load-extension=citus \
@@ -136,6 +133,9 @@ check-multi: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
+check-enterprise: all
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/enterprise_schedule $(EXTRA_TESTS)
 check-multi-1: all
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_1_schedule $(EXTRA_TESTS)
@@ -167,17 +167,31 @@ check-isolation: all  $(isolation_test_files)
 	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
 	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/isolation_schedule $(EXTRA_TESTS)
 
+check-enterprise-isolation: all $(isolation_test_files)
+	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
+	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/enterprise_isolation_schedule $(EXTRA_TESTS)
+
+# we have separate targets for logical replication tests because they take very long to complete
+# hence this increases parallelism a lot without sacrifing any coverage.
+check-enterprise-isolation-logicalrep-1: all $(isolation_test_files)
+	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
+	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/enterprise_isolation_logicalrep_1_schedule $(EXTRA_TESTS)
+
+check-enterprise-isolation-logicalrep-2: all $(isolation_test_files)
+	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
+	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/enterprise_isolation_logicalrep_2_schedule $(EXTRA_TESTS)
+
+check-enterprise-isolation-logicalrep-3: all $(isolation_test_files)
+	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
+	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/enterprise_isolation_logicalrep_3_schedule $(EXTRA_TESTS)
+
 check-isolation-base: all  $(isolation_test_files)
 	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
 	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/base_isolation_schedule $(EXTRA_TESTS)
 
-check-vanilla: all
-	# it is possible that sometimes vanilla tests will fail, which is related to postgres.
-	# So we try it once more if it fails to prevent some failures in our CI.
-	${MAKE} check-vanilla-internal  || ${MAKE} check-vanilla-internal
-
-check-vanilla-internal:
-	$(pg_regress_multi_check) --load-extension=citus --vanillatest
+# ci takes regression.diffs output from another location, so copy diffs file at the end.
+check-vanilla:
+	$(pg_regress_multi_check) --vanillatest || (cp $(vanilla_diffs_file) $(citus_abs_srcdir)/regression.diffs)
 
 check-multi-mx: all
 	$(pg_regress_multi_check) --load-extension=citus \
@@ -192,12 +206,16 @@ check-operations: all
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/operations_schedule $(EXTRA_TESTS)
 
 check-columnar:
-	$(pg_regress_multi_check) --load-extension=citus \
+	$(pg_regress_multi_check) --load-extension=citus_columnar --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/columnar_schedule $(EXTRA_TESTS)
 
 check-columnar-isolation: all  $(isolation_test_files)
 	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
 	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/columnar_isolation_schedule $(EXTRA_TESTS)
+
+check-split: all
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/split_schedule $(EXTRA_TESTS)
 
 check-failure: all
 	$(pg_regress_multi_check) --load-extension=citus --mitmproxy \
@@ -206,6 +224,10 @@ check-failure: all
 check-failure-base: all
 	$(pg_regress_multi_check) --load-extension=citus --mitmproxy \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/failure_base_schedule $(EXTRA_TESTS)
+
+check-enterprise-failure: all
+	$(pg_regress_multi_check) --load-extension=citus --mitmproxy \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/enterprise_failure_schedule $(EXTRA_TESTS)
 
 check-pg-upgrade:
 	$(pg_upgrade_check) --old-bindir=$(old-bindir) --new-bindir=$(new-bindir) --pgxsdir=$(pgxsdir)
@@ -248,7 +270,7 @@ clean-upgrade-artifacts:
 	rm -rf $(citus_abs_srcdir)/tmp_citus_tarballs/ $(citus_abs_srcdir)/tmp_citus_upgrade/ /tmp/citus_copy/
 
 clean distclean maintainer-clean:
-	rm -f $(output_files) $(input_files)
+	rm -rf input/ output/
 	rm -rf tmp_check/
 	rm -rf tmp_citus_test/
 

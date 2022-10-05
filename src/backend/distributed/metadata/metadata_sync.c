@@ -50,6 +50,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/metadata_utility.h"
+#include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata/pg_dist_object.h"
 #include "distributed/multi_executor.h"
@@ -62,6 +63,8 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/utils/function.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
@@ -70,6 +73,7 @@
 #include "executor/spi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
@@ -95,6 +99,8 @@ static char * SchemaOwnerName(Oid objectId);
 static bool HasMetadataWorkers(void);
 static void CreateShellTableOnWorkers(Oid relationId);
 static void CreateTableMetadataOnWorkers(Oid relationId);
+static void CreateDependingViewsOnWorkers(Oid relationId);
+static NodeMetadataSyncResult SyncNodeMetadataToNodesOptional(void);
 static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 											bool citusTableWithNoDistKey);
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
@@ -110,6 +116,11 @@ static List * GetObjectsForGrantStmt(ObjectType objectType, Oid objectId);
 static AccessPriv * GetAccessPrivObjectForGrantStmt(char *permission);
 static List * GenerateGrantOnSchemaQueriesFromAclItem(Oid schemaOid,
 													  AclItem *aclItem);
+static List * GenerateGrantOnFunctionQueriesFromAclItem(Oid schemaOid,
+														AclItem *aclItem);
+static List * GrantOnSequenceDDLCommands(Oid sequenceOid);
+static List * GenerateGrantOnSequenceQueriesFromAclItem(Oid sequenceOid,
+														AclItem *aclItem);
 static void SetLocalReplicateReferenceTablesOnActivate(bool state);
 static char * GenerateSetRoleQuery(Oid roleOid);
 static void MetadataSyncSigTermHandler(SIGNAL_ARGS);
@@ -136,6 +147,7 @@ static char * RemoteTypeIdExpression(Oid typeId);
 static char * RemoteCollationIdExpression(Oid colocationId);
 
 
+PG_FUNCTION_INFO_V1(start_metadata_sync_to_all_nodes);
 PG_FUNCTION_INFO_V1(start_metadata_sync_to_node);
 PG_FUNCTION_INFO_V1(stop_metadata_sync_to_node);
 PG_FUNCTION_INFO_V1(worker_record_sequence_dependency);
@@ -147,6 +159,7 @@ PG_FUNCTION_INFO_V1(worker_record_sequence_dependency);
  * or regular users as long as the regular user owns the input object.
  */
 PG_FUNCTION_INFO_V1(citus_internal_add_partition_metadata);
+PG_FUNCTION_INFO_V1(citus_internal_delete_partition_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_shard_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_placement_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_update_placement_metadata);
@@ -189,6 +202,33 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	SetLocalReplicateReferenceTablesOnActivate(prevReplicateRefTablesOnActivate);
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * start_metadata_sync_to_all_nodes function sets hasmetadata column of
+ * all the primary worker nodes to true, and then activate nodes without
+ * replicating reference tables.
+ */
+Datum
+start_metadata_sync_to_all_nodes(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	EnsureSuperUser();
+	EnsureCoordinator();
+
+	List *workerNodes = ActivePrimaryNonCoordinatorNodeList(RowShareLock);
+
+	bool prevReplicateRefTablesOnActivate = ReplicateReferenceTablesOnActivate;
+	SetLocalReplicateReferenceTablesOnActivate(false);
+
+	ActivateNodeList(workerNodes);
+	TransactionModifiedNodeMetadata = true;
+
+	SetLocalReplicateReferenceTablesOnActivate(prevReplicateRefTablesOnActivate);
+
+	PG_RETURN_BOOL(true);
 }
 
 
@@ -271,7 +311,8 @@ SyncNodeMetadataToNode(const char *nodeNameString, int32 nodePort)
  * SyncCitusTableMetadata syncs citus table metadata to worker nodes with metadata.
  * Our definition of metadata includes the shell table and its inter relations with
  * other shell tables, corresponding pg_dist_object, pg_dist_partiton, pg_dist_shard
- * and pg_dist_shard placement entries.
+ * and pg_dist_shard placement entries. This function also propagates the views that
+ * depend on the given relation, to the metadata workers.
  */
 void
 SyncCitusTableMetadata(Oid relationId)
@@ -286,6 +327,50 @@ SyncCitusTableMetadata(Oid relationId)
 		ObjectAddressSet(relationAddress, RelationRelationId, relationId);
 		MarkObjectDistributed(&relationAddress);
 	}
+
+	CreateDependingViewsOnWorkers(relationId);
+}
+
+
+/*
+ * CreateDependingViewsOnWorkers takes a relationId and creates the views that depend on
+ * that relation on workers with metadata. Propagated views are marked as distributed.
+ */
+static void
+CreateDependingViewsOnWorkers(Oid relationId)
+{
+	List *views = GetDependingViews(relationId);
+
+	if (list_length(views) < 1)
+	{
+		/* no view to propagate */
+		return;
+	}
+
+	SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
+
+	Oid viewOid = InvalidOid;
+	foreach_oid(viewOid, views)
+	{
+		if (!ShouldMarkRelationDistributed(viewOid))
+		{
+			continue;
+		}
+
+		ObjectAddress *viewAddress = palloc0(sizeof(ObjectAddress));
+		ObjectAddressSet(*viewAddress, RelationRelationId, viewOid);
+		EnsureAllObjectDependenciesExistOnAllNodes(list_make1(viewAddress));
+
+		char *createViewCommand = CreateViewDDLCommand(viewOid);
+		char *alterViewOwnerCommand = AlterViewOwnerCommand(viewOid);
+
+		SendCommandToWorkersWithMetadata(createViewCommand);
+		SendCommandToWorkersWithMetadata(alterViewOwnerCommand);
+
+		MarkObjectDistributed(viewAddress);
+	}
+
+	SendCommandToWorkersWithMetadata(ENABLE_DDL_PROPAGATION);
 }
 
 
@@ -424,6 +509,25 @@ ClusterHasKnownMetadataWorkers()
 
 
 /*
+ * ShouldSyncUserCommandForObject checks if the user command should be synced to the
+ * worker nodes for the given object.
+ */
+bool
+ShouldSyncUserCommandForObject(ObjectAddress objectAddress)
+{
+	if (objectAddress.classId == RelationRelationId)
+	{
+		Oid relOid = objectAddress.objectId;
+		return ShouldSyncTableMetadata(relOid) ||
+			   ShouldSyncSequenceMetadata(relOid) ||
+			   get_rel_relkind(relOid) == RELKIND_VIEW;
+	}
+
+	return false;
+}
+
+
+/*
  * ShouldSyncTableMetadata checks if the metadata of a distributed table should be
  * propagated to metadata workers, i.e. the table is a hash distributed table or
  * reference/citus local table.
@@ -488,6 +592,26 @@ ShouldSyncTableMetadataInternal(bool hashDistributed, bool citusTableWithNoDistK
 
 
 /*
+ * ShouldSyncSequenceMetadata checks if the metadata of a sequence should be
+ * propagated to metadata workers, i.e. the sequence is marked as distributed
+ */
+bool
+ShouldSyncSequenceMetadata(Oid relationId)
+{
+	if (!OidIsValid(relationId) || !(get_rel_relkind(relationId) == RELKIND_SEQUENCE))
+	{
+		return false;
+	}
+
+	ObjectAddress *sequenceAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*sequenceAddress, RelationRelationId, relationId);
+
+	return IsAnyObjectDistributed(list_make1(sequenceAddress));
+}
+
+
+/*
+ * SyncMetadataSnapshotToNode does the following:
  * SyncNodeMetadataSnapshotToNode does the following:
  *  1. Sets the localGroupId on the worker so the worker knows which tuple in
  *     pg_dist_node represents itself.
@@ -522,10 +646,10 @@ SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError)
 	 */
 	if (raiseOnError)
 	{
-		SendMetadataCommandListToWorkerInCoordinatedTransaction(workerNode->workerName,
-																workerNode->workerPort,
-																currentUser,
-																recreateMetadataSnapshotCommandList);
+		SendMetadataCommandListToWorkerListInCoordinatedTransaction(list_make1(
+																		workerNode),
+																	currentUser,
+																	recreateMetadataSnapshotCommandList);
 		return true;
 	}
 	else
@@ -1089,6 +1213,24 @@ DistributionDeleteCommand(const char *schemaName, const char *tableName)
 
 
 /*
+ * DistributionDeleteMetadataCommand returns a query to delete pg_dist_partition
+ * metadata from a worker node for a given table.
+ */
+char *
+DistributionDeleteMetadataCommand(Oid relationId)
+{
+	StringInfo deleteCommand = makeStringInfo();
+	char *qualifiedRelationName = generate_qualified_relation_name(relationId);
+
+	appendStringInfo(deleteCommand,
+					 "SELECT pg_catalog.citus_internal_delete_partition_metadata(%s)",
+					 quote_literal_cstr(qualifiedRelationName));
+
+	return deleteCommand->data;
+}
+
+
+/*
  * TableOwnerResetCommand generates a commands that can be executed
  * to reset the table owner.
  */
@@ -1250,6 +1392,23 @@ ShardListInsertCommand(List *shardIntervalList)
 
 
 /*
+ * ShardListDeleteCommand generates a command list that can be executed to delete
+ * shard and shard placement metadata for the given shard.
+ */
+List *
+ShardDeleteCommandList(ShardInterval *shardInterval)
+{
+	uint64 shardId = shardInterval->shardId;
+
+	StringInfo deleteShardCommand = makeStringInfo();
+	appendStringInfo(deleteShardCommand,
+					 "SELECT citus_internal_delete_shard_metadata(%ld);", shardId);
+
+	return list_make1(deleteShardCommand->data);
+}
+
+
+/*
  * NodeDeleteCommand generate a command that can be
  * executed to delete the metadata for a worker node.
  */
@@ -1383,6 +1542,8 @@ DDLCommandsForSequence(Oid sequenceOid, char *ownerName)
 
 	sequenceDDLList = lappend(sequenceDDLList, wrappedSequenceDef->data);
 	sequenceDDLList = lappend(sequenceDDLList, sequenceGrantStmt->data);
+	sequenceDDLList = list_concat(sequenceDDLList, GrantOnSequenceDDLCommands(
+									  sequenceOid));
 
 	return sequenceDDLList;
 }
@@ -1438,10 +1599,10 @@ GetAttributeTypeOid(Oid relationId, AttrNumber attnum)
  * attribute of the relationId.
  */
 void
-GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
-								  List **dependentSequenceList, AttrNumber attnum)
+GetDependentSequencesWithRelation(Oid relationId, List **seqInfoList,
+								  AttrNumber attnum)
 {
-	Assert(*attnumList == NIL && *dependentSequenceList == NIL);
+	Assert(*seqInfoList == NIL);
 
 	List *attrdefResult = NIL;
 	List *attrdefAttnumResult = NIL;
@@ -1478,8 +1639,25 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 			deprec->refobjsubid != 0 &&
 			deprec->deptype == DEPENDENCY_AUTO)
 		{
+			/*
+			 * We are going to generate corresponding SequenceInfo
+			 * in the following loop.
+			 */
 			attrdefResult = lappend_oid(attrdefResult, deprec->objid);
 			attrdefAttnumResult = lappend_int(attrdefAttnumResult, deprec->refobjsubid);
+		}
+		else if (deprec->deptype == DEPENDENCY_AUTO &&
+				 deprec->refobjsubid != 0 &&
+				 deprec->classid == RelationRelationId &&
+				 get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
+		{
+			SequenceInfo *seqInfo = (SequenceInfo *) palloc(sizeof(SequenceInfo));
+
+			seqInfo->sequenceOid = deprec->objid;
+			seqInfo->attributeNumber = deprec->refobjsubid;
+			seqInfo->isNextValDefault = false;
+
+			*seqInfoList = lappend(*seqInfoList, seqInfo);
 		}
 	}
 
@@ -1487,13 +1665,10 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 
 	table_close(depRel, AccessShareLock);
 
-	ListCell *attrdefOidCell = NULL;
-	ListCell *attrdefAttnumCell = NULL;
-	forboth(attrdefOidCell, attrdefResult, attrdefAttnumCell, attrdefAttnumResult)
+	AttrNumber attrdefAttnum = InvalidAttrNumber;
+	Oid attrdefOid = InvalidOid;
+	forboth_int_oid(attrdefAttnum, attrdefAttnumResult, attrdefOid, attrdefResult)
 	{
-		Oid attrdefOid = lfirst_oid(attrdefOidCell);
-		AttrNumber attrdefAttnum = lfirst_int(attrdefAttnumCell);
-
 		List *sequencesFromAttrDef = GetSequencesFromAttrDef(attrdefOid);
 
 		/* to simplify and eliminate cases like "DEFAULT nextval('..') - nextval('..')" */
@@ -1507,9 +1682,13 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 
 		if (list_length(sequencesFromAttrDef) == 1)
 		{
-			*dependentSequenceList = list_concat(*dependentSequenceList,
-												 sequencesFromAttrDef);
-			*attnumList = lappend_int(*attnumList, attrdefAttnum);
+			SequenceInfo *seqInfo = (SequenceInfo *) palloc(sizeof(SequenceInfo));
+
+			seqInfo->sequenceOid = linitial_oid(sequencesFromAttrDef);
+			seqInfo->attributeNumber = attrdefAttnum;
+			seqInfo->isNextValDefault = true;
+
+			*seqInfoList = lappend(*seqInfoList, seqInfo);
 		}
 	}
 }
@@ -1689,14 +1868,10 @@ SequenceDependencyCommandList(Oid relationId)
 
 	ExtractDefaultColumnsAndOwnedSequences(relationId, &columnNameList, &sequenceIdList);
 
-	ListCell *columnNameCell = NULL;
-	ListCell *sequenceIdCell = NULL;
-
-	forboth(columnNameCell, columnNameList, sequenceIdCell, sequenceIdList)
+	char *columnName = NULL;
+	Oid sequenceId = InvalidOid;
+	forboth_ptr_oid(columnName, columnNameList, sequenceId, sequenceIdList)
 	{
-		char *columnName = lfirst(columnNameCell);
-		Oid sequenceId = lfirst_oid(sequenceIdCell);
-
 		if (!OidIsValid(sequenceId))
 		{
 			/*
@@ -1849,7 +2024,7 @@ GrantOnSchemaDDLCommands(Oid schemaOid)
 
 
 /*
- * GenerateGrantOnSchemaQueryFromACL generates a query string for replicating a users permissions
+ * GenerateGrantOnSchemaQueryFromACLItem generates a query string for replicating a users permissions
  * on a schema.
  */
 List *
@@ -1933,6 +2108,35 @@ GetObjectsForGrantStmt(ObjectType objectType, Oid objectId)
 			return list_make1(makeString(get_namespace_name(objectId)));
 		}
 
+		/* enterprise supported object types */
+		case OBJECT_FUNCTION:
+		case OBJECT_AGGREGATE:
+		case OBJECT_PROCEDURE:
+		{
+			ObjectWithArgs *owa = ObjectWithArgsFromOid(objectId);
+			return list_make1(owa);
+		}
+
+		case OBJECT_FDW:
+		{
+			ForeignDataWrapper *fdw = GetForeignDataWrapper(objectId);
+			return list_make1(makeString(fdw->fdwname));
+		}
+
+		case OBJECT_FOREIGN_SERVER:
+		{
+			ForeignServer *server = GetForeignServer(objectId);
+			return list_make1(makeString(server->servername));
+		}
+
+		case OBJECT_SEQUENCE:
+		{
+			Oid namespaceOid = get_rel_namespace(objectId);
+			RangeVar *sequence = makeRangeVar(get_namespace_name(namespaceOid),
+											  get_rel_name(objectId), -1);
+			return list_make1(sequence);
+		}
+
 		default:
 		{
 			elog(ERROR, "unsupported object type for GRANT");
@@ -1940,6 +2144,215 @@ GetObjectsForGrantStmt(ObjectType objectType, Oid objectId)
 	}
 
 	return NIL;
+}
+
+
+/*
+ * GrantOnFunctionDDLCommands creates a list of ddl command for replicating the permissions
+ * of roles on distributed functions.
+ */
+List *
+GrantOnFunctionDDLCommands(Oid functionOid)
+{
+	HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionOid));
+
+	bool isNull = true;
+	Datum aclDatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proacl,
+									 &isNull);
+	if (isNull)
+	{
+		ReleaseSysCache(proctup);
+		return NIL;
+	}
+
+	Acl *acl = DatumGetAclPCopy(aclDatum);
+	AclItem *aclDat = ACL_DAT(acl);
+	int aclNum = ACL_NUM(acl);
+	List *commands = NIL;
+
+	ReleaseSysCache(proctup);
+
+	for (int i = 0; i < aclNum; i++)
+	{
+		commands = list_concat(commands,
+							   GenerateGrantOnFunctionQueriesFromAclItem(
+								   functionOid,
+								   &aclDat[i]));
+	}
+
+	return commands;
+}
+
+
+/*
+ * GrantOnForeignServerDDLCommands creates a list of ddl command for replicating the
+ * permissions of roles on distributed foreign servers.
+ */
+List *
+GrantOnForeignServerDDLCommands(Oid serverId)
+{
+	HeapTuple servertup = SearchSysCache1(FOREIGNSERVEROID, ObjectIdGetDatum(serverId));
+
+	bool isNull = true;
+	Datum aclDatum = SysCacheGetAttr(FOREIGNSERVEROID, servertup,
+									 Anum_pg_foreign_server_srvacl, &isNull);
+	if (isNull)
+	{
+		ReleaseSysCache(servertup);
+		return NIL;
+	}
+
+	Acl *aclEntry = DatumGetAclPCopy(aclDatum);
+	AclItem *privileges = ACL_DAT(aclEntry);
+	int numberOfPrivsGranted = ACL_NUM(aclEntry);
+	List *commands = NIL;
+
+	ReleaseSysCache(servertup);
+
+	for (int i = 0; i < numberOfPrivsGranted; i++)
+	{
+		commands = list_concat(commands,
+							   GenerateGrantOnForeignServerQueriesFromAclItem(
+								   serverId,
+								   &privileges[i]));
+	}
+
+	return commands;
+}
+
+
+/*
+ * GenerateGrantOnForeignServerQueriesFromAclItem generates a query string for
+ * replicating a users permissions on a foreign server.
+ */
+List *
+GenerateGrantOnForeignServerQueriesFromAclItem(Oid serverId, AclItem *aclItem)
+{
+	/* privileges to be granted */
+	AclMode permissions = ACLITEM_GET_PRIVS(*aclItem) & ACL_ALL_RIGHTS_FOREIGN_SERVER;
+
+	/* WITH GRANT OPTION clause */
+	AclMode grants = ACLITEM_GET_GOPTIONS(*aclItem) & ACL_ALL_RIGHTS_FOREIGN_SERVER;
+
+	/*
+	 * seems unlikely but we check if there is a grant option in the list without the actual permission
+	 */
+	Assert(!(grants & ACL_USAGE) || (permissions & ACL_USAGE));
+
+	Oid granteeOid = aclItem->ai_grantee;
+	List *queries = NIL;
+
+	/* switch to the role which had granted acl */
+	queries = lappend(queries, GenerateSetRoleQuery(aclItem->ai_grantor));
+
+	/* generate the GRANT stmt that will be executed by the grantor role */
+	if (permissions & ACL_USAGE)
+	{
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  OBJECT_FOREIGN_SERVER, granteeOid, serverId,
+										  "USAGE", grants & ACL_USAGE));
+		queries = lappend(queries, query);
+	}
+
+	/* reset the role back */
+	queries = lappend(queries, "RESET ROLE");
+
+	return queries;
+}
+
+
+/*
+ * GenerateGrantOnFunctionQueryFromACLItem generates a query string for replicating a users permissions
+ * on a distributed function.
+ */
+List *
+GenerateGrantOnFunctionQueriesFromAclItem(Oid functionOid, AclItem *aclItem)
+{
+	AclMode permissions = ACLITEM_GET_PRIVS(*aclItem) & ACL_ALL_RIGHTS_FUNCTION;
+	AclMode grants = ACLITEM_GET_GOPTIONS(*aclItem) & ACL_ALL_RIGHTS_FUNCTION;
+
+	/*
+	 * seems unlikely but we check if there is a grant option in the list without the actual permission
+	 */
+	Assert(!(grants & ACL_EXECUTE) || (permissions & ACL_EXECUTE));
+	Oid granteeOid = aclItem->ai_grantee;
+	List *queries = NIL;
+
+	queries = lappend(queries, GenerateSetRoleQuery(aclItem->ai_grantor));
+
+	if (permissions & ACL_EXECUTE)
+	{
+		char prokind = get_func_prokind(functionOid);
+		ObjectType objectType;
+
+		if (prokind == PROKIND_FUNCTION)
+		{
+			objectType = OBJECT_FUNCTION;
+		}
+		else if (prokind == PROKIND_PROCEDURE)
+		{
+			objectType = OBJECT_PROCEDURE;
+		}
+		else if (prokind == PROKIND_AGGREGATE)
+		{
+			objectType = OBJECT_AGGREGATE;
+		}
+		else
+		{
+			ereport(ERROR, (errmsg("unsupported prokind"),
+							errdetail("GRANT commands on procedures are propagated only "
+									  "for procedures, functions, and aggregates.")));
+		}
+
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  objectType, granteeOid, functionOid, "EXECUTE",
+										  grants & ACL_EXECUTE));
+		queries = lappend(queries, query);
+	}
+
+	queries = lappend(queries, "RESET ROLE");
+
+	return queries;
+}
+
+
+/*
+ * GenerateGrantOnFDWQueriesFromAclItem generates a query string for
+ * replicating a users permissions on a foreign data wrapper.
+ */
+List *
+GenerateGrantOnFDWQueriesFromAclItem(Oid FDWId, AclItem *aclItem)
+{
+	/* privileges to be granted */
+	AclMode permissions = ACLITEM_GET_PRIVS(*aclItem) & ACL_ALL_RIGHTS_FDW;
+
+	/* WITH GRANT OPTION clause */
+	AclMode grants = ACLITEM_GET_GOPTIONS(*aclItem) & ACL_ALL_RIGHTS_FDW;
+
+	/*
+	 * seems unlikely but we check if there is a grant option in the list without the actual permission
+	 */
+	Assert(!(grants & ACL_USAGE) || (permissions & ACL_USAGE));
+
+	Oid granteeOid = aclItem->ai_grantee;
+	List *queries = NIL;
+
+	/* switch to the role which had granted acl */
+	queries = lappend(queries, GenerateSetRoleQuery(aclItem->ai_grantor));
+
+	/* generate the GRANT stmt that will be executed by the grantor role */
+	if (permissions & ACL_USAGE)
+	{
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  OBJECT_FDW, granteeOid, FDWId, "USAGE",
+										  grants & ACL_USAGE));
+		queries = lappend(queries, query);
+	}
+
+	/* reset the role back */
+	queries = lappend(queries, "RESET ROLE");
+
+	return queries;
 }
 
 
@@ -1955,6 +2368,93 @@ GetAccessPrivObjectForGrantStmt(char *permission)
 	accessPriv->cols = NULL;
 
 	return accessPriv;
+}
+
+
+/*
+ * GrantOnSequenceDDLCommands creates a list of ddl command for replicating the permissions
+ * of roles on distributed sequences.
+ */
+static List *
+GrantOnSequenceDDLCommands(Oid sequenceOid)
+{
+	HeapTuple seqtup = SearchSysCache1(RELOID, ObjectIdGetDatum(sequenceOid));
+	bool isNull = false;
+	Datum aclDatum = SysCacheGetAttr(RELOID, seqtup, Anum_pg_class_relacl,
+									 &isNull);
+	if (isNull)
+	{
+		ReleaseSysCache(seqtup);
+		return NIL;
+	}
+
+	Acl *acl = DatumGetAclPCopy(aclDatum);
+	AclItem *aclDat = ACL_DAT(acl);
+	int aclNum = ACL_NUM(acl);
+	List *commands = NIL;
+
+	ReleaseSysCache(seqtup);
+
+	for (int i = 0; i < aclNum; i++)
+	{
+		commands = list_concat(commands,
+							   GenerateGrantOnSequenceQueriesFromAclItem(
+								   sequenceOid,
+								   &aclDat[i]));
+	}
+
+	return commands;
+}
+
+
+/*
+ * GenerateGrantOnSequenceQueriesFromAclItem generates a query string for replicating a users permissions
+ * on a distributed sequence.
+ */
+static List *
+GenerateGrantOnSequenceQueriesFromAclItem(Oid sequenceOid, AclItem *aclItem)
+{
+	AclMode permissions = ACLITEM_GET_PRIVS(*aclItem) & ACL_ALL_RIGHTS_SEQUENCE;
+	AclMode grants = ACLITEM_GET_GOPTIONS(*aclItem) & ACL_ALL_RIGHTS_SEQUENCE;
+
+	/*
+	 * seems unlikely but we check if there is a grant option in the list without the actual permission
+	 */
+	Assert(!(grants & ACL_USAGE) || (permissions & ACL_USAGE));
+	Assert(!(grants & ACL_SELECT) || (permissions & ACL_SELECT));
+	Assert(!(grants & ACL_UPDATE) || (permissions & ACL_UPDATE));
+
+	Oid granteeOid = aclItem->ai_grantee;
+	List *queries = NIL;
+	queries = lappend(queries, GenerateSetRoleQuery(aclItem->ai_grantor));
+
+	if (permissions & ACL_USAGE)
+	{
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  OBJECT_SEQUENCE, granteeOid, sequenceOid,
+										  "USAGE", grants & ACL_USAGE));
+		queries = lappend(queries, query);
+	}
+
+	if (permissions & ACL_SELECT)
+	{
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  OBJECT_SEQUENCE, granteeOid, sequenceOid,
+										  "SELECT", grants & ACL_SELECT));
+		queries = lappend(queries, query);
+	}
+
+	if (permissions & ACL_UPDATE)
+	{
+		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
+										  OBJECT_SEQUENCE, granteeOid, sequenceOid,
+										  "UPDATE", grants & ACL_UPDATE));
+		queries = lappend(queries, query);
+	}
+
+	queries = lappend(queries, "RESET ROLE");
+
+	return queries;
 }
 
 
@@ -2049,7 +2549,7 @@ SchemaOwnerName(Oid objectId)
 static bool
 HasMetadataWorkers(void)
 {
-	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
+	List *workerNodeList = ActiveReadableNonCoordinatorNodeList();
 
 	WorkerNode *workerNode = NULL;
 	foreach_ptr(workerNode, workerNodeList)
@@ -2224,16 +2724,16 @@ DetachPartitionCommandList(void)
 
 
 /*
- * SyncNodeMetadataToNodes tries recreating the metadata snapshot in the
- * metadata workers that are out of sync. Returns the result of
- * synchronization.
+ * SyncNodeMetadataToNodesOptional tries recreating the metadata
+ * snapshot in the metadata workers that are out of sync.
+ * Returns the result of synchronization.
  *
  * This function must be called within coordinated transaction
  * since updates on the pg_dist_node metadata must be rollbacked if anything
  * goes wrong.
  */
 static NodeMetadataSyncResult
-SyncNodeMetadataToNodes(void)
+SyncNodeMetadataToNodesOptional(void)
 {
 	NodeMetadataSyncResult result = NODE_METADATA_SYNC_SUCCESS;
 	if (!IsCoordinator())
@@ -2294,6 +2794,46 @@ SyncNodeMetadataToNodes(void)
 
 
 /*
+ * SyncNodeMetadataToNodes recreates the node metadata snapshot in all the
+ * metadata workers.
+ *
+ * This function runs within a coordinated transaction since updates on
+ * the pg_dist_node metadata must be rollbacked if anything
+ * goes wrong.
+ */
+void
+SyncNodeMetadataToNodes(void)
+{
+	EnsureCoordinator();
+
+	/*
+	 * Request a RowExclusiveLock so we don't run concurrently with other
+	 * functions updating pg_dist_node, but allow concurrency with functions
+	 * which are just reading from pg_dist_node.
+	 */
+	if (!ConditionalLockRelationOid(DistNodeRelationId(), RowExclusiveLock))
+	{
+		ereport(ERROR, (errmsg("cannot sync metadata because a concurrent "
+							   "metadata syncing operation is in progress")));
+	}
+
+	List *workerList = ActivePrimaryNonCoordinatorNodeList(NoLock);
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerList)
+	{
+		if (workerNode->hasMetadata)
+		{
+			SetWorkerColumnLocalOnly(workerNode, Anum_pg_dist_node_metadatasynced,
+									 BoolGetDatum(true));
+
+			bool raiseOnError = true;
+			SyncNodeMetadataSnapshotToNode(workerNode, raiseOnError);
+		}
+	}
+}
+
+
+/*
  * SyncNodeMetadataToNodesMain is the main function for syncing node metadata to
  * MX nodes. It retries until success and then exits.
  */
@@ -2339,7 +2879,7 @@ SyncNodeMetadataToNodesMain(Datum main_arg)
 		{
 			UseCoordinatedTransaction();
 
-			NodeMetadataSyncResult result = SyncNodeMetadataToNodes();
+			NodeMetadataSyncResult result = SyncNodeMetadataToNodesOptional();
 			syncedAllNodes = (result == NODE_METADATA_SYNC_SUCCESS);
 
 			/* we use LISTEN/NOTIFY to wait for metadata syncing in tests */
@@ -2675,6 +3215,35 @@ EnsurePartitionMetadataIsSane(Oid relationId, char distributionMethod, int coloc
 							   "as the replication model.",
 							   REPLICATION_MODEL_STREAMING, REPLICATION_MODEL_2PC)));
 	}
+}
+
+
+/*
+ * citus_internal_delete_partition_metadata is an internal UDF to
+ * delete a row in pg_dist_partition.
+ */
+Datum
+citus_internal_delete_partition_metadata(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	PG_ENSURE_ARGNOTNULL(0, "relation");
+	Oid relationId = PG_GETARG_OID(0);
+
+	/* only owner of the table (or superuser) is allowed to add the Citus metadata */
+	EnsureTableOwner(relationId);
+
+	/* we want to serialize all the metadata changes to this table */
+	LockRelationOid(relationId, ShareUpdateExclusiveLock);
+
+	if (!ShouldSkipMetadataChecks())
+	{
+		EnsureCoordinatorInitiatedOperation();
+	}
+
+	DeletePartitionRow(relationId);
+
+	PG_RETURN_VOID();
 }
 
 
@@ -3309,9 +3878,8 @@ RemoteTypeIdExpression(Oid typeId)
 
 /*
  * RemoteCollationIdExpression returns an expression in text form that can
- * be used to obtain the OID of a type on a different node when included
- * in a query string. Currently this is a sublink because regcollation type
- * is not available in PG12.
+ * be used to obtain the OID of a collation on a different node when included
+ * in a query string.
  */
 static char *
 RemoteCollationIdExpression(Oid colocationId)
@@ -3330,16 +3898,15 @@ RemoteCollationIdExpression(Oid colocationId)
 				(Form_pg_collation) GETSTRUCT(collationTuple);
 			char *collationName = NameStr(collationform->collname);
 			char *collationSchemaName = get_namespace_name(collationform->collnamespace);
+			char *qualifiedCollationName = quote_qualified_identifier(collationSchemaName,
+																	  collationName);
 
-			StringInfo colocationIdQuery = makeStringInfo();
-			appendStringInfo(colocationIdQuery,
-							 "(select oid from pg_collation"
-							 " where collname = %s"
-							 " and collnamespace = %s::regnamespace)",
-							 quote_literal_cstr(collationName),
-							 quote_literal_cstr(collationSchemaName));
+			StringInfo regcollationExpression = makeStringInfo();
+			appendStringInfo(regcollationExpression,
+							 "%s::regcollation",
+							 quote_literal_cstr(qualifiedCollationName));
 
-			expression = colocationIdQuery->data;
+			expression = regcollationExpression->data;
 		}
 
 		ReleaseSysCache(collationTuple);
@@ -3398,12 +3965,19 @@ ColocationGroupCreateCommandList(void)
 					 "distributioncolumncollationschema)  AS (VALUES ");
 
 	Relation pgDistColocation = table_open(DistColocationRelationId(), AccessShareLock);
+	Relation colocationIdIndexRel = index_open(DistColocationIndexId(), AccessShareLock);
 
-	bool indexOK = false;
-	SysScanDesc scanDescriptor = systable_beginscan(pgDistColocation, InvalidOid, indexOK,
-													NULL, 0, NULL);
+	/*
+	 * It is not strictly necessary to read the tuples in order.
+	 * However, it is useful to get consistent behavior, both for regression
+	 * tests and also in production systems.
+	 */
+	SysScanDesc scanDescriptor =
+		systable_beginscan_ordered(pgDistColocation, colocationIdIndexRel,
+								   NULL, 0, NULL);
 
-	HeapTuple colocationTuple = systable_getnext(scanDescriptor);
+	HeapTuple colocationTuple = systable_getnext_ordered(scanDescriptor,
+														 ForwardScanDirection);
 
 	while (HeapTupleIsValid(colocationTuple))
 	{
@@ -3461,10 +4035,11 @@ ColocationGroupCreateCommandList(void)
 							 "NULL, NULL)");
 		}
 
-		colocationTuple = systable_getnext(scanDescriptor);
+		colocationTuple = systable_getnext_ordered(scanDescriptor, ForwardScanDirection);
 	}
 
-	systable_endscan(scanDescriptor);
+	systable_endscan_ordered(scanDescriptor);
+	index_close(colocationIdIndexRel, AccessShareLock);
 	table_close(pgDistColocation, AccessShareLock);
 
 	if (!hasColocations)

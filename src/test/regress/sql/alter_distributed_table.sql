@@ -1,7 +1,3 @@
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS server_version_above_eleven;
-\gset
-
 CREATE SCHEMA alter_distributed_table;
 SET search_path TO alter_distributed_table;
 SET citus.shard_count TO 4;
@@ -88,6 +84,24 @@ SELECT * FROM partitioned_table ORDER BY 1, 2;
 SELECT * FROM partitioned_table_1_5 ORDER BY 1, 2;
 SELECT * FROM partitioned_table_6_10 ORDER BY 1, 2;
 
+-- test altering partitioned table colocate_with:none
+CREATE TABLE foo (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_1 PARTITION of foo for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_2 PARTITION of foo for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+
+SELECT create_distributed_table('foo','x');
+
+CREATE TABLE foo_bar (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_bar_1 PARTITION of foo_bar for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_bar_2 PARTITION of foo_bar for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+
+SELECT create_distributed_table('foo_bar','x');
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
+
+SELECT alter_distributed_table('foo', colocate_with => 'none');
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
 
 -- test references
 CREATE TABLE referenced_dist_table (a INT UNIQUE);
@@ -137,14 +151,12 @@ SELECT alter_distributed_table('col_with_ref_to_ref', shard_count:=10, cascade_t
 SELECT alter_distributed_table('col_with_ref_to_dist', shard_count:=6, cascade_to_colocated:=true);
 
 
-\if :server_version_above_eleven
 -- test altering columnar table
 CREATE TABLE columnar_table (a INT) USING columnar;
 SELECT create_distributed_table('columnar_table', 'a', colocate_with:='none');
 SELECT table_name::text, shard_count, access_method FROM public.citus_tables WHERE table_name::text = 'columnar_table';
 SELECT alter_distributed_table('columnar_table', shard_count:=6);
 SELECT table_name::text, shard_count, access_method FROM public.citus_tables WHERE table_name::text = 'columnar_table';
-\endif
 
 
 -- test complex cascade operations
@@ -198,6 +210,39 @@ SELECT create_distributed_table('par_table_1', 'a', colocate_with:='par_table');
 ALTER TABLE par_table ATTACH PARTITION par_table_1 FOR VALUES FROM (1) TO (5);
 
 SELECT alter_distributed_table('par_table', distribution_column:='b', colocate_with:='col_table');
+
+
+-- test changing shard count into a default colocation group with shard split
+-- ensure there is no colocation group with 23 shards
+SELECT count(*) FROM pg_dist_colocation WHERE shardcount = 23;
+SET citus.shard_count TO 23;
+
+CREATE TABLE shard_split_table (a int, b int);
+SELECT create_distributed_table ('shard_split_table', 'a');
+SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5, shard_transfer_mode => 'block_writes');
+
+-- show the difference in pg_dist_colocation and citus_tables shard counts
+SELECT
+	(
+		SELECT shardcount FROM pg_dist_colocation WHERE colocationid IN
+		(
+			SELECT colocation_id FROM public.citus_tables WHERE table_name = 'shard_split_table'::regclass
+		)
+	) AS "pg_dist_colocation",
+	(SELECT shard_count FROM public.citus_tables WHERE table_name = 'shard_split_table'::regclass) AS "citus_tables";
+
+SET citus.shard_count TO 4;
+
+-- distribute another table and then change shard count to 23
+CREATE TABLE shard_split_table_2 (a int, b int);
+SELECT create_distributed_table ('shard_split_table_2', 'a');
+SELECT alter_distributed_table ('shard_split_table_2', shard_count:=23, cascade_to_colocated:=false);
+
+SELECT a.colocation_id = b.colocation_id FROM public.citus_tables a, public.citus_tables b
+	WHERE a.table_name = 'shard_split_table'::regclass AND b.table_name = 'shard_split_table_2'::regclass;
+
+SELECT shard_count FROM public.citus_tables WHERE table_name = 'shard_split_table_2'::regclass;
+
 
 -- test messages
 -- test nothing to change
@@ -300,5 +345,41 @@ CREATE MATERIALIZED VIEW test_mat_view_am USING COLUMNAR AS SELECT count(*), a F
 SELECT alter_distributed_table('test_am_matview', shard_count:= 52);
 SELECT amname FROM pg_am WHERE oid IN (SELECT relam FROM pg_class WHERE relname ='test_mat_view_am');
 
+-- verify that alter_distributed_table works if it has dependent views and materialized views
+-- set colocate_with explicitly to not to affect other tables
+CREATE SCHEMA schema_to_test_alter_dist_table;
+SET search_path to schema_to_test_alter_dist_table;
+
+CREATE TABLE test_alt_dist_table_1(a int, b int);
+SELECT create_distributed_table('test_alt_dist_table_1', 'a', colocate_with => 'None');
+
+CREATE TABLE test_alt_dist_table_2(a int, b int);
+SELECT create_distributed_table('test_alt_dist_table_2', 'a', colocate_with => 'test_alt_dist_table_1');
+
+CREATE VIEW dependent_view_1 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2;
+CREATE VIEW dependent_view_2 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2 JOIN test_alt_dist_table_1 USING(a);
+
+CREATE MATERIALIZED VIEW dependent_mat_view_1 AS SELECT test_alt_dist_table_2.* FROM test_alt_dist_table_2;
+
+-- Alter owner to make sure that alter_distributed_table doesn't change view's owner
 SET client_min_messages TO WARNING;
+CREATE USER alter_dist_table_test_user;
+SELECT 1 FROM run_command_on_workers($$CREATE USER alter_dist_table_test_user$$);
+
+ALTER VIEW dependent_view_1 OWNER TO alter_dist_table_test_user;
+ALTER VIEW dependent_view_2 OWNER TO alter_dist_table_test_user;
+ALTER MATERIALIZED VIEW dependent_mat_view_1 OWNER TO alter_dist_table_test_user;
+
+SELECT alter_distributed_table('test_alt_dist_table_1', shard_count:=12, cascade_to_colocated:=true);
+SELECT viewowner FROM pg_views WHERE viewname IN ('dependent_view_1', 'dependent_view_2');
+SELECT matviewowner FROM pg_matviews WHERE matviewname = 'dependent_mat_view_1';
+
+-- Check the existence of the view on the worker node as well
+SELECT run_command_on_workers($$SELECT viewowner FROM pg_views WHERE viewname = 'dependent_view_1'$$);
+SELECT run_command_on_workers($$SELECT viewowner FROM pg_views WHERE viewname = 'dependent_view_2'$$);
+-- It is expected to not have mat view on worker node
+SELECT run_command_on_workers($$SELECT count(*) FROM pg_matviews WHERE matviewname = 'dependent_mat_view_1';$$);
+RESET search_path;
+
 DROP SCHEMA alter_distributed_table CASCADE;
+DROP SCHEMA schema_to_test_alter_dist_table CASCADE;

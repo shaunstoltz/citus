@@ -18,6 +18,7 @@
 #include "lib/ilist.h"
 #include "pg_config.h"
 #include "portability/instr_time.h"
+#include "storage/latch.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
@@ -28,11 +29,22 @@
 /* used for libpq commands that get an error buffer. Postgres docs recommend 256. */
 #define ERROR_BUFFER_SIZE 256
 
+/* values with special behavior for authinfo lookup */
+#define WILDCARD_NODE_ID 0
+#define LOCALHOST_NODE_ID -1
+
 /* application name used for internal connections in Citus */
 #define CITUS_APPLICATION_NAME_PREFIX "citus_internal gpid="
 
 /* application name used for internal connections in rebalancer */
 #define CITUS_REBALANCER_NAME "citus_rebalancer"
+
+/* application name used for connections made by run_command_on_* */
+#define CITUS_RUN_COMMAND_APPLICATION_NAME "citus_run_command"
+
+/* deal with waiteventset errors */
+#define WAIT_EVENT_SET_INDEX_NOT_INITIALIZED -1
+#define WAIT_EVENT_SET_INDEX_FAILED -2
 
 /* forward declare, to avoid forcing large headers on everyone */
 struct pg_conn; /* target of the PGconn typedef */
@@ -85,7 +97,18 @@ enum MultiConnectionMode
 	 * establishments may be suspended until a connection slot is available to
 	 * the remote host.
 	 */
-	WAIT_FOR_CONNECTION = 1 << 7
+	WAIT_FOR_CONNECTION = 1 << 7,
+
+	/*
+	 * Use the flag to start a connection for streaming replication.
+	 * This flag constructs additional libpq connection parameters needed for streaming
+	 * replication protocol. It adds 'replication=database' param which instructs
+	 * the backend to go into logical replication walsender mode.
+	 *  https://www.postgresql.org/docs/current/protocol-replication.html
+	 *
+	 * This is need to run 'CREATE_REPLICATION_SLOT' command.
+	 */
+	REQUIRE_REPLICATION_CONNECTION_PARAM = 1 << 8
 };
 
 
@@ -175,6 +198,9 @@ typedef struct MultiConnection
 	/* number of bytes sent to PQputCopyData() since last flush */
 	uint64 copyBytesWrittenSinceLastFlush;
 
+	/* replication option */
+	bool requiresReplication;
+
 	MultiConnectionStructInitializationState initilizationState;
 } MultiConnection;
 
@@ -195,6 +221,7 @@ typedef struct ConnectionHashKey
 	int32 port;
 	char user[NAMEDATALEN];
 	char database[NAMEDATALEN];
+	bool replicationConnParam;
 } ConnectionHashKey;
 
 /* hash entry */
@@ -242,6 +269,7 @@ extern struct MemoryContextData *ConnectionContext;
 extern void AfterXactConnectionHandling(bool isCommit);
 extern void InitializeConnectionManagement(void);
 
+extern char * GetAuthinfo(char *hostname, int32 port, char *user);
 extern void InitConnParams(void);
 extern void ResetConnParams(void);
 extern void InvalidateConnParamsHashEntries(void);
@@ -261,6 +289,7 @@ extern MultiConnection * StartNodeConnection(uint32 flags, const char *hostname,
 extern MultiConnection * GetNodeUserDatabaseConnection(uint32 flags, const char *hostname,
 													   int32 port, const char *user,
 													   const char *database);
+extern MultiConnection * GetConnectionForLocalQueriesOutsideTransaction(char *userName);
 extern MultiConnection * StartNodeUserDatabaseConnection(uint32 flags,
 														 const char *hostname,
 														 int32 port,
@@ -280,9 +309,14 @@ extern void FinishConnectionListEstablishment(List *multiConnectionList);
 extern void FinishConnectionEstablishment(MultiConnection *connection);
 extern void ClaimConnectionExclusively(MultiConnection *connection);
 extern void UnclaimConnection(MultiConnection *connection);
-extern bool IsCitusInternalBackend(void);
-extern bool IsRebalancerInternalBackend(void);
 extern void MarkConnectionConnected(MultiConnection *connection);
+
+/* waiteventset utilities */
+extern int CitusAddWaitEventSetToSet(WaitEventSet *set, uint32 events, pgsocket fd,
+									 Latch *latch, void *user_data);
+
+extern bool CitusModifyWaitEvent(WaitEventSet *set, int pos, uint32 events,
+								 Latch *latch);
 
 /* time utilities */
 extern double MillisecondsPassedSince(instr_time moment);

@@ -15,14 +15,15 @@
 
 #include "distributed/backend_data.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/remote_commands.h"
 #include "distributed/worker_manager.h"
 #include "lib/stringinfo.h"
 #include "signal.h"
 
 static bool CitusSignalBackend(uint64 globalPID, uint64 timeout, int sig);
 
-PG_FUNCTION_INFO_V1(pg_cancel_backend);
-PG_FUNCTION_INFO_V1(pg_terminate_backend);
+PG_FUNCTION_INFO_V1(citus_cancel_backend);
+PG_FUNCTION_INFO_V1(citus_terminate_backend);
 
 /*
  * pg_cancel_backend overrides the Postgres' pg_cancel_backend to cancel
@@ -33,7 +34,7 @@ PG_FUNCTION_INFO_V1(pg_terminate_backend);
  * pg_cancel_backend function is used.
  */
 Datum
-pg_cancel_backend(PG_FUNCTION_ARGS)
+citus_cancel_backend(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
 
@@ -56,7 +57,7 @@ pg_cancel_backend(PG_FUNCTION_ARGS)
  * pg_terminate_backend function is used.
  */
 Datum
-pg_terminate_backend(PG_FUNCTION_ARGS)
+citus_terminate_backend(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
 
@@ -111,18 +112,39 @@ CitusSignalBackend(uint64 globalPID, uint64 timeout, int sig)
 #endif
 	}
 
-	StringInfo queryResult = makeStringInfo();
+	int connectionFlags = 0;
+	MultiConnection *connection = GetNodeConnection(connectionFlags,
+													workerNode->workerName,
+													workerNode->workerPort);
 
-	bool reportResultError = true;
-
-	bool success = ExecuteRemoteQueryOrCommand(workerNode->workerName,
-											   workerNode->workerPort, cancelQuery->data,
-											   queryResult, reportResultError);
-
-	if (success && queryResult && strcmp(queryResult->data, "f") == 0)
+	if (!SendRemoteCommand(connection, cancelQuery->data))
 	{
+		/* if we cannot connect, we warn and report false */
+		ReportConnectionError(connection, WARNING);
+		return false;
+	}
+
+	bool raiseInterrupts = true;
+	PGresult *queryResult = GetRemoteCommandResult(connection, raiseInterrupts);
+
+	/* if remote node throws an error, we also throw an error */
+	if (!IsResponseOK(queryResult))
+	{
+		ReportResultError(connection, queryResult, ERROR);
+	}
+
+	StringInfo queryResultString = makeStringInfo();
+	bool success = EvaluateSingleQueryResult(connection, queryResult, queryResultString);
+	if (success && strcmp(queryResultString->data, "f") == 0)
+	{
+		/* worker node returned "f" */
 		success = false;
 	}
+
+	PQclear(queryResult);
+
+	bool raiseErrors = false;
+	ClearResults(connection, raiseErrors);
 
 	return success;
 }

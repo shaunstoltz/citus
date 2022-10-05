@@ -40,6 +40,7 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/query_pushdown_planning.h"
+#include "distributed/string_utils.h"
 #include "distributed/tdigest_extension.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
@@ -57,9 +58,6 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-#define StartsWith(msg, prefix) \
-	(strncmp(msg, prefix, strlen(prefix)) == 0)
 
 /* Config variable managed via guc.c */
 int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
@@ -545,7 +543,7 @@ OrSelectClauseList(List *selectClauseList)
 	Node *selectClause = NULL;
 	foreach_ptr(selectClause, selectClauseList)
 	{
-		bool orClause = or_clause(selectClause);
+		bool orClause = is_orclause(selectClause);
 		if (orClause)
 		{
 			orSelectClauseList = lappend(orSelectClauseList, selectClause);
@@ -1492,9 +1490,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 	masterExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
 	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
 	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
-#if PG_VERSION_NUM >= PG_VERSION_13
 	masterExtendedOpNode->limitOption = originalOpNode->limitOption;
-#endif
 	masterExtendedOpNode->havingQual = newHavingQual;
 
 	if (!extendedOpNodeProperties->onlyPushableWindowFunctions)
@@ -2491,14 +2487,12 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	workerExtendedOpNode->windowClause = queryWindowClause.workerWindowClauseList;
 	workerExtendedOpNode->sortClauseList = queryOrderByLimit.workerSortClauseList;
 	workerExtendedOpNode->limitCount = queryOrderByLimit.workerLimitCount;
-#if PG_VERSION_NUM >= PG_VERSION_13
 
 	/*
 	 * If the limitCount cannot be pushed down it will be NULL, so the deparser will
 	 * ignore the limitOption.
 	 */
 	workerExtendedOpNode->limitOption = originalOpNode->limitOption;
-#endif
 
 	return workerExtendedOpNode;
 }
@@ -3418,7 +3412,7 @@ GetAggregateType(Aggref *aggregateExpression)
 	 * perform these checks if there is some chance it will actually result in a positive
 	 * hit.
 	 */
-	if (StartsWith(aggregateProcName, "tdigest"))
+	if (StringStartsWith(aggregateProcName, "tdigest"))
 	{
 		if (aggFunctionId == TDigestExtensionAggTDigest1())
 		{
@@ -3680,9 +3674,9 @@ CoordCombineAggOid()
 static Oid
 TypeOid(Oid schemaId, const char *typeName)
 {
-	Oid typeOid = GetSysCacheOid2Compat(TYPENAMENSP, Anum_pg_type_oid,
-										PointerGetDatum(typeName),
-										ObjectIdGetDatum(schemaId));
+	Oid typeOid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+								  PointerGetDatum(typeName),
+								  ObjectIdGetDatum(schemaId));
 
 	return typeOid;
 }

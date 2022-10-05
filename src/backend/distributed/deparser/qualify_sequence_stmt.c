@@ -17,7 +17,9 @@
 
 #include "postgres.h"
 
+#include "distributed/commands.h"
 #include "distributed/deparser.h"
+#include "distributed/listutils.h"
 #include "distributed/version_compat.h"
 #include "parser/parse_func.h"
 #include "utils/lsyscache.h"
@@ -38,10 +40,46 @@ QualifyAlterSequenceOwnerStmt(Node *node)
 
 	if (seq->schemaname == NULL)
 	{
-		Oid schemaOid = RangeVarGetCreationNamespace(seq);
-		seq->schemaname = get_namespace_name(schemaOid);
+		Oid seqOid = RangeVarGetRelid(seq, NoLock, stmt->missing_ok);
+
+		if (OidIsValid(seqOid))
+		{
+			Oid schemaOid = get_rel_namespace(seqOid);
+			seq->schemaname = get_namespace_name(schemaOid);
+		}
 	}
 }
+
+
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+/*
+ * QualifyAlterSequencePersistenceStmt transforms a
+ * ALTER SEQUENCE .. SET LOGGED/UNLOGGED
+ * statement in place and makes the sequence name fully qualified.
+ */
+void
+QualifyAlterSequencePersistenceStmt(Node *node)
+{
+	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	RangeVar *seq = stmt->relation;
+
+	if (seq->schemaname == NULL)
+	{
+		Oid seqOid = RangeVarGetRelid(seq, NoLock, stmt->missing_ok);
+
+		if (OidIsValid(seqOid))
+		{
+			Oid schemaOid = get_rel_namespace(seqOid);
+			seq->schemaname = get_namespace_name(schemaOid);
+		}
+	}
+}
+
+
+#endif
 
 
 /*
@@ -59,8 +97,13 @@ QualifyAlterSequenceSchemaStmt(Node *node)
 
 	if (seq->schemaname == NULL)
 	{
-		Oid schemaOid = RangeVarGetCreationNamespace(seq);
-		seq->schemaname = get_namespace_name(schemaOid);
+		Oid seqOid = RangeVarGetRelid(seq, NoLock, stmt->missing_ok);
+
+		if (OidIsValid(seqOid))
+		{
+			Oid schemaOid = get_rel_namespace(seqOid);
+			seq->schemaname = get_namespace_name(schemaOid);
+		}
 	}
 }
 
@@ -80,7 +123,86 @@ QualifyRenameSequenceStmt(Node *node)
 
 	if (seq->schemaname == NULL)
 	{
-		Oid schemaOid = RangeVarGetCreationNamespace(seq);
-		seq->schemaname = get_namespace_name(schemaOid);
+		Oid seqOid = RangeVarGetRelid(seq, NoLock, stmt->missing_ok);
+
+		if (OidIsValid(seqOid))
+		{
+			Oid schemaOid = get_rel_namespace(seqOid);
+			seq->schemaname = get_namespace_name(schemaOid);
+		}
 	}
+}
+
+
+/*
+ * QualifyDropSequenceStmt transforms a DROP SEQUENCE
+ * statement in place and makes the sequence name fully qualified.
+ */
+void
+QualifyDropSequenceStmt(Node *node)
+{
+	DropStmt *stmt = castNode(DropStmt, node);
+
+	Assert(stmt->removeType == OBJECT_SEQUENCE);
+
+	List *objectNameListWithSchema = NIL;
+	List *objectNameList = NULL;
+	foreach_ptr(objectNameList, stmt->objects)
+	{
+		RangeVar *seq = makeRangeVarFromNameList(objectNameList);
+
+		if (seq->schemaname == NULL)
+		{
+			Oid seqOid = RangeVarGetRelid(seq, NoLock, stmt->missing_ok);
+
+			if (OidIsValid(seqOid))
+			{
+				Oid schemaOid = get_rel_namespace(seqOid);
+				seq->schemaname = get_namespace_name(schemaOid);
+			}
+		}
+
+		objectNameListWithSchema = lappend(objectNameListWithSchema,
+										   MakeNameListFromRangeVar(seq));
+	}
+
+	stmt->objects = objectNameListWithSchema;
+}
+
+
+/*
+ * QualifyGrantOnSequenceStmt transforms a
+ * GRANT ON SEQUENCE ...
+ * statement in place and makes the sequence names fully qualified.
+ */
+void
+QualifyGrantOnSequenceStmt(Node *node)
+{
+	GrantStmt *stmt = castNode(GrantStmt, node);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
+
+	/*
+	 * The other option would be GRANT ALL SEQUENCES ON SCHEMA ...
+	 * For that we don't need to qualify
+	 */
+	if (stmt->targtype != ACL_TARGET_OBJECT)
+	{
+		return;
+	}
+	List *qualifiedSequenceRangeVars = NIL;
+	RangeVar *sequenceRangeVar = NULL;
+	foreach_ptr(sequenceRangeVar, stmt->objects)
+	{
+		if (sequenceRangeVar->schemaname == NULL)
+		{
+			Oid seqOid = RangeVarGetRelid(sequenceRangeVar, NoLock, false);
+			Oid schemaOid = get_rel_namespace(seqOid);
+			sequenceRangeVar->schemaname = get_namespace_name(schemaOid);
+		}
+
+		qualifiedSequenceRangeVars = lappend(qualifiedSequenceRangeVars,
+											 sequenceRangeVar);
+	}
+
+	stmt->objects = qualifiedSequenceRangeVars;
 }

@@ -151,7 +151,7 @@ static Job * RouterJob(Query *originalQuery,
 static bool RelationPrunesToMultipleShards(List *relationShardList);
 static void NormalizeMultiRowInsertTargetList(Query *query);
 static void AppendNextDummyColReference(Alias *expendedReferenceNames);
-static Value * MakeDummyColumnString(int dummyColumnId);
+static String * MakeDummyColumnString(int dummyColumnId);
 static List * BuildRoutesForInsert(Query *query, DeferredErrorMessage **planningError);
 static List * GroupInsertValuesByShardId(List *insertValuesList);
 static List * ExtractInsertValuesList(Query *query, Var *partitionColumn);
@@ -2677,9 +2677,6 @@ TargetShardIntervalForFastPathQuery(Query *query, bool *isMultiShardQuery,
 	}
 
 	/* we're only expecting single shard from a single table */
-	Node *distKey PG_USED_FOR_ASSERTS_ONLY = NULL;
-	Assert(FastPathRouterQuery(query, &distKey) || !EnableFastPathRouterPlanner);
-
 	if (list_length(prunedShardIntervalList) > 1)
 	{
 		*isMultiShardQuery = true;
@@ -3249,7 +3246,7 @@ AppendNextDummyColReference(Alias *expendedReferenceNames)
 {
 	int existingColReferences = list_length(expendedReferenceNames->colnames);
 	int nextColReferenceId = existingColReferences + 1;
-	Value *missingColumnString = MakeDummyColumnString(nextColReferenceId);
+	String *missingColumnString = MakeDummyColumnString(nextColReferenceId);
 	expendedReferenceNames->colnames = lappend(expendedReferenceNames->colnames,
 											   missingColumnString);
 }
@@ -3259,12 +3256,12 @@ AppendNextDummyColReference(Alias *expendedReferenceNames)
  * MakeDummyColumnString returns a String (Value) object by appending given
  * integer to end of the "column" string.
  */
-static Value *
+static String *
 MakeDummyColumnString(int dummyColumnId)
 {
 	StringInfo dummyColumnStringInfo = makeStringInfo();
 	appendStringInfo(dummyColumnStringInfo, "column%d", dummyColumnId);
-	Value *dummyColumnString = makeString(dummyColumnStringInfo->data);
+	String *dummyColumnString = makeString(dummyColumnStringInfo->data);
 
 	return dummyColumnString;
 }
@@ -3558,19 +3555,9 @@ DeferErrorIfUnsupportedRouterPlannableSelectQuery(Query *query)
 							 NULL, NULL);
 	}
 
-	if (contain_nextval_expression_walker((Node *) query->targetList, NULL))
-	{
-		/*
-		 * We let queries with nextval in the target list fall through to
-		 * the logical planner, which knows how to handle those queries.
-		 */
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "Sequences cannot be used in router queries",
-							 NULL, NULL);
-	}
-
 	bool hasPostgresOrCitusLocalTable = false;
 	bool hasDistributedTable = false;
+	bool hasReferenceTable = false;
 
 	ExtractRangeTableRelationWalker((Node *) query, &rangeTableRelationList);
 	foreach(rangeTableRelationCell, rangeTableRelationList)
@@ -3584,6 +3571,11 @@ DeferErrorIfUnsupportedRouterPlannableSelectQuery(Query *query)
 			if (!IsCitusTable(distributedTableId))
 			{
 				hasPostgresOrCitusLocalTable = true;
+				continue;
+			}
+			else if (IsCitusTableType(distributedTableId, REFERENCE_TABLE))
+			{
+				hasReferenceTable = true;
 				continue;
 			}
 			else if (IsCitusTableType(distributedTableId, CITUS_LOCAL_TABLE))
@@ -3626,6 +3618,28 @@ DeferErrorIfUnsupportedRouterPlannableSelectQuery(Query *query)
 				}
 			}
 		}
+	}
+
+	/*
+	 * We want to make sure nextval happens on the coordinator / the current
+	 * node, since the user may have certain expectations around the values
+	 * produced by the sequence. We therefore cannot push down the nextval
+	 * call as part of a router query.
+	 *
+	 * We let queries with nextval in the target list fall through to
+	 * the logical planner, which will ensure that the nextval is called
+	 * in the combine query on the coordinator.
+	 *
+	 * If there are no distributed or reference tables in the query,
+	 * then the query will anyway happen on the coordinator, so we can
+	 * allow nextval.
+	 */
+	if (contain_nextval_expression_walker((Node *) query->targetList, NULL) &&
+		(hasDistributedTable || hasReferenceTable))
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "Sequences cannot be used in router queries",
+							 NULL, NULL);
 	}
 
 	/* local tables are not allowed if there are distributed tables */
@@ -3678,7 +3692,7 @@ CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 
 		newRestriction->index = oldRestriction->index;
 		newRestriction->relationId = oldRestriction->relationId;
-		newRestriction->distributedRelation = oldRestriction->distributedRelation;
+		newRestriction->citusTable = oldRestriction->citusTable;
 		newRestriction->rte = copyObject(oldRestriction->rte);
 
 		/* can't be copied, we copy (flatly) a RelOptInfo, and then decouple baserestrictinfo */

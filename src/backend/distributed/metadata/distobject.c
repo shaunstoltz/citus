@@ -28,8 +28,11 @@
 #include "catalog/pg_type.h"
 #include "citus_version.h"
 #include "commands/extension.h"
+#include "distributed/listutils.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata/pg_dist_object.h"
 #include "distributed/metadata_cache.h"
@@ -42,14 +45,15 @@
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 
 
-static void MarkObjectDistributedLocally(const ObjectAddress *distAddress);
 static char * CreatePgDistObjectEntryCommand(const ObjectAddress *objectAddress);
 static int ExecuteCommandAsSuperuser(char *query, int paramCount, Oid *paramTypes,
 									 Datum *paramValues);
+static bool IsObjectDistributed(const ObjectAddress *address);
 
 PG_FUNCTION_INFO_V1(citus_unmark_object_distributed);
 PG_FUNCTION_INFO_V1(master_unmark_object_distributed);
@@ -195,7 +199,7 @@ MarkObjectDistributedViaSuperUser(const ObjectAddress *distAddress)
  * This function should never be called alone, MarkObjectDistributed() or
  * MarkObjectDistributedViaSuperUser() should be called.
  */
-static void
+void
 MarkObjectDistributedLocally(const ObjectAddress *distAddress)
 {
 	int paramCount = 3;
@@ -218,6 +222,53 @@ MarkObjectDistributedLocally(const ObjectAddress *distAddress)
 	{
 		ereport(ERROR, (errmsg("failed to insert object into citus.pg_dist_object")));
 	}
+}
+
+
+/*
+ * ShouldMarkRelationDistributed is a helper function that
+ * decides whether the input relation should be marked as distributed.
+ */
+bool
+ShouldMarkRelationDistributed(Oid relationId)
+{
+	if (!EnableMetadataSync)
+	{
+		/*
+		 * Just in case anything goes wrong, we should still be able
+		 * to continue to the version upgrade.
+		 */
+		return false;
+	}
+
+	ObjectAddress *relationAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*relationAddress, RelationRelationId, relationId);
+
+	bool pgObject = (relationId < FirstNormalObjectId);
+	bool isObjectSupported = SupportedDependencyByCitus(relationAddress);
+	bool ownedByExtension = IsTableOwnedByExtension(relationId);
+	bool alreadyDistributed = IsObjectDistributed(relationAddress);
+	bool hasUnsupportedDependency =
+		DeferErrorIfAnyObjectHasUnsupportedDependency(list_make1(relationAddress)) !=
+		NULL;
+	bool hasCircularDependency =
+		DeferErrorIfCircularDependencyExists(relationAddress) != NULL;
+
+	/*
+	 * pgObject: Citus never marks pg objects as distributed
+	 * isObjectSupported: Citus does not support propagation of some objects
+	 * ownedByExtension: let extensions manage its own objects
+	 * alreadyDistributed: most likely via earlier versions
+	 * hasUnsupportedDependency: Citus doesn't know how to distribute its dependencies
+	 * hasCircularDependency: Citus cannot handle circular dependencies
+	 */
+	if (pgObject || !isObjectSupported || ownedByExtension || alreadyDistributed ||
+		hasUnsupportedDependency || hasCircularDependency)
+	{
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -341,7 +392,7 @@ UnmarkObjectDistributed(const ObjectAddress *address)
  * IsObjectDistributed returns if the object addressed is already distributed in the
  * cluster. This performs a local indexed lookup in pg_dist_object.
  */
-bool
+static bool
 IsObjectDistributed(const ObjectAddress *address)
 {
 	ScanKeyData key[3];
@@ -370,6 +421,26 @@ IsObjectDistributed(const ObjectAddress *address)
 	relation_close(pgDistObjectRel, AccessShareLock);
 
 	return result;
+}
+
+
+/*
+ * IsAnyObjectDistributed iteratively calls IsObjectDistributed for given addresses to
+ * determine if any object is distributed.
+ */
+bool
+IsAnyObjectDistributed(const List *addresses)
+{
+	ObjectAddress *address = NULL;
+	foreach_ptr(address, addresses)
+	{
+		if (IsObjectDistributed(address))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -471,4 +542,83 @@ UpdateDistributedObjectColocationId(uint32 oldColocationId,
 	systable_endscan(scanDescriptor);
 	table_close(pgDistObjectRel, NoLock);
 	CommandCounterIncrement();
+}
+
+
+/*
+ * DistributedFunctionList returns the list of ObjectAddress-es of all the
+ * distributed functions found in pg_dist_object
+ */
+List *
+DistributedFunctionList(void)
+{
+	List *distributedFunctionList = NIL;
+
+	ScanKeyData key[1];
+	Relation pgDistObjectRel = table_open(DistObjectRelationId(), AccessShareLock);
+
+	/* scan pg_dist_object for classid = ProcedureRelationId via index */
+	ScanKeyInit(&key[0], Anum_pg_dist_object_classid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ProcedureRelationId));
+	SysScanDesc pgDistObjectScan = systable_beginscan(pgDistObjectRel,
+													  DistObjectPrimaryKeyIndexId(),
+													  true, NULL, 1, key);
+
+	HeapTuple pgDistObjectTup = NULL;
+	while (HeapTupleIsValid(pgDistObjectTup = systable_getnext(pgDistObjectScan)))
+	{
+		Form_pg_dist_object pg_dist_object =
+			(Form_pg_dist_object) GETSTRUCT(pgDistObjectTup);
+
+		ObjectAddress *functionAddress = palloc0(sizeof(ObjectAddress));
+		functionAddress->classId = ProcedureRelationId;
+		functionAddress->objectId = pg_dist_object->objid;
+		functionAddress->objectSubId = pg_dist_object->objsubid;
+		distributedFunctionList = lappend(distributedFunctionList, functionAddress);
+	}
+
+	systable_endscan(pgDistObjectScan);
+	relation_close(pgDistObjectRel, AccessShareLock);
+	return distributedFunctionList;
+}
+
+
+/*
+ * DistributedSequenceList returns the list of ObjectAddress-es of all the
+ * distributed sequences found in pg_dist_object
+ */
+List *
+DistributedSequenceList(void)
+{
+	List *distributedSequenceList = NIL;
+
+	ScanKeyData key[1];
+	Relation pgDistObjectRel = table_open(DistObjectRelationId(), AccessShareLock);
+
+	/* scan pg_dist_object for classid = RelationRelationId via index */
+	ScanKeyInit(&key[0], Anum_pg_dist_object_classid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	SysScanDesc pgDistObjectScan = systable_beginscan(pgDistObjectRel,
+													  DistObjectPrimaryKeyIndexId(),
+													  true, NULL, 1, key);
+
+	HeapTuple pgDistObjectTup = NULL;
+	while (HeapTupleIsValid(pgDistObjectTup = systable_getnext(pgDistObjectScan)))
+	{
+		Form_pg_dist_object pg_dist_object =
+			(Form_pg_dist_object) GETSTRUCT(pgDistObjectTup);
+
+		if (get_rel_relkind(pg_dist_object->objid) == RELKIND_SEQUENCE)
+		{
+			ObjectAddress *sequenceAddress = palloc0(sizeof(ObjectAddress));
+			sequenceAddress->classId = RelationRelationId;
+			sequenceAddress->objectId = pg_dist_object->objid;
+			sequenceAddress->objectSubId = pg_dist_object->objsubid;
+			distributedSequenceList = lappend(distributedSequenceList, sequenceAddress);
+		}
+	}
+
+	systable_endscan(pgDistObjectScan);
+	relation_close(pgDistObjectRel, AccessShareLock);
+	return distributedSequenceList;
 }

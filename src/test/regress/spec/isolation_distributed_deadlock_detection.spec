@@ -1,8 +1,5 @@
 setup
 {
-  SELECT citus_internal.replace_isolation_tester_func();
-  SELECT citus_internal.refresh_isolation_tester_prepared_statement();
-
   CREATE TABLE deadlock_detection_reference (user_id int UNIQUE, some_val int);
   SELECT create_reference_table('deadlock_detection_reference');
 
@@ -26,7 +23,6 @@ teardown
   DROP TABLE local_deadlock_table;
   DROP TABLE deadlock_detection_test_rep_2;
   DROP TABLE deadlock_detection_reference;
-  SELECT citus_internal.restore_isolation_tester_func();
   SET citus.shard_replication_factor = 1;
 }
 
@@ -65,11 +61,6 @@ step "s1-insert-dist-10"
 step "s1-insert-local-10"
 {
   INSERT INTO local_deadlock_table VALUES (10, 10);
-}
-
-step "s1-set-2pc"
-{
-	set citus.multi_shard_commit_protocol TO '2pc';
 }
 
 step "s1-update-1-rep-2"
@@ -147,11 +138,6 @@ step "s2-insert-dist-10"
 step "s2-insert-local-10"
 {
   INSERT INTO local_deadlock_table VALUES (10, 10);
-}
-
-step "s2-set-2pc"
-{
-	set citus.multi_shard_commit_protocol TO '2pc';
 }
 
 step "s2-update-1-rep-2"
@@ -319,53 +305,50 @@ step "deadlock-checker-call"
   SELECT check_distributed_deadlocks();
 }
 
-// simplest case, loop with two nodes
-permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s2-update-1" "deadlock-checker-call" "s1-update-2"  "deadlock-checker-call" "s1-commit" "s2-commit"
+// simplest case, loop with two nodes (Reminder: Citus uses 2PC)
+permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s2-update-1" "deadlock-checker-call" "s1-update-2"("s2-update-1")  "deadlock-checker-call" "s1-commit" "s2-commit"
 
 // simplest case with replication factor 2
-permutation "s1-begin" "s2-begin" "s1-update-1-rep-2" "s2-update-2-rep-2" "s2-update-1-rep-2" "deadlock-checker-call" "s1-update-2-rep-2"  "deadlock-checker-call" "s1-commit" "s2-commit"
-
-// simplest case with 2pc enabled
-permutation "s1-begin" "s2-begin" "s1-set-2pc" "s2-set-2pc" "s1-update-1" "s2-update-2" "s2-update-1" "deadlock-checker-call" "s1-update-2"  "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s1-update-1-rep-2" "s2-update-2-rep-2" "s2-update-1-rep-2" "deadlock-checker-call" "s1-update-2-rep-2"("s2-update-1-rep-2")  "deadlock-checker-call" "s1-commit" "s2-commit"
 
 // simplest case with multi-shard query is cancelled
-permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s1-update-2" "deadlock-checker-call" "s2-upsert-select-all"  "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s1-update-2" "deadlock-checker-call" "s2-upsert-select-all"("s1-update-2")  "deadlock-checker-call" "s2-commit" "s1-commit"
 
 // simplest case with DDL is cancelled
-permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s1-update-2" "deadlock-checker-call" "s2-ddl"  "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s1-update-1" "s2-update-2" "s1-update-2" "deadlock-checker-call" "s2-ddl"("s1-update-2")  "deadlock-checker-call" "s2-commit" "s1-commit"
 
 // daedlock with local table
-permutation "s1-begin" "s2-begin" "s1-insert-dist-10" "s2-insert-local-10" "s2-insert-dist-10" "s1-insert-local-10" "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s1-insert-dist-10" "s2-insert-local-10" "s2-insert-dist-10" "s1-insert-local-10"("s2-insert-dist-10") "deadlock-checker-call" "s1-commit" "s2-commit"
 
 // daedlock with reference tables only
-permutation "s1-begin" "s2-begin" "s2-insert-ref-10" "s1-insert-ref-11" "s1-insert-ref-10" "s2-insert-ref-11" "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s2-insert-ref-10" "s1-insert-ref-11" "s1-insert-ref-10" "s2-insert-ref-11"("s1-insert-ref-10") "deadlock-checker-call" "s2-commit" "s1-commit"
 
 // deadlock with referecen + distributed tables
-permutation "s1-begin" "s2-begin" "s2-insert-ref-10" "s1-update-1" "deadlock-checker-call" "s2-update-1" "s1-insert-ref-10" "deadlock-checker-call" "s1-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s2-insert-ref-10" "s1-update-1" "deadlock-checker-call" "s2-update-1" "s1-insert-ref-10"("s2-update-1") "deadlock-checker-call" "s1-commit" "s2-commit"
 
 // slightly more complex case, loop with three nodes
-permutation "s1-begin" "s2-begin" "s3-begin"  "s1-update-1" "s2-update-2" "s3-update-3" "deadlock-checker-call" "s1-update-2" "s2-update-3" "s3-update-1" "deadlock-checker-call" "s3-commit" "s2-commit" "s1-commit"
+permutation "s1-begin" "s2-begin" "s3-begin"  "s1-update-1" "s2-update-2" "s3-update-3" "deadlock-checker-call" "s1-update-2" "s2-update-3" "s3-update-1"("s2-update-3") "deadlock-checker-call" "s3-commit" "s2-commit" "s1-commit"
 
 // similar to the above (i.e., 3 nodes), but the cycle starts from the second node
-permutation "s1-begin" "s2-begin" "s3-begin"  "s2-update-1" "s1-update-1" "s2-update-2" "s3-update-3" "s3-update-2" "deadlock-checker-call" "s2-update-3" "deadlock-checker-call" "s3-commit" "s2-commit" "s1-commit"
+permutation "s1-begin" "s2-begin" "s3-begin"  "s2-update-1" "s1-update-1" "s2-update-2" "s3-update-3" "s3-update-2" "deadlock-checker-call" "s2-update-3"("s3-update-2") "deadlock-checker-call" "s2-commit" "s3-commit" "s1-commit"
 
 // not connected graph
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s1-update-1" "s2-update-2" "s3-update-3" "s3-update-2" "deadlock-checker-call" "s4-update-4" "s2-update-3" "deadlock-checker-call" "s3-commit" "s2-commit" "s1-commit" "s4-commit"
+permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s1-update-1" "s2-update-2" "s3-update-3" "s3-update-2" "deadlock-checker-call" "s4-update-4" "s2-update-3"("s3-update-2") "deadlock-checker-call" "s2-commit" "s3-commit" "s1-commit" "s4-commit"
 
 // still a not connected graph, but each smaller graph contains dependencies, one of which is a distributed deadlock
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s4-update-1" "s1-update-1" "deadlock-checker-call" "s2-update-2" "s3-update-3" "s2-update-3" "s3-update-2" "deadlock-checker-call" "s3-commit" "s2-commit" "s4-commit" "s1-commit"
+permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s4-update-1" "s1-update-1" "deadlock-checker-call" "s2-update-2" "s3-update-3" "s2-update-3" "s3-update-2"("s2-update-3") "deadlock-checker-call" "s3-commit" "s2-commit" "s4-commit" "s1-commit"
 
 //  multiple deadlocks on a not connected graph
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s1-update-1" "s4-update-4" "s2-update-2" "s3-update-3" "s3-update-2" "s4-update-1" "s1-update-4" "deadlock-checker-call" "s1-commit" "s4-commit" "s2-update-3" "deadlock-checker-call"  "s2-commit" "s3-commit"
+permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s1-update-1" "s4-update-4" "s2-update-2" "s3-update-3" "s3-update-2" "s4-update-1" "s1-update-4"("s4-update-1") "deadlock-checker-call" "s1-commit" "s4-commit" "s2-update-3"("s3-update-2") "deadlock-checker-call"  "s2-commit" "s3-commit"
 
 // a larger graph where the first node is in the distributed deadlock
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s1-update-1" "s5-update-5" "s3-update-2" "s2-update-3" "s4-update-4" "s3-update-4" "deadlock-checker-call" "s6-update-6" "s4-update-6" "s1-update-5" "s5-update-1" "deadlock-checker-call" "s1-commit" "s5-commit" "s6-commit" "s4-commit" "s3-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s1-update-1" "s5-update-5" "s3-update-2" "s2-update-3" "s4-update-4" "s3-update-4" "deadlock-checker-call" "s6-update-6" "s4-update-6" "s1-update-5" "s5-update-1"("s1-update-5") "deadlock-checker-call" "s5-commit" "s1-commit" "s6-commit" "s4-commit" "s3-commit" "s2-commit"
 
 // a larger graph where the deadlock starts from a middle node
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s6-update-6" "s5-update-5" "s5-update-6" "s4-update-4" "s1-update-4" "s4-update-5" "deadlock-checker-call" "s2-update-3" "s3-update-2" "s2-update-2" "s3-update-3" "deadlock-checker-call" "s6-commit" "s5-commit" "s4-commit" "s1-commit" "s3-commit" "s2-commit"
+permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s6-update-6" "s5-update-5" "s5-update-6" "s4-update-4" "s1-update-4" "s4-update-5" "deadlock-checker-call" "s2-update-3" "s3-update-2" "s2-update-2" "s3-update-3"("s2-update-2") "deadlock-checker-call" "s3-commit" "s6-commit" "s5-commit" "s4-commit" "s1-commit" "s2-commit"
 
 // a larger graph where the deadlock starts from the last node
-permutation "s1-begin" "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s5-update-5" "s3-update-2" "s2-update-2" "s4-update-4" "s3-update-4" "s4-update-5" "s1-update-4" "deadlock-checker-call" "s6-update-6" "s5-update-6" "s6-update-5" "deadlock-checker-call" "s5-commit" "s6-commit" "s4-commit" "s3-commit"  "s1-commit" "s2-commit"
+permutation "s2-begin" "s3-begin" "s4-begin" "s5-begin" "s6-begin" "s5-update-5" "s3-update-2" "s2-update-2" "s4-update-4" "s3-update-4" "s4-update-5" "deadlock-checker-call" "s6-update-6" "s5-update-6" "s6-update-5"("s5-update-6") "deadlock-checker-call" "s6-commit" "s5-commit" "s4-commit" "s3-commit" "s2-commit"
 
 // a backend is blocked on multiple backends
 // note that session 5 is not strictly necessary to simulate the deadlock

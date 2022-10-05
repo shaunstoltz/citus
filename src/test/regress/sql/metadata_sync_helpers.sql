@@ -6,7 +6,6 @@ SET citus.next_placement_id TO 1500000;
 -- supress notice messages to make sure that the tests
 -- do not diverge with enterprise
 SET client_min_messages TO WARNING;
-SELECT run_command_on_workers($$CREATE ROLE metadata_sync_helper_role WITH LOGIN;$$);
 CREATE ROLE metadata_sync_helper_role WITH LOGIN;
 GRANT ALL ON SCHEMA metadata_sync_helpers TO metadata_sync_helper_role;
 RESET client_min_messages;
@@ -73,6 +72,13 @@ ROLLBACK;
 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 	SELECT assign_distributed_transaction_id(0, 8, '2021-07-09 15:41:55.542377+02');
 	SET application_name to 'citus_internal gpid=not a correct gpid';
+	SELECT citus_internal_add_partition_metadata ('test_2'::regclass, 'h', 'col_1', 0, 's');
+ROLLBACK;
+
+-- application_name with suffix is ok (e.g. pgbouncer might add this)
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+	SELECT assign_distributed_transaction_id(0, 8, '2021-07-09 15:41:55.542377+02');
+	SET application_name to 'citus_internal gpid=10000000001 - from 10.12.14.16:10370';
 	SELECT citus_internal_add_partition_metadata ('test_2'::regclass, 'h', 'col_1', 0, 's');
 ROLLBACK;
 
@@ -424,6 +430,7 @@ BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
     SET application_name to 'citus_internal gpid=10000000001';
     \set VERBOSITY terse
 
+	SET citus.enable_ddl_propagation TO OFF;
     CREATE FUNCTION distribution_test_function(int) RETURNS int
     AS $$ SELECT $1 $$
     LANGUAGE SQL;

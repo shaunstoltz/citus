@@ -31,6 +31,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/version_compat.h"
+#include "distributed/utils/array_type.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
 #include "storage/lmgr.h"
@@ -51,6 +52,7 @@ static int CompareShardPlacementsByNode(const void *leftElement,
 static void DeleteColocationGroup(uint32 colocationId);
 static uint32 CreateColocationGroupForRelation(Oid sourceRelationId);
 static void BreakColocation(Oid sourceRelationId);
+
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(mark_tables_colocated);
@@ -138,6 +140,17 @@ bool
 IsColocateWithNone(char *colocateWithTableName)
 {
 	return pg_strncasecmp(colocateWithTableName, "none", NAMEDATALEN) == 0;
+}
+
+
+/*
+ * IsColocateWithDefault returns true if the given table is
+ * the special keyword "default".
+ */
+bool
+IsColocateWithDefault(char *colocateWithTableName)
+{
+	return pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) == 0;
 }
 
 
@@ -303,9 +316,6 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 void
 ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 {
-	ListCell *leftShardIntervalCell = NULL;
-	ListCell *rightShardIntervalCell = NULL;
-
 	/* get sorted shard interval lists for both tables */
 	List *leftShardIntervalList = LoadShardIntervalList(leftRelationId);
 	List *rightShardIntervalList = LoadShardIntervalList(rightRelationId);
@@ -329,15 +339,11 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 	}
 
 	/* compare shard intervals one by one */
-	forboth(leftShardIntervalCell, leftShardIntervalList,
-			rightShardIntervalCell, rightShardIntervalList)
+	ShardInterval *leftInterval = NULL;
+	ShardInterval *rightInterval = NULL;
+	forboth_ptr(leftInterval, leftShardIntervalList,
+				rightInterval, rightShardIntervalList)
 	{
-		ShardInterval *leftInterval = (ShardInterval *) lfirst(leftShardIntervalCell);
-		ShardInterval *rightInterval = (ShardInterval *) lfirst(rightShardIntervalCell);
-
-		ListCell *leftPlacementCell = NULL;
-		ListCell *rightPlacementCell = NULL;
-
 		uint64 leftShardId = leftInterval->shardId;
 		uint64 rightShardId = rightInterval->shardId;
 
@@ -373,14 +379,11 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 												  CompareShardPlacementsByNode);
 
 		/* compare shard placements one by one */
-		forboth(leftPlacementCell, sortedLeftPlacementList,
-				rightPlacementCell, sortedRightPlacementList)
+		ShardPlacement *leftPlacement = NULL;
+		ShardPlacement *rightPlacement = NULL;
+		forboth_ptr(leftPlacement, sortedLeftPlacementList,
+					rightPlacement, sortedRightPlacementList)
 		{
-			ShardPlacement *leftPlacement =
-				(ShardPlacement *) lfirst(leftPlacementCell);
-			ShardPlacement *rightPlacement =
-				(ShardPlacement *) lfirst(rightPlacementCell);
-
 			/*
 			 * If shard placements are on different nodes, these shard
 			 * placements are not colocated.
@@ -574,6 +577,39 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType, 
 
 
 /*
+ * AcquireColocationDefaultLock serializes concurrent creation of a colocation entry
+ * for default group.
+ */
+void
+AcquireColocationDefaultLock(void)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = false;
+
+	SET_LOCKTAG_CITUS_OPERATION(tag, CITUS_CREATE_COLOCATION_DEFAULT);
+
+	(void) LockAcquire(&tag, ExclusiveLock, sessionLock, dontWait);
+}
+
+
+/*
+ * ReleaseColocationDefaultLock releases the lock for concurrent creation of a colocation entry
+ * for default group.
+ */
+void
+ReleaseColocationDefaultLock(void)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+
+	SET_LOCKTAG_CITUS_OPERATION(tag, CITUS_CREATE_COLOCATION_DEFAULT);
+
+	LockRelease(&tag, ExclusiveLock, sessionLock);
+}
+
+
+/*
  * CreateColocationGroup creates a new colocation id and writes it into
  * pg_dist_colocation with the given configuration. It also returns the created
  * colocation id.
@@ -628,7 +664,7 @@ InsertColocationGroupLocally(uint32 colocationId, int shardCount, int replicatio
 
 	/* increment the counter so that next command can see the row */
 	CommandCounterIncrement();
-	table_close(pgDistColocation, RowExclusiveLock);
+	table_close(pgDistColocation, NoLock);
 }
 
 
@@ -1267,10 +1303,17 @@ DeleteColocationGroupLocally(uint32 colocationId)
 	{
 		/*
 		 * simple_heap_delete() expects that the caller has at least an
-		 * AccessShareLock on replica identity index.
+		 * AccessShareLock on primary key index.
+		 *
+		 * XXX: This does not seem required, do we really need to acquire this lock?
+		 * Postgres doesn't acquire such locks on indexes before deleting catalog tuples.
+		 * Linking here the reasons we added this lock acquirement:
+		 * https://github.com/citusdata/citus/pull/2851#discussion_r306569462
+		 * https://github.com/citusdata/citus/pull/2855#discussion_r313628554
+		 * https://github.com/citusdata/citus/issues/1890
 		 */
 		Relation replicaIndex =
-			index_open(RelationGetReplicaIndex(pgDistColocation),
+			index_open(RelationGetPrimaryKeyIndex(pgDistColocation),
 					   AccessShareLock);
 		simple_heap_delete(pgDistColocation, &(heapTuple->t_self));
 
@@ -1280,5 +1323,110 @@ DeleteColocationGroupLocally(uint32 colocationId)
 	}
 
 	systable_endscan(scanDescriptor);
-	table_close(pgDistColocation, RowExclusiveLock);
+	table_close(pgDistColocation, NoLock);
+}
+
+
+/*
+ * FindColocateWithColocationId tries to find a colocation ID for a given
+ * colocate_with clause passed to create_distributed_table.
+ */
+uint32
+FindColocateWithColocationId(Oid relationId, char replicationModel,
+							 Oid distributionColumnType,
+							 Oid distributionColumnCollation,
+							 int shardCount, bool shardCountIsStrict,
+							 char *colocateWithTableName)
+{
+	uint32 colocationId = INVALID_COLOCATION_ID;
+
+	if (IsColocateWithDefault(colocateWithTableName))
+	{
+		/* check for default colocation group */
+		colocationId = ColocationId(shardCount, ShardReplicationFactor,
+									distributionColumnType,
+									distributionColumnCollation);
+
+		/*
+		 * if the shardCount is strict then we check if the shard count
+		 * of the colocated table is actually shardCount
+		 */
+		if (shardCountIsStrict && colocationId != INVALID_COLOCATION_ID)
+		{
+			Oid colocatedTableId = ColocatedTableId(colocationId);
+
+			if (colocatedTableId != InvalidOid)
+			{
+				CitusTableCacheEntry *cacheEntry =
+					GetCitusTableCacheEntry(colocatedTableId);
+				int colocatedTableShardCount = cacheEntry->shardIntervalArrayLength;
+
+				if (colocatedTableShardCount != shardCount)
+				{
+					colocationId = INVALID_COLOCATION_ID;
+				}
+			}
+		}
+	}
+	else if (!IsColocateWithNone(colocateWithTableName))
+	{
+		text *colocateWithTableNameText = cstring_to_text(colocateWithTableName);
+		Oid sourceRelationId = ResolveRelationId(colocateWithTableNameText, false);
+
+		EnsureTableCanBeColocatedWith(relationId, replicationModel,
+									  distributionColumnType, sourceRelationId);
+
+		colocationId = TableColocationId(sourceRelationId);
+	}
+
+	return colocationId;
+}
+
+
+/*
+ * EnsureTableCanBeColocatedWith checks whether a given replication model and
+ * distribution column type is suitable to distribute a table to be colocated
+ * with given source table.
+ *
+ * We only pass relationId to provide meaningful error messages.
+ */
+void
+EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
+							  Oid distributionColumnType, Oid sourceRelationId)
+{
+	CitusTableCacheEntry *sourceTableEntry = GetCitusTableCacheEntry(sourceRelationId);
+	char sourceReplicationModel = sourceTableEntry->replicationModel;
+	Var *sourceDistributionColumn = DistPartitionKeyOrError(sourceRelationId);
+
+	if (!IsCitusTableTypeCacheEntry(sourceTableEntry, HASH_DISTRIBUTED))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot distribute relation"),
+						errdetail("Currently, colocate_with option is only supported "
+								  "for hash distributed tables.")));
+	}
+
+	if (sourceReplicationModel != replicationModel)
+	{
+		char *relationName = get_rel_name(relationId);
+		char *sourceRelationName = get_rel_name(sourceRelationId);
+
+		ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
+							   sourceRelationName, relationName),
+						errdetail("Replication models don't match for %s and %s.",
+								  sourceRelationName, relationName)));
+	}
+
+	Oid sourceDistributionColumnType = sourceDistributionColumn->vartype;
+	if (sourceDistributionColumnType != distributionColumnType)
+	{
+		char *relationName = get_rel_name(relationId);
+		char *sourceRelationName = get_rel_name(sourceRelationId);
+
+		ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
+							   sourceRelationName, relationName),
+						errdetail("Distribution column types don't match for "
+								  "%s and %s.", sourceRelationName,
+								  relationName)));
+	}
 }

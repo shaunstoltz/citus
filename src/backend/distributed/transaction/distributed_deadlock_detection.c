@@ -16,6 +16,7 @@
 
 #include "access/hash.h"
 #include "distributed/backend_data.h"
+#include "distributed/errormessage.h"
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/errormessage.h"
 #include "distributed/hash_helpers.h"
@@ -656,7 +657,7 @@ LogDistributedDeadlockDebugMessage(const char *errorMessage)
 	}
 
 	ereport(LOG, (errmsg("[%s] %s", timestamptz_to_str(GetCurrentTimestamp()),
-						 ApplyLogRedaction(errorMessage))));
+						 errorMessage)));
 }
 
 

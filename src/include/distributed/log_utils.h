@@ -16,13 +16,12 @@
 #define CITUS_LOG_LEVEL_OFF 0
 
 
-extern bool IsLoggableLevel(int logLevel);
-extern char * HashLogMessage(const char *text);
+extern bool EnableUnsupportedFeatureMessages;
 
-#define ApplyLogRedaction(text) \
-	(log_min_messages <= ereport_loglevel ? HashLogMessage(text) : text)
+extern bool IsLoggableLevel(int logLevel);
 
 #undef ereport
+
 #define ereport(elevel, rest) \
 	do { \
 		int ereport_loglevel = elevel; \

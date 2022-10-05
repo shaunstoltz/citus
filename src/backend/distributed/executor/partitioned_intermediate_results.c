@@ -16,6 +16,7 @@
 #include "miscadmin.h"
 #include "port.h"
 
+#include "access/hash.h"
 #include "access/nbtree.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
@@ -26,6 +27,8 @@
 #include "distributed/pg_dist_shard.h"
 #include "distributed/remote_commands.h"
 #include "distributed/tuplestore.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/utils/function.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
 #include "nodes/makefuncs.h"
@@ -92,18 +95,6 @@ typedef struct PartitionedResultDestReceiver
 } PartitionedResultDestReceiver;
 
 static Portal StartPortalForQueryExecution(const char *queryString);
-static CitusTableCacheEntry * QueryTupleShardSearchInfo(ArrayType *minValuesArray,
-														ArrayType *maxValuesArray,
-														char partitionMethod,
-														Var *partitionColumn);
-static DestReceiver * CreatePartitionedResultDestReceiver(int partitionColumnIndex,
-														  int partitionCount,
-														  CitusTableCacheEntry *
-														  shardSearchInfo,
-														  DestReceiver **
-														  partitionedDestReceivers,
-														  bool lazyStartup,
-														  bool allowNullPartitionValues);
 static void PartitionedResultDestReceiverStartup(DestReceiver *dest, int operation,
 												 TupleDesc inputTupleDescriptor);
 static bool PartitionedResultDestReceiverReceive(TupleTableSlot *slot,
@@ -295,14 +286,14 @@ StartPortalForQueryExecution(const char *queryString)
 	Query *query = ParseQueryString(queryString, NULL, 0);
 
 	int cursorOptions = CURSOR_OPT_PARALLEL_OK;
-	PlannedStmt *queryPlan = pg_plan_query_compat(query, NULL, cursorOptions, NULL);
+	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions, NULL);
 
 	Portal portal = CreateNewPortal();
 
 	/* don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
 
-	PortalDefineQuery(portal, NULL, queryString, CMDTAG_SELECT_COMPAT,
+	PortalDefineQuery(portal, NULL, queryString, CMDTAG_SELECT,
 					  list_make1(queryPlan), NULL);
 	int eflags = 0;
 	PortalStart(portal, NULL, eflags, GetActiveSnapshot());
@@ -316,7 +307,7 @@ StartPortalForQueryExecution(const char *queryString)
  * information so that FindShardInterval() can find the shard corresponding
  * to a tuple.
  */
-static CitusTableCacheEntry *
+CitusTableCacheEntry *
 QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 						  char partitionMethod, Var *partitionColumn)
 {
@@ -349,6 +340,12 @@ QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 
 		hashFunction = palloc0(sizeof(FmgrInfo));
 		fmgr_info_copy(hashFunction, &(typeEntry->hash_proc_finfo), CurrentMemoryContext);
+
+		if (!OidIsValid(hashFunction->fn_oid))
+		{
+			ereport(ERROR, (errmsg("no hash function defined for type %s",
+								   format_type_be(partitionColumn->vartype))));
+		}
 	}
 
 	ShardInterval **shardIntervalArray = palloc0(partitionCount *
@@ -399,7 +396,7 @@ QueryTupleShardSearchInfo(ArrayType *minValuesArray, ArrayType *maxValuesArray,
 /*
  * CreatePartitionedResultDestReceiver sets up a partitioned dest receiver.
  */
-static DestReceiver *
+DestReceiver *
 CreatePartitionedResultDestReceiver(int partitionColumnIndex,
 									int partitionCount,
 									CitusTableCacheEntry *shardSearchInfo,

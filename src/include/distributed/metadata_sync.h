@@ -13,6 +13,7 @@
 #define METADATA_SYNC_H
 
 
+#include "distributed/commands/utility_hook.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "nodes/pg_list.h"
@@ -28,14 +29,34 @@ typedef enum
 	NODE_METADATA_SYNC_FAILED_SYNC = 2
 } NodeMetadataSyncResult;
 
+/*
+ * Information about dependent sequences. We do not have the
+ * dependent relationId as no caller needs. But, could be added
+ * here if needed.
+ */
+typedef struct SequenceInfo
+{
+	Oid sequenceOid;
+	int attributeNumber;
+
+	/*
+	 * true for nexval(seq) -- which also includes serials
+	 * false when only OWNED BY col
+	 */
+	bool isNextValDefault;
+} SequenceInfo;
+
+
 /* Functions declarations for metadata syncing */
 extern void SyncNodeMetadataToNode(const char *nodeNameString, int32 nodePort);
 extern void SyncCitusTableMetadata(Oid relationId);
 extern void EnsureSequentialModeMetadataOperations(void);
 extern bool ClusterHasKnownMetadataWorkers(void);
 extern char * LocalGroupIdUpdateCommand(int32 groupId);
+extern bool ShouldSyncUserCommandForObject(ObjectAddress objectAddress);
 extern bool ShouldSyncTableMetadata(Oid relationId);
 extern bool ShouldSyncTableMetadataViaCatalog(Oid relationId);
+extern bool ShouldSyncSequenceMetadata(Oid relationId);
 extern List * NodeMetadataCreateCommands(void);
 extern List * DistributedObjectMetadataSyncCommandList(void);
 extern List * ColocationGroupCreateCommandList(void);
@@ -48,21 +69,29 @@ extern char * MarkObjectsDistributedCreateCommand(List *addresses,
 extern char * DistributionCreateCommand(CitusTableCacheEntry *cacheEntry);
 extern char * DistributionDeleteCommand(const char *schemaName,
 										const char *tableName);
+extern char * DistributionDeleteMetadataCommand(Oid relationId);
 extern char * TableOwnerResetCommand(Oid distributedRelationId);
 extern char * NodeListInsertCommand(List *workerNodeList);
 extern List * ShardListInsertCommand(List *shardIntervalList);
+extern List * ShardDeleteCommandList(ShardInterval *shardInterval);
 extern char * NodeDeleteCommand(uint32 nodeId);
 extern char * NodeStateUpdateCommand(uint32 nodeId, bool isActive);
 extern char * ShouldHaveShardsUpdateCommand(uint32 nodeId, bool shouldHaveShards);
 extern char * ColocationIdUpdateCommand(Oid relationId, uint32 colocationId);
 extern char * CreateSchemaDDLCommand(Oid schemaId);
 extern List * GrantOnSchemaDDLCommands(Oid schemaId);
+extern List * GrantOnFunctionDDLCommands(Oid functionOid);
+extern List * GrantOnForeignServerDDLCommands(Oid serverId);
+extern List * GenerateGrantOnForeignServerQueriesFromAclItem(Oid serverId,
+															 AclItem *aclItem);
+extern List * GenerateGrantOnFDWQueriesFromAclItem(Oid serverId, AclItem *aclItem);
 extern char * PlacementUpsertCommand(uint64 shardId, uint64 placementId, int shardState,
 									 uint64 shardLength, int32 groupId);
 extern TableDDLCommand * TruncateTriggerCreateCommand(Oid relationId);
 extern void CreateInterTableRelationshipOfRelationOnWorkers(Oid relationId);
 extern List * InterTableRelationshipOfRelationCommandList(Oid relationId);
 extern List * DetachPartitionCommandList(void);
+extern void SyncNodeMetadataToNodes(void);
 extern BackgroundWorkerHandle * SpawnSyncNodeMetadataToNodes(Oid database, Oid owner);
 extern void SyncNodeMetadataToNodesMain(Datum main_arg);
 extern void SignalMetadataSyncDaemon(Oid database, int sig);
@@ -71,9 +100,8 @@ extern List * SequenceDependencyCommandList(Oid relationId);
 
 extern List * DDLCommandsForSequence(Oid sequenceOid, char *ownerName);
 extern List * GetSequencesFromAttrDef(Oid attrdefOid);
-extern void GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
-											  List **dependentSequenceList, AttrNumber
-											  attnum);
+extern void GetDependentSequencesWithRelation(Oid relationId, List **seqInfoList,
+											  AttrNumber attnum);
 extern List * GetDependentFunctionsWithRelation(Oid relationId);
 extern Oid GetAttributeTypeOid(Oid relationId, AttrNumber attnum);
 extern void SetLocalEnableMetadataSync(bool state);

@@ -38,10 +38,14 @@
 #endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "citus_version.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "distributed/adaptive_executor.h"
+#include "distributed/backend_data.h"
+#include "distributed/citus_depended_object.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/multi_copy.h"
@@ -53,6 +57,7 @@
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/maintenanced.h"
+#include "distributed/multi_logical_replication.h"
 #include "distributed/multi_partitioning_utils.h"
 #if PG_VERSION_NUM < 140000
 #include "distributed/metadata_cache.h"
@@ -64,7 +69,7 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/resource_lock.h"
-#include "distributed/transmit.h"
+#include "distributed/string_utils.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_transaction.h"
@@ -72,10 +77,13 @@
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/makefuncs.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
 
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
 int CreateObjectPropagationMode = CREATE_OBJECT_PROPAGATION_IMMEDIATE;
@@ -86,6 +94,7 @@ static int activeDropSchemaOrDBs = 0;
 static bool ConstraintDropped = false;
 
 
+ProcessUtility_hook_type PrevProcessUtility = NULL;
 int UtilityHookLevel = 0;
 
 
@@ -96,7 +105,7 @@ static void ProcessUtilityInternal(PlannedStmt *pstmt,
 								   ParamListInfo params,
 								   struct QueryEnvironment *queryEnv,
 								   DestReceiver *dest,
-								   QueryCompletionCompat *completionTag);
+								   QueryCompletion *completionTag);
 #if PG_VERSION_NUM >= 140000
 static void set_indexsafe_procflags(void);
 #endif
@@ -120,7 +129,7 @@ void
 ProcessUtilityParseTree(Node *node, const char *queryString, ProcessUtilityContext
 						context,
 						ParamListInfo params, DestReceiver *dest,
-						QueryCompletionCompat *completionTag)
+						QueryCompletion *completionTag)
 {
 	PlannedStmt *plannedStmt = makeNode(PlannedStmt);
 	plannedStmt->commandType = CMD_UTILITY;
@@ -150,7 +159,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 					 ParamListInfo params,
 					 struct QueryEnvironment *queryEnv,
 					 DestReceiver *dest,
-					 QueryCompletionCompat *completionTag)
+					 QueryCompletion *completionTag)
 {
 	Node *parsetree;
 
@@ -164,7 +173,6 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 	parsetree = pstmt->utilityStmt;
 
 	if (IsA(parsetree, TransactionStmt) ||
-		IsA(parsetree, LockStmt) ||
 		IsA(parsetree, ListenStmt) ||
 		IsA(parsetree, NotifyStmt) ||
 		IsA(parsetree, ExecuteStmt) ||
@@ -181,8 +189,8 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		 * that state. Since we never need to intercept transaction statements,
 		 * skip our checks and immediately fall into standard_ProcessUtility.
 		 */
-		standard_ProcessUtility_compat(pstmt, queryString, false, context,
-									   params, queryEnv, dest, completionTag);
+		PrevProcessUtility_compat(pstmt, queryString, false, context,
+								  params, queryEnv, dest, completionTag);
 
 		return;
 	}
@@ -194,14 +202,23 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		ErrorIfUnstableCreateOrAlterExtensionStmt(parsetree);
 	}
 
+	if (IsA(parsetree, CreateExtensionStmt))
+	{
+		/*
+		 * Postgres forbids creating/altering other extensions from within an extension script, so we use a utility hook instead
+		 * This preprocess check whether citus_columnar should be installed first before citus
+		 */
+		PreprocessCreateExtensionStmtForCitusColumnar(parsetree);
+	}
+
 	if (!CitusHasBeenLoaded())
 	{
 		/*
 		 * Ensure that utility commands do not behave any differently until CREATE
 		 * EXTENSION is invoked.
 		 */
-		standard_ProcessUtility_compat(pstmt, queryString, false, context,
-									   params, queryEnv, dest, completionTag);
+		PrevProcessUtility_compat(pstmt, queryString, false, context,
+								  params, queryEnv, dest, completionTag);
 
 		return;
 	}
@@ -232,8 +249,8 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 
 		PG_TRY();
 		{
-			standard_ProcessUtility_compat(pstmt, queryString, false, context,
-										   params, queryEnv, dest, completionTag);
+			PrevProcessUtility_compat(pstmt, queryString, false, context,
+									  params, queryEnv, dest, completionTag);
 
 			StoredProcedureLevel -= 1;
 
@@ -266,8 +283,8 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 
 		PG_TRY();
 		{
-			standard_ProcessUtility_compat(pstmt, queryString, false, context,
-										   params, queryEnv, dest, completionTag);
+			PrevProcessUtility_compat(pstmt, queryString, false, context,
+									  params, queryEnv, dest, completionTag);
 
 			DoBlockLevel -= 1;
 		}
@@ -356,10 +373,12 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 					   ParamListInfo params,
 					   struct QueryEnvironment *queryEnv,
 					   DestReceiver *dest,
-					   QueryCompletionCompat *completionTag)
+					   QueryCompletion *completionTag)
 {
 	Node *parsetree = pstmt->utilityStmt;
 	List *ddlJobs = NIL;
+	DistOpsValidationState distOpsValidationState = HasNoneValidObject;
+	bool oldSkipConstraintsValidationValue = SkipConstraintValidation;
 
 	if (IsA(parsetree, ExplainStmt) &&
 		IsA(((ExplainStmt *) parsetree)->query, Query))
@@ -410,6 +429,40 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	}
 
 	/*
+	 * For security and reliability reasons we disallow altering and dropping
+	 * subscriptions created by citus by non superusers. We could probably
+	 * disallow this for all subscriptions without issues. But out of an
+	 * abundance of caution for breaking subscription logic created by users
+	 * for other purposes, we only disallow it for the subscriptions that we
+	 * create i.e. ones that start with "citus_".
+	 */
+	if (IsA(parsetree, AlterSubscriptionStmt))
+	{
+		AlterSubscriptionStmt *alterSubStmt = (AlterSubscriptionStmt *) parsetree;
+		if (!superuser() &&
+			StringStartsWith(alterSubStmt->subname, "citus_"))
+		{
+			ereport(ERROR, (
+						errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg(
+							"Only superusers can alter subscriptions that are created by citus")));
+		}
+	}
+
+	if (IsA(parsetree, DropSubscriptionStmt))
+	{
+		DropSubscriptionStmt *dropSubStmt = (DropSubscriptionStmt *) parsetree;
+		if (!superuser() &&
+			StringStartsWith(dropSubStmt->subname, "citus_"))
+		{
+			ereport(ERROR, (
+						errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg(
+							"Only superusers can drop subscriptions that are created by citus")));
+		}
+	}
+
+	/*
 	 * Process SET LOCAL and SET TRANSACTION statements in multi-statement
 	 * transactions.
 	 */
@@ -425,42 +478,6 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		{
 			PostprocessVariableSetStmt(setStmt, queryString);
 		}
-	}
-
-	/*
-	 * TRANSMIT used to be separate command, but to avoid patching the grammar
-	 * it's now overlaid onto COPY, but with FORMAT = 'transmit' instead of the
-	 * normal FORMAT options.
-	 */
-	if (IsTransmitStmt(parsetree))
-	{
-		CopyStmt *copyStatement = (CopyStmt *) parsetree;
-		char *userName = TransmitStatementUser(copyStatement);
-		bool missingOK = false;
-		StringInfo transmitPath = makeStringInfo();
-
-		VerifyTransmitStmt(copyStatement);
-
-		/* ->relation->relname is the target file in our overloaded COPY */
-		appendStringInfoString(transmitPath, copyStatement->relation->relname);
-
-		if (userName != NULL)
-		{
-			Oid userId = get_role_oid(userName, missingOK);
-			appendStringInfo(transmitPath, ".%d", userId);
-		}
-
-		if (copyStatement->is_from)
-		{
-			RedirectCopyDataToRegularFile(transmitPath->data);
-		}
-		else
-		{
-			SendRegularFile(transmitPath->data);
-		}
-
-		/* Don't execute the faux copy statement */
-		return;
 	}
 
 	if (IsA(parsetree, CopyStmt))
@@ -505,6 +522,18 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		PreprocessTruncateStatement((TruncateStmt *) parsetree);
 	}
 
+	if (IsA(parsetree, LockStmt))
+	{
+		/*
+		 * PreprocessLockStatement might lock the relations locally if the
+		 * node executing the command is in pg_dist_node. Even though the process
+		 * utility will re-acquire the locks across the same relations if the node
+		 * is in the metadata (in the pg_dist_node table) that should not be a problem,
+		 * plus it ensures consistent locking order between the nodes.
+		 */
+		PreprocessLockStatement((LockStmt *) parsetree, context);
+	}
+
 	/*
 	 * We only process ALTER TABLE ... ATTACH PARTITION commands in the function below
 	 * and distribute the partition if necessary.
@@ -525,7 +554,37 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		parsetree = pstmt->utilityStmt;
 		ops = GetDistributeObjectOps(parsetree);
 
-		if (ops && ops->preprocess)
+		/*
+		 * Preprocess and qualify steps can cause pg tests to fail because of the
+		 * unwanted citus related warnings or early error logs related to invalid address.
+		 * Therefore, we first check if any address in the given statement is valid.
+		 * Then, we do not execute qualify and preprocess if none of the addresses are valid
+		 * or any address violates ownership rules to prevent before-mentioned citus related
+		 * messages. PG will complain about the invalid address or ownership violation, so we
+		 * are safe to not execute qualify and preprocess. Also note that we should not guard
+		 * any step after standardProcess_Utility with the enum state distOpsValidationState
+		 * because PG would have already failed the transaction.
+		 */
+		distOpsValidationState = DistOpsValidityState(parsetree, ops);
+
+		/*
+		 * For some statements Citus defines a Qualify function. The goal of this function
+		 * is to take any ambiguity from the statement that is contextual on either the
+		 * search_path or current settings.
+		 * Instead of relying on the search_path and settings we replace any deduced bits
+		 * and fill them out how postgres would resolve them. This makes subsequent
+		 * deserialize calls for the statement portable to other postgres servers, the
+		 * workers in our case.
+		 * If there are no valid objects or any object violates ownership, let's skip
+		 * the qualify and preprocess, and do not diverge from Postgres in terms of
+		 * error messages.
+		 */
+		if (ops && ops->qualify && DistOpsInValidState(distOpsValidationState))
+		{
+			ops->qualify(parsetree);
+		}
+
+		if (ops && ops->preprocess && DistOpsInValidState(distOpsValidationState))
 		{
 			ddlJobs = ops->preprocess(parsetree, queryString, context);
 		}
@@ -538,9 +597,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 * Citus intervening. The only exception is partition column drop, in
 		 * which case we error out. Advanced Citus users use this to implement their
 		 * own DDL propagation. We also use it to avoid re-propagating DDL commands
-		 * when changing MX tables on workers. Below, we also make sure that DDL
-		 * commands don't run queries that might get intercepted by Citus and error
-		 * out, specifically we skip validation in foreign keys.
+		 * when changing MX tables on workers.
 		 */
 
 		if (IsA(parsetree, AlterTableStmt))
@@ -559,8 +616,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 				 * Note validation is done on the shard level when DDL propagation
 				 * is enabled. The following eagerly executes some tasks on workers.
 				 */
-				parsetree =
-					SkipForeignKeyValidationIfConstraintIsFkey(alterTableStmt, false);
+				SkipForeignKeyValidationIfConstraintIsFkey(alterTableStmt);
 			}
 		}
 	}
@@ -568,14 +624,17 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	/* inform the user about potential caveats */
 	if (IsA(parsetree, CreatedbStmt))
 	{
-		ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
-								"distributed databases"),
-						 errdetail("Citus does not propagate CREATE DATABASE "
-								   "command to workers"),
-						 errhint("You can manually create a database and its "
-								 "extensions on workers.")));
+		if (EnableUnsupportedFeatureMessages)
+		{
+			ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
+									"distributed databases"),
+							 errdetail("Citus does not propagate CREATE DATABASE "
+									   "command to workers"),
+							 errhint("You can manually create a database and its "
+									 "extensions on workers.")));
+		}
 	}
-	else if (IsA(parsetree, CreateRoleStmt))
+	else if (IsA(parsetree, CreateRoleStmt) && !EnableCreateRolePropagation)
 	{
 		ereport(NOTICE, (errmsg("not propagating CREATE ROLE/USER commands to worker"
 								" nodes"),
@@ -605,6 +664,24 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		StopMaintenanceDaemon(MyDatabaseId);
 	}
 
+	/*
+	 * Make sure that dropping the role deletes the pg_dist_object entries. There is a
+	 * separate logic for roles, since roles are not included as dropped objects in the
+	 * drop event trigger. To handle it both on worker and coordinator nodes, it is not
+	 * implemented as a part of process functions but here.
+	 */
+	if (IsA(parsetree, DropRoleStmt))
+	{
+		DropRoleStmt *stmt = castNode(DropRoleStmt, parsetree);
+		List *allDropRoles = stmt->roles;
+
+		List *distributedDropRoles = FilterDistributedRoles(allDropRoles);
+		if (list_length(distributedDropRoles) > 0)
+		{
+			UnmarkRolesDistributed(distributedDropRoles);
+		}
+	}
+
 	pstmt->utilityStmt = parsetree;
 
 	PG_TRY();
@@ -626,10 +703,25 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		if (isAlterExtensionUpdateCitusStmt)
 		{
 			citusCanBeUpdatedToAvailableVersion = !InstalledAndAvailableVersionsSame();
+
+			/*
+			 * Check whether need to install/drop citus_columnar when upgrade/downgrade citus
+			 */
+			PreprocessAlterExtensionCitusStmtForCitusColumnar(parsetree);
 		}
 
-		standard_ProcessUtility_compat(pstmt, queryString, false, context,
-									   params, queryEnv, dest, completionTag);
+		PrevProcessUtility_compat(pstmt, queryString, false, context,
+								  params, queryEnv, dest, completionTag);
+
+		if (isAlterExtensionUpdateCitusStmt)
+		{
+			/*
+			 * Post process, upgrade citus_columnar from fake internal version to normal version if upgrade citus
+			 * or drop citus_columnar fake version when downgrade citus to older version that do not support
+			 * citus_columnar
+			 */
+			PostprocessAlterExtensionCitusStmtForCitusColumnar(parsetree);
+		}
 
 		/*
 		 * if we are running ALTER EXTENSION citus UPDATE (to "<version>") command, we may need
@@ -670,10 +762,14 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		if (IsA(parsetree, RenameStmt) && ((RenameStmt *) parsetree)->renameType ==
 			OBJECT_ROLE && EnableAlterRolePropagation)
 		{
-			ereport(NOTICE, (errmsg("not propagating ALTER ROLE ... RENAME TO commands "
-									"to worker nodes"),
-							 errhint("Connect to worker nodes directly to manually "
-									 "rename the role")));
+			if (EnableUnsupportedFeatureMessages)
+			{
+				ereport(NOTICE, (errmsg(
+									 "not propagating ALTER ROLE ... RENAME TO commands "
+									 "to worker nodes"),
+								 errhint("Connect to worker nodes directly to manually "
+										 "rename the role")));
+			}
 		}
 	}
 
@@ -713,6 +809,21 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		if (IsA(parsetree, AlterTableStmt))
 		{
 			PostprocessAlterTableStmt(castNode(AlterTableStmt, parsetree));
+		}
+		if (IsA(parsetree, GrantStmt))
+		{
+			GrantStmt *grantStmt = (GrantStmt *) parsetree;
+			if (grantStmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+			{
+				/*
+				 * Grant .. IN SCHEMA causes a deadlock if we don't use local execution
+				 * because standard process utility processes the shard placements as well
+				 * and the row-level locks in pg_class will not be released until the current
+				 * transaction commits. We could skip the local shard placements after standard
+				 * process utility, but for simplicity we just prefer using local execution.
+				 */
+				SetLocalExecutionStatus(LOCAL_EXECUTION_REQUIRED);
+			}
 		}
 
 		DDLJob *ddlJob = NULL;
@@ -774,17 +885,13 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 */
 		if (ops && ops->markDistributed)
 		{
-			ObjectAddress address = GetObjectAddressFromParseTree(parsetree, false);
-			MarkObjectDistributed(&address);
+			List *addresses = GetObjectAddressListFromParseTree(parsetree, false, true);
+			ObjectAddress *address = NULL;
+			foreach_ptr(address, addresses)
+			{
+				MarkObjectDistributed(address);
+			}
 		}
-	}
-
-	/* TODO: fold VACUUM's processing into the above block */
-	if (IsA(parsetree, VacuumStmt))
-	{
-		VacuumStmt *vacuumStmt = (VacuumStmt *) parsetree;
-
-		PostprocessVacuumStmt(vacuumStmt, queryString);
 	}
 
 	if (!IsDropCitusExtensionStmt(parsetree) && !IsA(parsetree, DropdbStmt))
@@ -795,6 +902,8 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 */
 		CitusHasBeenLoaded(); /* lgtm[cpp/return-value-ignored] */
 	}
+
+	SkipConstraintValidation = oldSkipConstraintsValidationValue;
 }
 
 
@@ -1081,16 +1190,20 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 
 	EnsureCoordinator();
 
-	Oid targetRelationId = ddlJob->targetRelationId;
+	ObjectAddress targetObjectAddress = ddlJob->targetObjectAddress;
 
-	if (OidIsValid(targetRelationId))
+	if (OidIsValid(targetObjectAddress.classId))
 	{
 		/*
-		 * Only for ddlJobs that are targetting a relation (table) we want to sync
-		 * its metadata and verify some properties around the table.
+		 * Only for ddlJobs that are targetting an object we want to sync
+		 * its metadata.
 		 */
-		shouldSyncMetadata = ShouldSyncTableMetadata(targetRelationId);
-		EnsurePartitionTableNotReplicated(targetRelationId);
+		shouldSyncMetadata = ShouldSyncUserCommandForObject(targetObjectAddress);
+
+		if (targetObjectAddress.classId == RelationRelationId)
+		{
+			EnsurePartitionTableNotReplicated(targetObjectAddress.objectId);
+		}
 	}
 
 	bool localExecutionSupported = true;
@@ -1300,53 +1413,6 @@ set_indexsafe_procflags(void)
 
 
 #endif
-
-
-/*
- * CreateCustomDDLTaskList creates a DDLJob which will apply a command to all placements
- * of shards of a distributed table. The command to be applied is generated by the
- * TableDDLCommand structure passed in.
- */
-DDLJob *
-CreateCustomDDLTaskList(Oid relationId, TableDDLCommand *command)
-{
-	List *taskList = NIL;
-	List *shardIntervalList = LoadShardIntervalList(relationId);
-	uint64 jobId = INVALID_JOB_ID;
-	Oid namespace = get_rel_namespace(relationId);
-	char *namespaceName = get_namespace_name(namespace);
-	int taskId = 1;
-
-	/* lock metadata before getting placement lists */
-	LockShardListMetadata(shardIntervalList, ShareLock);
-
-	ShardInterval *shardInterval = NULL;
-	foreach_ptr(shardInterval, shardIntervalList)
-	{
-		uint64 shardId = shardInterval->shardId;
-
-		char *commandStr = GetShardedTableDDLCommand(command, shardId, namespaceName);
-
-		Task *task = CitusMakeNode(Task);
-		task->jobId = jobId;
-		task->taskId = taskId++;
-		task->taskType = DDL_TASK;
-		SetTaskQueryString(task, commandStr);
-		task->replicationModel = REPLICATION_MODEL_INVALID;
-		task->dependentTaskList = NULL;
-		task->anchorShardId = shardId;
-		task->taskPlacementList = ActiveShardPlacementList(shardId);
-
-		taskList = lappend(taskList, task);
-	}
-
-	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-	ddlJob->targetRelationId = relationId;
-	ddlJob->metadataSyncCommand = GetTableDDLCommand(command);
-	ddlJob->taskList = taskList;
-
-	return ddlJob;
-}
 
 
 /*
@@ -1592,10 +1658,9 @@ NodeDDLTaskList(TargetWorkerSet targets, List *commands)
 	}
 
 	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-	ddlJob->targetRelationId = InvalidOid;
+	ddlJob->targetObjectAddress = InvalidObjectAddress;
 	ddlJob->metadataSyncCommand = NULL;
 	ddlJob->taskList = list_make1(task);
-
 	return list_make1(ddlJob);
 }
 
@@ -1619,27 +1684,4 @@ bool
 DropSchemaOrDBInProgress(void)
 {
 	return activeDropSchemaOrDBs > 0;
-}
-
-
-/*
- * ColumnarTableSetOptionsHook propagates columnar table options to shards, if
- * necessary.
- */
-void
-ColumnarTableSetOptionsHook(Oid relationId, ColumnarOptions options)
-{
-	if (EnableDDLPropagation && IsCitusTable(relationId))
-	{
-		/* when a columnar table is distributed update all settings on the shards */
-		Oid namespaceId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(namespaceId);
-		char *relationName = get_rel_name(relationId);
-		TableDDLCommand *command = ColumnarGetCustomTableOptionsDDL(schemaName,
-																	relationName,
-																	options);
-		DDLJob *ddljob = CreateCustomDDLTaskList(relationId, command);
-
-		ExecuteDistributedDDLJob(ddljob);
-	}
 }

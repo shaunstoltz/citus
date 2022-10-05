@@ -4,7 +4,9 @@
  *
  * Type and function declarations for the shard rebalancer tool.
  *
- * Copyright (c), Citus Data, Inc.
+ * Copyright (c) 2016, Citus Data, Inc.
+ *
+ * $Id$
  *
  *-------------------------------------------------------------------------
  */
@@ -71,7 +73,6 @@
 /* *INDENT-ON* */
 
 #define REBALANCE_ACTIVITY_MAGIC_NUMBER 1337
-#define REBALANCE_PROGRESS_ERROR -1
 #define REBALANCE_PROGRESS_WAITING 0
 #define REBALANCE_PROGRESS_MOVING 1
 #define REBALANCE_PROGRESS_MOVED 2
@@ -105,6 +106,7 @@ typedef struct PlacementUpdateEventProgress
 	int sourcePort;
 	char targetName[255];
 	int targetPort;
+	PlacementUpdateType updateType;
 	pg_atomic_uint64 progress;
 } PlacementUpdateEventProgress;
 
@@ -192,6 +194,11 @@ extern List * RebalancePlacementUpdates(List *workerNodeList,
 extern List * ReplicationPlacementUpdates(List *workerNodeList, List *shardPlacementList,
 										  int shardReplicationFactor);
 extern void ExecuteRebalancerCommandInSeparateTransaction(char *command);
+extern void AcquirePlacementColocationLock(Oid relationId, int lockMode,
+										   const char *operationName);
 
+extern void SetupRebalanceMonitor(List *placementUpdateList,
+								  Oid relationId,
+								  uint64 initialProgressState);
 
 #endif   /* SHARD_REBALANCER_H */

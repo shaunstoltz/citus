@@ -1,7 +1,6 @@
 SET citus.next_shard_id TO 20010000;
 
 CREATE USER typeuser;
-SELECT run_command_on_workers($$CREATE USER typeuser;$$);
 
 CREATE SCHEMA type_tests AUTHORIZATION typeuser;
 CREATE SCHEMA type_tests2 AUTHORIZATION typeuser; -- to test creation in a specific schema and moving to schema
@@ -260,20 +259,8 @@ UPDATE field_indirection_test_2 SET (ct2_col.text_1, ct1_col.int_2) = ('text2', 
 
 CREATE TYPE two_ints as (if1 int, if2 int);
 CREATE DOMAIN domain AS two_ints CHECK ((VALUE).if1 > 0);
--- citus does not propagate domain objects
--- TODO: Once domains are supported, remove enable_metadata_sync off/on change
--- on dependent table distribution below.
-SELECT run_command_on_workers(
-$$
-    CREATE DOMAIN type_tests.domain AS type_tests.two_ints CHECK ((VALUE).if1 > 0);
-$$);
 CREATE TABLE domain_indirection_test (f1 int, f3 domain, domain_array domain[]);
-
--- Disable metadata sync since citus doesn't support distributing
--- domains for now.
-SET citus.enable_metadata_sync TO OFF;
 SELECT create_distributed_table('domain_indirection_test', 'f1');
-RESET citus.enable_metadata_sync;
 
 -- not supported (field indirection to underlying composite type)
 INSERT INTO domain_indirection_test (f1,f3.if1, f3.if2) VALUES (0, 1, 2);
@@ -334,9 +321,37 @@ CREATE TYPE circ_type1 AS (a int);
 CREATE TYPE circ_type2 AS (a int, b circ_type1);
 ALTER TYPE circ_type1 ADD ATTRIBUTE b circ_type2;
 
+-- Show that types can be created locally if has unsupported dependency
+CREATE TYPE text_local_def;
+CREATE FUNCTION text_local_def_in(cstring)
+   RETURNS text_local_def
+   AS 'textin'
+   LANGUAGE internal STRICT IMMUTABLE;
+CREATE FUNCTION text_local_def_out(text_local_def)
+   RETURNS cstring
+   AS 'textout'
+   LANGUAGE internal STRICT IMMUTABLE;
+CREATE TYPE text_local_def (
+   internallength = variable,
+   input = text_local_def_in,
+   output = text_local_def_out,
+   alignment = int4,
+   default = 'zippo'
+);
+
+-- It should be created locally as it has unsupported dependency
+CREATE TYPE default_test_row AS (f1 text_local_def, f2 int4);
+
+-- Distributing table depending on that type should error out
+CREATE TABLE table_text_local_def(id int, col_1 default_test_row);
+SELECT create_distributed_table('table_text_local_def','id');
+
+-- will skip trying to propagate the type/enum due to temp schema
+CREATE TYPE pg_temp.temp_type AS (int_field int);
+CREATE TYPE pg_temp.temp_enum AS ENUM ('one', 'two', 'three');
+
 -- clear objects
 SET client_min_messages TO error; -- suppress cascading objects dropping
 DROP SCHEMA type_tests CASCADE;
 DROP SCHEMA type_tests2 CASCADE;
 DROP USER typeuser;
-SELECT run_command_on_workers($$DROP USER typeuser;$$);

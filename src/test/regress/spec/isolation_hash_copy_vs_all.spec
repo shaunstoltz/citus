@@ -5,8 +5,6 @@
 // create append distributed table to test behavior of COPY in concurrent operations
 setup
 {
-      SELECT citus_internal.replace_isolation_tester_func();
-  SELECT citus_internal.refresh_isolation_tester_prepared_statement();
 	SET citus.shard_replication_factor TO 1;
 	CREATE TABLE hash_copy(id integer, data text, int_data int);
 	SELECT create_distributed_table('hash_copy', 'id');
@@ -16,7 +14,6 @@ setup
 teardown
 {
 	DROP TABLE IF EXISTS hash_copy CASCADE;
- SELECT citus_internal.restore_isolation_tester_func();
 }
 
 // session 1
@@ -86,6 +83,10 @@ step "s2-table-size" { SELECT citus_total_relation_size('hash_copy'); }
 step "s2-master-modify-multiple-shards" { DELETE FROM hash_copy; }
 step "s2-master-drop-all-shards" { SELECT citus_drop_all_shards('hash_copy'::regclass, 'public', 'hash_copy'); }
 step "s2-distribute-table" { SELECT create_distributed_table('hash_copy', 'id'); }
+// We use this as a way to wait for s2-ddl-create-index-concurrently to
+// complete. We know it can complete after s1-commit has succeeded, this way we
+// make sure no other query is run over session s1 before that happens.
+step "s2-empty" {}
 
 // permutations - COPY vs COPY
 permutation "s1-initialize" "s1-begin" "s1-copy" "s2-copy" "s1-commit" "s1-select-count"
@@ -102,7 +103,7 @@ permutation "s1-initialize" "s1-begin" "s1-copy" "s2-truncate" "s1-commit" "s1-s
 permutation "s1-initialize" "s1-begin" "s1-copy" "s2-drop" "s1-commit" "s1-select-count"
 permutation "s1-initialize" "s1-begin" "s1-copy" "s2-ddl-create-index" "s1-commit" "s1-select-count" "s1-show-indexes"
 permutation "s1-initialize" "s1-ddl-create-index" "s1-begin" "s1-copy" "s2-ddl-drop-index" "s1-commit" "s1-select-count" "s1-show-indexes"
-permutation "s1-initialize" "s1-begin" "s1-copy" "s2-ddl-create-index-concurrently" "s1-commit" "s1-select-count" "s1-show-indexes"
+permutation "s1-initialize" "s1-begin" "s1-copy" "s2-ddl-create-index-concurrently" "s1-commit" "s2-empty" "s1-select-count" "s1-show-indexes"
 permutation "s1-initialize" "s1-begin" "s1-copy" "s2-ddl-add-column" "s1-commit" "s1-select-count" "s1-show-columns"
 permutation "s1-initialize" "s1-ddl-add-column" "s1-begin" "s1-copy-additional-column" "s2-ddl-drop-column" "s1-commit" "s1-select-count" "s1-show-columns"
 permutation "s1-initialize" "s1-begin" "s1-copy" "s2-ddl-rename-column" "s1-commit" "s1-select-count" "s1-show-columns"

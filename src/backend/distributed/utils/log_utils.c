@@ -9,9 +9,25 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "utils/guc.h"
 #include "distributed/log_utils.h"
+#include "distributed/errormessage.h"
+#include "common/sha2.h"
 
+#include "utils/builtins.h"
+
+#if PG_VERSION_NUM >= PG_VERSION_14
+#include "common/cryptohash.h"
+#endif
+
+
+/*
+ * GUC controls showing of some of the unwanted citus messages, it is intended to be set false
+ * before vanilla tests to not break postgres test logs.
+ */
+bool EnableUnsupportedFeatureMessages = true;
 
 /*
  * IsLoggableLevel returns true if either of client or server log guc is configured to
@@ -22,14 +38,4 @@ bool
 IsLoggableLevel(int logLevel)
 {
 	return log_min_messages <= logLevel || client_min_messages <= logLevel;
-}
-
-
-/*
- * HashLogMessage is only supported in Citus Enterprise
- */
-char *
-HashLogMessage(const char *logText)
-{
-	return (char *) logText;
 }

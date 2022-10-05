@@ -50,12 +50,33 @@ extern void QualifyRenameCollationStmt(Node *stmt);
 extern void QualifyAlterCollationSchemaStmt(Node *stmt);
 extern void QualifyAlterCollationOwnerStmt(Node *stmt);
 
+/* forward declarations for deparse_domain_stmts.c */
+extern char * DeparseCreateDomainStmt(Node *node);
+extern char * DeparseDropDomainStmt(Node *node);
+extern char * DeparseAlterDomainStmt(Node *node);
+extern char * DeparseDomainRenameConstraintStmt(Node *node);
+extern char * DeparseAlterDomainOwnerStmt(Node *node);
+extern char * DeparseRenameDomainStmt(Node *node);
+extern char * DeparseAlterDomainSchemaStmt(Node *node);
+
+extern void QualifyCreateDomainStmt(Node *node);
+extern void QualifyDropDomainStmt(Node *node);
+extern void QualifyAlterDomainStmt(Node *node);
+extern void QualifyDomainRenameConstraintStmt(Node *node);
+extern void QualifyAlterDomainOwnerStmt(Node *node);
+extern void QualifyRenameDomainStmt(Node *node);
+extern void QualifyAlterDomainSchemaStmt(Node *node);
+
+/* forward declarations for deparse_foreign_data_wrapper_stmts.c */
+extern char * DeparseGrantOnFDWStmt(Node *node);
+
 /* forward declarations for deparse_foreign_server_stmts.c */
 extern char * DeparseCreateForeignServerStmt(Node *node);
 extern char * DeparseAlterForeignServerStmt(Node *node);
 extern char * DeparseAlterForeignServerRenameStmt(Node *node);
 extern char * DeparseAlterForeignServerOwnerStmt(Node *node);
 extern char * DeparseDropForeignServerStmt(Node *node);
+extern char * DeparseGrantOnForeignServerStmt(Node *node);
 
 /* forward declarations for deparse_table_stmts.c */
 extern char * DeparseAlterTableSchemaStmt(Node *stmt);
@@ -84,6 +105,9 @@ extern char * DeparseCreateSchemaStmt(Node *node);
 extern char * DeparseDropSchemaStmt(Node *node);
 extern char * DeparseGrantOnSchemaStmt(Node *stmt);
 extern char * DeparseAlterSchemaRenameStmt(Node *stmt);
+
+extern void AppendGrantPrivileges(StringInfo buf, GrantStmt *stmt);
+extern void AppendGrantGrantees(StringInfo buf, GrantStmt *stmt);
 
 /* forward declarations for deparse_statistics_stmts.c */
 extern char * DeparseCreateStatisticsStmt(Node *node);
@@ -121,10 +145,28 @@ extern void QualifyCreateEnumStmt(Node *stmt);
 extern void QualifyAlterTypeSchemaStmt(Node *stmt);
 extern void QualifyAlterTypeOwnerStmt(Node *stmt);
 
-extern ObjectAddress GetObjectAddressFromParseTree(Node *parseTree, bool missing_ok);
-extern ObjectAddress RenameAttributeStmtObjectAddress(Node *stmt, bool missing_ok);
+extern char * GetTypeNamespaceNameByNameList(List *names);
+extern Oid TypeOidGetNamespaceOid(Oid typeOid);
+
+extern List * GetObjectAddressListFromParseTree(Node *parseTree, bool missing_ok, bool
+												isPostprocess);
+extern List * RenameAttributeStmtObjectAddress(Node *stmt, bool missing_ok, bool
+											   isPostprocess);
+
+/* forward declarations for deparse_view_stmts.c */
+extern void QualifyDropViewStmt(Node *node);
+extern void QualifyAlterViewStmt(Node *node);
+extern void QualifyRenameViewStmt(Node *node);
+extern void QualifyAlterViewSchemaStmt(Node *node);
+extern char * DeparseRenameViewStmt(Node *stmt);
+extern char * DeparseAlterViewStmt(Node *node);
+extern char * DeparseDropViewStmt(Node *node);
+extern char * DeparseAlterViewSchemaStmt(Node *node);
+
 
 /* forward declarations for deparse_function_stmts.c */
+extern bool isFunction(ObjectType objectType);
+
 extern char * DeparseDropFunctionStmt(Node *stmt);
 extern char * DeparseAlterFunctionStmt(Node *stmt);
 
@@ -132,6 +174,8 @@ extern char * DeparseRenameFunctionStmt(Node *stmt);
 extern char * DeparseAlterFunctionSchemaStmt(Node *stmt);
 extern char * DeparseAlterFunctionOwnerStmt(Node *stmt);
 extern char * DeparseAlterFunctionDependsStmt(Node *stmt);
+
+extern char * DeparseGrantOnFunctionStmt(Node *node);
 
 extern void AppendVariableSet(StringInfo buf, VariableSetStmt *setStmt);
 
@@ -148,6 +192,9 @@ extern char * DeparseAlterRoleSetStmt(Node *stmt);
 extern List * MakeSetStatementArguments(char *configurationName,
 										char *configurationValue);
 extern void QualifyAlterRoleSetStmt(Node *stmt);
+extern char * DeparseCreateRoleStmt(Node *stmt);
+extern char * DeparseDropRoleStmt(Node *stmt);
+extern char * DeparseGrantRoleStmt(Node *stmt);
 
 /* forward declarations for deparse_extension_stmts.c */
 extern DefElem * GetExtensionOption(List *extensionOptions,
@@ -179,10 +226,19 @@ extern char * DeparseDropSequenceStmt(Node *node);
 extern char * DeparseRenameSequenceStmt(Node *node);
 extern char * DeparseAlterSequenceSchemaStmt(Node *node);
 extern char * DeparseAlterSequenceOwnerStmt(Node *node);
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+extern char * DeparseAlterSequencePersistenceStmt(Node *node);
+#endif
+extern char * DeparseGrantOnSequenceStmt(Node *node);
 
 /* forward declarations for qualify_sequence_stmt.c */
 extern void QualifyRenameSequenceStmt(Node *node);
+extern void QualifyDropSequenceStmt(Node *node);
 extern void QualifyAlterSequenceSchemaStmt(Node *node);
 extern void QualifyAlterSequenceOwnerStmt(Node *node);
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+extern void QualifyAlterSequencePersistenceStmt(Node *node);
+#endif
+extern void QualifyGrantOnSequenceStmt(Node *node);
 
 #endif /* CITUS_DEPARSER_H */

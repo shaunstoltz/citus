@@ -149,6 +149,9 @@ typedef struct CitusCopyDestReceiver
 } CitusCopyDestReceiver;
 
 
+/* GUCs */
+extern bool SkipJsonbValidationInCopy;
+
 /* managed via GUC, the default is 4MB */
 extern int CopySwitchOverThresholdBytes;
 
@@ -173,12 +176,13 @@ extern void AppendCopyBinaryFooters(CopyOutState footerOutputState);
 extern void EndRemoteCopy(int64 shardId, List *connectionList);
 extern List * CreateRangeTable(Relation rel, AclMode requiredAccess);
 extern Node * ProcessCopyStmt(CopyStmt *copyStatement,
-							  QueryCompletionCompat *completionTag,
+							  QueryCompletion *completionTag,
 							  const char *queryString);
 extern void CheckCopyPermissions(CopyStmt *copyStatement);
 extern bool IsCopyResultStmt(CopyStmt *copyStatement);
 extern void ConversionPathForTypes(Oid inputType, Oid destType, CopyCoercionData *result);
 extern Datum CoerceColumnValue(Datum inputValue, CopyCoercionData *coercionPath);
+extern void ReportCopyError(MultiConnection *connection, PGresult *result);
 
 
 #endif /* MULTI_COPY_H */

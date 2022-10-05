@@ -81,11 +81,6 @@ stop_session_level_connection_to_node
 
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-start-session-level-connection s1-begin-on-worker s1-select s2-start-session-level-connection s2-begin-on-worker s2-insert-select s1-commit-worker s2-commit-worker s1-stop-connection s2-stop-connection s3-select-count
 step s1-start-session-level-connection:
@@ -174,11 +169,6 @@ step s3-select-count:
 count
 ---------------------------------------------------------------------
    10
-(1 row)
-
-restore_isolation_tester_func
----------------------------------------------------------------------
-
 (1 row)
 
 
@@ -271,11 +261,6 @@ count
     4
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-start-session-level-connection s1-begin-on-worker s1-select s2-start-session-level-connection s2-begin-on-worker s2-copy s1-commit-worker s2-commit-worker s1-stop-connection s2-stop-connection s3-select-count
 step s1-start-session-level-connection:
@@ -366,11 +351,6 @@ count
     7
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
-
-(1 row)
-
 
 starting permutation: s1-start-session-level-connection s1-begin-on-worker s1-select s2-begin s2-index s1-commit-worker s2-commit s1-stop-connection
 step s1-start-session-level-connection:
@@ -418,11 +398,6 @@ step s1-stop-connection:
  SELECT stop_session_level_connection_to_node();
 
 stop_session_level_connection_to_node
----------------------------------------------------------------------
-
-(1 row)
-
-restore_isolation_tester_func
 ---------------------------------------------------------------------
 
 (1 row)
@@ -509,13 +484,8 @@ stop_session_level_connection_to_node
 
 (1 row)
 
-restore_isolation_tester_func
----------------------------------------------------------------------
 
-(1 row)
-
-
-starting permutation: s1-start-session-level-connection s1-begin-on-worker s1-disable-binary-protocol-on-worker s1-select s2-coordinator-create-index-concurrently s1-commit-worker s1-stop-connection
+starting permutation: s1-start-session-level-connection s1-begin-on-worker s1-disable-binary-protocol-on-worker s1-select s2-coordinator-create-index-concurrently s2-empty s1-commit-worker s1-stop-connection
 step s1-start-session-level-connection:
         SELECT start_session_level_connection_to_node('localhost', 57637);
 
@@ -551,7 +521,9 @@ run_commands_on_session_level_connection_to_node
 
 step s2-coordinator-create-index-concurrently:
  CREATE INDEX CONCURRENTLY select_table_index ON select_table(id);
-
+ <waiting ...>
+step s2-coordinator-create-index-concurrently: <... completed>
+step s2-empty:
 step s1-commit-worker:
  SELECT run_commands_on_session_level_connection_to_node('COMMIT');
 
@@ -564,11 +536,6 @@ step s1-stop-connection:
  SELECT stop_session_level_connection_to_node();
 
 stop_session_level_connection_to_node
----------------------------------------------------------------------
-
-(1 row)
-
-restore_isolation_tester_func
 ---------------------------------------------------------------------
 
 (1 row)

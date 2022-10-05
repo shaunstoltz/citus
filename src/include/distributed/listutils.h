@@ -52,7 +52,7 @@ typedef struct ListCellAndListWrapper
 	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
 		 (var ## CellDoNotUse) != NULL && \
 		 (((var) = lfirst(var ## CellDoNotUse)) || true); \
-		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
+		 var ## CellDoNotUse = lnext(l, var ## CellDoNotUse))
 
 
 /*
@@ -65,7 +65,7 @@ typedef struct ListCellAndListWrapper
 	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
 		 (var ## CellDoNotUse) != NULL && \
 		 (((var) = lfirst_int(var ## CellDoNotUse)) || true); \
-		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
+		 var ## CellDoNotUse = lnext(l, var ## CellDoNotUse))
 
 
 /*
@@ -78,7 +78,60 @@ typedef struct ListCellAndListWrapper
 	for (ListCell *(var ## CellDoNotUse) = list_head(l); \
 		 (var ## CellDoNotUse) != NULL && \
 		 (((var) = lfirst_oid(var ## CellDoNotUse)) || true); \
-		 var ## CellDoNotUse = lnext_compat(l, var ## CellDoNotUse))
+		 var ## CellDoNotUse = lnext(l, var ## CellDoNotUse))
+
+/*
+ * forboth_ptr -
+ *	  a convenience macro which loops through two lists of pointers at the same
+ *	  time, without needing a ListCell. It only needs two declared pointer
+ *	  variables to store the pointer of each of the two cells in.
+ */
+#define forboth_ptr(var1, l1, var2, l2) \
+	for (ListCell *(var1 ## CellDoNotUse) = list_head(l1), \
+		 *(var2 ## CellDoNotUse) = list_head(l2); \
+		 (var1 ## CellDoNotUse) != NULL && \
+		 (var2 ## CellDoNotUse) != NULL && \
+		 (((var1) = lfirst(var1 ## CellDoNotUse)) || true) && \
+		 (((var2) = lfirst(var2 ## CellDoNotUse)) || true); \
+		 var1 ## CellDoNotUse = lnext(l1, var1 ## CellDoNotUse), \
+		 var2 ## CellDoNotUse = lnext(l2, var2 ## CellDoNotUse) \
+		 )
+
+/*
+ * forboth_ptr_oid -
+ *	  a convenience macro which loops through two lists at the same time. The
+ *	  first list should contain pointers and the second list should contain
+ *	  Oids. It does not need a ListCell to do this. It only needs two declared
+ *	  variables to store the pointer and the Oid of each of the two cells in.
+ */
+#define forboth_ptr_oid(var1, l1, var2, l2) \
+	for (ListCell *(var1 ## CellDoNotUse) = list_head(l1), \
+		 *(var2 ## CellDoNotUse) = list_head(l2); \
+		 (var1 ## CellDoNotUse) != NULL && \
+		 (var2 ## CellDoNotUse) != NULL && \
+		 (((var1) = lfirst(var1 ## CellDoNotUse)) || true) && \
+		 (((var2) = lfirst_oid(var2 ## CellDoNotUse)) || true); \
+		 var1 ## CellDoNotUse = lnext(l1, var1 ## CellDoNotUse), \
+		 var2 ## CellDoNotUse = lnext(l2, var2 ## CellDoNotUse) \
+		 )
+
+/*
+ * forboth_int_oid -
+ *	  a convenience macro which loops through two lists at the same time. The
+ *	  first list should contain integers and the second list should contain
+ *	  Oids. It does not need a ListCell to do this. It only needs two declared
+ *	  variables to store the int and the Oid of each of the two cells in.
+ */
+#define forboth_int_oid(var1, l1, var2, l2) \
+	for (ListCell *(var1 ## CellDoNotUse) = list_head(l1), \
+		 *(var2 ## CellDoNotUse) = list_head(l2); \
+		 (var1 ## CellDoNotUse) != NULL && \
+		 (var2 ## CellDoNotUse) != NULL && \
+		 (((var1) = lfirst_int(var1 ## CellDoNotUse)) || true) && \
+		 (((var2) = lfirst_oid(var2 ## CellDoNotUse)) || true); \
+		 var1 ## CellDoNotUse = lnext(l1, var1 ## CellDoNotUse), \
+		 var2 ## CellDoNotUse = lnext(l2, var2 ## CellDoNotUse) \
+		 )
 
 /*
  * foreach_ptr_append -
@@ -92,10 +145,7 @@ typedef struct ListCellAndListWrapper
  *
  *	  For more information, see postgres commit with sha
  *	  1cff1b95ab6ddae32faa3efe0d95a820dbfdc164
- */
-#if PG_VERSION_NUM >= PG_VERSION_13
-
-/*
+ *
  *	  How it works:
  *	  - An index is declared with the name {var}PositionDoNotUse and used
  *	    throughout the for loop using ## to concat.
@@ -109,21 +159,19 @@ typedef struct ListCellAndListWrapper
 		 (var ## PositionDoNotUse) < list_length(l) && \
 		 (((var) = list_nth(l, var ## PositionDoNotUse)) || true); \
 		 var ## PositionDoNotUse ++)
-#else
-#define foreach_ptr_append(var, l) foreach_ptr(var, l)
-#endif
 
 /* utility functions declaration shared within this module */
 extern List * SortList(List *pointerList,
 					   int (*ComparisonFunction)(const void *, const void *));
 extern void ** PointerArrayFromList(List *pointerList);
-extern ArrayType * DatumArrayToArrayType(Datum *datumArray, int datumCount,
-										 Oid datumTypeId);
 extern HTAB * ListToHashSet(List *pointerList, Size keySize, bool isStringList);
 extern char * StringJoin(List *stringList, char delimiter);
+extern char * StringJoinParams(List *stringList, char delimiter,
+							   char *prefix, char *postfix);
 extern List * ListTake(List *pointerList, int size);
 extern void * safe_list_nth(const List *list, int index);
 extern List * GeneratePositiveIntSequenceList(int upTo);
 extern List * GenerateListFromElement(void *listElement, int listLength);
+extern List * list_filter_oid(List *list, bool (*keepElement)(Oid element));
 
 #endif /* CITUS_LISTUTILS_H */

@@ -4,14 +4,6 @@ CREATE TABLE alter_am_pg_version_table (a INT);
 SELECT alter_table_set_access_method('alter_am_pg_version_table', 'columnar');
 DROP TABLE alter_am_pg_version_table;
 
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 11 AS server_version_above_eleven
-\gset
-\if :server_version_above_eleven
-\else
-\q
-\endif
-
 
 CREATE SCHEMA alter_table_set_access_method;
 SET search_path TO alter_table_set_access_method;
@@ -223,7 +215,6 @@ create view v_dist as select * from dist;
 select alter_table_set_access_method('local','columnar');
 select alter_table_set_access_method('ref','columnar');
 select alter_table_set_access_method('dist','columnar');
-
 
 SELECT alter_distributed_table('dist', shard_count:=1, cascade_to_colocated:=false);
 

@@ -32,6 +32,8 @@
 #include "distributed/transmit.h"
 #include "distributed/transaction_identifier.h"
 #include "distributed/tuplestore.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/utils/directory.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
 #include "nodes/makefuncs.h"
@@ -45,7 +47,7 @@
 #include "utils/syscache.h"
 
 
-static bool CreatedResultsDirectory = false;
+static List *CreatedResultsDirectories = NIL;
 
 
 /* CopyDestReceiver can be used to stream results into a distributed table */
@@ -594,25 +596,27 @@ CreateIntermediateResultsDirectory(void)
 {
 	char *resultDirectory = IntermediateResultsDirectory();
 
-	if (!CreatedResultsDirectory)
+	int makeOK = mkdir(resultDirectory, S_IRWXU);
+	if (makeOK != 0)
 	{
-		int makeOK = mkdir(resultDirectory, S_IRWXU);
-		if (makeOK != 0)
+		if (errno == EEXIST)
 		{
-			if (errno == EEXIST)
-			{
-				/* someone else beat us to it, that's ok */
-				return resultDirectory;
-			}
-
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not create intermediate results directory "
-								   "\"%s\": %m",
-								   resultDirectory)));
+			/* someone else beat us to it, that's ok */
+			return resultDirectory;
 		}
 
-		CreatedResultsDirectory = true;
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not create intermediate results directory "
+							   "\"%s\": %m",
+							   resultDirectory)));
 	}
+
+	MemoryContext oldContext = MemoryContextSwitchTo(TopTransactionContext);
+
+	CreatedResultsDirectories =
+		lappend(CreatedResultsDirectories, pstrdup(resultDirectory));
+
+	MemoryContextSwitchTo(oldContext);
 
 	return resultDirectory;
 }
@@ -693,13 +697,14 @@ IntermediateResultsDirectory(void)
 
 
 /*
- * RemoveIntermediateResultsDirectory removes the intermediate result directory
+ * RemoveIntermediateResultsDirectories removes the intermediate result directory
  * for the current distributed transaction, if any was created.
  */
 void
-RemoveIntermediateResultsDirectory(void)
+RemoveIntermediateResultsDirectories(void)
 {
-	if (CreatedResultsDirectory)
+	char *directoryElement = NULL;
+	foreach_ptr(directoryElement, CreatedResultsDirectories)
 	{
 		/*
 		 * The shared directory is renamed before deleting it. Otherwise it
@@ -708,7 +713,7 @@ RemoveIntermediateResultsDirectory(void)
 		 * that's not possible. The current PID is included in the new
 		 * filename, so there can be no collisions with other backends.
 		 */
-		char *sharedName = IntermediateResultsDirectory();
+		char *sharedName = directoryElement;
 		StringInfo privateName = makeStringInfo();
 		appendStringInfo(privateName, "%s.removed-by-%d", sharedName, MyProcPid);
 		if (rename(sharedName, privateName->data))
@@ -728,9 +733,12 @@ RemoveIntermediateResultsDirectory(void)
 		{
 			PathNameDeleteTemporaryDir(privateName->data);
 		}
-
-		CreatedResultsDirectory = false;
 	}
+
+	/* cleanup */
+	list_free_deep(CreatedResultsDirectories);
+
+	CreatedResultsDirectories = NIL;
 }
 
 

@@ -1,3 +1,13 @@
+--
+-- LOCAL_SHARD_EXECUTION_REPLICATED
+--
+-- This test file has an alternative output because of the change in the
+-- display of SQL-standard function's arguments in INSERT/SELECT in PG15.
+-- The alternative output can be deleted when we drop support for PG14
+--
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15;
+
 CREATE SCHEMA local_shard_execution_replicated;
 SET search_path TO local_shard_execution_replicated;
 
@@ -194,7 +204,9 @@ SELECT * FROM second_distributed_table WHERE key = 1 ORDER BY 1,2;
 -- Put row back for other tests
 INSERT INTO distributed_table VALUES (1, '22', 20);
 
+SET citus.enable_ddl_propagation TO OFF;
 CREATE VIEW abcd_view AS SELECT * FROM abcd;
+RESET citus.enable_ddl_propagation;
 
 SELECT * FROM abcd first join abcd second on first.b = second.b ORDER BY 1,2,3,4;
 
@@ -729,15 +741,19 @@ ROLLBACK;
 
 -- probably not a realistic case since views are not very
 -- well supported with MX
+SET citus.enable_ddl_propagation TO OFF;
 CREATE VIEW v_local_query_execution AS
 SELECT * FROM distributed_table WHERE key = 500;
+RESET citus.enable_ddl_propagation;
 
 SELECT * FROM v_local_query_execution;
 
 -- similar test, but this time the view itself is a non-local
 -- query, but the query on the view is local
+SET citus.enable_ddl_propagation TO OFF;
 CREATE VIEW v_local_query_execution_2 AS
 SELECT * FROM distributed_table;
+RESET citus.enable_ddl_propagation;
 
 SELECT * FROM v_local_query_execution_2 WHERE key = 500;
 

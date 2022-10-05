@@ -2,7 +2,7 @@
 // so setting the corresponding shard here is useful
 setup
 {
-
+    SET citus.enable_metadata_sync TO off;
     CREATE OR REPLACE FUNCTION run_try_drop_marked_shards()
     RETURNS VOID
     AS 'citus'
@@ -23,14 +23,12 @@ setup
         LANGUAGE C STRICT VOLATILE
         AS 'citus', $$stop_session_level_connection_to_node$$;
 
-  SELECT citus_internal.replace_isolation_tester_func();
-  SELECT citus_internal.refresh_isolation_tester_prepared_statement();
-
 CREATE OR REPLACE PROCEDURE isolation_cleanup_orphaned_shards()
     LANGUAGE C
     AS 'citus', $$isolation_cleanup_orphaned_shards$$;
 COMMENT ON PROCEDURE isolation_cleanup_orphaned_shards()
     IS 'cleanup orphaned shards';
+    RESET citus.enable_metadata_sync;
 
     SET citus.next_shard_id to 120000;
 	SET citus.shard_count TO 8;
@@ -43,8 +41,6 @@ COMMENT ON PROCEDURE isolation_cleanup_orphaned_shards()
 
 teardown
 {
-  SELECT citus_internal.restore_isolation_tester_func();
-
   DROP TABLE selected_shard;
   DROP TABLE t1;
 }

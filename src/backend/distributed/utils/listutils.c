@@ -91,25 +91,6 @@ PointerArrayFromList(List *pointerList)
 
 
 /*
- * DatumArrayToArrayType converts the provided Datum array (of the specified
- * length and type) into an ArrayType suitable for returning from a UDF.
- */
-ArrayType *
-DatumArrayToArrayType(Datum *datumArray, int datumCount, Oid datumTypeId)
-{
-	int16 typeLength = 0;
-	bool typeByValue = false;
-	char typeAlignment = 0;
-
-	get_typlenbyvalalign(datumTypeId, &typeLength, &typeByValue, &typeAlignment);
-	ArrayType *arrayObject = construct_array(datumArray, datumCount, datumTypeId,
-											 typeLength, typeByValue, typeAlignment);
-
-	return arrayObject;
-}
-
-
-/*
  * ListToHashSet creates a hash table in which the keys are copied from
  * from itemList and the values are the same as the keys. This can
  * be used for fast lookups of the presence of a byte array in a set.
@@ -180,12 +161,30 @@ GeneratePositiveIntSequenceList(int upTo)
 /*
  * StringJoin gets a list of char * and then simply
  * returns a newly allocated char * joined with the
- * given delimiter.
+ * given delimiter. It uses ';' as the delimiter by
+ * default.
  */
 char *
 StringJoin(List *stringList, char delimiter)
 {
+	return StringJoinParams(stringList, delimiter, NULL, NULL);
+}
+
+
+/*
+ * StringJoin gets a list of char * and then simply
+ * returns a newly allocated char * joined with the
+ * given delimiter, prefix and postfix.
+ */
+char *
+StringJoinParams(List *stringList, char delimiter, char *prefix, char *postfix)
+{
 	StringInfo joinedString = makeStringInfo();
+
+	if (prefix != NULL)
+	{
+		appendStringInfoString(joinedString, prefix);
+	}
 
 	const char *command = NULL;
 	int curIndex = 0;
@@ -197,6 +196,11 @@ StringJoin(List *stringList, char delimiter)
 		}
 		appendStringInfoString(joinedString, command);
 		curIndex++;
+	}
+
+	if (postfix != NULL)
+	{
+		appendStringInfoString(joinedString, postfix);
 	}
 
 	return joinedString->data;
@@ -263,4 +267,25 @@ GenerateListFromElement(void *listElement, int listLength)
 	}
 
 	return list;
+}
+
+
+/*
+ * list_filter_oid filters a list of oid-s based on a keepElement
+ * function
+ */
+List *
+list_filter_oid(List *list, bool (*keepElement)(Oid element))
+{
+	List *result = NIL;
+	Oid element = InvalidOid;
+	foreach_oid(element, list)
+	{
+		if (keepElement(element))
+		{
+			result = lappend_oid(result, element);
+		}
+	}
+
+	return result;
 }

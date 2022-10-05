@@ -114,41 +114,12 @@ DROP TABLE test_truncate_range;
 -- expect shard to be present, data to be truncated
 --
 CREATE TABLE test_truncate_hash(a int);
-SELECT master_create_distributed_table('test_truncate_hash', 'a', 'hash');
-
--- verify no error is thrown when no shards are present
-TRUNCATE TABLE test_truncate_hash;
-
-SELECT count(*) FROM test_truncate_hash;
+SELECT create_distributed_table('test_truncate_hash', 'a', 'hash');
 
 INSERT INTO test_truncate_hash values (1);
 INSERT INTO test_truncate_hash values (1001);
 INSERT INTO test_truncate_hash values (2000);
 INSERT INTO test_truncate_hash values (100);
-
-SELECT count(*) FROM test_truncate_hash;
-
--- verify 4 shards are present
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass ORDER BY shardid;
-
-TRUNCATE TABLE test_truncate_hash;
-
-SELECT master_create_worker_shards('test_truncate_hash', 4, 1);
-
-INSERT INTO test_truncate_hash values (1);
-INSERT INTO test_truncate_hash values (1001);
-INSERT INTO test_truncate_hash values (2000);
-INSERT INTO test_truncate_hash values (100);
-
-SELECT count(*) FROM test_truncate_hash;
-
-TRUNCATE TABLE test_truncate_hash;
-
--- verify data is truncated from the table
-SELECT count(*) FROM test_truncate_hash;
-
--- verify 4 shards are still presents
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass ORDER BY shardid;
 
 -- verify that truncate can be aborted
 INSERT INTO test_truncate_hash VALUES (1);
@@ -319,7 +290,8 @@ INSERT INTO t1 VALUES(1,1);
 SELECT create_distributed_table('t1', 'a');
 ALTER TABLE t1 ADD CONSTRAINT t1_a_check CHECK(a > 2) NOT VALID;
 
--- will error out with "ERROR:  CHECK CONSTRAINT "t1_a_check" is violated by some row"
+-- will error out with
+-- "ERROR:  CHECK CONSTRAINT "t1_a_check" of relation "t1" is violated by some row"
 ALTER TABLE t1 VALIDATE CONSTRAINT t1_a_check;
 -- remove violating row
 DELETE FROM t1 where a = 1;

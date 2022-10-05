@@ -17,6 +17,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "distributed/backend_data.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
@@ -169,7 +170,7 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 		}
 
 		/*
-		 * In pg12's planning phase empty FROMs are represented with an RTE_RESULT.
+		 * In the planning phase empty FROMs are represented with an RTE_RESULT.
 		 * When we arrive here, standard_planner has already been called which calls
 		 * replace_empty_jointree() which replaces empty fromlist with a list of
 		 * single RTE_RESULT RangleTableRef node.
