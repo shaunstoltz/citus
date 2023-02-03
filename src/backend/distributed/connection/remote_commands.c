@@ -254,6 +254,11 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 	if (pgConn != NULL)
 	{
 		messageDetail = pchomp(PQerrorMessage(pgConn));
+		if (messageDetail == NULL || messageDetail[0] == '\0')
+		{
+			/* give a similar messages to Postgres */
+			messageDetail = "connection not open";
+		}
 	}
 
 	if (messageDetail)
@@ -416,6 +421,43 @@ ExecuteCriticalRemoteCommand(MultiConnection *connection, const char *command)
 
 	PQclear(result);
 	ForgetResults(connection);
+}
+
+
+/*
+ * ExecuteRemoteCommandInConnectionList executes a remote command, on all connections
+ * given in the list, that is critical to the transaction. If the command fails then
+ * the transaction aborts.
+ */
+void
+ExecuteRemoteCommandInConnectionList(List *nodeConnectionList, const char *command)
+{
+	MultiConnection *connection = NULL;
+
+	foreach_ptr(connection, nodeConnectionList)
+	{
+		int querySent = SendRemoteCommand(connection, command);
+
+		if (querySent == 0)
+		{
+			ReportConnectionError(connection, ERROR);
+		}
+	}
+
+	/* Process the result */
+	foreach_ptr(connection, nodeConnectionList)
+	{
+		bool raiseInterrupts = true;
+		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
+
+		if (!IsResponseOK(result))
+		{
+			ReportResultError(connection, result, ERROR);
+		}
+
+		PQclear(result);
+		ForgetResults(connection);
+	}
 }
 
 
@@ -1200,4 +1242,35 @@ StoreErrorMessage(MultiConnection *connection, StringInfo queryResultString)
 	}
 
 	appendStringInfo(queryResultString, "%s", errorMessage);
+}
+
+
+/*
+ * IsSettingSafeToPropagate returns whether a SET LOCAL is safe to propagate.
+ *
+ * We exclude settings that are highly specific to the client or session and also
+ * ban propagating the citus.propagate_set_commands setting (not for correctness,
+ * more to avoid confusion).
+ */
+bool
+IsSettingSafeToPropagate(const char *name)
+{
+	/* if this list grows considerably we should switch to bsearch */
+	const char *skipSettings[] = {
+		"application_name",
+		"citus.propagate_set_commands",
+		"client_encoding",
+		"exit_on_error",
+		"max_stack_depth"
+	};
+
+	for (Index settingIndex = 0; settingIndex < lengthof(skipSettings); settingIndex++)
+	{
+		if (pg_strcasecmp(skipSettings[settingIndex], name) == 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }

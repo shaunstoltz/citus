@@ -17,6 +17,7 @@
 #include "nodes/pg_list.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
+#include "distributed/shard_cleaner.h"
 
 
 /* Config variables managed via guc.c */
@@ -131,7 +132,8 @@ extern void LogicallyReplicateShards(List *shardList, char *sourceNodeName,
 									 int sourceNodePort, char *targetNodeName,
 									 int targetNodePort);
 
-extern void ConflictOnlyWithIsolationTesting(void);
+extern void ConflictWithIsolationTestingBeforeCopy(void);
+extern void ConflictWithIsolationTestingAfterCopy(void);
 extern void CreateReplicaIdentities(List *subscriptionInfoList);
 extern void CreateReplicaIdentitiesOnNode(List *shardList,
 										  char *nodeName,
@@ -149,19 +151,15 @@ extern char * CreateReplicationSlots(MultiConnection *sourceConnection,
 									 List *subscriptionInfoList,
 									 char *outputPlugin);
 extern void EnableSubscriptions(List *subscriptionInfoList);
-extern void DropSubscriptions(List *subscriptionInfoList);
-extern void DropReplicationSlots(MultiConnection *sourceConnection,
-								 List *subscriptionInfoList);
-extern void DropPublications(MultiConnection *sourceConnection,
-							 HTAB *publicationInfoHash);
-extern void DropAllLogicalReplicationLeftovers(LogicalRepType type);
 
 extern char * PublicationName(LogicalRepType type, uint32_t nodeId, Oid ownerId);
-extern char * ReplicationSlotName(LogicalRepType type, uint32_t nodeId, Oid ownerId);
+extern char * ReplicationSlotNameForNodeAndOwnerForOperation(LogicalRepType type,
+															 uint32_t nodeId,
+															 Oid ownerId,
+															 OperationId operationId);
 extern char * SubscriptionName(LogicalRepType type, Oid ownerId);
 extern char * SubscriptionRoleName(LogicalRepType type, Oid ownerId);
 
-extern void WaitForAllSubscriptionsToBecomeReady(HTAB *groupedLogicalRepTargetsHash);
 extern void WaitForAllSubscriptionsToCatchUp(MultiConnection *sourceConnection,
 											 HTAB *groupedLogicalRepTargetsHash);
 extern void WaitForShardSubscriptionToCatchUp(MultiConnection *targetConnection,

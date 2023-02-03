@@ -35,6 +35,7 @@ test: distributed_triggers
 
 test: multi_test_catalog_views
 test: multi_table_ddl
+test: multi_alias
 test: multi_sequence_default
 test: grant_on_sequence_propagation
 test: multi_name_lengths
@@ -67,7 +68,7 @@ test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_
 test: multi_shard_update_delete recursive_dml_with_different_planners_executors
 test: insert_select_repartition window_functions dml_recursive multi_insert_select_window
 test: multi_insert_select_conflict citus_table_triggers
-test: multi_row_insert insert_select_into_local_table multi_create_table_new_features alter_index
+test: multi_row_insert insert_select_into_local_table alter_index
 
 # following should not run in parallel because it relies on connection counts to workers
 test: insert_select_connection_leak
@@ -84,7 +85,8 @@ test: ensure_no_intermediate_data_leak
 # Tests for partitioning support
 # ----------
 test: multi_partitioning_utils replicated_partitioned_table
-test: multi_partitioning partitioning_issue_3970
+test: multi_partitioning
+test: partitioning_issue_3970
 test: drop_partitioned_table
 test: multi_fix_partition_shard_index_names
 test: partition_wise_join
@@ -149,6 +151,8 @@ test: with_executors with_join with_partitioning with_transactions with_dml
 test: multi_index_statements
 test: multi_alter_table_statements
 test: multi_alter_table_add_constraints
+test: multi_alter_table_add_constraints_without_name
+test: multi_alter_table_add_foreign_key_without_name
 
 # ----------
 # Tests to check if we inform the user about potential caveats of creating new
@@ -196,6 +200,7 @@ test: local_dist_join_modifications
 test: local_table_join
 test: local_dist_join_mixed
 test: citus_local_dist_joins
+test: recurring_outer_join
 test: pg_dump
 
 # ---------
@@ -288,7 +293,7 @@ test: auto_undist_citus_local
 test: mx_regular_user
 test: citus_locks
 test: global_cancel
-test: sequencenes_owned_by
+test: sequences_owned_by
 test: remove_coordinator
 
 # ----------

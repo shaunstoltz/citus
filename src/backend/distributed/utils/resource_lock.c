@@ -781,14 +781,7 @@ SerializeNonCommutativeWrites(List *shardIntervalList, LOCKMODE lockMode)
 static bool
 AnyTableReplicated(List *shardIntervalList, List **replicatedShardIntervalList)
 {
-	if (replicatedShardIntervalList == NULL)
-	{
-		/* the caller is not interested in the replicatedShardIntervalList */
-		List *localList = NIL;
-		replicatedShardIntervalList = &localList;
-	}
-
-	*replicatedShardIntervalList = NIL;
+	List *localList = NIL;
 
 	ShardInterval *shardInterval = NULL;
 	foreach_ptr(shardInterval, shardIntervalList)
@@ -798,17 +791,22 @@ AnyTableReplicated(List *shardIntervalList, List **replicatedShardIntervalList)
 		Oid relationId = RelationIdForShard(shardId);
 		if (ReferenceTableShardId(shardId))
 		{
-			*replicatedShardIntervalList =
-				lappend(*replicatedShardIntervalList, LoadShardInterval(shardId));
+			localList =
+				lappend(localList, LoadShardInterval(shardId));
 		}
 		else if (!SingleReplicatedTable(relationId))
 		{
-			*replicatedShardIntervalList =
-				lappend(*replicatedShardIntervalList, LoadShardInterval(shardId));
+			localList =
+				lappend(localList, LoadShardInterval(shardId));
 		}
 	}
 
-	return list_length(*replicatedShardIntervalList) > 0;
+	if (replicatedShardIntervalList != NULL)
+	{
+		*replicatedShardIntervalList = localList;
+	}
+
+	return list_length(localList) > 0;
 }
 
 
@@ -1357,7 +1355,11 @@ AcquireDistributedLockOnRelations(List *relationList, LOCKMODE lockMode, uint32 
 													 (void *) lockRelationRecord);
 		}
 
-		if ((configs & DIST_LOCK_REFERENCING_TABLES) > 0)
+		char relkind = get_rel_relkind(relationId);
+		bool relationCanBeReferenced = (relkind == RELKIND_RELATION ||
+										relkind == RELKIND_PARTITIONED_TABLE);
+		if (relationCanBeReferenced &&
+			(configs & DIST_LOCK_REFERENCING_TABLES) > 0)
 		{
 			CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 			Assert(cacheEntry != NULL);

@@ -231,15 +231,16 @@ SELECT * FROM
 	) s1
 ORDER BY 2 DESC, 1;
 
--- event vs table non-partition-key join is not supported
--- given that we cannot recursively plan tables yet
-SELECT * FROM
+-- event vs table non-partition-key join is supported
+-- given that we can recursively plan events_table
+SELECT count(*), user_id, done_event FROM
 	(SELECT ru.user_id, CASE WHEN et.user_id IS NULL THEN 'NO' ELSE 'YES' END as done_event
 		FROM recent_users ru
 		LEFT JOIN events_table et
 		ON(ru.user_id = et.event_type)
 	) s1
-ORDER BY 2 DESC, 1;
+GROUP BY user_id, done_event
+ORDER BY 1,2,3;
 
 -- create a select only view
 CREATE VIEW selected_users AS SELECT * FROM users_table WHERE value_1 >= 1 and value_1 <3;
@@ -673,5 +674,46 @@ CREATE MATERIALIZED VIEW v3 AS SELECT id AS col1 FROM small;
 DELETE  FROM ref_1  WHERE value in (SELECT col1 FROM v3);
 SELECT * FROM ref_1 ORDER BY key, value;
 
+-- show that we correctly handle renamed columns when expanding view query
+
+CREATE TABLE column_alias_test_1(a int, b int);
+SELECT create_distributed_table('column_alias_test_1', 'a');
+
+INSERT INTO column_alias_test_1 VALUES (1, 2);
+
+CREATE VIEW column_alias_test_1_view AS
+SELECT * FROM column_alias_test_1;
+
+ALTER TABLE column_alias_test_1 RENAME COLUMN a TO tmp;
+ALTER TABLE column_alias_test_1 RENAME COLUMN b TO a;
+ALTER TABLE column_alias_test_1 RENAME COLUMN tmp TO b;
+
+-- A tricky implication of #5932:
+--
+-- Even if we renamed column names, this should normally print:
+-- a | b
+-- 1 | 2
+--
+-- This is because, views preserve original column names by
+-- aliasing renamed columns.
+--
+-- But before fixing #5932, this was printing:
+-- a | b
+-- 2 | 1
+--
+-- which was not correct.
+SELECT * FROM column_alias_test_1_view;
+
+CREATE TABLE column_alias_test_2(a int, b int);
+SELECT create_distributed_table('column_alias_test_2', 'a');
+
+INSERT INTO column_alias_test_2 VALUES (1, 2);
+
+CREATE VIEW column_alias_test_2_view AS
+SELECT * FROM column_alias_test_2;
+
+ALTER TABLE column_alias_test_2 RENAME COLUMN a TO a_renamed;
+
+SELECT * FROM column_alias_test_2_view;
 
 DROP TABLE large, small, ref_1 CASCADE;

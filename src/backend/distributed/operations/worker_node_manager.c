@@ -19,7 +19,6 @@
 #include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_client_executor.h"
 #include "distributed/worker_manager.h"
 #include "libpq/hba.h"
 #include "common/ip.h"
@@ -267,8 +266,11 @@ ErrorIfCoordinatorNotAddedAsWorkerNode()
 		return;
 	}
 
-	ereport(ERROR, (errmsg("could not find the coordinator node in "
-						   "metadata as it is not added as a worker")));
+	ereport(ERROR, (errmsg("operation is not allowed when coordinator "
+						   "is not added into metadata"),
+					errhint("Use \"SELECT citus_set_coordinator_host('"
+							"<hostname>', '<port>')\" to configure the "
+							"coordinator hostname and port")));
 }
 
 

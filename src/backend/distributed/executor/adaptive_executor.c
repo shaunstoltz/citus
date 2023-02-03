@@ -146,7 +146,6 @@
 #include "distributed/intermediate_result_pruning.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
-#include "distributed/multi_client_executor.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
 #include "distributed/multi_partitioning_utils.h"
@@ -242,8 +241,14 @@ typedef struct DistributedExecution
 	 * would make code a bit harder to read than making this non-local, so we
 	 * move it here. See comments for PG_TRY() in postgres/src/include/elog.h
 	 * and "man 3 siglongjmp" for more context.
+	 *
+	 * Another reason for keeping these here is to cache a single
+	 * WaitEventSet/WaitEvent within the execution pair until we
+	 * need to rebuild the waitEvents.
 	 */
 	WaitEventSet *waitEventSet;
+	WaitEvent *events;
+	int eventSetSize;
 
 	/*
 	 * The number of connections we aim to open per worker.
@@ -476,6 +481,12 @@ typedef struct WorkerSession
 
 	/* events reported by the latest call to WaitEventSetWait */
 	int latestUnconsumedWaitEvents;
+
+	/* for some restricted scenarios, we allow a single connection retry */
+	bool connectionRetried;
+
+	/* keep track of if the session has an active connection */
+	bool sessionHasActiveConnection;
 } WorkerSession;
 
 
@@ -675,6 +686,9 @@ static void MarkEstablishingSessionsTimedOut(WorkerPool *workerPool);
 static int UsableConnectionCount(WorkerPool *workerPool);
 static long NextEventTimeout(DistributedExecution *execution);
 static WaitEventSet * BuildWaitEventSet(List *sessionList);
+static void FreeExecutionWaitEvents(DistributedExecution *execution);
+static void AddSessionToWaitEventSet(WorkerSession *session,
+									 WaitEventSet *waitEventSet);
 static void RebuildWaitEventSetFlags(WaitEventSet *waitEventSet, List *sessionList);
 static TaskPlacementExecution * PopPlacementExecution(WorkerSession *session);
 static TaskPlacementExecution * PopAssignedPlacementExecution(WorkerSession *session);
@@ -712,9 +726,15 @@ static int GetEventSetSize(List *sessionList);
 static bool ProcessSessionsWithFailedWaitEventSetOperations(
 	DistributedExecution *execution);
 static bool HasIncompleteConnectionEstablishment(DistributedExecution *execution);
-static int RebuildWaitEventSet(DistributedExecution *execution);
+static void RebuildWaitEventSet(DistributedExecution *execution);
+static void RebuildWaitEventSetForSessions(DistributedExecution *execution);
+static void AddLatchWaitEventToExecution(DistributedExecution *execution);
 static void ProcessWaitEvents(DistributedExecution *execution, WaitEvent *events, int
 							  eventCount, bool *cancellationReceived);
+#if PG_VERSION_NUM >= PG_VERSION_15
+static void RemoteSocketClosedForAnySession(DistributedExecution *execution);
+static void ProcessWaitEventsForSocketClosed(WaitEvent *events, int eventCount);
+#endif
 static long MillisecondsBetweenTimestamps(instr_time startTime, instr_time endTime);
 static uint64 MicrosecondsBetweenTimestamps(instr_time startTime, instr_time endTime);
 static HeapTuple BuildTupleFromBytes(AttInMetadata *attinmeta, fmStringInfo *values);
@@ -2421,14 +2441,22 @@ FindOrCreateWorkerSession(WorkerPool *workerPool, MultiConnection *connection)
 	session->commandsSent = 0;
 	session->waitEventSetIndex = WAIT_EVENT_SET_INDEX_NOT_INITIALIZED;
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+
+	/* always detect closed sockets */
+	UpdateConnectionWaitFlags(session, WL_SOCKET_CLOSED);
+#endif
+
 	dlist_init(&session->pendingTaskQueue);
 	dlist_init(&session->readyTaskQueue);
 
-	/* keep track of how many connections are ready */
 	if (connection->connectionState == MULTI_CONNECTION_CONNECTED)
 	{
+		/* keep track of how many connections are ready */
 		workerPool->activeConnectionCount++;
 		workerPool->idleConnectionCount++;
+
+		session->sessionHasActiveConnection = true;
 	}
 
 	workerPool->unusedConnectionCount++;
@@ -2448,6 +2476,38 @@ FindOrCreateWorkerSession(WorkerPool *workerPool, MultiConnection *connection)
 
 	return session;
 }
+
+
+/*
+ * RemoteSocketClosedForNewSession is a helper function for detecting whether
+ * the remote socket corresponding to the input session is closed. This is
+ * mostly common there is a cached connection and remote server restarted
+ * (due to failover or restart etc.).
+ *
+ * The function is not a generic function that can be called at the start of
+ * the execution. The function is not generic because it does not check all
+ * the events, even ignores cancellation events. Future callers of this
+ * function should consider its limitations.
+ */
+#if PG_VERSION_NUM >= PG_VERSION_15
+static void
+RemoteSocketClosedForAnySession(DistributedExecution *execution)
+{
+	if (!WaitEventSetCanReportClosed())
+	{
+		/* we cannot detect for this OS */
+		return;
+	}
+
+	long timeout = 0;/* don't wait */
+
+	int eventCount = WaitEventSetWait(execution->waitEventSet, timeout, execution->events,
+									  execution->eventSetSize, WAIT_EVENT_CLIENT_READ);
+	ProcessWaitEventsForSocketClosed(execution->events, eventCount);
+}
+
+
+#endif
 
 
 /*
@@ -2536,8 +2596,6 @@ SequentialRunDistributedExecution(DistributedExecution *execution)
 void
 RunDistributedExecution(DistributedExecution *execution)
 {
-	WaitEvent *events = NULL;
-
 	AssignTasksToConnectionsOrWorkerPool(execution);
 
 	PG_TRY();
@@ -2550,8 +2608,6 @@ RunDistributedExecution(DistributedExecution *execution)
 		}
 
 		bool cancellationReceived = false;
-
-		int eventSetSize = GetEventSetSize(execution->sessionList);
 
 		/* always (re)build the wait event set the first time */
 		execution->rebuildWaitEventSet = true;
@@ -2594,17 +2650,7 @@ RunDistributedExecution(DistributedExecution *execution)
 			}
 			else if (execution->rebuildWaitEventSet)
 			{
-				if (events != NULL)
-				{
-					/*
-					 * The execution might take a while, so explicitly free at this point
-					 * because we don't need anymore.
-					 */
-					pfree(events);
-					events = NULL;
-				}
-				eventSetSize = RebuildWaitEventSet(execution);
-				events = palloc0(eventSetSize * sizeof(WaitEvent));
+				RebuildWaitEventSet(execution);
 
 				skipWaitEvents =
 					ProcessSessionsWithFailedWaitEventSetOperations(execution);
@@ -2631,21 +2677,15 @@ RunDistributedExecution(DistributedExecution *execution)
 
 			/* wait for I/O events */
 			long timeout = NextEventTimeout(execution);
-			int eventCount = WaitEventSetWait(execution->waitEventSet, timeout, events,
-											  eventSetSize, WAIT_EVENT_CLIENT_READ);
-			ProcessWaitEvents(execution, events, eventCount, &cancellationReceived);
+			int eventCount =
+				WaitEventSetWait(execution->waitEventSet, timeout, execution->events,
+								 execution->eventSetSize, WAIT_EVENT_CLIENT_READ);
+
+			ProcessWaitEvents(execution, execution->events, eventCount,
+							  &cancellationReceived);
 		}
 
-		if (events != NULL)
-		{
-			pfree(events);
-		}
-
-		if (execution->waitEventSet != NULL)
-		{
-			FreeWaitEventSet(execution->waitEventSet);
-			execution->waitEventSet = NULL;
-		}
+		FreeExecutionWaitEvents(execution);
 
 		CleanUpSessions(execution);
 	}
@@ -2657,11 +2697,7 @@ RunDistributedExecution(DistributedExecution *execution)
 		 */
 		UnclaimAllSessionConnections(execution->sessionList);
 
-		if (execution->waitEventSet != NULL)
-		{
-			FreeWaitEventSet(execution->waitEventSet);
-			execution->waitEventSet = NULL;
-		}
+		FreeExecutionWaitEvents(execution);
 
 		PG_RE_THROW();
 	}
@@ -2745,22 +2781,52 @@ HasIncompleteConnectionEstablishment(DistributedExecution *execution)
  * RebuildWaitEventSet updates the waitEventSet for the distributed execution.
  * This happens when the connection set for the distributed execution is changed,
  * which means that we need to update which connections we wait on for events.
- * It returns the new event set size.
  */
-static int
+static void
 RebuildWaitEventSet(DistributedExecution *execution)
 {
-	if (execution->waitEventSet != NULL)
-	{
-		FreeWaitEventSet(execution->waitEventSet);
-		execution->waitEventSet = NULL;
-	}
+	RebuildWaitEventSetForSessions(execution);
+
+	AddLatchWaitEventToExecution(execution);
+}
+
+
+/*
+ * AddLatchWaitEventToExecution is a helper function that adds the latch
+ * wait event to the execution->waitEventSet. Note that this function assumes
+ * that execution->waitEventSet has already allocated enough slot for latch
+ * event.
+ */
+static void
+AddLatchWaitEventToExecution(DistributedExecution *execution)
+{
+	CitusAddWaitEventSetToSet(execution->waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET,
+							  MyLatch, NULL);
+}
+
+
+/*
+ * RebuildWaitEventSetForSessions re-creates the waitEventSet for the
+ * sessions involved in the distributed execution.
+ *
+ * Most of the time you need RebuildWaitEventSet() which also includes
+ * adds the Latch wait event to the set.
+ */
+static void
+RebuildWaitEventSetForSessions(DistributedExecution *execution)
+{
+	FreeExecutionWaitEvents(execution);
 
 	execution->waitEventSet = BuildWaitEventSet(execution->sessionList);
+
+	execution->eventSetSize = GetEventSetSize(execution->sessionList);
+	execution->events = palloc0(execution->eventSetSize * sizeof(WaitEvent));
+
+	CitusAddWaitEventSetToSet(execution->waitEventSet, WL_POSTMASTER_DEATH,
+							  PGINVALID_SOCKET, NULL, NULL);
+
 	execution->rebuildWaitEventSet = false;
 	execution->waitFlagsChanged = false;
-
-	return GetEventSetSize(execution->sessionList);
 }
 
 
@@ -2811,6 +2877,43 @@ ProcessWaitEvents(DistributedExecution *execution, WaitEvent *events, int eventC
 		ConnectionStateMachine(session);
 	}
 }
+
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+
+/*
+ * ProcessWaitEventsForSocketClosed mainly checks for WL_SOCKET_CLOSED event.
+ * If WL_SOCKET_CLOSED is found, the function sets the underlying connection's
+ * state as MULTI_CONNECTION_LOST.
+ */
+static void
+ProcessWaitEventsForSocketClosed(WaitEvent *events, int eventCount)
+{
+	int eventIndex = 0;
+
+	/* process I/O events */
+	for (; eventIndex < eventCount; eventIndex++)
+	{
+		WaitEvent *event = &events[eventIndex];
+
+		if (event->events & WL_POSTMASTER_DEATH)
+		{
+			ereport(ERROR, (errmsg("postmaster was shut down, exiting")));
+		}
+
+		WorkerSession *session = (WorkerSession *) event->user_data;
+		session->latestUnconsumedWaitEvents = event->events;
+
+		if (session->latestUnconsumedWaitEvents & WL_SOCKET_CLOSED)
+		{
+			/* let the ConnectionStateMachine handle the rest */
+			session->connection->connectionState = MULTI_CONNECTION_LOST;
+		}
+	}
+}
+
+
+#endif
 
 
 /*
@@ -2890,7 +2993,6 @@ ManageWorkerPool(WorkerPool *workerPool)
 	}
 
 	INSTR_TIME_SET_CURRENT(workerPool->lastConnectionOpenTime);
-	execution->rebuildWaitEventSet = true;
 }
 
 
@@ -3213,6 +3315,7 @@ OpenNewConnections(WorkerPool *workerPool, int newConnectionCount,
 	ereport(DEBUG4, (errmsg("opening %d new connections to %s:%d", newConnectionCount,
 							workerPool->nodeName, workerPool->nodePort)));
 
+	List *newSessionsList = NIL;
 	for (int connectionIndex = 0; connectionIndex < newConnectionCount; connectionIndex++)
 	{
 		/* experimental: just to see the perf benefits of caching connections */
@@ -3271,7 +3374,69 @@ OpenNewConnections(WorkerPool *workerPool, int newConnectionCount,
 
 		/* create a session for the connection */
 		WorkerSession *session = FindOrCreateWorkerSession(workerPool, connection);
+		newSessionsList = lappend(newSessionsList, session);
+	}
 
+	if (list_length(newSessionsList) == 0)
+	{
+		/* nothing to do as no new connections happened */
+		return;
+	}
+
+	DistributedExecution *execution = workerPool->distributedExecution;
+
+
+	/*
+	 * Although not ideal, there is a slight difference in the implementations
+	 * of PG15+ and others.
+	 *
+	 * Recreating the WaitEventSet even once is prohibitively expensive (almost
+	 * ~7% overhead for select-only pgbench). For all versions, the aim is to
+	 * be able to create the WaitEventSet only once after any new connections
+	 * are added to the execution. That is the main reason behind the implementation
+	 * differences.
+	 *
+	 * For pre-PG15 versions, we leave the waitEventSet recreation to the main
+	 * execution loop. For PG15+, we do it right here.
+	 *
+	 * We require this difference because for PG15+, there is a new type of
+	 * WaitEvent (WL_SOCKET_CLOSED). We can provide this new event at this point,
+	 * and check RemoteSocketClosedForAnySession(). For earlier versions, we have
+	 * to defer the rebuildWaitEventSet as there is no other event to waitFor
+	 * at this point. We could have forced to re-build, but that would mean we try to
+	 * create waitEventSet without any actual events. That has some other implications
+	 * such that we have to avoid certain optimizations of WaitEventSet creation.
+	 *
+	 * Instead, we prefer this slight difference, which in effect has almost no
+	 * difference, but doing things in different points in time.
+	 */
+#if PG_VERSION_NUM >= PG_VERSION_15
+
+	/* we added new connections, rebuild the waitEventSet */
+	RebuildWaitEventSetForSessions(execution);
+
+	/*
+	 * If there are any closed sockets, mark connection lost such that
+	 * we can re-connect.
+	 */
+	RemoteSocketClosedForAnySession(execution);
+
+	/*
+	 * For RemoteSocketClosedForAnySession() purposes, we explicitly skip
+	 * the latch because we want to handle all cancellations to be caught
+	 * on the main execution loop, not here. We mostly skip cancellations
+	 * on RemoteSocketClosedForAnySession() for simplicity. Handling
+	 * cancellations on the main execution loop much easier to break out
+	 * of the execution.
+	 */
+	AddLatchWaitEventToExecution(execution);
+#else
+	execution->rebuildWaitEventSet = true;
+#endif
+
+	WorkerSession *session = NULL;
+	foreach_ptr(session, newSessionsList)
+	{
 		/* immediately run the state machine to handle potential failure */
 		ConnectionStateMachine(session);
 	}
@@ -3647,13 +3812,38 @@ ConnectionStateMachine(WorkerSession *session)
 
 			case MULTI_CONNECTION_LOST:
 			{
-				/* managed to connect, but connection was lost */
-				workerPool->activeConnectionCount--;
-
-				if (session->currentTask == NULL)
+				/*
+				 * If a connection is lost, we retry the connection for some
+				 * very restricted scenarios. The main use case is to retry
+				 * connection establishment when a cached connection is used
+				 * in the executor while remote server has restarted / failedover
+				 * etc.
+				 *
+				 * For simplicity, we only allow retrying connection establishment
+				 * a single time.
+				 *
+				 * We can only retry connection when the remote transaction has
+				 * not started over the connection. Otherwise, we'd have to deal
+				 * with restoring the transaction state, which iis beyond our
+				 * purpose at this time.
+				 */
+				RemoteTransaction *transaction = &connection->remoteTransaction;
+				if (!session->connectionRetried &&
+					transaction->transactionState == REMOTE_TRANS_NOT_STARTED)
 				{
-					/* this was an idle connection */
-					workerPool->idleConnectionCount--;
+					/*
+					 * Try to connect again, we will reuse the same MultiConnection
+					 * and keep it as claimed.
+					 */
+					RestartConnection(connection);
+
+					/* socket have changed */
+					execution->rebuildWaitEventSet = true;
+					session->latestUnconsumedWaitEvents = 0;
+
+					session->connectionRetried = true;
+
+					break;
 				}
 
 				connection->connectionState = MULTI_CONNECTION_FAILED;
@@ -3662,6 +3852,20 @@ ConnectionStateMachine(WorkerSession *session)
 
 			case MULTI_CONNECTION_FAILED:
 			{
+				/* managed to connect, but connection was lost */
+				if (session->sessionHasActiveConnection)
+				{
+					workerPool->activeConnectionCount--;
+
+					if (session->currentTask == NULL)
+					{
+						/* this was an idle connection */
+						workerPool->idleConnectionCount--;
+					}
+
+					session->sessionHasActiveConnection = false;
+				}
+
 				/* connection failed or was lost */
 				int totalConnectionCount = list_length(workerPool->sessionList);
 
@@ -3821,6 +4025,7 @@ HandleMultiConnectionSuccess(WorkerSession *session)
 
 	workerPool->activeConnectionCount++;
 	workerPool->idleConnectionCount++;
+	session->sessionHasActiveConnection = true;
 }
 
 
@@ -4164,7 +4369,13 @@ UpdateConnectionWaitFlags(WorkerSession *session, int waitFlags)
 		return;
 	}
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+
+	/* always detect closed sockets */
+	connection->waitFlags = waitFlags | WL_SOCKET_CLOSED;
+#else
 	connection->waitFlags = waitFlags;
+#endif
 
 	/* without signalling the execution, the flag changes won't be reflected */
 	execution->waitFlagsChanged = true;
@@ -4188,6 +4399,14 @@ CheckConnectionReady(WorkerSession *session)
 		connection->connectionState = MULTI_CONNECTION_LOST;
 		return false;
 	}
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+	if ((session->latestUnconsumedWaitEvents & WL_SOCKET_CLOSED) != 0)
+	{
+		connection->connectionState = MULTI_CONNECTION_LOST;
+		return false;
+	}
+#endif
 
 	/* try to send all pending data */
 	int sendStatus = PQflush(connection->pgConn);
@@ -5341,52 +5560,80 @@ BuildWaitEventSet(List *sessionList)
 	WorkerSession *session = NULL;
 	foreach_ptr(session, sessionList)
 	{
-		MultiConnection *connection = session->connection;
-
-		if (connection->pgConn == NULL)
-		{
-			/* connection died earlier in the transaction */
-			continue;
-		}
-
-		if (connection->waitFlags == 0)
-		{
-			/* not currently waiting for this connection */
-			continue;
-		}
-
-		int sock = PQsocket(connection->pgConn);
-		if (sock == -1)
-		{
-			/* connection was closed */
-			continue;
-		}
-
-		int waitEventSetIndex =
-			CitusAddWaitEventSetToSet(waitEventSet, connection->waitFlags, sock,
-									  NULL, (void *) session);
-		session->waitEventSetIndex = waitEventSetIndex;
-
-		/*
-		 * Inform failed to add to wait event set with a debug message as this
-		 * is too detailed information for users.
-		 */
-		if (session->waitEventSetIndex == WAIT_EVENT_SET_INDEX_FAILED)
-		{
-			ereport(DEBUG1, (errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("Adding wait event for node %s:%d failed. "
-									"The socket was: %d",
-									session->workerPool->nodeName,
-									session->workerPool->nodePort, sock)));
-		}
+		AddSessionToWaitEventSet(session, waitEventSet);
 	}
 
-	CitusAddWaitEventSetToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL,
-							  NULL);
-	CitusAddWaitEventSetToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
-							  NULL);
-
 	return waitEventSet;
+}
+
+
+/*
+ * FreeExecutionWaitEvents is a helper function that gets
+ * a DistributedExecution and frees events and waitEventSet.
+ */
+static void
+FreeExecutionWaitEvents(DistributedExecution *execution)
+{
+	if (execution->events != NULL)
+	{
+		pfree(execution->events);
+		execution->events = NULL;
+	}
+
+	if (execution->waitEventSet != NULL)
+	{
+		FreeWaitEventSet(execution->waitEventSet);
+		execution->waitEventSet = NULL;
+	}
+}
+
+
+/*
+ * AddSessionToWaitEventSet is a helper function which adds the session to
+ * the waitEventSet. The function does certain checks before adding the session
+ * to the waitEventSet.
+ */
+static void
+AddSessionToWaitEventSet(WorkerSession *session, WaitEventSet *waitEventSet)
+{
+	MultiConnection *connection = session->connection;
+
+	if (connection->pgConn == NULL)
+	{
+		/* connection died earlier in the transaction */
+		return;
+	}
+
+	if (connection->waitFlags == 0)
+	{
+		/* not currently waiting for this connection */
+		return;
+	}
+
+	int sock = PQsocket(connection->pgConn);
+	if (sock == -1)
+	{
+		/* connection was closed */
+		return;
+	}
+
+	int waitEventSetIndex =
+		CitusAddWaitEventSetToSet(waitEventSet, connection->waitFlags, sock,
+								  NULL, (void *) session);
+	session->waitEventSetIndex = waitEventSetIndex;
+
+	/*
+	 * Inform failed to add to wait event set with a debug message as this
+	 * is too detailed information for users.
+	 */
+	if (session->waitEventSetIndex == WAIT_EVENT_SET_INDEX_FAILED)
+	{
+		ereport(DEBUG1, (errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("Adding wait event for node %s:%d failed. "
+								"The socket was: %d",
+								session->workerPool->nodeName,
+								session->workerPool->nodePort, sock)));
+	}
 }
 
 

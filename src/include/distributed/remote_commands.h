@@ -46,6 +46,8 @@ extern void ExecuteCriticalRemoteCommandList(MultiConnection *connection,
 											 List *commandList);
 extern void ExecuteCriticalRemoteCommand(MultiConnection *connection,
 										 const char *command);
+extern void ExecuteRemoteCommandInConnectionList(List *nodeConnectionList,
+												 const char *command);
 extern int ExecuteOptionalRemoteCommand(MultiConnection *connection,
 										const char *command,
 										PGresult **result);
@@ -69,5 +71,8 @@ extern bool SendCancelationRequest(MultiConnection *connection);
 extern bool EvaluateSingleQueryResult(MultiConnection *connection, PGresult *queryResult,
 									  StringInfo queryResultString);
 extern void StoreErrorMessage(MultiConnection *connection, StringInfo queryResultString);
+
+extern bool IsSettingSafeToPropagate(const char *name);
+
 
 #endif /* REMOTE_COMMAND_H */

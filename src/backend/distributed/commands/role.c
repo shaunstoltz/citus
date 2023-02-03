@@ -354,17 +354,23 @@ ExtractEncryptedPassword(Oid roleOid)
 
 	Datum passwordDatum = heap_getattr(tuple, Anum_pg_authid_rolpassword,
 									   pgAuthIdDescription, &isNull);
-	char *passwordCstring = TextDatumGetCString(passwordDatum);
+
+	/*
+	 * In PG, an empty password is treated the same as NULL.
+	 * So we propagate NULL password to the other nodes, even if
+	 * the user supplied an empty password
+	 */
+
+	char *passwordCstring = NULL;
+	if (!isNull)
+	{
+		passwordCstring = pstrdup(TextDatumGetCString(passwordDatum));
+	}
 
 	table_close(pgAuthId, AccessShareLock);
 	ReleaseSysCache(tuple);
 
-	if (isNull)
-	{
-		return NULL;
-	}
-
-	return pstrdup(passwordCstring);
+	return passwordCstring;
 }
 
 
@@ -915,7 +921,7 @@ PreprocessCreateRoleStmt(Node *node, const char *queryString,
 	commands = lappend(commands, DISABLE_DDL_PROPAGATION);
 	commands = lappend(commands, createOrAlterRoleQuery);
 
-	/* deparse all grant statements and add them to the to commands list */
+	/* deparse all grant statements and add them to the commands list */
 	Node *stmt = NULL;
 	foreach_ptr(stmt, grantRoleStmts)
 	{
